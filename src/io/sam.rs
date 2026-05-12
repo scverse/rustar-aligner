@@ -194,7 +194,6 @@ impl SamWriter {
         let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
         *record.sequence_mut() = Sequence::from(seq_bytes);
 
-        // Quality scores: convert FASTQ ASCII (Phred+33) to raw Phred for BAM
         *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
 
         maybe_insert_rg_tag(&mut record, rg_id);
