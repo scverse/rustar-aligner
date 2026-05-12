@@ -843,9 +843,6 @@ where
         builder = builder.add_read_group(id, map);
     }
 
-    // @PG line. Per SAM spec §1.3, populate PN/VN/CL alongside ID so downstream
-    // provenance tools (MultiQC program-version table, etc.) see a fully
-    // populated record matching STAR's @PG format.
     let mut pg = Map::<Program>::default();
     pg.other_fields_mut()
         .insert(program_tag::NAME, BString::from("rustar-aligner"));
@@ -1390,8 +1387,6 @@ mod tests {
 
     #[test]
     fn test_build_sam_header_pg_line_populated() {
-        // The @PG line must carry PN, VN and CL alongside ID per SAM spec §1.3,
-        // so downstream provenance tools (MultiQC etc.) get a non-blank entry.
         let genome = make_test_genome();
         let mut params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
         params.command_line =
@@ -1428,8 +1423,6 @@ mod tests {
 
     #[test]
     fn test_build_sam_header_pg_line_default_cl_when_unset() {
-        // When command_line is None (e.g. tests, library use), fall back to
-        // the program name so CL is still non-empty.
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
         assert!(params.command_line.is_none());
