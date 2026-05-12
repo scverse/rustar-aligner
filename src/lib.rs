@@ -258,21 +258,6 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     stats.write_log_final(&log_path, time_start, time_map_start, time_finish)?;
     info!("Wrote {}", log_path.display());
 
-    let log_out_path = params.out_file_name_prefix.join("Log.out");
-    crate::stats::write_log_out(
-        &log_out_path,
-        &params,
-        time_start,
-        time_map_start,
-        time_finish,
-    )?;
-    info!("Wrote {}", log_out_path.display());
-
-    let log_progress_path = params.out_file_name_prefix.join("Log.progress.out");
-    let total_reads = stats.total_reads.load(std::sync::atomic::Ordering::Relaxed);
-    crate::stats::write_log_progress(&log_progress_path, total_reads, time_map_start, time_finish)?;
-    info!("Wrote {}", log_progress_path.display());
-
     // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
     if let Some(ref ctx) = quant_ctx {
         let quant_path = params.out_file_name_prefix.join("ReadsPerGene.out.tab");

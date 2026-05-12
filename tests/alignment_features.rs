@@ -795,23 +795,6 @@ fn test_two_pass_mode() {
         "SJ.pass1.out.tab should no longer be emitted at the top level"
     );
 
-    let log_out = output_dir.join("Log.out");
-    assert!(log_out.exists(), "Log.out not found");
-    let log_out_content = fs::read_to_string(&log_out).unwrap();
-    assert!(!log_out_content.is_empty(), "Log.out is empty");
-    assert!(
-        log_out_content.contains("##### Run parameters"),
-        "Log.out missing parameters section"
-    );
-
-    let log_progress = output_dir.join("Log.progress.out");
-    assert!(log_progress.exists(), "Log.progress.out not found");
-    let log_progress_content = fs::read_to_string(&log_progress).unwrap();
-    assert!(
-        log_progress_content.lines().count() >= 2,
-        "Log.progress.out should have a header and at least one data line"
-    );
-
     let sam_path = output_dir.join("Aligned.out.sam");
     assert!(sam_path.exists(), "Aligned.out.sam not found");
 
