@@ -1302,12 +1302,11 @@ fn stitch_align_to_transcript(
                 return None;
             }
 
-            // Check annotation (needed for sjdbScore bonus and finalization check)
             let is_annotated = junction_db.is_some_and(|db| {
                 let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
                 let donor_fwd =
                     index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-                let acceptor_fwd = donor_fwd + del as u64;
+                let acceptor_fwd = donor_fwd + del as u64 - 1;
                 db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
                     || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
                     || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
