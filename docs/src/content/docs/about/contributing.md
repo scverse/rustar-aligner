@@ -3,7 +3,7 @@ title: Contributing
 description: How to build, test, and contribute to rustar-aligner.
 ---
 
-Contributions are welcome. The repository is on GitHub at [Psy-Fer/rustar-aligner](https://github.com/Psy-Fer/rustar-aligner).
+Contributions are welcome. The repository is on GitHub at [scverse/rustar-aligner](https://github.com/scverse/rustar-aligner).
 
 ## Building and testing
 

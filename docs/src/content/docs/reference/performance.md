@@ -46,4 +46,4 @@ The benchmark suite under construction will report:
 
 ## Reporting your own numbers
 
-If you've benchmarked rustar-aligner on a real dataset, we'd love to hear about it — please [open an issue](https://github.com/Psy-Fer/rustar-aligner/issues) with the genome, read count, hardware, parameters, and timing. Real-world data shapes the optimisation work.
+If you've benchmarked rustar-aligner on a real dataset, we'd love to hear about it — please [open an issue](https://github.com/scverse/rustar-aligner/issues) with the genome, read count, hardware, parameters, and timing. Real-world data shapes the optimisation work.

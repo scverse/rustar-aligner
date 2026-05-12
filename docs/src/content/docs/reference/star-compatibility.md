@@ -103,4 +103,4 @@ For the overwhelming majority of bioinformatics workflows — read counting, dif
 - Workflows that depend on the *specific copy* a multi-mapper landed on (rare; in those cases, you should be using the full alignment set anyway, not just the primary).
 - Reproducing exact byte-equality of SAM output across STAR and rustar-aligner runs (not achievable today; the RNG difference is the dominant source).
 
-If you find a divergence not described here, please [open an issue](https://github.com/Psy-Fer/rustar-aligner/issues) — the project goal is to keep this list as short as possible.
+If you find a divergence not described here, please [open an issue](https://github.com/scverse/rustar-aligner/issues) — the project goal is to keep this list as short as possible.

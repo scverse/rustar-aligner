@@ -3,7 +3,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://psy-fer.github.io',
+  site: 'https://scverse.org',
   base: '/rustar-aligner',
   integrations: [
     starlight({
@@ -31,11 +31,11 @@ export default defineConfig({
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/Psy-Fer/rustar-aligner',
+          href: 'https://github.com/scverse/rustar-aligner',
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/Psy-Fer/rustar-aligner/edit/main/docs/',
+        baseUrl: 'https://github.com/scverse/rustar-aligner/edit/main/docs/',
       },
       sidebar: [
         {
