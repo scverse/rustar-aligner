@@ -295,10 +295,6 @@ mod tests {
 
     #[test]
     fn test_chimeric_junction_writer_creates_missing_parent() {
-        // Regression test for #35: when --twopassMode Basic is combined with
-        // --chimSegmentMin > 0 and --outFileNamePrefix doesn't end in `/`, the
-        // chim writer fires before any other output writer creates the parent
-        // directory. The writer must create the parent itself.
         let dir = tempdir().unwrap();
         let prefix_path = dir.path().join("sample.");
         let prefix = prefix_path.to_str().unwrap();
