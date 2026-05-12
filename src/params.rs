@@ -363,9 +363,7 @@ pub struct Parameters {
     #[arg(long = "limitBAMsortRAM", default_value_t = 0)]
     pub limit_bam_sort_ram: u64,
 
-    /// Maximum available RAM (bytes) for genome generation.
-    ///
-    /// Accepted for STAR CLI compatibility. Not currently enforced — rustar uses its own memory management.
+    /// Maximum RAM (bytes) for genome generation.
     #[arg(long = "limitGenomeGenerateRAM", default_value_t = 31_000_000_000_u64)]
     pub limit_genome_generate_ram: u64,
 
