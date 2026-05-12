@@ -777,6 +777,33 @@ impl Parameters {
         attrs
     }
 
+    /// Effective `--outSAMattributes` set after coupling with `--outSAMstrandField`.
+    ///
+    /// Mirrors STAR's `Parameters_samAttributes.cpp:172-179` and `:213-216`:
+    /// `XS` in the attribute set and `--outSAMstrandField intronMotif` imply
+    /// each other. If either is set the returned set contains `XS`; otherwise
+    /// `XS` is excluded even if it was listed in `--outSAMattributes` without
+    /// a matching strand field (STAR forces the strand field on, so XS stays).
+    pub fn effective_sam_attribute_set(&self) -> HashSet<String> {
+        let mut attrs = self.sam_attribute_set();
+        if self.effective_out_sam_strand_field() == "intronMotif" {
+            attrs.insert("XS".to_string());
+        }
+        attrs
+    }
+
+    /// Effective `--outSAMstrandField` value after coupling with `--outSAMattributes`.
+    ///
+    /// `XS` in `--outSAMattributes` forces `intronMotif` even when the user
+    /// left `--outSAMstrandField` at its default (`None`).
+    pub fn effective_out_sam_strand_field(&self) -> &str {
+        if self.out_sam_strand_field == "intronMotif" || self.sam_attribute_set().contains("XS") {
+            "intronMotif"
+        } else {
+            self.out_sam_strand_field.as_str()
+        }
+    }
+
     /// True if the user provided a non-default `--outSAMattrRGline`.
     pub fn rg_line_set(&self) -> bool {
         !self.out_sam_attr_rg_line.is_empty() && self.out_sam_attr_rg_line[0] != "-"
@@ -952,6 +979,19 @@ impl Parameters {
             ));
         }
         self.rg_ids()?;
+
+        let user_xs_in_attrs = self.sam_attribute_set().contains("XS");
+        let user_strand_intron_motif = self.out_sam_strand_field == "intronMotif";
+        if user_xs_in_attrs && !user_strand_intron_motif {
+            log::info!(
+                "--outSAMattributes contains XS, therefore rustar-aligner will use --outSAMstrandField intronMotif"
+            );
+        }
+        if user_strand_intron_motif && !user_xs_in_attrs {
+            log::info!(
+                "--outSAMstrandField=intronMotif, therefore rustar-aligner will output XS attribute"
+            );
+        }
 
         // quantMode TranscriptomeSAM requires transcript annotations —
         // either via --sjdbGTFfile or pre-generated transcriptInfo.tab
@@ -1487,5 +1527,48 @@ mod tests {
             "3",
         ]);
         assert_eq!(p.align_sj_stitch_mismatch_nmax, vec![1, -1, 2, 3]);
+    }
+
+    #[test]
+    fn xs_strand_field_intron_motif_adds_xs_to_attrs() {
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMstrandField",
+            "intronMotif",
+        ]);
+        let attrs = p.effective_sam_attribute_set();
+        assert!(attrs.contains("XS"));
+        assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
+    }
+
+    #[test]
+    fn xs_attr_forces_intron_motif_strand_field() {
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "NH",
+            "HI",
+            "XS",
+        ]);
+        assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
+        let attrs = p.effective_sam_attribute_set();
+        assert!(attrs.contains("XS"));
+    }
+
+    #[test]
+    fn xs_coupling_dormant_without_user_request() {
+        let p = parse(&["--readFilesIn", "r.fq"]);
+        let attrs = p.effective_sam_attribute_set();
+        assert!(!attrs.contains("XS"));
+        assert_eq!(p.effective_out_sam_strand_field(), "None");
+    }
+
+    #[test]
+    fn xs_attr_via_all_preset_couples_strand_field() {
+        let p = parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]);
+        assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
+        assert!(p.effective_sam_attribute_set().contains("XS"));
     }
 }
