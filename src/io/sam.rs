@@ -588,9 +588,6 @@ impl SamWriter {
         let n_alignments = projected.len();
         let mut records = Vec::with_capacity(n_alignments);
 
-        // STAR pushes ATTR_RG onto both outSAMattrOrder and outSAMattrOrderQuant
-        // when --outSAMattrRGline is set; mirror that here so transcriptome
-        // records get the per-record RG:Z:<id> tag matching the @RG header.
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -1534,10 +1531,6 @@ mod tests {
 
     #[test]
     fn test_build_transcriptome_records_stamps_rg_tag() {
-        // Regression test for #32: when --outSAMattrRGline is supplied, every
-        // transcriptome record must carry the RG:Z:<id> tag matching the @RG
-        // header (mirroring STAR's outSAMattrOrderQuant.push_back(ATTR_RG) at
-        // Parameters_samAttributes.cpp:201-205).
         let params = Parameters::parse_from(vec![
             "rustar-aligner",
             "--readFilesIn",
@@ -1610,9 +1603,6 @@ mod tests {
 
     #[test]
     fn test_build_transcriptome_records_no_rg_when_unset() {
-        // When --outSAMattrRGline is not supplied, no RG:Z: tag should be
-        // emitted on transcriptome records (matching the existing genome-BAM
-        // behavior gated on `rg_id.is_some()`).
         let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let projected = vec![Transcript {
