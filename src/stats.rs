@@ -828,6 +828,35 @@ mod tests {
     }
 
     #[test]
+    fn test_unmapped_other_routed_and_totals_conserved() {
+        let stats = AlignmentStats::new();
+
+        let n_other = 7;
+        let n_short = 3;
+        let n_mismatches = 2;
+        for _ in 0..n_other {
+            stats.record_unmapped_reason(UnmappedReason::Other);
+        }
+        for _ in 0..n_short {
+            stats.record_unmapped_reason(UnmappedReason::TooShort);
+        }
+        for _ in 0..n_mismatches {
+            stats.record_unmapped_reason(UnmappedReason::TooManyMismatches);
+        }
+        stats.record_unmapped_reason(UnmappedReason::TooManyLoci);
+
+        let unmapped_other = stats.unmapped_other.load(Ordering::Relaxed);
+        let unmapped_short = stats.unmapped_short.load(Ordering::Relaxed);
+        let unmapped_mismatches = stats.unmapped_mismatches.load(Ordering::Relaxed);
+
+        assert!(unmapped_other > 0, "Other bucket must be populated");
+        assert_eq!(unmapped_other, n_other);
+        assert_eq!(unmapped_short, n_short);
+        assert_eq!(unmapped_mismatches, n_mismatches);
+        assert_eq!(unmapped_other + unmapped_short, (n_other + n_short));
+    }
+
+    #[test]
     fn test_splice_motif_aggregation() {
         use crate::align::score::SpliceMotif;
         use crate::align::transcript::Exon;
