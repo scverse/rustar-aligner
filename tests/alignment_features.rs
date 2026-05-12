@@ -784,10 +784,32 @@ fn test_two_pass_mode() {
         .assert()
         .success();
 
-    let pass1_path = output_dir.join("SJ.pass1.out.tab");
+    let pass1_path = output_dir.join("_STARpass1").join("SJ.out.tab");
     assert!(
         pass1_path.exists(),
-        "SJ.pass1.out.tab not found — two-pass mode did not write pass-1 junctions"
+        "_STARpass1/SJ.out.tab not found — two-pass mode did not write pass-1 junctions"
+    );
+    let top_level_pass1 = output_dir.join("SJ.pass1.out.tab");
+    assert!(
+        !top_level_pass1.exists(),
+        "SJ.pass1.out.tab should no longer be emitted at the top level"
+    );
+
+    let log_out = output_dir.join("Log.out");
+    assert!(log_out.exists(), "Log.out not found");
+    let log_out_content = fs::read_to_string(&log_out).unwrap();
+    assert!(!log_out_content.is_empty(), "Log.out is empty");
+    assert!(
+        log_out_content.contains("##### Run parameters"),
+        "Log.out missing parameters section"
+    );
+
+    let log_progress = output_dir.join("Log.progress.out");
+    assert!(log_progress.exists(), "Log.progress.out not found");
+    let log_progress_content = fs::read_to_string(&log_progress).unwrap();
+    assert!(
+        log_progress_content.lines().count() >= 2,
+        "Log.progress.out should have a header and at least one data line"
     );
 
     let sam_path = output_dir.join("Aligned.out.sam");
