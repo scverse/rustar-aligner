@@ -7,7 +7,7 @@ import { Image } from 'astro:assets';
 import rustarIcon from '../../assets/rustar-icon.svg';
 
 export const installCode = `<span class="comment"># Step 1 · install</span>
-<span class="prompt">$</span> cargo install <span class="flag">--git</span> https://github.com/Psy-Fer/rustar-aligner
+<span class="prompt">$</span> cargo install <span class="flag">--git</span> https://github.com/scverse/rustar-aligner
 
 <span class="comment"># Step 2 · align</span>
 <span class="prompt">$</span> rustar-aligner \\
@@ -26,7 +26,7 @@ export const installCode = `<span class="comment"># Step 1 · install</span>
     <p class="lead-2">Same <code>{'--camelCase'}</code> CLI. Same SAM/BAM output formats. 99.883% mate-pair faithfulness on a 10,000-pair yeast benchmark, with zero MAPQ inflations.</p>
     <div class="rustar-btns rustar-hero-btns">
       <a href="/rustar-aligner/getting-started/introduction/" class="primary">Documentation</a>
-      <a href="https://github.com/Psy-Fer/rustar-aligner">GitHub ↗</a>
+      <a href="https://github.com/scverse/rustar-aligner">GitHub ↗</a>
     </div>
   </div>
   <Image src={rustarIcon} alt="rustar-aligner mascot: a red crab cradling a golden starfish" class="rustar-mascot" loading="eager" />

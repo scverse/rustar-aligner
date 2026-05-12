@@ -29,4 +29,4 @@ SOFTWARE.
 
 ## Vendored notices
 
-The repository's `LICENSES/` directory contains license notices for vendored or referenced third-party material. See [`LICENSES/`](https://github.com/Psy-Fer/rustar-aligner/tree/main/LICENSES) on GitHub.
+The repository's `LICENSES/` directory contains license notices for vendored or referenced third-party material. See [`LICENSES/`](https://github.com/scverse/rustar-aligner/tree/main/LICENSES) on GitHub.
