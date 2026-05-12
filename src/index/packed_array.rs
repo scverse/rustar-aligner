@@ -196,7 +196,7 @@ mod tests {
     fn round_trip_cross_byte_boundary() {
         let mut arr = PackedArray::new(33, 100); // Human genome SA width
 
-        let test_values = vec![
+        let test_values = [
             0x1FFFFFFFF, // All 33 bits set
             0x100000000, // Bit 32 set (strand bit)
             0x0FFFFFFFF, // Bits 0-31 set (max forward position)

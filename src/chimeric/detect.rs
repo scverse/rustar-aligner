@@ -1344,8 +1344,15 @@ mod tests {
         let read_len = 100usize;
         let t1 = make_clipped_transcript(0, 50, false, read_len, 0, 0);
         let read_seq = make_read_seq(read_len);
-        let result =
-            detect_chimeric_old(&[t1.clone()], &t1, &read_seq, "r", &params, &index).unwrap();
+        let result = detect_chimeric_old(
+            std::slice::from_ref(&t1),
+            &t1,
+            &read_seq,
+            "r",
+            &params,
+            &index,
+        )
+        .unwrap();
         assert!(result.is_empty());
     }
 

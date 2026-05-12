@@ -1519,7 +1519,7 @@ mod tests {
             Some("read1".to_string())
         );
         assert_eq!(record.reference_sequence_id(), Some(0));
-        assert_eq!(record.alignment_start().map(|p| usize::from(p)), Some(11)); // 1-based
+        assert_eq!(record.alignment_start().map(usize::from), Some(11)); // 1-based
         // hit_index=1, so NOT secondary
         assert!(!record.flags().is_secondary());
     }
@@ -1754,7 +1754,7 @@ mod tests {
         assert_eq!(rec.mate_reference_sequence_id(), Some(0));
 
         // PNEXT = mate's per-chr position (genome_start=4, chr_start=0 → pos=5)
-        assert_eq!(rec.mate_alignment_start().map(|p| usize::from(p)), Some(5));
+        assert_eq!(rec.mate_alignment_start().map(usize::from), Some(5));
 
         // Check TLEN
         assert_eq!(rec.template_length(), 250);
@@ -2792,7 +2792,7 @@ mod tests {
 
         assert!(rec1.flags().is_mate_reverse_complemented());
         assert!(!rec1.flags().is_reverse_complemented());
-        assert_eq!(rec1.mate_alignment_start().map(|p| usize::from(p)), Some(5)); // genome_start=4, chr_start=0 → 5
+        assert_eq!(rec1.mate_alignment_start().map(usize::from), Some(5)); // genome_start=4, chr_start=0 → 5
 
         // Mate2 record: mate is forward → 0x20 NOT set, PNEXT=1
         let rec2 = build_paired_mate_record(
@@ -2815,7 +2815,7 @@ mod tests {
 
         assert!(!rec2.flags().is_mate_reverse_complemented());
         assert!(rec2.flags().is_reverse_complemented());
-        assert_eq!(rec2.mate_alignment_start().map(|p| usize::from(p)), Some(1)); // genome_start=0, chr_start=0 → 1
+        assert_eq!(rec2.mate_alignment_start().map(usize::from), Some(1)); // genome_start=0, chr_start=0 → 1
     }
 
     #[test]
@@ -3499,13 +3499,13 @@ mod tests {
         let mapped = &records[0];
         assert_eq!(mapped.reference_sequence_id(), Some(0));
         assert_eq!(
-            mapped.alignment_start().map(|p| usize::from(p)),
+            mapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
         // RNEXT and PNEXT should point to own position (STAR convention)
         assert_eq!(mapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
-            mapped.mate_alignment_start().map(|p| usize::from(p)),
+            mapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
         );
 
@@ -3513,12 +3513,12 @@ mod tests {
         let unmapped = &records[1];
         assert_eq!(unmapped.reference_sequence_id(), Some(0));
         assert_eq!(
-            unmapped.alignment_start().map(|p| usize::from(p)),
+            unmapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
         assert_eq!(unmapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
-            unmapped.mate_alignment_start().map(|p| usize::from(p)),
+            unmapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
         );
         // MAPQ = 0 for unmapped
