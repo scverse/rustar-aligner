@@ -1,0 +1,66 @@
+---
+// Minimal sun/moon theme toggle.
+// - First load (no stored preference): follows OS via Starlight's existing
+//   inline init script in <head>, which sets data-theme on <html>.
+// - Click: flips to the opposite of the current effective theme and persists
+//   under Starlight's key ('starlight-theme') so the choice survives reload.
+---
+
+<button
+  type="button"
+  class="rustar-theme-toggle"
+  aria-label="Toggle light or dark theme"
+  data-rustar-theme-toggle
+>
+  <svg class="icon-sun" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="4"/>
+    <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+  </svg>
+  <svg class="icon-moon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+  </svg>
+</button>
+
+<style>
+  .rustar-theme-toggle {
+    background: transparent;
+    border: none;
+    padding: 6px;
+    cursor: pointer;
+    color: var(--sl-color-gray-2);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+    transition: color 150ms ease;
+  }
+  .rustar-theme-toggle:hover,
+  .rustar-theme-toggle:focus-visible {
+    color: var(--sl-color-text-accent);
+    outline: none;
+  }
+  .rustar-theme-toggle svg { width: 18px; height: 18px; }
+  .rustar-theme-toggle .icon-sun,
+  .rustar-theme-toggle .icon-moon { display: none; }
+  :global(:root[data-theme='dark']) .rustar-theme-toggle .icon-sun { display: block; }
+  :global(:root[data-theme='light']) .rustar-theme-toggle .icon-moon { display: block; }
+</style>
+
+<script is:inline>
+  (() => {
+    const KEY = 'starlight-theme';
+    const btn = document.querySelector('[data-rustar-theme-toggle]');
+    if (!btn) return;
+    const root = document.documentElement;
+    const effective = () => {
+      const stored = localStorage.getItem(KEY);
+      if (stored === 'light' || stored === 'dark') return stored;
+      return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    };
+    btn.addEventListener('click', () => {
+      const next = effective() === 'dark' ? 'light' : 'dark';
+      root.dataset.theme = next;
+      localStorage.setItem(KEY, next);
+    });
+  })();
+</script>

@@ -1,0 +1,166 @@
+---
+title: rustar-aligner
+description: A faithful Rust reimplementation of STAR, the canonical RNA-seq aligner.
+---
+
+import { Image } from 'astro:assets';
+import rustarIcon from '../../assets/rustar-icon.svg';
+
+export const installCode = `<span class="comment"># Step 1 · install</span>
+<span class="prompt">$</span> cargo install <span class="flag">--git</span> https://github.com/Psy-Fer/rustar-aligner
+
+<span class="comment"># Step 2 · align</span>
+<span class="prompt">$</span> rustar-aligner \\
+    <span class="flag">--genomeDir</span> <span class="str">./yeast_index</span> \\
+    <span class="flag">--readFilesIn</span> <span class="str">r1.fq r2.fq</span> \\
+    <span class="flag">--outSAMtype</span> BAM SortedByCoordinate \\
+    <span class="flag">--runThreadN</span> 8 \\
+    <span class="flag">--outFileNamePrefix</span> <span class="str">./out_</span>`;
+
+<div class="rustar-home">
+
+<section class="rustar-hero">
+  <div>
+    <h1>rustar-aligner</h1>
+    <p class="lead">A faithful Rust reimplementation of <em>STAR</em>, the canonical RNA-seq aligner originally written in C++ by Alexander Dobin.</p>
+    <p class="lead-2">Same <code>{'--camelCase'}</code> CLI. Same SAM/BAM output formats. 99.883% mate-pair faithfulness on a 10,000-pair yeast benchmark, with zero MAPQ inflations.</p>
+    <div class="rustar-btns rustar-hero-btns">
+      <a href="/rustar-aligner/getting-started/introduction/" class="primary">Documentation</a>
+      <a href="https://github.com/Psy-Fer/rustar-aligner">GitHub ↗</a>
+    </div>
+  </div>
+  <Image src={rustarIcon} alt="rustar-aligner mascot: a red crab cradling a golden starfish" class="rustar-mascot" loading="eager" />
+</section>
+
+<svg class="rustar-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="rustar-section">
+  <h2>Where rustar agrees with the original.</h2>
+  <p class="lede">10,000 yeast RNA-seq read pairs, ERR12389696, 150 bp paired-end. Same genome index, same CLI parameters as STAR 2.7.x. Compared mate by mate.</p>
+  <div class="rustar-stats">
+    <div class="rustar-stat">
+      <div class="num">99.883%</div>
+      <div class="lbl">PE Faithfulness</div>
+      <div class="sub">tie-adjusted; 16,284 of 16,306 mate alignments byte-for-byte identical to STAR.</div>
+    </div>
+    <div class="rustar-stat">
+      <div class="num">0</div>
+      <div class="lbl">MAPQ Inflations</div>
+      <div class="sub">zero deflations, zero NH-tag diffs, zero proper-pair classification differences.</div>
+    </div>
+  </div>
+</section>
+
+<svg class="rustar-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="rustar-section">
+  <h2>What it does.</h2>
+  <div class="rustar-feats">
+    <div class="rustar-feat">
+      <div class="n">01</div>
+      <div>
+        <h3>Drop-in CLI</h3>
+        <p>Same <code>{'--camelCase'}</code> parameter names as STAR. Existing wrapper scripts work without modification.</p>
+      </div>
+    </div>
+    <div class="rustar-feat">
+      <div class="n">02</div>
+      <div>
+        <h3>Same output formats</h3>
+        <p>SAM, unsorted BAM, coordinate-sorted BAM, SJ.out.tab, ReadsPerGene.out.tab, Chimeric.out.junction.</p>
+      </div>
+    </div>
+    <div class="rustar-feat">
+      <div class="n">03</div>
+      <div>
+        <h3>Splice + chimeric + two-pass</h3>
+        <p>Full splice-junction detection, two-pass mode, multi-junction chimeric (Tier 3) detection.</p>
+      </div>
+    </div>
+    <div class="rustar-feat">
+      <div class="n">04</div>
+      <div>
+        <h3>Deterministic tie-breaking</h3>
+        <p><code>{'--runRNGseed'}</code> mirrors STAR. Identical seed produces identical primary tie-break within rustar runs.</p>
+      </div>
+    </div>
+    <div class="rustar-feat">
+      <div class="n">05</div>
+      <div>
+        <h3>Single-binary install</h3>
+        <p>~14 MB stripped binary. No dynamic-library deps beyond <code>libc</code>. Builds with stable Rust 1.80+.</p>
+      </div>
+    </div>
+    <div class="rustar-feat">
+      <div class="n">06</div>
+      <div>
+        <h3>Multi-threaded</h3>
+        <p>Rayon-based parallelism. Scales linearly across logical CPUs for the alignment phase.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<svg class="rustar-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="rustar-section rustar-install-section">
+  <h2>Two commands, one alignment.</h2>
+  <div class="rustar-install">
+    <div>
+      <h3>Install &amp; run</h3>
+      <p>Cargo will fetch the source, resolve dependencies, compile in release mode, and place the binary on your <code>$PATH</code>. About 90 to 180 seconds on recent hardware.</p>
+      <p>Then run a paired-end alignment against a pre-built genome index.</p>
+      <div class="rustar-btns">
+        <a href="/rustar-aligner/getting-started/installation/" class="primary">install</a>
+        <a href="/rustar-aligner/getting-started/quick-start/">quick start</a>
+        <a href="/rustar-aligner/guides/migrating-from-star/">migrating from STAR</a>
+      </div>
+    </div>
+    <pre class="rustar-code" set:html={installCode}></pre>
+  </div>
+</section>
+
+<svg class="rustar-topo" viewBox="0 0 1200 50" preserveAspectRatio="none" aria-hidden="true">
+  <path d="M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,18 Q300,5 600,18 T1200,18" fill="none" stroke="currentColor" stroke-width="0.6" />
+  <path d="M0,38 Q400,24 800,38 T1200,38" fill="none" stroke="currentColor" stroke-width="0.6" />
+</svg>
+
+<section class="rustar-section">
+  <h2>Side by side with the original.</h2>
+  <p class="lede">Selected metrics from the standard 10k-pair yeast benchmark. See the <a href="/rustar-aligner/reference/star-compatibility/">full compatibility scoreboard</a> for the rest.</p>
+  <table class="rustar-compare">
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th style="text-align:right">rustar</th>
+        <th style="text-align:right">STAR</th>
+        <th style="text-align:right">Δ</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td class="metric">Both mates mapped</td><td class="num">8,390</td><td class="num">8,390</td><td class="match">match</td></tr>
+      <tr><td class="metric">Half-mapped pairs</td><td class="num">0</td><td class="num">0</td><td class="match">match</td></tr>
+      <tr><td class="metric">Position agreement (SE)</td><td class="num">99.815%</td><td class="num">—</td><td class="match">tie-adj.</td></tr>
+      <tr><td class="metric">PE faithfulness</td><td class="num">99.883%</td><td class="num">—</td><td class="match">tie-adj.</td></tr>
+      <tr><td class="metric">MAPQ inflations</td><td class="num">0</td><td class="num">—</td><td class="match">none</td></tr>
+      <tr><td class="metric">NH-tag diffs</td><td class="num">0</td><td class="num">—</td><td class="match">none</td></tr>
+      <tr><td class="metric">Proper-pair diffs</td><td class="num">0</td><td class="num">—</td><td class="match">none</td></tr>
+      <tr><td class="metric">Tests passing</td><td class="num">396</td><td class="num">—</td><td class="match">all green</td></tr>
+    </tbody>
+  </table>
+</section>
+
+</div>

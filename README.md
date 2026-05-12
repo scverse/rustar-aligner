@@ -1,4 +1,4 @@
-# ![rustar-aligner](docs/logo/rustar-logo.svg)
+# ![rustar-aligner](docs/src/assets/rustar-logo.svg)
 
 A Rust reimplementation of [STAR](https://github.com/alexdobin/STAR) (Spliced Transcripts Alignment to a Reference), the widely-used RNA-seq aligner originally written in C++ by Alexander Dobin.
 

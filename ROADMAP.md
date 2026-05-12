@@ -1,6 +1,6 @@
 # rustar-aligner Implementation Roadmap
 
-Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs/`.
+Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs-old/` (the published Astro Starlight docs site lives in `docs/`).
 
 ## Phase Dependency Graph
 
@@ -51,10 +51,10 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 | 10 | BAM Output | ✅ | 136 | BGZF streaming, `--outSAMtype BAM Unsorted` |
 | 11 | Two-Pass Mode | ✅ | 138 | Novel junction discovery, pass1→pass2 |
 | 12 | Chimeric Detection | ✅ | 170 | SE chimeric, Chimeric.out.junction |
-| [13](docs/phase13_accuracy.md) | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
-| [15](docs/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
-| [16](docs/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
-| [17](docs/phase17_features.md) | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
+| [13](docs-old/phase13_accuracy.md) | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
+| [15](docs-old/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
+| [16](docs-old/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
+| [17](docs-old/phase17_features.md) | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
 | 14 | STARsolo | DEFERRED | — | Waiting for accuracy parity |
 
 *Partially complete — see linked docs for sub-phase status.
@@ -166,7 +166,7 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 
 ## Phase 13: Performance + Accuracy ✅
 
-See [docs/phase13_accuracy.md](docs/phase13_accuracy.md) for detailed sub-phase notes (13.1-13.14).
+See [docs-old/phase13_accuracy.md](docs-old/phase13_accuracy.md) for detailed sub-phase notes (13.1-13.14).
 
 **Summary**: From 42% to 94.5% position agreement through SA position encoding fix, CIGAR reversal, splice motif fix, extendAlign, bidirectional seeding, BySJout filtering, and scoring fixes.
 
@@ -174,7 +174,7 @@ See [docs/phase13_accuracy.md](docs/phase13_accuracy.md) for detailed sub-phase 
 
 ## Phase 15: SAM Tags + Output Correctness ✅
 
-See [docs/phase15_sam_tags.md](docs/phase15_sam_tags.md) for detailed sub-phase notes (15.1-15.6 + PE fix).
+See [docs-old/phase15_sam_tags.md](docs-old/phase15_sam_tags.md) for detailed sub-phase notes (15.1-15.6 + PE fix).
 
 **Summary**: NH/HI/AS/NM/nM/XS/jM/jI/MD tags, SECONDARY flag, outSAMmultNmax, outSAMattributes enforcement, PE FLAG/PNEXT fixes, independent mate alignment.
 
@@ -182,7 +182,7 @@ See [docs/phase15_sam_tags.md](docs/phase15_sam_tags.md) for detailed sub-phase 
 
 ## Phase 16: Algorithm Parity ✅ (partial)
 
-See [docs/phase16_algorithm.md](docs/phase16_algorithm.md) for sub-phase notes (16.1-16.13), [docs/phase16_14_nstart_fix.md](docs/phase16_14_nstart_fix.md) for the Nstart fix.
+See [docs-old/phase16_algorithm.md](docs-old/phase16_algorithm.md) for sub-phase notes (16.1-16.13), [docs-old/phase16_14_nstart_fix.md](docs-old/phase16_14_nstart_fix.md) for the Nstart fix.
 
 **Summary**: Bin-based windowing, pre-DP seed extension, MMP SA range narrowing, multi-transcript DP, recursive combinatorial stitcher, STAR-faithful scoring (scoreStitchSJshift removed), sparse bidirectional seed search with Nstart +1 fix, WALrec persistent threshold, post-jR shared base scoring, hierarchical SAindex lookup, nWA reset + overlap detection, coverage filter removal, Lread-1 filter fix, too-many-loci filter, mate rescue, SA range narrowing fix (find_mult_range + max_mappable_length), reverse-strand stitcher coordinate fix (RC read + forward genome coords), PE joint DP stitching via combined-read path, STAR-faithful PE architecture (no cross-product), combined-read score threshold fix (pre-split check prevents double-counting), extendAlign EXTEND_ORDER fix (5' of read first; reverse-strand reads extend right before left) + float comparison fix.
 
@@ -282,7 +282,7 @@ Instrumented locations (all gated on read name match, no performance impact on n
 
 ## Phase 17: Features + Polish ✅ (partial)
 
-See [docs/phase17_features.md](docs/phase17_features.md) for sub-phase table and 17.1 details.
+See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase table and 17.1 details.
 
 **Completed sub-phases:**
 - 17.1: Log.final.out (STAR-compatible, MultiQC-parseable)
