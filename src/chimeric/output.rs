@@ -25,6 +25,12 @@ impl ChimericJunctionWriter {
         let mut path = PathBuf::from(prefix);
         path.push("Chimeric.out.junction");
 
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
+        }
+
         let file = File::create(&path).map_err(|e| Error::io(e, &path))?;
 
         let writer = BufWriter::new(file);
@@ -285,6 +291,30 @@ mod tests {
         let mut path = PathBuf::from(prefix);
         path.push("Chimeric.out.junction");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_chimeric_junction_writer_creates_missing_parent() {
+        // Regression test for #35: when --twopassMode Basic is combined with
+        // --chimSegmentMin > 0 and --outFileNamePrefix doesn't end in `/`, the
+        // chim writer fires before any other output writer creates the parent
+        // directory. The writer must create the parent itself.
+        let dir = tempdir().unwrap();
+        let prefix_path = dir.path().join("sample.");
+        let prefix = prefix_path.to_str().unwrap();
+
+        assert!(!prefix_path.exists(), "parent dir should not exist yet");
+
+        let writer = ChimericJunctionWriter::new(prefix);
+        assert!(
+            writer.is_ok(),
+            "writer should create missing parent dir, got: {:?}",
+            writer.err()
+        );
+
+        let mut path = PathBuf::from(prefix);
+        path.push("Chimeric.out.junction");
+        assert!(path.exists(), "chim output file should exist at {:?}", path);
     }
 
     #[test]
