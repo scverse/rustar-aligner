@@ -1084,10 +1084,11 @@ pub fn align_paired_read(
 
     // Step 3: TooManyLoci check (post-dedup, matching STAR's ordering: multMapSelect → dedup → TooManyLoci).
     if joint_pairs.len() > params.out_filter_multimap_nmax as usize {
+        let n_loci = joint_pairs.len();
         return Ok((
             Vec::new(),
             pe_chimeric,
-            0,
+            n_loci,
             Some(UnmappedReason::TooManyLoci),
         ));
     }
