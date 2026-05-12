@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# ci.sh - Fast CI test suite for ruSTAR
+# ci.sh - Fast CI test suite for rustar-aligner
 # Runs minimal test set for quick validation (pre-commit, CI/CD)
 # Exit codes: 0=pass, 1=regression, 2=build failed, 3=execution failed
 
@@ -21,10 +21,10 @@ error() {
 # Build
 # ==============================================================================
 
-log "Building ruSTAR in release mode..."
+log "Building rustar-aligner in release mode..."
 cd "$PROJECT_ROOT"
 
-if ! cargo build --release 2>&1 | tee /tmp/rustar_build.log; then
+if ! cargo build --release 2>&1 | tee /tmp/rustar-aligner_build.log; then
     error "Build failed"
     exit 2
 fi
@@ -37,7 +37,7 @@ log "Build successful"
 
 log "Running unit tests..."
 
-if ! cargo test --release 2>&1 | tee /tmp/rustar_test.log; then
+if ! cargo test --release 2>&1 | tee /tmp/rustar-aligner_test.log; then
     error "Unit tests failed"
     exit 3
 fi
@@ -79,7 +79,7 @@ if [[ -d "$GOLDEN_DIR" ]]; then
     if [[ -f "$GOLDEN_DIR/stats.json" ]]; then
         if ! python3 "$SCRIPT_DIR/compare_golden.py" \
             --golden "$GOLDEN_DIR/stats.json" \
-            --current "$LATEST_RESULT/rustar" \
+            --current "$LATEST_RESULT/rustar-aligner" \
             --tolerance 0.01; then
             error "Regression detected: statistics differ from golden output"
             exit 1

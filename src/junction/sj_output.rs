@@ -522,7 +522,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
 
         let output_file = NamedTempFile::new().unwrap();
         stats
@@ -583,7 +583,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
 
         let output_file = NamedTempFile::new().unwrap();
         stats
@@ -619,7 +619,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
 
         let output_file = NamedTempFile::new().unwrap();
         stats
@@ -650,7 +650,7 @@ mod tests {
         // Low-count canonical junction (unique=0 < 1)
         stats.record_junction(0, 500, 600, 1, SpliceMotif::GtAg, false, 20, false);
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
         let surviving = stats.compute_surviving_junctions(&params);
 
         // Only the first junction should survive
@@ -673,7 +673,7 @@ mod tests {
         // Annotated junction with terrible stats (should still survive)
         stats.record_junction(0, 100, 200, 1, SpliceMotif::NonCanonical, false, 1, true);
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
         let surviving = stats.compute_surviving_junctions(&params);
 
         assert_eq!(surviving.len(), 1);
@@ -702,7 +702,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
 
         // compute_surviving_junctions should return same set as what write_output writes
         let surviving = stats.compute_surviving_junctions(&params);

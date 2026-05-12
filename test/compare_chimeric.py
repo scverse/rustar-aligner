@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-compare_chimeric.py - Compare Chimeric.out.junction files from ruSTAR and STAR
+compare_chimeric.py - Compare Chimeric.out.junction files from rustar-aligner and STAR
 
 Chimeric.out.junction format (14 columns):
 1. chr_donorA
@@ -20,7 +20,7 @@ Chimeric.out.junction format (14 columns):
 14. cigar_alnB
 
 Usage:
-    python compare_chimeric.py --star STAR_Chimeric.out.junction --rustar ruSTAR_Chimeric.out.junction [options]
+    python compare_chimeric.py --star STAR_Chimeric.out.junction --rustar-aligner rustar-aligner_Chimeric.out.junction [options]
 """
 
 import argparse
@@ -117,49 +117,49 @@ def parse_chimeric_file(filename: str) -> List[ChimericJunction]:
     return junctions
 
 
-def compare_chimeric(star_junctions: List[ChimericJunction], rustar_junctions: List[ChimericJunction], tolerance: float) -> Tuple[bool, List[str]]:
+def compare_chimeric(star_junctions: List[ChimericJunction], rustar_aligner_junctions: List[ChimericJunction], tolerance: float) -> Tuple[bool, List[str]]:
     """Compare chimeric junction sets."""
     messages = []
-    messages.append("\n=== Chimeric Alignment Comparison: ruSTAR vs STAR ===")
+    messages.append("\n=== Chimeric Alignment Comparison: rustar-aligner vs STAR ===")
 
     # Overall counts
-    messages.append(f"  Total chimeric junctions (ruSTAR): {len(rustar_junctions)}")
+    messages.append(f"  Total chimeric junctions (rustar-aligner): {len(rustar_aligner_junctions)}")
     messages.append(f"  Total chimeric junctions (STAR):   {len(star_junctions)}")
 
     # If both are empty, that's a match
-    if len(star_junctions) == 0 and len(rustar_junctions) == 0:
+    if len(star_junctions) == 0 and len(rustar_aligner_junctions) == 0:
         messages.append("  No chimeric alignments detected by either aligner")
         return True, messages
 
     # Group by breakpoint
     star_breakpoints = defaultdict(list)
-    rustar_breakpoints = defaultdict(list)
+    rustar_aligner_breakpoints = defaultdict(list)
 
     for junc in star_junctions:
         star_breakpoints[junc.breakpoint_key()].append(junc)
 
-    for junc in rustar_junctions:
-        rustar_breakpoints[junc.breakpoint_key()].append(junc)
+    for junc in rustar_aligner_junctions:
+        rustar_aligner_breakpoints[junc.breakpoint_key()].append(junc)
 
     # Find common and unique breakpoints
     star_keys = set(star_breakpoints.keys())
-    rustar_keys = set(rustar_breakpoints.keys())
+    rustar_aligner_keys = set(rustar_aligner_breakpoints.keys())
 
-    common_keys = star_keys & rustar_keys
-    star_only = star_keys - rustar_keys
-    rustar_only = rustar_keys - star_keys
+    common_keys = star_keys & rustar_aligner_keys
+    star_only = star_keys - rustar_aligner_keys
+    rustar_aligner_only = rustar_aligner_keys - star_keys
 
-    messages.append(f"\n  Unique breakpoints (ruSTAR): {len(rustar_breakpoints)}")
+    messages.append(f"\n  Unique breakpoints (rustar-aligner): {len(rustar_aligner_breakpoints)}")
     messages.append(f"  Unique breakpoints (STAR):   {len(star_breakpoints)}")
     messages.append(f"  Common breakpoints:          {len(common_keys)}")
 
     if star_only:
         messages.append(f"  Only in STAR:                {len(star_only)}")
-    if rustar_only:
-        messages.append(f"  Only in ruSTAR:              {len(rustar_only)}")
+    if rustar_aligner_only:
+        messages.append(f"  Only in rustar-aligner:              {len(rustar_aligner_only)}")
 
     # Calculate overlap rate
-    total_breakpoints = len(star_keys | rustar_keys)
+    total_breakpoints = len(star_keys | rustar_aligner_keys)
     if total_breakpoints > 0:
         overlap_rate = 100.0 * len(common_keys) / total_breakpoints
         messages.append(f"  Overlap rate:                {overlap_rate:.1f}%")
@@ -172,19 +172,19 @@ def compare_chimeric(star_junctions: List[ChimericJunction], rustar_junctions: L
         return inter_chr, strand_break, large_distance
 
     star_inter, star_strand, star_large = categorize_junctions(star_junctions)
-    rustar_inter, rustar_strand, rustar_large = categorize_junctions(rustar_junctions)
+    rustar_aligner_inter, rustar_aligner_strand, rustar_aligner_large = categorize_junctions(rustar_aligner_junctions)
 
     messages.append("\n  Fusion categories:")
-    messages.append(f"    Inter-chromosomal:  ruSTAR={rustar_inter}, STAR={star_inter}")
-    messages.append(f"    Strand breaks:      ruSTAR={rustar_strand}, STAR={star_strand}")
-    messages.append(f"    Large distance:     ruSTAR={rustar_large}, STAR={star_large}")
+    messages.append(f"    Inter-chromosomal:  rustar-aligner={rustar_aligner_inter}, STAR={star_inter}")
+    messages.append(f"    Strand breaks:      rustar-aligner={rustar_aligner_strand}, STAR={star_strand}")
+    messages.append(f"    Large distance:     rustar-aligner={rustar_aligner_large}, STAR={star_large}")
 
     # Show unique breakpoints (up to 5 each)
-    if rustar_only:
-        messages.append(f"\n  Unique to ruSTAR ({len(rustar_only)} total, showing first 5):")
-        for key in sorted(rustar_only)[:5]:
+    if rustar_aligner_only:
+        messages.append(f"\n  Unique to rustar-aligner ({len(rustar_aligner_only)} total, showing first 5):")
+        for key in sorted(rustar_aligner_only)[:5]:
             chr_d, brkpt_d, strand_d, chr_a, brkpt_a, strand_a = key
-            junctions = rustar_breakpoints[key]
+            junctions = rustar_aligner_breakpoints[key]
             messages.append(
                 f"    {chr_d}:{brkpt_d}({strand_d}) -> {chr_a}:{brkpt_a}({strand_a}) "
                 f"[{len(junctions)} reads]"
@@ -205,31 +205,31 @@ def compare_chimeric(star_junctions: List[ChimericJunction], rustar_junctions: L
 
     for key in common_keys:
         star_count = len(star_breakpoints[key])
-        rustar_count = len(rustar_breakpoints[key])
+        rustar_aligner_count = len(rustar_aligner_breakpoints[key])
 
         if star_count > 0:
-            diff_pct = abs(rustar_count - star_count) / star_count
+            diff_pct = abs(rustar_aligner_count - star_count) / star_count
             if diff_pct > tolerance:
-                read_count_differences.append((key, star_count, rustar_count, diff_pct))
+                read_count_differences.append((key, star_count, rustar_aligner_count, diff_pct))
 
     if read_count_differences:
         messages.append(f"\n  Read count differences (>{tolerance*100:.0f}% threshold): {len(read_count_differences)}")
-        for key, star_count, rustar_count, diff_pct in sorted(read_count_differences, key=lambda x: x[3], reverse=True)[:5]:
+        for key, star_count, rustar_aligner_count, diff_pct in sorted(read_count_differences, key=lambda x: x[3], reverse=True)[:5]:
             chr_d, brkpt_d, strand_d, chr_a, brkpt_a, strand_a = key
             messages.append(
                 f"    {chr_d}:{brkpt_d}({strand_d}) -> {chr_a}:{brkpt_a}({strand_a}): "
-                f"ruSTAR={rustar_count}, STAR={star_count} ({diff_pct*100:+.1f}%)"
+                f"rustar-aligner={rustar_aligner_count}, STAR={star_count} ({diff_pct*100:+.1f}%)"
             )
 
     # Determine pass/fail
     passed = True
 
     # If one found chimeric alignments but the other didn't, that's a significant difference
-    if (len(star_junctions) == 0) != (len(rustar_junctions) == 0):
+    if (len(star_junctions) == 0) != (len(rustar_aligner_junctions) == 0):
         passed = False
 
     # If both found chimeric alignments, check overlap
-    if len(star_junctions) > 0 and len(rustar_junctions) > 0:
+    if len(star_junctions) > 0 and len(rustar_aligner_junctions) > 0:
         if total_breakpoints > 0 and overlap_rate < 80.0:
             # More lenient threshold for chimeric alignments (can be harder to detect)
             passed = False
@@ -238,9 +238,9 @@ def compare_chimeric(star_junctions: List[ChimericJunction], rustar_junctions: L
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Compare Chimeric.out.junction files from ruSTAR and STAR')
+    parser = argparse.ArgumentParser(description='Compare Chimeric.out.junction files from rustar-aligner and STAR')
     parser.add_argument('--star', required=True, help='STAR Chimeric.out.junction file')
-    parser.add_argument('--rustar', required=True, help='ruSTAR Chimeric.out.junction file')
+    parser.add_argument('--rustar-aligner', required=True, help='rustar-aligner Chimeric.out.junction file')
     parser.add_argument('--tolerance', type=float, default=0.20, help='Tolerance for read count differences (default: 0.20 = 20%%)')
     parser.add_argument('--output', help='Output file for comparison report')
 
@@ -250,11 +250,11 @@ def main():
     print(f"Parsing STAR chimeric junctions: {args.star}")
     star_junctions = parse_chimeric_file(args.star)
 
-    print(f"Parsing ruSTAR chimeric junctions: {args.rustar}")
-    rustar_junctions = parse_chimeric_file(args.rustar)
+    print(f"Parsing rustar-aligner chimeric junctions: {args.rustar_aligner}")
+    rustar_aligner_junctions = parse_chimeric_file(args.rustar_aligner)
 
     # Compare
-    passed, messages = compare_chimeric(star_junctions, rustar_junctions, args.tolerance)
+    passed, messages = compare_chimeric(star_junctions, rustar_aligner_junctions, args.tolerance)
 
     # Add overall status
     messages.append("\n" + "=" * 50)

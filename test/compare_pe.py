@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PE-aware SAM comparison: ruSTAR vs STAR.
+PE-aware SAM comparison: rustar-aligner vs STAR.
 Separates mate1 (FLAG 0x40) and mate2 (FLAG 0x80), compares per-mate.
 """
 
@@ -67,31 +67,31 @@ def get_primary(records):
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <rustar_sam> <star_sam>")
+        print(f"Usage: {sys.argv[0]} <rustar_aligner_sam> <star_sam>")
         sys.exit(1)
 
-    rustar_path = sys.argv[1]
+    rustar_aligner_path = sys.argv[1]
     star_path = sys.argv[2]
 
     # Auto-append Aligned.out.sam if directory given
-    if os.path.isdir(rustar_path):
-        rustar_path = os.path.join(rustar_path, "Aligned.out.sam")
+    if os.path.isdir(rustar_aligner_path):
+        rustar_aligner_path = os.path.join(rustar_aligner_path, "Aligned.out.sam")
     if os.path.isdir(star_path):
         star_path = os.path.join(star_path, "Aligned.out.sam")
 
     print("=" * 80)
-    print("PE-AWARE COMPARISON: ruSTAR vs STAR")
+    print("PE-AWARE COMPARISON: rustar-aligner vs STAR")
     print("=" * 80)
 
-    print(f"\nParsing {rustar_path}...")
-    rustar = parse_pe_sam(rustar_path)
+    print(f"\nParsing {rustar_aligner_path}...")
+    rustar_aligner = parse_pe_sam(rustar_aligner_path)
     print(f"Parsing {star_path}...")
     star = parse_pe_sam(star_path)
 
     # Count unique read pairs
-    rustar_pairs = set(qname for qname, mate in rustar.keys())
+    rustar_aligner_pairs = set(qname for qname, mate in rustar_aligner.keys())
     star_pairs = set(qname for qname, mate in star.keys())
-    print(f"\nruSTAR: {len(rustar_pairs)} read pairs, {sum(len(v) for v in rustar.values())} total records")
+    print(f"\nrustar-aligner: {len(rustar_aligner_pairs)} read pairs, {sum(len(v) for v in rustar_aligner.values())} total records")
     print(f"STAR:   {len(star_pairs)} read pairs, {sum(len(v) for v in star.values())} total records")
 
     # === Per-mate comparison ===
@@ -103,7 +103,7 @@ def main():
         print(f"\n--- Mate {mate_num} ---")
 
         all_reads = set()
-        for (qname, m) in set(rustar.keys()) | set(star.keys()):
+        for (qname, m) in set(rustar_aligner.keys()) | set(star.keys()):
             if m == mate_num:
                 all_reads.add(qname)
 
@@ -111,7 +111,7 @@ def main():
         agree_strand = 0
         agree_cigar = 0
         disagree_pos = 0
-        rustar_only = 0
+        rustar_aligner_only = 0
         star_only = 0
         both_unmapped = 0
         disagree_diff_chr = 0
@@ -119,7 +119,7 @@ def main():
         disagree_same_chr_same_strand = 0
 
         for qname in sorted(all_reads):
-            r_recs = rustar.get((qname, mate_num), [])
+            r_recs = rustar_aligner.get((qname, mate_num), [])
             s_recs = star.get((qname, mate_num), [])
 
             r_pri = get_primary(r_recs) if r_recs else None
@@ -154,13 +154,13 @@ def main():
                     else:
                         disagree_same_chr_same_strand += 1
             elif r_mapped and not s_mapped:
-                rustar_only += 1
+                rustar_aligner_only += 1
             elif not r_mapped and s_mapped:
                 star_only += 1
             else:
                 both_unmapped += 1
 
-        total = agree_pos + disagree_pos + rustar_only + star_only + both_unmapped
+        total = agree_pos + disagree_pos + rustar_aligner_only + star_only + both_unmapped
         both_mapped = agree_pos + disagree_pos
 
         print(f"  Total mates:         {total}")
@@ -174,7 +174,7 @@ def main():
                 print(f"      Diff chr:          {disagree_diff_chr}")
                 print(f"      Same chr, diff strand: {disagree_same_chr_diff_strand}")
                 print(f"      Same chr, same strand: {disagree_same_chr_same_strand}")
-        print(f"  ruSTAR only mapped:  {rustar_only}")
+        print(f"  rustar-aligner only mapped:  {rustar_aligner_only}")
         print(f"  STAR only mapped:    {star_only}")
         print(f"  Both unmapped:       {both_unmapped}")
 
@@ -183,41 +183,41 @@ def main():
     print("PAIR-LEVEL COMPARISON")
     print("=" * 80)
 
-    all_pairs = rustar_pairs | star_pairs
+    all_pairs = rustar_aligner_pairs | star_pairs
 
     pair_both_mapped = 0
     pair_agree = 0
     pair_disagree = 0
-    pair_rustar_only = 0
+    pair_rustar_aligner_only = 0
     pair_star_only = 0
     pair_both_unmapped = 0
 
-    # Count half-mapped in ruSTAR
-    rustar_half_mapped = 0
-    for qname in rustar_pairs:
-        r1 = rustar.get((qname, 1), [])
-        r2 = rustar.get((qname, 2), [])
+    # Count half-mapped in rustar-aligner
+    rustar_aligner_half_mapped = 0
+    for qname in rustar_aligner_pairs:
+        r1 = rustar_aligner.get((qname, 1), [])
+        r2 = rustar_aligner.get((qname, 2), [])
         r1_pri = get_primary(r1) if r1 else None
         r2_pri = get_primary(r2) if r2 else None
         r1_unmapped = any(r["is_unmapped"] for r in r1)
         r2_unmapped = any(r["is_unmapped"] for r in r2)
 
         if (r1_pri and not r2_pri and r2_unmapped) or (r2_pri and not r1_pri and r1_unmapped):
-            rustar_half_mapped += 1
+            rustar_aligner_half_mapped += 1
 
     # Count mapping categories
-    rustar_both_mates_mapped = 0
-    rustar_no_mates_mapped = 0
+    rustar_aligner_both_mates_mapped = 0
+    rustar_aligner_no_mates_mapped = 0
     star_both_mates_mapped = 0
     star_no_mates_mapped = 0
 
-    for qname in rustar_pairs:
-        r1 = get_primary(rustar.get((qname, 1), []))
-        r2 = get_primary(rustar.get((qname, 2), []))
+    for qname in rustar_aligner_pairs:
+        r1 = get_primary(rustar_aligner.get((qname, 1), []))
+        r2 = get_primary(rustar_aligner.get((qname, 2), []))
         if r1 and r2:
-            rustar_both_mates_mapped += 1
+            rustar_aligner_both_mates_mapped += 1
         elif not r1 and not r2:
-            rustar_no_mates_mapped += 1
+            rustar_aligner_no_mates_mapped += 1
 
     for qname in star_pairs:
         s1 = get_primary(star.get((qname, 1), []))
@@ -227,10 +227,10 @@ def main():
         elif not s1 and not s2:
             star_no_mates_mapped += 1
 
-    print(f"\nruSTAR pair-level mapping:")
-    print(f"  Both mates mapped:   {rustar_both_mates_mapped} ({100.0*rustar_both_mates_mapped/len(rustar_pairs):.1f}%)")
-    print(f"  Half-mapped pairs:   {rustar_half_mapped} ({100.0*rustar_half_mapped/len(rustar_pairs):.1f}%)")
-    print(f"  Neither mate mapped: {rustar_no_mates_mapped} ({100.0*rustar_no_mates_mapped/len(rustar_pairs):.1f}%)")
+    print(f"\nrustar-aligner pair-level mapping:")
+    print(f"  Both mates mapped:   {rustar_aligner_both_mates_mapped} ({100.0*rustar_aligner_both_mates_mapped/len(rustar_aligner_pairs):.1f}%)")
+    print(f"  Half-mapped pairs:   {rustar_aligner_half_mapped} ({100.0*rustar_aligner_half_mapped/len(rustar_aligner_pairs):.1f}%)")
+    print(f"  Neither mate mapped: {rustar_aligner_no_mates_mapped} ({100.0*rustar_aligner_no_mates_mapped/len(rustar_aligner_pairs):.1f}%)")
 
     print(f"\nSTAR pair-level mapping:")
     print(f"  Both mates mapped:   {star_both_mates_mapped} ({100.0*star_both_mates_mapped/len(star_pairs):.1f}%)")
@@ -238,7 +238,7 @@ def main():
 
     # === Half-mapped SAM format check ===
     print("\n" + "=" * 80)
-    print("HALF-MAPPED PAIR DETAILS (ruSTAR)")
+    print("HALF-MAPPED PAIR DETAILS (rustar-aligner)")
     print("=" * 80)
 
     hm_mate1_mapped = 0
@@ -246,9 +246,9 @@ def main():
     hm_correct_flags = 0
     hm_colocated = 0
 
-    for qname in rustar_pairs:
-        r1 = rustar.get((qname, 1), [])
-        r2 = rustar.get((qname, 2), [])
+    for qname in rustar_aligner_pairs:
+        r1 = rustar_aligner.get((qname, 1), [])
+        r2 = rustar_aligner.get((qname, 2), [])
         r1_pri = get_primary(r1) if r1 else None
         r2_pri = get_primary(r2) if r2 else None
         r1_unmapped = any(r["is_unmapped"] for r in r1)
@@ -295,12 +295,12 @@ def main():
 
     for mate_num in [1, 2]:
         all_reads = set()
-        for (qname, m) in set(rustar.keys()) | set(star.keys()):
+        for (qname, m) in set(rustar_aligner.keys()) | set(star.keys()):
             if m == mate_num:
                 all_reads.add(qname)
 
         for qname in all_reads:
-            r_pri = get_primary(rustar.get((qname, mate_num), []))
+            r_pri = get_primary(rustar_aligner.get((qname, mate_num), []))
             s_pri = get_primary(star.get((qname, mate_num), []))
 
             if r_pri and s_pri:
@@ -316,9 +316,9 @@ def main():
         print(f"\n  Per-mate position agreement: {total_mates_agree}/{total_mates_compared} ({100.0*total_mates_agree/total_mates_compared:.1f}%)")
         print(f"  Per-mate CIGAR agreement:    {total_mates_cigar_agree}/{total_mates_compared} ({100.0*total_mates_cigar_agree/total_mates_compared:.1f}%)")
 
-    print(f"\n  ruSTAR mapped pairs:         {rustar_both_mates_mapped + rustar_half_mapped}/{len(rustar_pairs)} ({100.0*(rustar_both_mates_mapped + rustar_half_mapped)/len(rustar_pairs):.1f}%)")
-    print(f"    Both mates mapped:         {rustar_both_mates_mapped} ({100.0*rustar_both_mates_mapped/len(rustar_pairs):.1f}%)")
-    print(f"    Half-mapped:               {rustar_half_mapped} ({100.0*rustar_half_mapped/len(rustar_pairs):.1f}%)")
+    print(f"\n  rustar-aligner mapped pairs:         {rustar_aligner_both_mates_mapped + rustar_aligner_half_mapped}/{len(rustar_aligner_pairs)} ({100.0*(rustar_aligner_both_mates_mapped + rustar_aligner_half_mapped)/len(rustar_aligner_pairs):.1f}%)")
+    print(f"    Both mates mapped:         {rustar_aligner_both_mates_mapped} ({100.0*rustar_aligner_both_mates_mapped/len(rustar_aligner_pairs):.1f}%)")
+    print(f"    Half-mapped:               {rustar_aligner_half_mapped} ({100.0*rustar_aligner_half_mapped/len(rustar_aligner_pairs):.1f}%)")
     print(f"  STAR mapped pairs:           {star_both_mates_mapped}/{len(star_pairs)} ({100.0*star_both_mates_mapped/len(star_pairs):.1f}%)")
 
 

@@ -4,6 +4,12 @@
 /// of its exons overlap any exon of that gene.  Output: `ReadsPerGene.out.tab`
 /// with four columns — gene_id, unstranded, strand1 (same strand as gene),
 /// strand2 (opposite strand).
+///
+/// Submodules:
+/// - `transcriptome` — transcript-level alignment projection for
+///   `--quantMode TranscriptomeSAM` (Salmon / RSEM input).
+pub mod transcriptome;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,18 +36,19 @@ pub struct GeneAnnotation {
 }
 
 impl GeneAnnotation {
-    /// Build from GTF exon records (already parsed by `junction::gtf::parse_gtf`).
-    pub fn from_gtf_exons(exons: &[GtfRecord], genome: &Genome) -> Self {
+    /// Build from GTF exon records using `gene_tag` as the gene grouping attribute.
+    ///
+    /// `gene_tag` is STAR's `sjdbGTFtagExonParentGene` (default `"gene_id"`).
+    pub fn from_gtf_exons_configured(exons: &[GtfRecord], genome: &Genome, gene_tag: &str) -> Self {
         let n_chrs = genome.n_chr_real;
         let mut gene_ids: Vec<String> = Vec::new();
         let mut gene_is_reverse: Vec<bool> = Vec::new();
-        // Preserve first-seen order while assigning stable indices.
         let mut gene_id_to_idx: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
 
         for exon in exons {
-            let gene_id = match exon.attributes.get("gene_id") {
+            let gene_id = match exon.attributes.get(gene_tag) {
                 Some(id) => id.clone(),
                 None => continue,
             };
@@ -84,6 +91,11 @@ impl GeneAnnotation {
             gene_is_reverse,
             chr_exons,
         }
+    }
+
+    /// Build from GTF exon records using default `"gene_id"` attribute (backward-compatible).
+    pub fn from_gtf_exons(exons: &[GtfRecord], genome: &Genome) -> Self {
+        Self::from_gtf_exons_configured(exons, genome, "gene_id")
     }
 
     pub fn n_genes(&self) -> usize {
@@ -341,9 +353,15 @@ pub struct QuantContext {
 
 impl QuantContext {
     /// Build from a GTF file.  Call once before alignment.
-    pub fn build(gtf_path: &Path, genome: &Genome) -> Result<Self, Error> {
-        let exons = crate::junction::gtf::parse_gtf(gtf_path)?;
-        let gene_ann = GeneAnnotation::from_gtf_exons(&exons, genome);
+    pub fn build(
+        gtf_path: &Path,
+        genome: &Genome,
+        feature_exon: &str,
+        chr_prefix: &str,
+        gene_tag: &str,
+    ) -> Result<Self, Error> {
+        let exons = crate::junction::gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
+        let gene_ann = GeneAnnotation::from_gtf_exons_configured(&exons, genome, gene_tag);
         let n = gene_ann.n_genes();
         log::info!("quantMode GeneCounts: {} genes loaded from GTF", n);
         let counts = GeneCounts::new(n);
@@ -404,6 +422,7 @@ mod tests {
                 genome_end: ge,
                 read_start: 0,
                 read_end: (ge - gs) as usize,
+                i_frag: 0,
             }],
             cigar: vec![],
             score: 100,

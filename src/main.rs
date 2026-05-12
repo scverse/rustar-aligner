@@ -1,7 +1,7 @@
 use clap::Parser;
 
-use ruSTAR::cpu;
-use ruSTAR::params::Parameters;
+use rustar_aligner::cpu;
+use rustar_aligner::params::Parameters;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -9,5 +9,5 @@ fn main() -> anyhow::Result<()> {
     cpu::check_cpu_compat()?;
 
     let params = Parameters::parse();
-    ruSTAR::run(&params)
+    rustar_aligner::run(&params)
 }

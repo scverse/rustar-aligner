@@ -547,6 +547,118 @@ impl SamWriter {
         Ok(records)
     }
 
+    /// Build transcriptome-space SAM records for `--quantMode TranscriptomeSAM`.
+    ///
+    /// Each projected `Transcript` is converted to a record where:
+    ///   * `chr_idx` is the transcript index (matches the transcriptome
+    ///     header's @SQ order),
+    ///   * `genome_start` is the 0-based transcript-space position (→ POS =
+    ///     t-space_pos + 1),
+    ///   * splice-aware tags (`jM`, `jI`, `XS`) are not emitted (splices
+    ///     collapse in t-space and have no meaning there),
+    ///   * standard tags (`NH`, `HI`, `AS`, `NM`/`nM`, `MD`) are emitted per
+    ///     the `--outSAMattributes` set.
+    ///
+    /// `primary_hit_idx` (0-based) is the projected alignment selected as
+    /// primary (randomly among ties per STAR's `rngUniformReal0to1`).  All
+    /// other records get the SECONDARY flag (0x100).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_transcriptome_records(
+        read_name: &str,
+        read_seq: &[u8],
+        read_qual: &[u8],
+        projected: &[Transcript],
+        mapq: u8,
+        params: &Parameters,
+        primary_hit_idx: usize,
+    ) -> Result<Vec<RecordBuf>, Error> {
+        if projected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut attrs = params.sam_attribute_set();
+        // Splice tags are meaningless in t-space.
+        attrs.remove("jM");
+        attrs.remove("jI");
+        attrs.remove("XS");
+        // MD-tag would require the transcript's t-space reference which we do
+        // not precompute; drop it to keep this writer simple.  STAR also does
+        // not emit MD for transcriptome SAM.
+        attrs.remove("MD");
+
+        let n_alignments = projected.len();
+        let mut records = Vec::with_capacity(n_alignments);
+
+        for (hit_idx, t) in projected.iter().enumerate() {
+            let mut record = RecordBuf::default();
+            record.name_mut().replace(read_name.into());
+
+            // FLAGS: SECONDARY if not the primary; REVERSE if is_reverse.
+            let mut flags = sam::alignment::record::Flags::empty();
+            if t.is_reverse {
+                flags |= sam::alignment::record::Flags::REVERSE_COMPLEMENTED;
+            }
+            if hit_idx != primary_hit_idx {
+                flags |= sam::alignment::record::Flags::SECONDARY;
+            }
+            *record.flags_mut() = flags;
+
+            // RNAME = transcript index (maps to transcriptome header).
+            *record.reference_sequence_id_mut() = Some(t.chr_idx);
+
+            // POS = t-space position + 1 (1-based).
+            let pos = (t.genome_start + 1) as usize;
+            *record.alignment_start_mut() = Some(pos.try_into().map_err(|e| {
+                Error::Alignment(format!("invalid t-space position {}: {}", pos, e))
+            })?);
+
+            // MAPQ
+            *record.mapping_quality_mut() = MappingQuality::new(mapq);
+
+            // CIGAR (already has N ops stripped by align_to_transcripts)
+            *record.cigar_mut() = convert_cigar(&t.cigar)?;
+
+            // SEQ / QUAL — STAR writes the original-orientation sequence when
+            // FLAG 0x10 is unset (forward alignment in t-space) and RC'd seq
+            // when 0x10 is set.  We follow SAM spec: SEQ matches the CIGAR's
+            // read orientation, so we mirror `transcript_to_record`.
+            if t.is_reverse {
+                let seq_bytes: Vec<u8> = read_seq
+                    .iter()
+                    .rev()
+                    .map(|&b| decode_base(complement_base(b)))
+                    .collect();
+                *record.sequence_mut() = Sequence::from(seq_bytes);
+                let mut qual = read_qual.to_vec();
+                qual.reverse();
+                *record.quality_scores_mut() = QualityScores::from(qual);
+            } else {
+                let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
+                *record.sequence_mut() = Sequence::from(seq_bytes);
+                *record.quality_scores_mut() = QualityScores::from(read_qual.to_vec());
+            }
+
+            // Optional tags
+            let data = record.data_mut();
+            if attrs.contains("NH") {
+                data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
+            }
+            if attrs.contains("HI") {
+                // HI is 1-based; primary = 1, secondaries > 1 in emission order.
+                data.insert(Tag::HIT_INDEX, Value::from((hit_idx + 1) as i32));
+            }
+            if attrs.contains("AS") {
+                data.insert(Tag::ALIGNMENT_SCORE, Value::from(t.score));
+            }
+            if attrs.contains("NM") || attrs.contains("nM") {
+                data.insert(Tag::new(b'n', b'M'), Value::from(t.n_mismatch as i32));
+            }
+
+            records.push(record);
+        }
+
+        Ok(records)
+    }
+
     /// Build unmapped paired records (both mates unmapped)
     pub fn build_paired_unmapped_records(
         read_name: &str,
@@ -598,23 +710,104 @@ impl SamWriter {
     }
 }
 
+/// SAM writer that streams to stdout.
+pub struct SamStdoutWriter {
+    writer: sam::io::Writer<BufWriter<std::io::Stdout>>,
+    header: sam::Header,
+}
+
+impl SamStdoutWriter {
+    pub fn create(genome: &Genome, params: &Parameters) -> Result<Self, Error> {
+        let header = build_sam_header(genome, params)?;
+        let mut writer = sam::io::Writer::new(BufWriter::new(std::io::stdout()));
+        writer.write_header(&header)?;
+        Ok(Self { writer, header })
+    }
+
+    pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
+        for record in batch {
+            self.writer.write_alignment_record(&self.header, record)?;
+        }
+        Ok(())
+    }
+}
+
 /// Build paired SAM header from genome
 pub fn build_sam_header(genome: &Genome, params: &Parameters) -> Result<sam::Header, Error> {
+    build_sam_header_from_refs(
+        (0..genome.n_chr_real)
+            .map(|i| (genome.chr_name[i].as_str(), genome.chr_length[i] as usize)),
+        params,
+    )
+}
+
+/// Create a SAM writer for BySJout disk-buffering (temp file). Returns (header, writer).
+pub fn create_bysj_writer(
+    file: std::fs::File,
+    genome: &Genome,
+    params: &Parameters,
+) -> Result<(sam::Header, sam::io::Writer<BufWriter<std::fs::File>>), Error> {
+    let header = build_sam_header(genome, params)?;
+    let mut writer = sam::io::Writer::new(BufWriter::new(file));
+    writer.write_header(&header)?;
+    Ok((header, writer))
+}
+
+/// Write a slice of RecordBuf to a SAM writer (for BySJout temp file).
+pub fn bysj_write_records<W: std::io::Write>(
+    writer: &mut sam::io::Writer<W>,
+    header: &sam::Header,
+    records: &[RecordBuf],
+) -> Result<(), Error> {
+    for rec in records {
+        writer.write_alignment_record(header, rec)?;
+    }
+    Ok(())
+}
+
+/// Read exactly `n` records from a SAM reader. If `collect` is true, return them in a Vec;
+/// otherwise just advance the reader position (discard records).
+pub fn bysj_read_n_records<R: std::io::BufRead>(
+    reader: &mut sam::io::Reader<R>,
+    header: &sam::Header,
+    n: u32,
+    collect: bool,
+) -> Result<Vec<RecordBuf>, Error> {
+    let mut out = if collect {
+        Vec::with_capacity(n as usize)
+    } else {
+        Vec::new()
+    };
+    let mut buf = RecordBuf::default();
+    for _ in 0..n {
+        reader.read_record_buf(header, &mut buf)?;
+        if collect {
+            out.push(buf.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Build a SAM header from an iterator of (name, length) reference pairs.
+///
+/// Used both for the genome header (chromosomes) and the transcriptome header
+/// (one @SQ per transcript, length = transcript-space length).
+pub fn build_sam_header_from_refs<'a, I>(refs: I, params: &Parameters) -> Result<sam::Header, Error>
+where
+    I: IntoIterator<Item = (&'a str, usize)>,
+{
     let mut builder = sam::Header::builder();
 
     // @HD line (default version and unsorted)
     builder = builder.set_header(Default::default());
 
-    // @SQ lines for each chromosome
-    for i in 0..genome.n_chr_real {
-        let name = &genome.chr_name[i];
-        let length = genome.chr_length[i] as usize;
-
+    // @SQ lines for each reference
+    for (name, length) in refs {
         let length_nz = NonZeroUsize::new(length)
-            .ok_or_else(|| Error::Index(format!("chromosome {} has zero length", name)))?;
+            .ok_or_else(|| Error::Index(format!("reference {} has zero length", name)))?;
 
         builder = builder.add_reference_sequence(
-            name.as_str(),
+            name,
             Map::<sam::header::record::value::map::ReferenceSequence>::new(length_nz),
         );
     }
@@ -651,7 +844,7 @@ pub fn build_sam_header(genome: &Genome, params: &Parameters) -> Result<sam::Hea
     }
 
     // @PG line
-    builder = builder.add_program("ruSTAR", Map::<Program>::default());
+    builder = builder.add_program("rustar-aligner", Map::<Program>::default());
 
     Ok(builder.build())
 }
@@ -939,8 +1132,8 @@ fn build_md_tag(
     md
 }
 
-/// Convert ruSTAR CigarOp to noodles Cigar
-fn convert_cigar(ops: &[CigarOp]) -> Result<sam::alignment::record_buf::Cigar, Error> {
+/// Convert rustar-aligner CigarOp to noodles Cigar
+pub(crate) fn convert_cigar(ops: &[CigarOp]) -> Result<sam::alignment::record_buf::Cigar, Error> {
     use sam::alignment::record::cigar::op::Kind;
 
     let mut cigar = sam::alignment::record_buf::Cigar::default();
@@ -1169,7 +1362,7 @@ mod tests {
     #[test]
     fn test_build_sam_header() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let header = build_sam_header(&genome, &params).unwrap();
 
@@ -1184,7 +1377,7 @@ mod tests {
     fn test_build_sam_header_with_rg() {
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "test.fq",
             "--outSAMattrRGline",
@@ -1213,7 +1406,7 @@ mod tests {
 
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "test.fq",
             "--outSAMattrRGline",
@@ -1234,6 +1427,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -1276,7 +1470,7 @@ mod tests {
     #[test]
     fn test_sam_writer_creation() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let tmpfile = NamedTempFile::new().unwrap();
         let writer = SamWriter::create(tmpfile.path(), &genome, &params);
@@ -1336,7 +1530,7 @@ mod tests {
         let mate1_qual = vec![30, 30, 30, 30];
         let mate2_seq = vec![3, 2, 1, 0]; // TGCA
         let mate2_qual = vec![30, 30, 30, 30];
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "t.fq"]);
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "t.fq"]);
 
         let records = SamWriter::build_paired_unmapped_records(
             "read1",
@@ -1389,6 +1583,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -1410,6 +1605,7 @@ mod tests {
                 genome_end: 7,
                 read_start: 0,
                 read_end: 3,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(3)],
             score: 90,
@@ -1498,6 +1694,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 200,
@@ -1520,6 +1717,7 @@ mod tests {
                 genome_end: 7,
                 read_start: 0,
                 read_end: 3,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(3)],
             score: 150,
@@ -1789,7 +1987,7 @@ mod tests {
     #[test]
     fn test_secondary_flag() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let transcripts = vec![
             Transcript {
@@ -2106,7 +2304,7 @@ mod tests {
     fn test_out_sam_mult_nmax() {
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "test.fq",
             "--outSAMmultNmax",
@@ -2535,6 +2733,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -2557,6 +2756,7 @@ mod tests {
                 genome_end: 7,
                 read_start: 0,
                 read_end: 3,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(3)],
             score: 90,
@@ -2635,6 +2835,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -2657,6 +2858,7 @@ mod tests {
                 genome_end: 7,
                 read_start: 0,
                 read_end: 3,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(2), CigarOp::Del(1), CigarOp::Match(1)],
             score: 80,
@@ -2751,6 +2953,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -2772,6 +2975,7 @@ mod tests {
                 genome_end: 7,
                 read_start: 0,
                 read_end: 3,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(3)],
             score: 90,
@@ -3058,7 +3262,7 @@ mod tests {
         use crate::params::Parameters;
 
         // Standard
-        let p = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "r.fq"]);
+        let p = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r.fq"]);
         let attrs = p.sam_attribute_set();
         assert_eq!(attrs.len(), 5);
         assert!(attrs.contains("NH"));
@@ -3069,7 +3273,7 @@ mod tests {
 
         // All
         let p = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "r.fq",
             "--outSAMattributes",
@@ -3085,7 +3289,7 @@ mod tests {
 
         // None
         let p = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "r.fq",
             "--outSAMattributes",
@@ -3096,7 +3300,7 @@ mod tests {
 
         // Explicit subset
         let p = Parameters::parse_from(vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--readFilesIn",
             "r.fq",
             "--outSAMattributes",
@@ -3175,7 +3379,8 @@ mod tests {
         use crate::align::transcript::Exon;
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params =
+            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3187,6 +3392,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -3242,7 +3448,8 @@ mod tests {
         use crate::align::transcript::Exon;
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params =
+            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3254,6 +3461,7 @@ mod tests {
                 genome_end: 6,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,
@@ -3322,7 +3530,8 @@ mod tests {
         use crate::align::transcript::Exon;
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["ruSTAR", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params =
+            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3334,6 +3543,7 @@ mod tests {
                 genome_end: 4,
                 read_start: 0,
                 read_end: 4,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(4)],
             score: 100,

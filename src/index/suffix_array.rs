@@ -134,29 +134,48 @@ fn compare_suffixes(
     let start_a = if reverse_a { pos_a + n_genome } else { pos_a };
     let start_b = if reverse_b { pos_b + n_genome } else { pos_b };
 
-    // Maximum comparison length
-    let max_len = n_genome.min(1000); // Limit to prevent excessive comparisons
+    // Compare up to n_genome bytes. Padding (5) stops the comparison early
+    // in practice. Out-of-bounds (RC suffixes near the genome boundary) is
+    // treated as padding so those entries sort correctly rather than falling
+    // through to the position-only fallback.
+    let max_len = n_genome;
 
-    // Compare byte by byte (simplified from STAR's 8-byte word comparison)
     for offset in 0..max_len {
         let idx_a = start_a + offset;
         let idx_b = start_b + offset;
 
-        // Check bounds
-        if idx_a >= sequence.len() || idx_b >= sequence.len() {
-            break;
-        }
-
-        let byte_a = sequence[idx_a];
-        let byte_b = sequence[idx_b];
+        let byte_a = if idx_a < sequence.len() {
+            sequence[idx_a]
+        } else {
+            5
+        };
+        let byte_b = if idx_b < sequence.len() {
+            sequence[idx_b]
+        } else {
+            5
+        };
 
         // Stop at padding (value 5) - this is STAR's sentinel
         let is_padding_a = byte_a == 5;
         let is_padding_b = byte_b == 5;
 
         if is_padding_a && is_padding_b {
-            // Both hit padding at same depth - anti-stable sort by position
-            return pos_b.cmp(&pos_a);
+            // Both hit padding at same depth — sort ascending by packed SA value
+            // (strand bit at position gstrand_bit, same as what's stored in the SA).
+            // For yeast (gstrand_bit=32): FW entries have packed_value = pos (no bit 32),
+            // RC entries have packed_value = pos | (1<<32). All FW entries therefore
+            // sort before all RC entries, matching STAR's tie-breaking behavior.
+            let packed_a = if reverse_a {
+                pos_a | (1usize << 32)
+            } else {
+                pos_a
+            };
+            let packed_b = if reverse_b {
+                pos_b | (1usize << 32)
+            } else {
+                pos_b
+            };
+            return packed_a.cmp(&packed_b);
         }
 
         if is_padding_a {
@@ -174,8 +193,18 @@ fn compare_suffixes(
         }
     }
 
-    // If we exhausted max_len, fall back to position comparison
-    pos_a.cmp(&pos_b)
+    // If we exhausted max_len, fall back to packed SA value comparison
+    let packed_a = if reverse_a {
+        pos_a | (1usize << 32)
+    } else {
+        pos_a
+    };
+    let packed_b = if reverse_b {
+        pos_b | (1usize << 32)
+    } else {
+        pos_b
+    };
+    packed_a.cmp(&packed_b)
 }
 
 #[cfg(test)]
@@ -193,7 +222,7 @@ mod tests {
 
         let bin_nbits_str = bin_nbits.to_string();
         let args = vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--runMode",
             "genomeGenerate",
             "--genomeFastaFiles",

@@ -41,7 +41,7 @@ check() {
 }
 
 echo "=========================================="
-echo "ruSTAR Test Framework Verification"
+echo "rustar-aligner Test Framework Verification"
 echo "=========================================="
 echo ""
 
@@ -77,15 +77,15 @@ for doc in README.md STAR_REFERENCE.md; do
     fi
 done
 
-# Check ruSTAR binary
+# Check rustar-aligner binary
 echo ""
-echo "Checking ruSTAR build..."
-if check test -x "$PROJECT_ROOT/target/release/ruSTAR"; then
-    pass "ruSTAR binary exists"
-    version=$("$PROJECT_ROOT/target/release/ruSTAR" --version 2>&1 || echo "unknown")
+echo "Checking rustar-aligner build..."
+if check test -x "$PROJECT_ROOT/target/release/rustar-aligner"; then
+    pass "rustar-aligner binary exists"
+    version=$("$PROJECT_ROOT/target/release/rustar-aligner" --version 2>&1 || echo "unknown")
     echo "  Version: $version"
 else
-    fail "ruSTAR binary NOT found"
+    fail "rustar-aligner binary NOT found"
     warn "Run: cargo build --release"
 fi
 

@@ -1,6 +1,6 @@
 # STAR Source Code Reference
 
-Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
+Quick reference for mapping rustar-aligner implementation to STAR's C++ codebase.
 
 **STAR Repository:** https://github.com/alexdobin/STAR
 
@@ -10,7 +10,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### Genome Generation
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/genome/mod.rs` | `source/Genome_genomeGenerate.cpp` |
 | `src/genome/fasta.rs` | `source/SequenceFuns.cpp` |
@@ -26,7 +26,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### Index Loading
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/index/io.rs` | `source/Genome.cpp::genomeLoad()` |
 | `src/index/packed_array.rs` | `source/PackedArray.h` |
@@ -38,13 +38,13 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 **Key differences:**
 - STAR uses memory-mapped files (`mmap`) for large arrays
-- ruSTAR uses `memmap2` crate with same logic
+- rustar-aligner uses `memmap2` crate with same logic
 
 ---
 
 ### Seed Finding
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/align/seed.rs` | `source/ReadAlign_maxMappableLength2strands.cpp` |
 |  | `source/ReadAlign_mappedFilter.cpp` |
@@ -67,7 +67,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### Seed Clustering
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/align/stitch.rs::cluster_seeds()` | `source/stitchWindowAligns.cpp::stitchWindowSeeds()` |
 
@@ -82,14 +82,14 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 - `--seedNoneLociPerWindow` → `seed_none_loci_per_window` (default: 10)
 
 **Known differences:**
-- ruSTAR caps expanded seeds at 200 per cluster (Phase 13 optimization)
+- rustar-aligner caps expanded seeds at 200 per cluster (Phase 13 optimization)
 - STAR does not have explicit cap (can cause O(n²) in repetitive regions)
 
 ---
 
 ### DP Stitching
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/align/stitch.rs::stitch_seeds_dp()` | `source/stitchWindowAligns.cpp` |
 | `src/align/score.rs` | `source/alignSmithWaterman.cpp` |
@@ -118,7 +118,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### Transcript Filtering
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/align/read_align.rs::filter_transcripts()` | `source/ReadAlign_outputAlignments.cpp` |
 
@@ -141,7 +141,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### MAPQ Calculation
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/mapq.rs` | `source/ReadAlign_outputAlignments.cpp` |
 
@@ -157,17 +157,17 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### SAM Output
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/io/sam.rs` | `source/ReadAlign_outputAlignments.cpp` |
 |  | `source/ReadAlign_outputTranscriptSAM.cpp` |
 
-**SAM tags (STAR vs ruSTAR):**
-- `NH:i` (number of hits): STAR ✓, ruSTAR ✗ (deferred)
-- `HI:i` (hit index): STAR ✓, ruSTAR ✗ (deferred)
-- `AS:i` (alignment score): STAR ✓, ruSTAR ✗ (deferred)
-- `NM:i` (edit distance): STAR ✓, ruSTAR ✗ (deferred)
-- `nM:i` (mismatches): STAR ✓, ruSTAR ✗ (deferred)
+**SAM tags (STAR vs rustar-aligner):**
+- `NH:i` (number of hits): STAR ✓, rustar-aligner ✗ (deferred)
+- `HI:i` (hit index): STAR ✓, rustar-aligner ✗ (deferred)
+- `AS:i` (alignment score): STAR ✓, rustar-aligner ✗ (deferred)
+- `NM:i` (edit distance): STAR ✓, rustar-aligner ✗ (deferred)
+- `nM:i` (mismatches): STAR ✓, rustar-aligner ✗ (deferred)
 
 **Reason for deferral:** noodles crate lifetime complexity
 
@@ -175,7 +175,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### GTF Parsing
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/junction/gtf.rs` | `source/sjdbLoadFromFiles.cpp` |
 | `src/junction/mod.rs` | `source/SjdbClass.cpp` |
@@ -198,7 +198,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### SJ.out.tab Output
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/junction/sj_output.rs` | `source/outputSJ.cpp` |
 
@@ -214,14 +214,14 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 9. Maximum overhang
 
 **Known differences:**
-- Overhang calculation: ruSTAR uses placeholder (5bp), STAR computes exact value
-- Thread-safe accumulation: ruSTAR uses DashMap, STAR uses locks
+- Overhang calculation: rustar-aligner uses placeholder (5bp), STAR computes exact value
+- Thread-safe accumulation: rustar-aligner uses DashMap, STAR uses locks
 
 ---
 
 ### Threading
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/lib.rs::run_with_threads()` | `source/STAR.cpp::main()` |
 |  | `source/ThreadControl.cpp` |
@@ -236,13 +236,13 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 **Known differences:**
 - STAR uses custom thread pool with load balancing
-- ruSTAR uses rayon for simpler parallelization
+- rustar-aligner uses rayon for simpler parallelization
 
 ---
 
 ### Two-Pass Mode
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/lib.rs::run_two_pass()` | `source/STAR.cpp::main()` (--twopassMode Basic) |
 
@@ -268,7 +268,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 
 ### Chimeric Alignment Detection
 
-| ruSTAR | STAR |
+| rustar-aligner | STAR |
 |--------|------|
 | `src/chimeric/detect.rs` | `source/ReadAlign_chimericDetection.cpp` |
 | `src/chimeric/output.rs` | `source/ReadAlign_outputTranscriptChimeric.cpp` |
@@ -276,7 +276,7 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 **Detection tiers:**
 1. **Tier 1 (soft-clip):** Detect from soft-clipped reads (>20% clipped)
 2. **Tier 2 (multi-cluster):** Detect from multi-locus seed clusters
-3. **Tier 3 (re-mapping):** Re-map soft-clipped regions (NOT YET IMPLEMENTED in ruSTAR)
+3. **Tier 3 (re-mapping):** Re-map soft-clipped regions (NOT YET IMPLEMENTED in rustar-aligner)
 
 **Parameters:**
 - `--chimSegmentMin` → `chim_segment_min` (default: 0 = disabled, typical: 20)
@@ -287,18 +287,18 @@ Quick reference for mapping ruSTAR implementation to STAR's C++ codebase.
 **Output file:** `Chimeric.out.junction` (14 columns)
 
 **Known limitations:**
-- ruSTAR: Single-end only, tiers 1-2
+- rustar-aligner: Single-end only, tiers 1-2
 - STAR: Single-end and paired-end, tiers 1-3
 
 ---
 
 ## Parameter Name Mapping
 
-STAR uses `--camelCase` CLI parameters. ruSTAR mirrors these exactly.
+STAR uses `--camelCase` CLI parameters. rustar-aligner mirrors these exactly.
 
 ### Commonly Used Parameters
 
-| STAR | ruSTAR Field | Default |
+| STAR | rustar-aligner Field | Default |
 |------|--------------|---------|
 | `--genomeDir` | `genome_dir` | (required) |
 | `--readFilesIn` | `read_files_in` | (required) |
@@ -317,7 +317,7 @@ See `src/params.rs` for complete parameter list (~40 parameters).
 
 ## Known Algorithmic Differences
 
-### Phase 13 Optimizations (ruSTAR-specific)
+### Phase 13 Optimizations (rustar-aligner-specific)
 
 1. **Lazy seed position iterator:** Avoids Vec allocation per seed
 2. **PackedArray fast-path:** Direct 8-byte slice read for aligned positions
@@ -329,7 +329,7 @@ See `src/params.rs` for complete parameter list (~40 parameters).
 
 ### SAM Optional Tags
 
-**Not yet implemented in ruSTAR:**
+**Not yet implemented in rustar-aligner:**
 - `NH:i` (number of hits)
 - `HI:i` (hit index)
 - `AS:i` (alignment score)
@@ -368,7 +368,7 @@ let base = genome.get_base(pos + offset);
 
 ## Investigation Workflow
 
-When ruSTAR output differs from STAR:
+When rustar-aligner output differs from STAR:
 
 1. **Identify discrepancy type:**
    - Different chromosome → Seed clustering
@@ -383,7 +383,7 @@ When ruSTAR output differs from STAR:
 
 3. **Re-run with debug logging:**
    ```bash
-   RUST_LOG=debug ./target/release/ruSTAR --runMode alignReads ...
+   RUST_LOG=debug ./target/release/rustar-aligner --runMode alignReads ...
    ```
 
 4. **Compare STAR source:**
@@ -431,6 +431,6 @@ When ruSTAR output differs from STAR:
 
 **STAR version tested against:** 2.7.11b (latest stable as of 2026-02-07)
 
-**ruSTAR phases completed:** 1-13 (Phases 1-11 = feature parity, 12 = chimeric, 13 = optimization)
+**rustar-aligner phases completed:** 1-13 (Phases 1-11 = feature parity, 12 = chimeric, 13 = optimization)
 
 **Next phase:** 14 (STARsolo single-cell features)

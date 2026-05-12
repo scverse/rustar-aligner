@@ -32,7 +32,14 @@ pub struct Transcript {
     pub read_seq: Vec<u8>,
 }
 
-/// An exon segment in a transcript
+/// An exon segment in a transcript.
+///
+/// `i_frag` carries the mate index (0 for mate1 / single-end, 1 for mate2),
+/// matching STAR's `Transcript::exons[i][EX_iFrag]`
+/// (`source/IncludeDefine.h:209`). PE alignments span both mates; this
+/// field marks which mate each exon block belongs to and is the input for
+/// STAR's single-end filter in transcriptome projection
+/// (`ReadAlign_quantTranscriptome.cpp:17`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Exon {
     /// Genomic start position (0-based, inclusive)
@@ -43,6 +50,8 @@ pub struct Exon {
     pub read_start: usize,
     /// Read end position (0-based, exclusive)
     pub read_end: usize,
+    /// Mate index (0 for mate1/SE, 1 for mate2). Matches STAR's `EX_iFrag`.
+    pub i_frag: u8,
 }
 
 /// CIGAR operation
@@ -284,6 +293,7 @@ mod tests {
             genome_end: 1050,
             read_start: 0,
             read_end: 50,
+            i_frag: 0,
         };
 
         assert_eq!(exon.genome_start, 1000);

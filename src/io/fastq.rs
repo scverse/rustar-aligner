@@ -3,9 +3,48 @@ use crate::error::Error;
 use flate2::read::GzDecoder;
 use noodles::fastq;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// Writer for unmapped reads in FASTQ format (`--outReadsUnmapped Fastx`).
+pub struct UnmappedFastqWriter {
+    writer: BufWriter<File>,
+}
+
+impl UnmappedFastqWriter {
+    pub fn create(path: &Path) -> Result<Self, Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
+        }
+        let file = File::create(path).map_err(|e| Error::io(e, path))?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
+    }
+
+    /// Write one FASTQ record. `seq` is in genome encoding (0=A,1=C,2=G,3=T,4=N).
+    /// `qual` is raw FASTQ quality bytes.
+    pub fn write_record(&mut self, name: &str, seq: &[u8], qual: &[u8]) -> Result<(), Error> {
+        self.writer.write_all(b"@").map_err(Error::from)?;
+        self.writer
+            .write_all(name.as_bytes())
+            .map_err(Error::from)?;
+        self.writer.write_all(b"\n").map_err(Error::from)?;
+        for &b in seq {
+            self.writer
+                .write_all(&[decode_base(b)])
+                .map_err(Error::from)?;
+        }
+        self.writer.write_all(b"\n+\n").map_err(Error::from)?;
+        self.writer.write_all(qual).map_err(Error::from)?;
+        self.writer.write_all(b"\n").map_err(Error::from)
+    }
+
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.writer.flush().map_err(Error::from)
+    }
+}
 
 /// A read from a FASTQ file with encoded bases
 #[derive(Debug, Clone)]

@@ -2,8 +2,8 @@
 # debug_star.sh - Run STAR with read-name tracing on specific reads
 #
 # Usage:
-#   # Trace reads from a ruSTAR-only or STAR-only PE comparison:
-#   ./debug_star.sh pe <rustar_sam> <star_sam> [n_reads]
+#   # Trace reads from a rustar-aligner-only or STAR-only PE comparison:
+#   ./debug_star.sh pe <rustar-aligner_sam> <star_sam> [n_reads]
 #
 #   # Trace specific read names directly:
 #   ./debug_star.sh reads <read1,read2,...>
@@ -24,14 +24,14 @@ mkdir -p "$OUT_DIR"
 mode="${1:-pe}"
 
 extract_reads_from_comparison() {
-    local rustar_sam="$1"
+    local rustar_aligner_sam="$1"
     local star_sam="$2"
     local n="${3:-20}"
-    python3 - "$rustar_sam" "$star_sam" "$n" <<'PYEOF'
+    python3 - "$rustar_aligner_sam" "$star_sam" "$n" <<'PYEOF'
 import sys
 from collections import defaultdict
 
-rustar_sam, star_sam, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rustar_aligner_sam, star_sam, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
 def parse_pe_sam(path):
     mapped = {}  # qname -> (chr, pos, mapq, cigar)
@@ -47,38 +47,38 @@ def parse_pe_sam(path):
             mapped[qname] = (f2[2], int(f2[3]), int(f2[4]), f2[5])
     return mapped
 
-r = parse_pe_sam(rustar_sam)
+r = parse_pe_sam(rustar_aligner_sam)
 s = parse_pe_sam(star_sam)
 
-rustar_only = []
+rustar_aligner_only = []
 for qname in sorted(r.keys()):
     if qname not in s:
-        rustar_only.append(qname)
+        rustar_aligner_only.append(qname)
     # same name but STAR has it unmapped would also count - check both dicts
 
 # Also STAR-only
 star_only = [q for q in sorted(s.keys()) if q not in r]
 
-print(f"# ruSTAR-only (false positives): {len(rustar_only)}")
+print(f"# rustar-aligner-only (false positives): {len(rustar_aligner_only)}")
 print(f"# STAR-only (missed): {len(star_only)}")
 print()
 
-out_reads = rustar_only[:n] + star_only[:min(5, n)]
+out_reads = rustar_aligner_only[:n] + star_only[:min(5, n)]
 print(','.join(out_reads[:n]))
 PYEOF
 }
 
 if [ "$mode" = "pe" ]; then
     if [ $# -lt 3 ]; then
-        echo "Usage: $0 pe <rustar_sam> <star_sam> [n_reads=20]"
+        echo "Usage: $0 pe <rustar_aligner_sam> <star_sam> [n_reads=20]"
         exit 1
     fi
-    rustar_sam="$2"
+    rustar_aligner_sam="$2"
     star_sam="$3"
     n_reads="${4:-20}"
 
     echo "=== Extracting read names from PE comparison ==="
-    read_list=$(extract_reads_from_comparison "$rustar_sam" "$star_sam" "$n_reads" | tail -1)
+    read_list=$(extract_reads_from_comparison "$rustar_aligner_sam" "$star_sam" "$n_reads" | tail -1)
     echo "Reads to trace: $read_list"
 
 elif [ "$mode" = "reads" ]; then
@@ -91,7 +91,7 @@ elif [ "$mode" = "reads" ]; then
     echo "Reads: $read_list"
 else
     echo "Unknown mode: $mode"
-    echo "Usage: $0 pe <rustar_sam> <star_sam> [n_reads]"
+    echo "Usage: $0 pe <rustar_aligner_sam> <star_sam> [n_reads]"
     echo "       $0 reads <read1,read2,...>"
     exit 1
 fi

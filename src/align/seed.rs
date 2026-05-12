@@ -679,7 +679,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let args = vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--runMode",
             "genomeGenerate",
             "--genomeFastaFiles",
@@ -713,7 +713,7 @@ mod tests {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -731,7 +731,7 @@ mod tests {
         let index = make_test_index("AAAAAAAA");
         let read = encode_sequence("AAA");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         // With min_seed_length=4, should find nothing (read is only 3bp)
@@ -748,7 +748,7 @@ mod tests {
         let index = make_test_index("ACAC");
         let read = encode_sequence("GGGG");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 2, &params, "").unwrap();
@@ -762,7 +762,7 @@ mod tests {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -783,7 +783,7 @@ mod tests {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -801,7 +801,7 @@ mod tests {
         let mate1 = encode_sequence("ACGT");
         let mate2 = encode_sequence("TTGG");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
@@ -830,7 +830,7 @@ mod tests {
         let mate1 = encode_sequence("ACGT");
         let mate2 = encode_sequence("ACGT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
@@ -881,7 +881,7 @@ mod tests {
         // Read is RC of genome: CCAAGGTT
         let read = encode_sequence("CCAAGGTT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -924,7 +924,7 @@ mod tests {
         let read = encode_sequence("ACGTACGT");
 
         let args = vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--runMode",
             "alignReads",
             "--seedPerReadNmax",
@@ -983,7 +983,7 @@ mod tests {
         let index = make_test_index("AACCTTGG");
         let read = encode_sequence("CCAAGGTT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -1018,7 +1018,7 @@ mod tests {
         // Use a read that's long enough for multiple start positions
         let read = encode_sequence("ACGTACGTACGTACGTACGTACGT"); // 24bp
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let sparse_seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
         let index = make_test_index("AACCTTGG");
         let read = encode_sequence("CCAAGGTT");
 
-        let args = vec!["ruSTAR", "--runMode", "alignReads"];
+        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
         let params = Parameters::parse_from(args);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();

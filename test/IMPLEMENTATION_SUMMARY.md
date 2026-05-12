@@ -1,4 +1,4 @@
-# ruSTAR Testing Framework - Implementation Summary
+# rustar-aligner Testing Framework - Implementation Summary
 
 **Date:** 2026-02-07
 **Status:** ✅ COMPLETE
@@ -8,10 +8,10 @@
 
 ## What Was Implemented
 
-A complete testing infrastructure for systematic validation of ruSTAR against STAR, comprising:
+A complete testing infrastructure for systematic validation of rustar-aligner against STAR, comprising:
 
 ### 1. Test Orchestration (`run_tests.sh`)
-- Master test runner that executes both STAR and ruSTAR on identical inputs
+- Master test runner that executes both STAR and rustar-aligner on identical inputs
 - 6 predefined test cases (100 reads to 10K reads, single/paired-end, SAM/BAM, two-pass)
 - Parallel execution support
 - Automated comparison and pass/fail determination
@@ -35,7 +35,7 @@ A complete testing infrastructure for systematic validation of ruSTAR against ST
   - Suggests likely causes and code locations
   - Maps to STAR source files
 - **`STAR_REFERENCE.md`** — Comprehensive reference guide
-  - ruSTAR → STAR module mapping
+  - rustar-aligner → STAR module mapping
   - Algorithm descriptions
   - Parameter mappings
   - Known differences and bug patterns
@@ -103,7 +103,7 @@ test/
 ├── results/                  # Test outputs (git-ignored)
 │   └── TIMESTAMP_testname/
 │       ├── star/
-│       ├── rustar/
+│       ├── rustar-aligner/
 │       └── comparison/
 ├── debug/                    # Investigation workspace (git-ignored)
 └── data/                     # Test data (git-ignored)
@@ -123,7 +123,7 @@ Framework verified with `verify_framework.sh`:
 ✓ All test scripts executable
 ✓ All Python comparison utilities executable
 ✓ Documentation complete
-✓ ruSTAR binary built (v0.1.0)
+✓ rustar-aligner binary built (v0.1.0)
 ✓ STAR installed (v2.7.11b)
 ✓ Python 3 available (v3.10.12)
 ✓ Test data present (10 FASTQ files)
@@ -148,7 +148,7 @@ cd test
 
 **Output:**
 - `test/results/TIMESTAMP_yeast_100/star/` — STAR outputs
-- `test/results/TIMESTAMP_yeast_100/rustar/` — ruSTAR outputs
+- `test/results/TIMESTAMP_yeast_100/rustar/` — rustar-aligner outputs
 - `test/results/TIMESTAMP_yeast_100/comparison/` — Comparison reports
 - `test/results/TIMESTAMP_yeast_100/PASSED` or `FAILED` — Status marker
 
@@ -211,7 +211,7 @@ All Python scripts use only standard library (no `pysam`, `pandas`, etc.)
 ### 4. Debugging-Focused
 - Investigation tool extracts discrepant reads
 - Maps discrepancy types to likely causes
-- Suggests relevant ruSTAR and STAR source files
+- Suggests relevant rustar-aligner and STAR source files
 - Provides debug re-run commands
 
 ### 5. Extensible
@@ -254,7 +254,7 @@ cd test && ./ci.sh
 - Future: Add human chr22, full human genome
 
 ### 2. Comparison Depth
-- SAM tags (AS, NM, NH, HI) not compared (ruSTAR doesn't output them yet)
+- SAM tags (AS, NM, NH, HI) not compared (rustar-aligner doesn't output them yet)
 - BAM requires conversion to SAM (uses `samtools view`)
 - Chimeric comparison is basic (no detailed segment analysis)
 
@@ -280,7 +280,7 @@ cd test && ./ci.sh
 - Coverage-based test selection
 
 ### Comparison Improvements
-- SAM tag comparison (when ruSTAR implements them)
+- SAM tag comparison (when rustar-aligner implements them)
 - Detailed CIGAR alignment visualization
 - Junction overhang calculation verification
 - Chimeric segment re-mapping validation
@@ -344,7 +344,7 @@ Framework is successful if:
 
 4. **Performance validation:**
    - Run yeast_10k test (benchmark)
-   - Compare ruSTAR vs STAR timing
+   - Compare rustar-aligner vs STAR timing
 
 5. **Continuous monitoring:**
    - Run test suite after each code change

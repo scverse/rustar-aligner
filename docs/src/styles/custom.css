@@ -1,0 +1,658 @@
+/* ==========================================================================
+   rustar-aligner · design tokens (concept 11 — blueprint)
+   Light: bone paper + prussian ink (cyanotype-inverted).
+   Dark:  deep navy paper + parchment ink (atlas dark).
+   Body has a graph-paper grid background. Display = Archivo Narrow,
+   body = Inter, mono = JetBrains Mono. The brand wordmark stays mono.
+   ========================================================================== */
+
+/* ---------- Tokens ---------- */
+
+:root {
+  /* Paper / surfaces */
+  --rustar-paper:       oklch(96% 0.012 80);
+  --rustar-paper-deep:  oklch(92% 0.02 230);
+  --rustar-paper-line:  oklch(82% 0.04 230);
+
+  /* Ink / text */
+  --rustar-ink:         oklch(28% 0.10 245);
+  --rustar-ink-soft:    oklch(40% 0.10 245);
+  --rustar-ink-mute:    oklch(58% 0.06 245);
+
+  /* Accents */
+  --rustar-accent:      oklch(48% 0.13 230);
+  --rustar-accent-soft: oklch(78% 0.10 220);
+  --rustar-warn:        oklch(56% 0.21 28);
+
+  /* Background grid */
+  --rustar-grid:        oklch(75% 0.04 230 / 0.16);
+  --rustar-contour:     oklch(68% 0.07 230);
+
+  /* Rule / border colour. In light mode this is full ink; in dark mode it
+     drops to the paper-line shade so borders read as quiet hairlines instead
+     of high-contrast cream-on-navy lines. */
+  --rustar-rule:        var(--rustar-ink);
+
+  /* Fonts */
+  --rustar-sans:        'Inter', system-ui, -apple-system, sans-serif;
+  --rustar-condensed:   'Archivo Narrow', sans-serif;
+  --rustar-mono:        'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Override Starlight tokens (light mode) */
+  --sl-font:            var(--rustar-sans);
+  --sl-font-mono:       var(--rustar-mono);
+  --sl-color-bg:                 var(--rustar-paper);
+  --sl-color-bg-nav:             var(--rustar-paper);
+  --sl-color-bg-sidebar:         var(--rustar-paper);
+  --sl-color-bg-inline-code:     var(--rustar-paper-deep);
+  --sl-color-text:               var(--rustar-ink);
+  --sl-color-text-accent:        var(--rustar-accent);
+  --sl-color-white:              var(--rustar-ink);
+  --sl-color-gray-1:             var(--rustar-ink);
+  --sl-color-gray-2:             var(--rustar-ink-soft);
+  --sl-color-gray-3:             var(--rustar-ink-mute);
+  --sl-color-gray-4:             var(--rustar-ink-mute);
+  --sl-color-gray-5:             var(--rustar-paper-line);
+  --sl-color-gray-6:             var(--rustar-paper-line);
+  --sl-color-hairline:           var(--rustar-paper-line);
+  --sl-color-hairline-light:     var(--rustar-paper-line);
+  --sl-color-hairline-shade:     var(--rustar-paper-line);
+}
+
+:root[data-theme='dark'] {
+  --rustar-paper:       oklch(17% 0.045 245);
+  --rustar-paper-deep:  oklch(21% 0.05 245);
+  --rustar-paper-line:  oklch(28% 0.05 245);
+
+  --rustar-ink:         oklch(94% 0.013 75);
+  --rustar-ink-soft:    oklch(80% 0.02 75);
+  --rustar-ink-mute:    oklch(62% 0.03 75);
+
+  --rustar-accent:      oklch(78% 0.13 220);
+  --rustar-accent-soft: oklch(60% 0.10 220);
+  --rustar-warn:        oklch(70% 0.20 28);
+
+  --rustar-grid:        oklch(28% 0.05 245 / 0.40);
+  --rustar-contour:     oklch(48% 0.07 235);
+  --rustar-rule:        oklch(48% 0.04 240);
+
+  --sl-color-bg:                 var(--rustar-paper);
+  --sl-color-bg-nav:             var(--rustar-paper);
+  --sl-color-bg-sidebar:         var(--rustar-paper);
+  --sl-color-bg-inline-code:     var(--rustar-paper-deep);
+  --sl-color-text:               var(--rustar-ink);
+  --sl-color-text-accent:        var(--rustar-accent);
+  --sl-color-white:              var(--rustar-ink);
+  --sl-color-gray-1:             var(--rustar-ink);
+  --sl-color-gray-2:             var(--rustar-ink-soft);
+  --sl-color-gray-3:             var(--rustar-ink-mute);
+  --sl-color-gray-4:             var(--rustar-ink-mute);
+  --sl-color-gray-5:             var(--rustar-paper-line);
+  --sl-color-gray-6:             var(--rustar-paper-line);
+  --sl-color-hairline:           var(--rustar-paper-line);
+  --sl-color-hairline-light:     var(--rustar-paper-line);
+  --sl-color-hairline-shade:     var(--rustar-paper-line);
+}
+
+/* ---------- Base body: graph-paper grid ---------- */
+
+body {
+  background-color: var(--rustar-paper);
+  background-image:
+    linear-gradient(to right, var(--rustar-grid) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--rustar-grid) 1px, transparent 1px);
+  background-size: 24px 24px;
+  font-feature-settings: "ss01", "cv11";
+  font-optical-sizing: auto;
+}
+
+::selection { background: var(--rustar-accent-soft); color: var(--rustar-ink); }
+
+/* ---------- Brand wordmark / nav ---------- */
+
+.site-title {
+  font-family: var(--rustar-mono);
+  font-weight: 700;
+  letter-spacing: 0.005em;
+}
+
+.rustar-header .top-nav a {
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-weight: 500;
+  font-size: 0.92rem;
+}
+
+.rustar-header .version-pill {
+  font-family: var(--rustar-mono);
+}
+
+/* ---------- Headings: Archivo Narrow ---------- */
+/* Applied to every h1–h6 in main (page-h1, markdown headings, the rustar-home
+   custom hero/sections — everything except the .site-title brand wordmark
+   which keeps its mono override below). */
+
+main h1, main h2, main h3, main h4, main h5, main h6 {
+  font-family: var(--rustar-condensed);
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  color: var(--rustar-ink);
+}
+
+.sl-markdown-content h1 { font-size: clamp(2rem, 5vw, 3rem); line-height: 1.05; }
+.sl-markdown-content h2 { font-size: clamp(1.55rem, 3vw, 2rem); line-height: 1.1; margin-top: 2.25rem; }
+.sl-markdown-content h3 { font-size: 1.25rem; margin-top: 1.6rem; }
+.sl-markdown-content h4 { font-size: 1.05rem; }
+
+/* Auto page heading rendered by Starlight (the h1 shown above markdown
+   content on every doc page). Sized larger and condensed. */
+main > .content-panel:first-of-type > .sl-container > h1 {
+  font-family: var(--rustar-condensed);
+  font-weight: 700;
+  font-size: clamp(2.25rem, 5.5vw, 3.5rem);
+  line-height: 1.05;
+  letter-spacing: -0.005em;
+  color: var(--rustar-ink);
+}
+
+/* Inline code: keep on one line, quiet styling */
+:not(pre) > code {
+  white-space: nowrap;
+  font-family: var(--rustar-mono);
+  font-size: 0.9em;
+  background: var(--rustar-paper-deep);
+  border: 0.5px solid var(--rustar-paper-line);
+  padding: 1px 6px;
+  border-radius: 0;
+  color: var(--rustar-ink);
+}
+
+/* Hide the terminal-style title bar; restore a top border on framed code so
+   the box still reads as enclosed. */
+.expressive-code .frame.is-terminal .header { display: none; }
+.expressive-code .frame.has-title pre,
+.expressive-code .frame.is-terminal pre {
+  border-top: var(--ec-brdWd) solid var(--ec-brdCol);
+}
+
+/* Sidebar: cleaner, hairline rules */
+starlight-menu-button { color: var(--rustar-ink); }
+
+/* Section dividers in markdown — wiggle topo line */
+.sl-markdown-content hr {
+  border: none;
+  height: 50px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 50' preserveAspectRatio='none'><path d='M0,28 Q200,14 400,28 T800,28 Q1000,16 1200,28' fill='none' stroke='%23999' stroke-width='0.6'/><path d='M0,18 Q300,5 600,18 T1200,18' fill='none' stroke='%23999' stroke-width='0.6'/><path d='M0,38 Q400,24 800,38 T1200,38' fill='none' stroke='%23999' stroke-width='0.6'/></svg>");
+  background-size: 100% 100%;
+  background-repeat: no-repeat;
+  margin: 2.5rem 0;
+  opacity: 0.7;
+}
+
+/* ==========================================================================
+   Homepage (template: splash) — matches mockup 11
+   ========================================================================== */
+
+.rustar-home {
+  --rustar-content-pad: clamp(1rem, 4vw, 2.25rem);
+  margin: 0 auto;
+  max-width: 1240px;
+  padding: 0 var(--rustar-content-pad);
+  font-size: 16.5px;
+  line-height: 1.6;
+  color: var(--rustar-ink);
+}
+
+/* Hero */
+.rustar-hero {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 64px;
+  align-items: end;
+  padding: 64px 0 56px;
+}
+
+.rustar-hero h1 {
+  font-family: var(--rustar-condensed);
+  font-weight: 700;
+  font-size: clamp(56px, 9vw, 124px);
+  line-height: 0.95;
+  letter-spacing: -0.008em;
+  margin: 0 0 22px;
+  color: var(--rustar-ink);
+}
+
+.rustar-hero .lead {
+  font-size: 21px;
+  line-height: 1.5;
+  color: var(--rustar-ink-soft);
+  max-width: 50ch;
+  margin: 0 0 14px;
+}
+
+.rustar-hero .lead em { color: var(--rustar-ink); font-style: normal; font-weight: 600; }
+
+.rustar-hero .lead-2 {
+  font-size: 18px;
+  color: var(--rustar-ink-soft);
+  max-width: 52ch;
+  margin: 14px 0 0;
+}
+
+.rustar-hero .lead-2 code {
+  font-family: var(--rustar-mono);
+  font-size: 0.9em;
+  background: var(--rustar-paper-deep);
+  border: 0.5px solid var(--rustar-paper-line);
+  padding: 1px 6px;
+}
+
+.rustar-hero-btns { margin-top: 28px; }
+.rustar-btns.rustar-hero-btns a { text-transform: none; letter-spacing: 0.02em; }
+
+.rustar-mascot {
+  width: 100%;
+  max-width: 280px;
+  height: auto;
+  display: block;
+  margin: 0 0 0 auto;
+  filter: drop-shadow(0 2px 0 oklch(20% 0.05 245 / 0.08));
+}
+
+/* Wiggle topo divider — water-surface undulation via CSS path() morphing.
+   Each line's `d` attribute is overridden in CSS and animated between several
+   waveform variants. The control-point Y values drift independently per line,
+   with prime-ish durations and large negative delays so the three lines never
+   re-sync. Result: organic, water-like motion rather than rigid translation.
+
+   See: https://medium.com/@r_tripti/css-only-svg-wave-animation-291c1cadd15f
+   `d:` as a CSS property is supported in Chrome 108+, Safari 16.4+, Firefox 128+. */
+
+.rustar-topo {
+  display: block;
+  width: 100%;
+  height: 50px;
+  color: var(--rustar-contour);
+  margin: 0;
+  overflow: visible;
+}
+.rustar-topo path {
+  stroke-width: 0.9;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Static d (also the reduced-motion fallback). Each path is converted from
+   the original Q…T form to explicit Q…Q so we can morph each control point
+   independently. */
+.rustar-topo path:nth-of-type(1) {
+  d: path("M 0,28 Q 200,14 400,28 Q 600,42 800,28 Q 1000,16 1200,28");
+}
+.rustar-topo path:nth-of-type(2) {
+  d: path("M 0,18 Q 300,5 600,18 Q 900,31 1200,18");
+}
+.rustar-topo path:nth-of-type(3) {
+  d: path("M 0,38 Q 400,24 800,38 Q 1100,50 1200,38");
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .rustar-topo path:nth-of-type(1) {
+    animation: rustar-wave-a 8.6s ease-in-out infinite;
+  }
+  .rustar-topo path:nth-of-type(2) {
+    animation: rustar-wave-b 11.4s ease-in-out infinite -3.4s;
+  }
+  .rustar-topo path:nth-of-type(3) {
+    animation: rustar-wave-c 14s ease-in-out infinite -7.4s;
+  }
+}
+
+/* Belt-and-braces: explicit reduce block. The path stays at its static `d`
+   defined above (the 0%/100% keyframe value), no morphing applied. */
+@media (prefers-reduced-motion: reduce) {
+  .rustar-topo path { animation: none !important; }
+}
+
+/* Path 1 — three humps along centreline 28; each control-point Y breathes. */
+@keyframes rustar-wave-a {
+  0%, 100% { d: path("M 0,28 Q 200,14 400,28 Q 600,42 800,28 Q 1000,16 1200,28"); }
+  20%      { d: path("M 0,28 Q 200,8  400,28 Q 600,48 800,28 Q 1000,22 1200,28"); }
+  40%      { d: path("M 0,28 Q 200,20 400,28 Q 600,38 800,28 Q 1000,10 1200,28"); }
+  60%      { d: path("M 0,28 Q 200,12 400,28 Q 600,46 800,28 Q 1000,20 1200,28"); }
+  80%      { d: path("M 0,28 Q 200,18 400,28 Q 600,40 800,28 Q 1000,14 1200,28"); }
+}
+
+/* Path 2 — two humps at centreline 18, smaller amplitude. */
+@keyframes rustar-wave-b {
+  0%, 100% { d: path("M 0,18 Q 300,5  600,18 Q 900,31 1200,18"); }
+  25%      { d: path("M 0,18 Q 300,12 600,18 Q 900,24 1200,18"); }
+  50%      { d: path("M 0,18 Q 300,2  600,18 Q 900,34 1200,18"); }
+  75%      { d: path("M 0,18 Q 300,8  600,18 Q 900,28 1200,18"); }
+}
+
+/* Path 3 — single big hump at centreline 38. */
+@keyframes rustar-wave-c {
+  0%, 100% { d: path("M 0,38 Q 400,24 800,38 Q 1100,50 1200,38"); }
+  30%      { d: path("M 0,38 Q 400,30 800,38 Q 1100,44 1200,38"); }
+  55%      { d: path("M 0,38 Q 400,18 800,38 Q 1100,56 1200,38"); }
+  85%      { d: path("M 0,38 Q 400,32 800,38 Q 1100,42 1200,38"); }
+}
+
+/* Section base */
+.rustar-section { padding: 56px 0 16px; }
+
+.rustar-section .figmark {
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.28em;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--rustar-accent);
+  margin-bottom: 14px;
+}
+
+.rustar-section h2 {
+  font-family: var(--rustar-condensed);
+  font-weight: 700;
+  font-size: clamp(32px, 4.5vw, 52px);
+  line-height: 1;
+  letter-spacing: -0.005em;
+  margin: 0 0 20px;
+  color: var(--rustar-ink);
+}
+
+.rustar-section .lede {
+  font-size: 18px;
+  color: var(--rustar-ink-soft);
+  max-width: 60ch;
+  margin: 0 0 32px;
+}
+
+/* Stats — 2 cells */
+.rustar-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 56px;
+  border-top: 0.5px solid var(--rustar-rule);
+  padding-top: 32px;
+}
+
+.rustar-stat .num {
+  font-family: var(--rustar-condensed);
+  font-weight: 700;
+  font-size: clamp(64px, 9vw, 128px);
+  line-height: 0.92;
+  color: var(--rustar-accent);
+  letter-spacing: -0.015em;
+  font-feature-settings: "tnum";
+}
+
+.rustar-stat .lbl {
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.22em;
+  font-size: 12.5px;
+  color: var(--rustar-ink-soft);
+  margin-top: 18px;
+  font-weight: 600;
+}
+
+.rustar-stat .sub {
+  font-size: 15.5px;
+  color: var(--rustar-ink-mute);
+  line-height: 1.5;
+  max-width: 40ch;
+  margin-top: 8px;
+}
+
+/* Features grid */
+.rustar-feats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 56px;
+  border-top: 0.5px solid var(--rustar-rule);
+}
+
+.rustar-feat {
+  padding: 28px 0;
+  border-bottom: 0.5px solid var(--rustar-paper-line);
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 18px;
+  align-items: baseline;
+}
+
+.rustar-feat:nth-last-child(-n+2) { border-bottom: 0.5px solid var(--rustar-rule); }
+
+.rustar-feat .n {
+  font-family: var(--rustar-mono);
+  font-size: 13px;
+  color: var(--rustar-accent);
+  letter-spacing: 0.04em;
+  font-feature-settings: "tnum";
+  font-weight: 500;
+}
+
+.rustar-feat h3 {
+  font-family: var(--rustar-condensed);
+  font-weight: 600;
+  font-size: 21px;
+  margin: 0 0 6px;
+  letter-spacing: -0.005em;
+  color: var(--rustar-ink);
+}
+
+.rustar-feat p {
+  margin: 0;
+  font-size: 15.5px;
+  color: var(--rustar-ink-soft);
+  line-height: 1.55;
+  max-width: 60ch;
+}
+
+.rustar-feat code {
+  font-family: var(--rustar-mono);
+  font-size: 0.92em;
+  background: var(--rustar-paper-deep);
+  padding: 1px 6px;
+  border: 0.5px solid var(--rustar-paper-line);
+}
+
+/* Quick start */
+.rustar-install {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 56px;
+  border-top: 0.5px solid var(--rustar-rule);
+  padding-top: 36px;
+  align-items: start;
+}
+
+.rustar-install h3 {
+  font-family: var(--rustar-condensed);
+  font-weight: 600;
+  font-size: 26px;
+  margin: 0 0 12px;
+  color: var(--rustar-ink);
+}
+
+.rustar-install p {
+  margin: 0 0 14px;
+  font-size: 16.5px;
+  color: var(--rustar-ink-soft);
+  line-height: 1.6;
+  max-width: 44ch;
+}
+
+.rustar-install p code {
+  font-family: var(--rustar-mono);
+  font-size: 0.92em;
+  background: var(--rustar-paper-deep);
+  padding: 1px 6px;
+  border: 0.5px solid var(--rustar-paper-line);
+}
+
+/* Mono buttons */
+.rustar-btns {
+  display: flex;
+  gap: 0;
+  margin-top: 18px;
+  flex-wrap: wrap;
+  font-family: var(--rustar-mono);
+  font-size: 13px;
+}
+
+.rustar-btns a {
+  display: inline-block;
+  padding: 11px 16px;
+  border: 0.5px solid var(--rustar-ink);
+  color: var(--rustar-ink);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  border-right: none;
+  text-decoration: none;
+  font-weight: 500;
+  background: var(--rustar-paper);
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.rustar-btns a:last-child { border-right: 0.5px solid var(--rustar-ink); }
+.rustar-btns a:hover { background: var(--rustar-accent); color: var(--rustar-paper); border-color: var(--rustar-accent); }
+.rustar-btns a.primary { background: var(--rustar-ink); color: var(--rustar-paper); border-color: var(--rustar-ink); }
+.rustar-btns a.primary:hover { background: var(--rustar-accent); color: var(--rustar-paper); border-color: var(--rustar-accent); }
+
+/* Code block on the homepage */
+.rustar-code {
+  background: var(--rustar-paper-deep);
+  border: 0.5px solid var(--rustar-rule);
+  padding: 22px 24px;
+  font-family: var(--rustar-mono);
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--rustar-ink);
+  overflow-x: auto;
+  position: relative;
+  font-variant-ligatures: none;
+  white-space: pre;
+}
+
+.rustar-code-label {
+  position: absolute;
+  top: -10px;
+  left: 14px;
+  background: var(--rustar-paper);
+  padding: 1px 10px;
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.22em;
+  font-size: 10.5px;
+  color: var(--rustar-accent);
+  font-weight: 600;
+  border: 0.5px solid var(--rustar-rule);
+}
+
+.rustar-code .prompt { color: var(--rustar-accent); user-select: none; margin-right: 6px; }
+.rustar-code .flag { color: var(--rustar-accent); font-weight: 500; }
+.rustar-code .str { color: var(--rustar-ink-soft); }
+.rustar-code .comment { color: var(--rustar-ink-mute); font-style: italic; }
+
+/* Compatibility table */
+.rustar-compare {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 16px;
+  font-feature-settings: "lnum","tnum";
+  margin-top: 12px;
+}
+
+.rustar-compare th,
+.rustar-compare td {
+  padding: 12px 14px;
+  border-bottom: 0.5px solid var(--rustar-paper-line);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.rustar-compare thead th {
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--rustar-ink-soft);
+  border-bottom: 0.5px solid var(--rustar-rule);
+}
+
+.rustar-compare td.metric { color: var(--rustar-ink); }
+.rustar-compare td.num { text-align: right; font-family: var(--rustar-mono); font-size: 14.5px; color: var(--rustar-ink); }
+.rustar-compare td.match {
+  text-align: right;
+  color: var(--rustar-accent);
+  font-family: var(--rustar-condensed);
+  font-variant: all-small-caps;
+  letter-spacing: 0.18em;
+  font-size: 12px;
+  font-weight: 600;
+}
+.rustar-compare tbody tr:last-child td { border-bottom: 0.5px solid var(--rustar-rule); }
+
+/* ---------- Homepage layout: collapse desktop sidebar/TOC, keep mobile drawer ---------- */
+/* Detect homepage via the `.rustar-home` wrapper. Hide chrome that doesn't
+   make sense on a landing page (right TOC, pagination, last-modified, footer,
+   the auto page-h1) but never the mobile sidebar element — that's where the
+   menu toggle and drawer live, so mobile users still get full navigation. */
+
+:root:has(.rustar-home) main > .content-panel:first-of-type {
+  display: none;
+}
+:root:has(.rustar-home) .right-sidebar-container,
+:root:has(.rustar-home) .pagination-links,
+:root:has(.rustar-home) .meta,
+:root:has(.rustar-home) main > footer {
+  display: none !important;
+}
+:root:has(.rustar-home) {
+  --sl-mobile-toc-height: 0rem;
+}
+
+@media (min-width: 50rem) {
+  :root:has(.rustar-home) {
+    --sl-content-width: 72rem;
+    --sl-sidebar-width: 0rem;
+  }
+  :root:has(.rustar-home) .page > nav.sidebar { display: none !important; }
+  :root:has(.rustar-home) .main-frame { padding-inline-start: 0 !important; }
+  :root:has(.rustar-home) .main-pane {
+    width: 100% !important;
+    --sl-content-margin-inline: auto !important;
+  }
+  :root:has(.rustar-home) .content-panel > .sl-container {
+    margin-inline: auto !important;
+  }
+}
+
+/* Strip the default content-panel padding on the homepage so the rustar-home
+   container controls its own padding. */
+:root:has(.rustar-home) main > .content-panel {
+  padding-block: 0;
+}
+:root:has(.rustar-home) main > .content-panel > .sl-container {
+  max-width: none;
+  padding: 0;
+}
+
+/* ---------- Mobile ---------- */
+
+@media (max-width: 920px) {
+  .rustar-hero {
+    grid-template-columns: 1fr;
+    gap: 28px;
+    padding: 36px 0 28px;
+  }
+  .rustar-mascot { max-width: 200px; margin: 0; }
+  .rustar-stats { grid-template-columns: 1fr; gap: 36px; }
+  .rustar-feats { grid-template-columns: 1fr; }
+  .rustar-feat:nth-last-child(-n+2) { border-bottom: 0.5px solid var(--rustar-paper-line); }
+  .rustar-feat:last-child { border-bottom: 0.5px solid var(--rustar-rule); }
+  .rustar-install { grid-template-columns: 1fr; gap: 28px; }
+}

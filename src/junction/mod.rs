@@ -7,6 +7,7 @@
 /// - Junction statistics collection for SJ.out.tab output
 pub(crate) mod gtf;
 mod sj_output;
+pub mod sjdb_insert;
 
 pub use sj_output::SpliceJunctionStats;
 pub(crate) use sj_output::{SjKey, encode_motif};
@@ -58,24 +59,38 @@ impl SpliceJunctionDb {
         }
     }
 
-    /// Build junction database from GTF file
-    pub fn from_gtf(gtf_path: &Path, genome: &Genome) -> Result<Self, Error> {
+    /// Build junction database from GTF file with configurable GTF attribute names.
+    pub fn from_gtf_configured(
+        gtf_path: &Path,
+        genome: &Genome,
+        feature_exon: &str,
+        chr_prefix: &str,
+        transcript_tag: &str,
+    ) -> Result<Self, Error> {
         log::info!("Loading GTF annotations from: {}", gtf_path.display());
 
-        // Parse GTF and extract exon features
-        let exons = gtf::parse_gtf(gtf_path)?;
+        let exons = gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
         log::debug!("Parsed {} exon features from GTF", exons.len());
 
-        // Extract junctions from consecutive exons
-        let junctions_vec = gtf::extract_junctions_from_exons(exons, genome)?;
-        log::info!(
-            "Extracted {} annotated junctions from GTF",
-            junctions_vec.len()
-        );
+        let raw = gtf::extract_junctions_configured(exons, genome, transcript_tag)?;
+        log::info!("Extracted {} annotated junctions from GTF", raw.len());
 
-        // Build HashMap for fast lookup
-        let mut junctions = HashMap::new();
-        for (chr_idx, intron_start, intron_end, strand) in junctions_vec {
+        Ok(Self::from_raw_junctions(&raw))
+    }
+
+    /// Build junction database from GTF file (default STAR attribute names).
+    pub fn from_gtf(gtf_path: &Path, genome: &Genome) -> Result<Self, Error> {
+        Self::from_gtf_configured(gtf_path, genome, "exon", "", "transcript_id")
+    }
+
+    /// Build junction database from a pre-extracted list of annotated
+    /// junctions `(chr_idx, intron_start, intron_end, strand)`. Used by
+    /// the `genomeGenerate` path so it can share the parsed GTF with
+    /// `TranscriptomeIndex` and the `sjdb_insert` pipeline without
+    /// re-parsing the file.
+    pub fn from_raw_junctions(raw: &[(usize, u64, u64, u8)]) -> Self {
+        let mut junctions = HashMap::with_capacity(raw.len());
+        for &(chr_idx, intron_start, intron_end, strand) in raw {
             let key = JunctionKey {
                 chr_idx,
                 intron_start,
@@ -84,8 +99,7 @@ impl SpliceJunctionDb {
             };
             junctions.insert(key, JunctionInfo { annotated: true });
         }
-
-        Ok(Self { junctions })
+        Self { junctions }
     }
 
     /// Check if a junction is annotated in the GTF
@@ -348,7 +362,7 @@ mod tests {
         sj_stats.record_junction(0, 500, 600, 1, SpliceMotif::GtAg, true, 20, true);
 
         // Create minimal params for testing
-        let params = Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
 
         let novel_junctions = filter_novel_junctions(&sj_stats, &params);
 
@@ -376,7 +390,7 @@ mod tests {
             sj_stats.record_junction(0, 300, 400, 1, SpliceMotif::NonCanonical, true, 35, false);
         }
 
-        let params = Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
         let novel_junctions = filter_novel_junctions(&sj_stats, &params);
 
         // Only the 35-overhang junction should pass (30bp minimum for non-canonical)

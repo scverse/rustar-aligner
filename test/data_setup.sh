@@ -1,5 +1,5 @@
 # Project structure
-mkdir -p data/{small,medium,large}/{reference,reads,indices,outputs/{star,ruSTAR}}
+mkdir -p data/{small,medium,large}/{reference,reads,indices,outputs/{star,rustar-aligner}}
 
 # small dataset
 
@@ -23,7 +23,7 @@ seqtk sample -s100 ERR12389696_2.fastq.gz 100000 | gzip > ERR12389696_sub_2.fast
 
 cd ..
 
-# 3. Build STAR index (shared between STAR and ruSTAR)
+# 3. Build STAR index (shared between STAR and rustar-aligner)
 STAR --runMode genomeGenerate \
      --genomeDir indices \
      --genomeFastaFiles reference/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa \

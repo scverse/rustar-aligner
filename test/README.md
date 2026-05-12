@@ -1,12 +1,12 @@
-# ruSTAR Testing Framework
+# rustar-aligner Testing Framework
 
-Comprehensive testing infrastructure for validating ruSTAR against STAR.
+Comprehensive testing infrastructure for validating rustar-aligner against STAR.
 
 ## Quick Start
 
 ```bash
-# Build ruSTAR
-cd /path/to/ruSTAR
+# Build rustar-aligner
+cd /path/to/rustar-aligner
 cargo build --release
 
 # Run single test
@@ -41,7 +41,7 @@ cd test
 ```
 
 **Features:**
-- Runs both STAR and ruSTAR on same inputs
+- Runs both STAR and rustar-aligner on same inputs
 - Automated comparison of outputs
 - Pass/fail determination with tolerance
 - HTML/text report generation
@@ -64,7 +64,7 @@ cd test
 ```bash
 python compare_sam.py \
   --star star_output/Aligned.out.sam \
-  --rustar rustar_output/Aligned.out.sam \
+  --rustar-aligner rustar_aligner_output/Aligned.out.sam \
   --tolerance 0.01 \
   --output comparison_report.txt
 ```
@@ -84,7 +84,7 @@ python compare_sam.py \
 ```bash
 python compare_junctions.py \
   --star star_output/SJ.out.tab \
-  --rustar rustar_output/SJ.out.tab \
+  --rustar-aligner rustar_aligner_output/SJ.out.tab \
   --tolerance 0.10 \
   --output junction_report.txt
 ```
@@ -104,7 +104,7 @@ python compare_junctions.py \
 ```bash
 python compare_chimeric.py \
   --star star_output/Chimeric.out.junction \
-  --rustar rustar_output/Chimeric.out.junction \
+  --rustar-aligner rustar_aligner_output/Chimeric.out.junction \
   --tolerance 0.20 \
   --output chimeric_report.txt
 ```
@@ -142,7 +142,7 @@ python compare_chimeric.py \
 ```bash
 python compare_golden.py \
   --golden golden/yeast_100/stats.json \
-  --current results/20260207_yeast_100/rustar \
+  --current results/20260207_yeast_100/rustar-aligner \
   --tolerance 0.01
 ```
 
@@ -157,7 +157,7 @@ Used by CI to ensure outputs haven't regressed.
 ```
 
 **Workflow:**
-1. Build ruSTAR in release mode
+1. Build rustar-aligner in release mode
 2. Run unit tests
 3. Run fast integration test (100 reads)
 4. Compare against golden outputs (if available)
@@ -185,12 +185,12 @@ Used by CI to ensure outputs haven't regressed.
 **Example output:**
 ```
 Found 2 discrepant reads:
-  1. read_137: Different chromosome (ruSTAR=chr1, STAR=chr2)
-  2. read_842: Different mapping status (ruSTAR=unmapped, STAR=mapped)
+  1. read_137: Different chromosome (rustar-aligner=chr1, STAR=chr2)
+  2. read_842: Different mapping status (rustar-aligner=unmapped, STAR=mapped)
 
 Investigation suggestions:
   read_137: Likely seed clustering difference
-    - Check ruSTAR: src/align/stitch.rs (cluster_seeds)
+    - Check rustar-aligner: src/align/stitch.rs (cluster_seeds)
     - Check STAR: source/stitchWindowAligns.cpp (stitchWindowSeeds)
 ```
 
@@ -198,7 +198,7 @@ Investigation suggestions:
 
 **`STAR_REFERENCE.md`** - Quick reference guide
 
-Maps ruSTAR modules to STAR C++ source files, including:
+Maps rustar-aligner modules to STAR C++ source files, including:
 - Algorithm descriptions
 - Parameter mappings
 - Known differences
@@ -215,7 +215,7 @@ test/
 │       │   ├── Aligned.out.sam
 │       │   ├── SJ.out.tab
 │       │   └── Log.final.out
-│       ├── rustar/              # ruSTAR outputs
+│       ├── rustar-aligner/              # rustar-aligner outputs
 │       │   ├── Aligned.out.sam
 │       │   ├── SJ.out.tab
 │       │   └── stats.log
@@ -271,7 +271,7 @@ This creates:
 ### Validate a Code Change
 
 ```bash
-# 1. Make changes to ruSTAR code
+# 1. Make changes to rustar-aligner code
 vim src/align/stitch.rs
 
 # 2. Rebuild
@@ -298,7 +298,7 @@ cat results/$(ls -t results/ | head -1)/comparison/summary.txt
 ./investigate.sh results/$(ls -t results/ | head -1)/comparison/alignment_diff.txt
 
 # 3. Re-run with debug logging
-RUST_LOG=debug ../target/release/ruSTAR \
+RUST_LOG=debug ../target/release/rustar-aligner \
   --runMode alignReads \
   --genomeDir data/small/yeast/genome_index \
   --readFilesIn debug/discrepant_reads.fq \
@@ -412,11 +412,11 @@ cd test/data/small/yeast
 ./test_yeast.sh setup
 ```
 
-### "ruSTAR binary not found"
+### "rustar-aligner binary not found"
 
-Build ruSTAR first:
+Build rustar-aligner first:
 ```bash
-cd /path/to/ruSTAR
+cd /path/to/rustar-aligner
 cargo build --release
 ```
 
@@ -475,4 +475,4 @@ When adding new features:
 
 ## License
 
-Same as ruSTAR (MIT License)
+Same as rustar-aligner (MIT License)

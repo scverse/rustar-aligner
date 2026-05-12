@@ -1,6 +1,6 @@
-# ruSTAR Implementation Roadmap
+# rustar-aligner Implementation Roadmap
 
-Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs/`.
+Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs-old/` (the published Astro Starlight docs site lives in `docs/`).
 
 ## Phase Dependency Graph
 
@@ -51,10 +51,10 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 | 10 | BAM Output | ✅ | 136 | BGZF streaming, `--outSAMtype BAM Unsorted` |
 | 11 | Two-Pass Mode | ✅ | 138 | Novel junction discovery, pass1→pass2 |
 | 12 | Chimeric Detection | ✅ | 170 | SE chimeric, Chimeric.out.junction |
-| [13](docs/phase13_accuracy.md) | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
-| [15](docs/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
-| [16](docs/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8796/8926 (0 STAR-only)**, 2.2% splice, **MAPQ 100%**; PE: **8390/8390 (0 gap)**, 99.0% per-mate pos, 98.9% CIGAR, **4 MAPQ inflations**, 0 deflations; faithfulness: SE 98.5%+, PE 98.903%, SJ 96.97% (Phase 16.50) |
-| [17](docs/phase17_features.md) | Features + Polish | ✅* | 268 | Log.final.out, clippy cleanup, scoreSeedBest pre-ext (17.A); per-mate seeding (17.B) planned |
+| [13](docs-old/phase13_accuracy.md) | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
+| [15](docs-old/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
+| [16](docs-old/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
+| [17](docs-old/phase17_features.md) | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
 | 14 | STARsolo | DEFERRED | — | Waiting for accuracy parity |
 
 *Partially complete — see linked docs for sub-phase status.
@@ -166,7 +166,7 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 
 ## Phase 13: Performance + Accuracy ✅
 
-See [docs/phase13_accuracy.md](docs/phase13_accuracy.md) for detailed sub-phase notes (13.1-13.14).
+See [docs-old/phase13_accuracy.md](docs-old/phase13_accuracy.md) for detailed sub-phase notes (13.1-13.14).
 
 **Summary**: From 42% to 94.5% position agreement through SA position encoding fix, CIGAR reversal, splice motif fix, extendAlign, bidirectional seeding, BySJout filtering, and scoring fixes.
 
@@ -174,7 +174,7 @@ See [docs/phase13_accuracy.md](docs/phase13_accuracy.md) for detailed sub-phase 
 
 ## Phase 15: SAM Tags + Output Correctness ✅
 
-See [docs/phase15_sam_tags.md](docs/phase15_sam_tags.md) for detailed sub-phase notes (15.1-15.6 + PE fix).
+See [docs-old/phase15_sam_tags.md](docs-old/phase15_sam_tags.md) for detailed sub-phase notes (15.1-15.6 + PE fix).
 
 **Summary**: NH/HI/AS/NM/nM/XS/jM/jI/MD tags, SECONDARY flag, outSAMmultNmax, outSAMattributes enforcement, PE FLAG/PNEXT fixes, independent mate alignment.
 
@@ -182,7 +182,7 @@ See [docs/phase15_sam_tags.md](docs/phase15_sam_tags.md) for detailed sub-phase 
 
 ## Phase 16: Algorithm Parity ✅ (partial)
 
-See [docs/phase16_algorithm.md](docs/phase16_algorithm.md) for sub-phase notes (16.1-16.13), [docs/phase16_14_nstart_fix.md](docs/phase16_14_nstart_fix.md) for the Nstart fix.
+See [docs-old/phase16_algorithm.md](docs-old/phase16_algorithm.md) for sub-phase notes (16.1-16.13), [docs-old/phase16_14_nstart_fix.md](docs-old/phase16_14_nstart_fix.md) for the Nstart fix.
 
 **Summary**: Bin-based windowing, pre-DP seed extension, MMP SA range narrowing, multi-transcript DP, recursive combinatorial stitcher, STAR-faithful scoring (scoreStitchSJshift removed), sparse bidirectional seed search with Nstart +1 fix, WALrec persistent threshold, post-jR shared base scoring, hierarchical SAindex lookup, nWA reset + overlap detection, coverage filter removal, Lread-1 filter fix, too-many-loci filter, mate rescue, SA range narrowing fix (find_mult_range + max_mappable_length), reverse-strand stitcher coordinate fix (RC read + forward genome coords), PE joint DP stitching via combined-read path, STAR-faithful PE architecture (no cross-product), combined-read score threshold fix (pre-split check prevents double-counting), extendAlign EXTEND_ORDER fix (5' of read first; reverse-strand reads extend right before left) + float comparison fix.
 
@@ -197,22 +197,23 @@ See [docs/phase16_algorithm.md](docs/phase16_algorithm.md) for sub-phase notes (
 | Fixable algorithm differences | 26 | 0.29% | Yes |
 | **Parity excl. unavoidable ties** | **8800/8826** | **99.70%** | — |
 
-**Adjusted SE summary (post Phase 16.29)**: 99.7% position agreement, 99.9% CIGAR, 2.2% splice rate (= STAR), 99.9% MAPQ, 26 actionable disagreements, 1 STAR-only / 1 ruSTAR-only. MAPQ inflation: 4 reads, MAPQ deflation: 4 reads.
+**Adjusted SE summary (post Phase 16.29)**: 99.7% position agreement, 99.9% CIGAR, 2.2% splice rate (= STAR), 99.9% MAPQ, 26 actionable disagreements, 1 STAR-only / 1 rustar-aligner-only. MAPQ inflation: 4 reads, MAPQ deflation: 4 reads.
 
-**PE parity (10k yeast pairs, 150 bp, post Phase 17.C):**
+**PE parity (10k yeast pairs, 150 bp, post Phase G2):**
 
-| Metric | ruSTAR | STAR |
+| Metric | rustar-aligner | STAR |
 |--------|--------|------|
 | Both-mapped pairs | **8390** | 8390 |
-| Half-mapped pairs | 0 | 0 |
+| Half-mapped pairs | **0** | 0 |
 | Net gap | **0 (exact match)** | — |
-| Per-mate position agreement | **99.0%** | — |
-| Per-mate CIGAR agreement | **98.9%** | — |
-| Faithfulness (pos+CIGAR+MAPQ+proper+NH) | **98.915%** | — |
-| ruSTAR-only false positives | 2 | — |
-| STAR-only missed | 2 | — |
+| PE faithfulness (tie-adj, pos+CIGAR+MAPQ+proper+NH) | **99.883%** (16,284/16,306) | — |
+| Tie-breaking diffs (excluded) | 475 | — |
+| rustar-aligner-only false positives | 1 (`.6302610`) | — |
+| STAR-only missed | 1 (`.18919121`) | — |
 | MAPQ inflations | **0** | — |
 | MAPQ deflations | **0** | — |
+| NH diffs | **0** | — |
+| Proper-pair diffs | **0** | — |
 
 **PE implementation path (summary):**
 - 16.PE1: Recursive combinatorial stitcher
@@ -247,9 +248,11 @@ All 127 SE position disagreements (100 diff-chr + 27 same-chr) verified as **gen
 | Issue | Count | Difficulty |
 |-------|-------|------------|
 | SE CIGAR insertion placement | 1 | Hard — `ERR12389696.13573895` (AS=133 both, same pos, homopolymer seed-level tie) |
-| PE NH diff (`.7118031`) | 1 pair | NH=6 vs STAR's 9 (both MAPQ=0, no MAPQ impact) — cross-copy pairs with larger penalty gap |
-| PE ruSTAR-only FPs | 2 | TBD — `.17779410` (616kb spurious intron), `.6302610` |
-| PE STAR-only | 2 | TBD — `.18919121`, `.6302610` |
+| PE rustar-aligner-only FP | 1 | `.6302610` — adapter contamination at mate2 pos 40, seeding-level |
+| PE STAR-only | 1 | `.18919121` — SA construction diff (EX_R=0 vs 1), SA-level |
+| PE AS diffs | 6 | Residual combined-score parity gaps |
+
+**Phase G2** (2026-04-29): `MAX_RECURSION` 10k→100k + `sa_pos_to_forward` saturating_sub. Fixed `ERR12389696.7118031` NH=3→9 (rDNA 47-WA cluster exhausted 10k budget). 0 NH diffs, 0 MAPQ inflations. PE faithfulness: 99.865%→99.883%.
 
 ---
 
@@ -265,7 +268,7 @@ STAR ... 2>star_debug.log
 
 Helper script: `test/debug_star.sh`
 ```bash
-./debug_star.sh pe <rustar.sam> <star.sam> [n_reads]  # extract & trace false positives
+./debug_star.sh pe <rustar-aligner.sam> <star.sam> [n_reads]  # extract & trace false positives
 ./debug_star.sh reads "read1,read2"                    # trace specific reads
 ```
 
@@ -279,9 +282,29 @@ Instrumented locations (all gated on read name match, no performance impact on n
 
 ## Phase 17: Features + Polish ✅ (partial)
 
-See [docs/phase17_features.md](docs/phase17_features.md) for sub-phase table and 17.1 details.
+See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase table and 17.1 details.
 
-**Summary**: Log.final.out complete. Clippy cleanup (0 warnings). Sorted BAM, PE chimeric, quantMode planned.
+**Completed sub-phases:**
+- 17.1: Log.final.out (STAR-compatible, MultiQC-parseable)
+- 17.5: Clippy cleanup (0 warnings target)
+- 17.8: `--quantMode GeneCounts` → ReadsPerGene.out.tab
+- 17.A: `scoreSeedBest` pre-extension on WA entries
+- 17.B: per-mate seeding architecture
+- 17.C: STAR-faithful SCORE-GATE + mappedFilter
+- 17.D: combined-span penalty fix + dedup ordering
+- Phase E fix/E2/E3/E4/E5/E6: combined-read PE seeding (STAR-faithful)
+- Phase F1: `--runRNGseed` + seeded primary tie-break
+- Phase F2: `--outSAMattrRGline` (read group tags)
+- Phase F3: `--quantMode TranscriptomeSAM`
+- Phase F4: SJDB insertion into Genome+SA at genomeGenerate
+- Phase G1: `split_combined_wt` junction_idx fix (rDNA cross-copy filter)
+- Phase G2: MAX_RECURSION 10k→100k + `sa_pos_to_forward` overflow fix
+
+**Planned sub-phases:**
+- 17.2: Coordinate-sorted BAM output (`--outSAMtype BAM SortedByCoordinate`)
+- 17.3: Paired-end chimeric detection
+- 17.4: `--outReadsUnmapped Fastx`
+- 17.6: `--outStd SAM/BAM` (stdout streaming)
 
 ---
 

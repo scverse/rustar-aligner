@@ -1,16 +1,12 @@
 [package]
-name = "ruSTAR"
-# TODO: the `rustar` crate name is already taken on crates.io. A different
-# published name must be chosen before the first `cargo publish` (for example
-# `rustar-aligner` or `rustar-rnaseq`). The `publish-crate` job in
-# `.github/workflows/release.yml` is gated off until this is resolved.
+name = "rustar-aligner"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["James Ferguson"]
 description = "A Rust reimplementation of STAR (Spliced Transcripts Alignment to a Reference), the RNA-seq aligner"
 license = "MIT"
-repository = "https://github.com/Psy-Fer/ruSTAR"
+repository = "https://github.com/Psy-Fer/rustar-aligner"
 readme = "README.md"
 keywords = ["bioinformatics", "rna-seq", "aligner", "sequencing", "star"]
 categories = ["command-line-utilities", "science"]
@@ -21,18 +17,12 @@ exclude = [
     ".github/",
     "Dockerfile",
     ".dockerignore",
-    "ALIGNMENT_FIXES.md",
-    "BUGFIX_2026-02-09.md",
-    "PERFORMANCE_FIX.md",
-    "PHASE12_COMPLETE.md",
     "ROADMAP.md",
-    "STAR_SA_RESEARCH.md",
-    "TESTING_SUMMARY.md",
     "CLAUDE.md",
 ]
 
 [[bin]]
-name = "ruSTAR"
+name = "rustar-aligner"
 path = "src/main.rs"
 
 [dependencies]
@@ -50,9 +40,9 @@ rayon = "1"
 dashmap = "6"
 chrono = "0.4"
 rand = "0.8"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 

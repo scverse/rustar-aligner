@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-compare_sam.py - Compare SAM/BAM files from ruSTAR and STAR
+compare_sam.py - Compare SAM/BAM files from rustar-aligner and STAR
 
 Performs multi-level comparison:
 1. Statistics comparison (read counts, mapping rates, MAPQ distribution)
@@ -9,7 +9,7 @@ Performs multi-level comparison:
 3. CIGAR comparison (alignment structure validation)
 
 Usage:
-    python compare_sam.py --star STAR.sam --rustar ruSTAR.sam [options]
+    python compare_sam.py --star STAR.sam --rustar-aligner rustar-aligner.sam [options]
 """
 
 import argparse
@@ -145,75 +145,75 @@ def parse_sam_file(filename: str) -> Tuple[Dict[str, SamRecord], AlignmentStats]
     return records, stats
 
 
-def compare_statistics(star_stats: AlignmentStats, rustar_stats: AlignmentStats, tolerance: float) -> Tuple[bool, List[str]]:
-    """Compare statistics between STAR and ruSTAR."""
+def compare_statistics(star_stats: AlignmentStats, rustar_aligner_stats: AlignmentStats, tolerance: float) -> Tuple[bool, List[str]]:
+    """Compare statistics between STAR and rustar-aligner."""
     messages = []
     passed = True
 
-    def check_metric(name: str, star_val: float, rustar_val: float, allow_diff: bool = False) -> bool:
+    def check_metric(name: str, star_val: float, rustar_aligner_val: float, allow_diff: bool = False) -> bool:
         """Check if metric is within tolerance."""
-        if star_val == 0 and rustar_val == 0:
-            messages.append(f"  {name:25s} {rustar_val:>8} vs {star_val:>8}  ✓")
+        if star_val == 0 and rustar_aligner_val == 0:
+            messages.append(f"  {name:25s} {rustar_aligner_val:>8} vs {star_val:>8}  ✓")
             return True
 
         if star_val == 0:
-            diff_pct = float('inf') if rustar_val != 0 else 0
+            diff_pct = float('inf') if rustar_aligner_val != 0 else 0
         else:
-            diff_pct = abs(rustar_val - star_val) / star_val
+            diff_pct = abs(rustar_aligner_val - star_val) / star_val
 
         status = "✓" if diff_pct <= tolerance else "⚠"
-        diff_str = f"({abs(rustar_val - star_val):+.0f})" if diff_pct > 0.001 else ""
+        diff_str = f"({abs(rustar_aligner_val - star_val):+.0f})" if diff_pct > 0.001 else ""
 
-        messages.append(f"  {name:25s} {rustar_val:>8.0f} vs {star_val:>8.0f}  {status} {diff_str}")
+        messages.append(f"  {name:25s} {rustar_aligner_val:>8.0f} vs {star_val:>8.0f}  {status} {diff_str}")
 
         if diff_pct > tolerance and not allow_diff:
             return False
         return True
 
-    messages.append("\n=== Statistics Comparison: ruSTAR vs STAR ===")
+    messages.append("\n=== Statistics Comparison: rustar-aligner vs STAR ===")
 
-    check_metric("Total reads", star_stats.total_reads, rustar_stats.total_reads)
-    passed &= check_metric("Mapped reads", star_stats.mapped_reads, rustar_stats.mapped_reads, allow_diff=True)
-    passed &= check_metric("Unmapped reads", star_stats.unmapped_reads, rustar_stats.unmapped_reads, allow_diff=True)
-    passed &= check_metric("Unique mapped", star_stats.unique_mapped, rustar_stats.unique_mapped, allow_diff=True)
-    passed &= check_metric("Multi-mapped", star_stats.multi_mapped, rustar_stats.multi_mapped, allow_diff=True)
-    check_metric("Mean MAPQ", star_stats.mean_mapq, rustar_stats.mean_mapq, allow_diff=True)
-    check_metric("Mean alignment length", star_stats.mean_alignment_length, rustar_stats.mean_alignment_length, allow_diff=True)
-    check_metric("Total junctions", star_stats.total_junctions, rustar_stats.total_junctions, allow_diff=True)
+    check_metric("Total reads", star_stats.total_reads, rustar_aligner_stats.total_reads)
+    passed &= check_metric("Mapped reads", star_stats.mapped_reads, rustar_aligner_stats.mapped_reads, allow_diff=True)
+    passed &= check_metric("Unmapped reads", star_stats.unmapped_reads, rustar_aligner_stats.unmapped_reads, allow_diff=True)
+    passed &= check_metric("Unique mapped", star_stats.unique_mapped, rustar_aligner_stats.unique_mapped, allow_diff=True)
+    passed &= check_metric("Multi-mapped", star_stats.multi_mapped, rustar_aligner_stats.multi_mapped, allow_diff=True)
+    check_metric("Mean MAPQ", star_stats.mean_mapq, rustar_aligner_stats.mean_mapq, allow_diff=True)
+    check_metric("Mean alignment length", star_stats.mean_alignment_length, rustar_aligner_stats.mean_alignment_length, allow_diff=True)
+    check_metric("Total junctions", star_stats.total_junctions, rustar_aligner_stats.total_junctions, allow_diff=True)
 
     # Mapping rate
     if star_stats.total_reads > 0:
         star_rate = 100.0 * star_stats.mapped_reads / star_stats.total_reads
-        rustar_rate = 100.0 * rustar_stats.mapped_reads / rustar_stats.total_reads
-        messages.append(f"  {'Mapping rate':25s} {rustar_rate:>7.2f}% vs {star_rate:>7.2f}%")
+        rustar_aligner_rate = 100.0 * rustar_aligner_stats.mapped_reads / rustar_aligner_stats.total_reads
+        messages.append(f"  {'Mapping rate':25s} {rustar_aligner_rate:>7.2f}% vs {star_rate:>7.2f}%")
 
     # Unique mapping rate
     if star_stats.mapped_reads > 0:
         star_unique_rate = 100.0 * star_stats.unique_mapped / star_stats.mapped_reads
-        rustar_unique_rate = 100.0 * rustar_stats.unique_mapped / rustar_stats.mapped_reads
-        messages.append(f"  {'Unique rate (of mapped)':25s} {rustar_unique_rate:>7.2f}% vs {star_unique_rate:>7.2f}%")
+        rustar_aligner_unique_rate = 100.0 * rustar_aligner_stats.unique_mapped / rustar_aligner_stats.mapped_reads
+        messages.append(f"  {'Unique rate (of mapped)':25s} {rustar_aligner_unique_rate:>7.2f}% vs {star_unique_rate:>7.2f}%")
 
     return passed, messages
 
 
-def compare_records(star_records: Dict[str, SamRecord], rustar_records: Dict[str, SamRecord], tolerance: float) -> Tuple[bool, List[str]]:
+def compare_records(star_records: Dict[str, SamRecord], rustar_aligner_records: Dict[str, SamRecord], tolerance: float) -> Tuple[bool, List[str]]:
     """Compare individual alignment records."""
     messages = []
     messages.append("\n=== Record-Level Comparison ===")
 
     # Find common reads
     star_reads = set(star_records.keys())
-    rustar_reads = set(rustar_records.keys())
+    rustar_aligner_reads = set(rustar_aligner_records.keys())
 
-    common_reads = star_reads & rustar_reads
-    star_only = star_reads - rustar_reads
-    rustar_only = rustar_reads - star_reads
+    common_reads = star_reads & rustar_aligner_reads
+    star_only = star_reads - rustar_aligner_reads
+    rustar_aligner_only = rustar_aligner_reads - star_reads
 
     messages.append(f"  Common reads: {len(common_reads)}")
     if star_only:
         messages.append(f"  Only in STAR: {len(star_only)}")
-    if rustar_only:
-        messages.append(f"  Only in ruSTAR: {len(rustar_only)}")
+    if rustar_aligner_only:
+        messages.append(f"  Only in rustar-aligner: {len(rustar_aligner_only)}")
 
     # Compare common reads
     discrepancies = []
@@ -224,46 +224,46 @@ def compare_records(star_records: Dict[str, SamRecord], rustar_records: Dict[str
 
     for qname in common_reads:
         star_rec = star_records[qname]
-        rustar_rec = rustar_records[qname]
+        rustar_aligner_rec = rustar_aligner_records[qname]
 
         issues = []
 
         # Compare unmapped status
-        if star_rec.is_unmapped() != rustar_rec.is_unmapped():
-            issues.append(f"mapping status (ruSTAR={'unmapped' if rustar_rec.is_unmapped() else 'mapped'}, STAR={'unmapped' if star_rec.is_unmapped() else 'mapped'})")
+        if star_rec.is_unmapped() != rustar_aligner_rec.is_unmapped():
+            issues.append(f"mapping status (rustar-aligner={'unmapped' if rustar_aligner_rec.is_unmapped() else 'mapped'}, STAR={'unmapped' if star_rec.is_unmapped() else 'mapped'})")
 
         # Compare mapped reads
-        if not star_rec.is_unmapped() and not rustar_rec.is_unmapped():
+        if not star_rec.is_unmapped() and not rustar_aligner_rec.is_unmapped():
             # Chromosome
-            if star_rec.rname != rustar_rec.rname:
-                issues.append(f"chromosome (ruSTAR={rustar_rec.rname}, STAR={star_rec.rname})")
+            if star_rec.rname != rustar_aligner_rec.rname:
+                issues.append(f"chromosome (rustar-aligner={rustar_aligner_rec.rname}, STAR={star_rec.rname})")
 
             # Position (allow small differences for ties)
-            pos_diff = abs(star_rec.pos - rustar_rec.pos)
+            pos_diff = abs(star_rec.pos - rustar_aligner_rec.pos)
             if pos_diff > 10:
-                issues.append(f"position (ruSTAR={rustar_rec.pos}, STAR={star_rec.pos}, diff={pos_diff})")
+                issues.append(f"position (rustar-aligner={rustar_aligner_rec.pos}, STAR={star_rec.pos}, diff={pos_diff})")
                 position_diffs.append(pos_diff)
 
             # MAPQ (allow differences for multi-mappers)
-            mapq_diff = abs(star_rec.mapq - rustar_rec.mapq)
-            if mapq_diff > 5 and not (star_rec.mapq < 10 and rustar_rec.mapq < 10):
-                issues.append(f"MAPQ (ruSTAR={rustar_rec.mapq}, STAR={star_rec.mapq})")
+            mapq_diff = abs(star_rec.mapq - rustar_aligner_rec.mapq)
+            if mapq_diff > 5 and not (star_rec.mapq < 10 and rustar_aligner_rec.mapq < 10):
+                issues.append(f"MAPQ (rustar-aligner={rustar_aligner_rec.mapq}, STAR={star_rec.mapq})")
                 mapq_diffs.append(mapq_diff)
 
             # CIGAR
-            if star_rec.cigar != rustar_rec.cigar:
+            if star_rec.cigar != rustar_aligner_rec.cigar:
                 # Parse and compare structure
                 star_ops = parse_cigar(star_rec.cigar)
-                rustar_ops = parse_cigar(rustar_rec.cigar)
+                rustar_aligner_ops = parse_cigar(rustar_aligner_rec.cigar)
 
-                if star_ops != rustar_ops:
-                    issues.append(f"CIGAR (ruSTAR={rustar_rec.cigar}, STAR={star_rec.cigar})")
-                    cigar_diffs.append((star_rec.cigar, rustar_rec.cigar))
+                if star_ops != rustar_aligner_ops:
+                    issues.append(f"CIGAR (rustar-aligner={rustar_aligner_rec.cigar}, STAR={star_rec.cigar})")
+                    cigar_diffs.append((star_rec.cigar, rustar_aligner_rec.cigar))
 
             # Flags (check important bits)
-            if star_rec.is_reverse() != rustar_rec.is_reverse():
-                issues.append(f"strand (ruSTAR={'-' if rustar_rec.is_reverse() else '+'}, STAR={'-' if star_rec.is_reverse() else '+'})")
-                flag_diffs.append((star_rec.flag, rustar_rec.flag))
+            if star_rec.is_reverse() != rustar_aligner_rec.is_reverse():
+                issues.append(f"strand (rustar-aligner={'-' if rustar_aligner_rec.is_reverse() else '+'}, STAR={'-' if star_rec.is_reverse() else '+'})")
+                flag_diffs.append((star_rec.flag, rustar_aligner_rec.flag))
 
         if issues:
             discrepancies.append((qname, issues))
@@ -299,9 +299,9 @@ def compare_records(star_records: Dict[str, SamRecord], rustar_records: Dict[str
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Compare SAM files from ruSTAR and STAR')
+    parser = argparse.ArgumentParser(description='Compare SAM files from rustar-aligner and STAR')
     parser.add_argument('--star', required=True, help='STAR SAM file')
-    parser.add_argument('--rustar', required=True, help='ruSTAR SAM file')
+    parser.add_argument('--rustar-aligner', required=True, help='rustar-aligner SAM file')
     parser.add_argument('--tolerance', type=float, default=0.01, help='Tolerance for differences (default: 0.01 = 1%%)')
     parser.add_argument('--output', help='Output file for comparison report')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
@@ -312,14 +312,14 @@ def main():
     print(f"Parsing STAR output: {args.star}")
     star_records, star_stats = parse_sam_file(args.star)
 
-    print(f"Parsing ruSTAR output: {args.rustar}")
-    rustar_records, rustar_stats = parse_sam_file(args.rustar)
+    print(f"Parsing rustar-aligner output: {args.rustar_aligner}")
+    rustar_aligner_records, rustar_aligner_stats = parse_sam_file(args.rustar_aligner)
 
     # Compare statistics
-    stats_passed, stats_messages = compare_statistics(star_stats, rustar_stats, args.tolerance)
+    stats_passed, stats_messages = compare_statistics(star_stats, rustar_aligner_stats, args.tolerance)
 
     # Compare records
-    records_passed, records_messages = compare_records(star_records, rustar_records, args.tolerance)
+    records_passed, records_messages = compare_records(star_records, rustar_aligner_records, args.tolerance)
 
     # Combine messages
     all_messages = stats_messages + records_messages

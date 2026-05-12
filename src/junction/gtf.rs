@@ -28,10 +28,15 @@ pub struct GtfRecord {
     pub attributes: HashMap<String, String>,
 }
 
-/// Parse GTF file and extract exon features
+/// Parse GTF file, returning only records matching `feature_exon`.
 ///
-/// Returns only records with feature == "exon"
-pub fn parse_gtf(path: &Path) -> Result<Vec<GtfRecord>, Error> {
+/// `chr_prefix` is prepended to every seqname (STAR: `sjdbGTFchrPrefix`).
+/// `feature_exon` is the feature column value to keep (STAR: `sjdbGTFfeatureExon`, default `"exon"`).
+pub fn parse_gtf_configured(
+    path: &Path,
+    feature_exon: &str,
+    chr_prefix: &str,
+) -> Result<Vec<GtfRecord>, Error> {
     let file =
         File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {}", e)))?;
     let reader = BufReader::new(file);
@@ -44,28 +49,33 @@ pub fn parse_gtf(path: &Path) -> Result<Vec<GtfRecord>, Error> {
         let line =
             line.map_err(|e| Error::Gtf(format!("Failed to read line {}: {}", line_num, e)))?;
 
-        // Skip comments and empty lines
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        // Parse GTF line
         match parse_gtf_line(line) {
-            Ok(record) => {
-                // Only keep exon features
-                if record.feature.eq_ignore_ascii_case("exon") {
+            Ok(mut record) => {
+                if record.feature.eq_ignore_ascii_case(feature_exon) {
+                    if !chr_prefix.is_empty() {
+                        record.seqname = format!("{}{}", chr_prefix, record.seqname);
+                    }
                     exons.push(record);
                 }
             }
             Err(e) => {
                 log::warn!("Skipping malformed GTF line {}: {}", line_num, e);
-                continue;
             }
         }
     }
 
     Ok(exons)
+}
+
+/// Parse GTF file and extract exon features (default: feature `"exon"`, no chr prefix).
+#[allow(dead_code)]
+pub fn parse_gtf(path: &Path) -> Result<Vec<GtfRecord>, Error> {
+    parse_gtf_configured(path, "exon", "")
 }
 
 /// Parse a single GTF line
@@ -135,24 +145,24 @@ fn parse_attributes(attr_str: &str) -> Result<HashMap<String, String>, Error> {
     Ok(attributes)
 }
 
-/// Extract junctions from exon records
+/// Extract junctions from exon records, grouping by `transcript_tag`.
 ///
-/// Groups exons by transcript_id, sorts them by position,
-/// and calculates intron coordinates from consecutive exons.
+/// `transcript_tag` is the GTF attribute key for the parent transcript
+/// (STAR: `sjdbGTFtagExonParentTranscript`, default `"transcript_id"`).
 ///
 /// Returns: Vec<(chr_idx, intron_start, intron_end, strand)>
-pub fn extract_junctions_from_exons(
+pub fn extract_junctions_configured(
     exons: Vec<GtfRecord>,
     genome: &Genome,
+    transcript_tag: &str,
 ) -> Result<Vec<(usize, u64, u64, u8)>, Error> {
-    // Group exons by transcript_id
     let mut transcripts: HashMap<String, Vec<GtfRecord>> = HashMap::new();
 
     for exon in exons {
         let transcript_id = exon
             .attributes
-            .get("transcript_id")
-            .ok_or_else(|| Error::Gtf("Exon missing transcript_id attribute".to_string()))?
+            .get(transcript_tag)
+            .ok_or_else(|| Error::Gtf(format!("Exon missing {} attribute", transcript_tag)))?
             .clone();
 
         transcripts.entry(transcript_id).or_default().push(exon);
@@ -217,6 +227,15 @@ pub fn extract_junctions_from_exons(
     junctions.dedup();
 
     Ok(junctions)
+}
+
+/// Extract junctions grouping by `"transcript_id"` (default, backward-compatible wrapper).
+#[allow(dead_code)]
+pub fn extract_junctions_from_exons(
+    exons: Vec<GtfRecord>,
+    genome: &Genome,
+) -> Result<Vec<(usize, u64, u64, u8)>, Error> {
+    extract_junctions_configured(exons, genome, "transcript_id")
 }
 
 #[cfg(test)]
@@ -546,5 +565,83 @@ mod tests {
         let (_chr_idx, start, end, _strand) = junctions[0];
         assert_eq!(start, 201);
         assert_eq!(end, 299);
+    }
+
+    #[test]
+    fn test_parse_gtf_configured_chr_prefix() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "1\ttest\texon\t100\t200\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\";"
+        )
+        .unwrap();
+
+        let exons = parse_gtf_configured(file.path(), "exon", "chr").unwrap();
+        assert_eq!(exons.len(), 1);
+        assert_eq!(exons[0].seqname, "chr1");
+    }
+
+    #[test]
+    fn test_parse_gtf_configured_custom_feature() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "chr1\ttest\texon\t100\t200\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\";"
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "chr1\ttest\tCDS\t100\t200\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\";"
+        )
+        .unwrap();
+
+        let exons = parse_gtf_configured(file.path(), "CDS", "").unwrap();
+        assert_eq!(exons.len(), 1);
+        assert_eq!(exons[0].feature, "CDS");
+    }
+
+    #[test]
+    fn test_extract_junctions_configured_custom_transcript_tag() {
+        let genome = Genome {
+            sequence: vec![0; 1000],
+            n_genome: 1000,
+            n_chr_real: 1,
+            chr_start: vec![0, 1000],
+            chr_length: vec![1000],
+            chr_name: vec!["chr1".to_string()],
+        };
+
+        let exons = vec![
+            GtfRecord {
+                seqname: "chr1".to_string(),
+                feature: "exon".to_string(),
+                start: 100,
+                end: 200,
+                strand: '+',
+                attributes: vec![
+                    ("gene_id".to_string(), "G1".to_string()),
+                    ("Parent".to_string(), "transcript:T1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            GtfRecord {
+                seqname: "chr1".to_string(),
+                feature: "exon".to_string(),
+                start: 300,
+                end: 400,
+                strand: '+',
+                attributes: vec![
+                    ("gene_id".to_string(), "G1".to_string()),
+                    ("Parent".to_string(), "transcript:T1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+
+        let junctions = extract_junctions_configured(exons, &genome, "Parent").unwrap();
+        assert_eq!(junctions.len(), 1);
+        assert_eq!(junctions[0], (0, 201, 299, 1));
     }
 }

@@ -72,7 +72,7 @@ jobs:
             exit 1
           fi
 
-          LOCK_VERSION=$(awk '/^name = "ruSTAR"/{found=1} found && /^version =/{print; exit}' Cargo.lock | sed 's/.*"\(.*\)"/\1/')
+          LOCK_VERSION=$(awk '/^name = "rustar-aligner"/{found=1} found && /^version =/{print; exit}' Cargo.lock | sed 's/.*"\(.*\)"/\1/')
           if [ "$LOCK_VERSION" != "$RAW" ]; then
             echo "::error::Cargo.lock version ($LOCK_VERSION) does not match Cargo.toml version ($RAW)"
             exit 1
@@ -160,7 +160,7 @@ jobs:
         id: package
         shell: bash
         run: |
-          BIN="ruSTAR"
+          BIN="rustar-aligner"
           EXT="${{ matrix.ext }}"
           ARCHIVE="${BIN}-${{ matrix.name }}"
 
@@ -402,7 +402,7 @@ jobs:
         run: |
           gh release create "${{ needs.check-release.outputs.version }}" \
             --target "${{ github.sha }}" \
-            --title "ruSTAR ${{ needs.check-release.outputs.version }}" \
+            --title "rustar-aligner ${{ needs.check-release.outputs.version }}" \
             --notes-file /tmp/release-notes.md
 
       - name: Create release (auto-generated notes)
@@ -412,7 +412,7 @@ jobs:
         run: |
           gh release create "${{ needs.check-release.outputs.version }}" \
             --target "${{ github.sha }}" \
-            --title "ruSTAR ${{ needs.check-release.outputs.version }}" \
+            --title "rustar-aligner ${{ needs.check-release.outputs.version }}" \
             --generate-notes
 
   # ------------------------------------------------------------------
@@ -443,16 +443,10 @@ jobs:
 
   # ------------------------------------------------------------------
   # 5. Publish to crates.io (release only, last step)
-  #
-  # TODO: The `rustar` crate name is already taken on crates.io. This job will
-  # fail until a free name is chosen in `Cargo.toml`. Gated off with `if:
-  # false` for now — flip back to `needs.check-release.outputs.is_release ==
-  # 'true'` once the name is resolved (and a crates.io trusted-publisher
-  # config has been set up for this repository).
   # ------------------------------------------------------------------
   publish-crate:
     name: Publish to crates.io
-    if: false
+    if: needs.check-release.outputs.is_release == 'true'
     needs: [check-release, upload-binaries]
     runs-on: ubuntu-latest
     permissions:

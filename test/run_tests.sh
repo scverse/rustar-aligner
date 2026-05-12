@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# run_tests.sh - Master test orchestration script for ruSTAR vs STAR comparison
+# run_tests.sh - Master test orchestration script for rustar-aligner vs STAR comparison
 # Usage: ./run_tests.sh [--all | test_name1 test_name2 ...] [--parallel] [--keep-all]
 
 set -euo pipefail
@@ -11,14 +11,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUSTAR_BIN="$PROJECT_ROOT/target/release/ruSTAR"
+RUSTAR_BIN="$PROJECT_ROOT/target/release/rustar-aligner-aligner"
 STAR_BIN="${STAR_BIN:-$(which STAR || echo "")}"
 
 # Test data paths
 DATA_DIR="$SCRIPT_DIR/data/small/yeast"
 READS_DIR="$DATA_DIR/reads"
 STAR_GENOME_DIR="$DATA_DIR/indices"
-RUSTAR_GENOME_DIR="$DATA_DIR/indices_rustar"
+RUSTAR_ALIGNER_GENOME_DIR="$DATA_DIR/indices_rustar"
 GTF_FILE="$DATA_DIR/reference/Saccharomyces_cerevisiae.R64-1-1.110.gtf"
 
 # Output paths
@@ -86,9 +86,9 @@ error() {
 check_prerequisites() {
     log "Checking prerequisites..."
 
-    # Check ruSTAR binary
+    # Check rustar-aligner binary
     if [[ ! -x "$RUSTAR_BIN" ]]; then
-        error "ruSTAR binary not found at $RUSTAR_BIN"
+        error "rustar-aligner binary not found at $RUSTAR_BIN"
         error "Run: cargo build --release"
         exit 1
     fi
@@ -168,20 +168,20 @@ run_star() {
     fi
 }
 
-run_rustar() {
+run_rustar_aligner() {
     local output_dir="$1"
     local reads="$2"
     local extra_args="$3"
 
     mkdir -p "$output_dir"
 
-    log "Running ruSTAR..."
+    log "Running rustar-aligner..."
 
-    # Build ruSTAR command
+    # Build rustar-aligner command
     local cmd=(
         "$RUSTAR_BIN"
         --runMode alignReads
-        --genomeDir "$RUSTAR_GENOME_DIR"
+        --genomeDir "$RUSTAR_ALIGNER_GENOME_DIR"
         --readFilesIn ${reads//,/ }
         --readFilesCommand zcat
         --outFileNamePrefix "$output_dir/"
@@ -195,12 +195,12 @@ run_rustar() {
     fi
 
     # Run with timeout
-    if timeout "$TIMEOUT" "${cmd[@]}" > "$output_dir/rustar.log" 2>&1; then
-        log "ruSTAR completed successfully"
+    if timeout "$TIMEOUT" "${cmd[@]}" > "$output_dir/rustar-aligner-aligner.log" 2>&1; then
+        log "rustar-aligner completed successfully"
         return 0
     else
-        error "ruSTAR failed or timed out"
-        cat "$output_dir/rustar.log" >&2
+        error "rustar-aligner failed or timed out"
+        cat "$output_dir/rustar-aligner-aligner.log" >&2
         return 1
     fi
 }
@@ -208,7 +208,7 @@ run_rustar() {
 compare_outputs() {
     local test_dir="$1"
     local star_dir="$test_dir/star"
-    local rustar_dir="$test_dir/rustar"
+    local rustar_aligner_dir="$test_dir/rustar-aligner-aligner"
     local comparison_dir="$test_dir/comparison"
 
     mkdir -p "$comparison_dir"
@@ -218,10 +218,10 @@ compare_outputs() {
     local status=0
 
     # Compare SAM/BAM files
-    if [[ -f "$star_dir/Aligned.out.sam" && -f "$rustar_dir/Aligned.out.sam" ]]; then
+    if [[ -f "$star_dir/Aligned.out.sam" && -f "$rustar_aligner_dir/Aligned.out.sam" ]]; then
         if python3 "$SCRIPT_DIR/compare_sam.py" \
             --star "$star_dir/Aligned.out.sam" \
-            --rustar "$rustar_dir/Aligned.out.sam" \
+            --rustar-aligner "$rustar_aligner_dir/Aligned.out.sam" \
             --tolerance 0.01 \
             --output "$comparison_dir/alignment_diff.txt" \
             > "$comparison_dir/sam_comparison.log" 2>&1; then
@@ -230,15 +230,15 @@ compare_outputs() {
             error "SAM comparison: FAIL"
             status=1
         fi
-    elif [[ -f "$star_dir/Aligned.out.bam" && -f "$rustar_dir/Aligned.out.bam" ]]; then
+    elif [[ -f "$star_dir/Aligned.out.bam" && -f "$rustar_aligner_dir/Aligned.out.bam" ]]; then
         # For BAM, convert to SAM first
         log "Converting BAM to SAM for comparison..."
         samtools view -h "$star_dir/Aligned.out.bam" > "$comparison_dir/star_tmp.sam"
-        samtools view -h "$rustar_dir/Aligned.out.bam" > "$comparison_dir/rustar_tmp.sam"
+        samtools view -h "$rustar_aligner_dir/Aligned.out.bam" > "$comparison_dir/rustar_aligner_tmp.sam"
 
         if python3 "$SCRIPT_DIR/compare_sam.py" \
             --star "$comparison_dir/star_tmp.sam" \
-            --rustar "$comparison_dir/rustar_tmp.sam" \
+            --rustar-aligner "$comparison_dir/rustar_aligner_tmp.sam" \
             --tolerance 0.01 \
             --output "$comparison_dir/alignment_diff.txt" \
             > "$comparison_dir/sam_comparison.log" 2>&1; then
@@ -248,14 +248,14 @@ compare_outputs() {
             status=1
         fi
 
-        rm -f "$comparison_dir/star_tmp.sam" "$comparison_dir/rustar_tmp.sam"
+        rm -f "$comparison_dir/star_tmp.sam" "$comparison_dir/rustar_aligner_tmp.sam"
     fi
 
     # Compare junction files
-    if [[ -f "$star_dir/SJ.out.tab" && -f "$rustar_dir/SJ.out.tab" ]]; then
+    if [[ -f "$star_dir/SJ.out.tab" && -f "$rustar_aligner_dir/SJ.out.tab" ]]; then
         if python3 "$SCRIPT_DIR/compare_junctions.py" \
             --star "$star_dir/SJ.out.tab" \
-            --rustar "$rustar_dir/SJ.out.tab" \
+            --rustar-aligner "$rustar_aligner_dir/SJ.out.tab" \
             --tolerance 0.10 \
             --output "$comparison_dir/junction_diff.txt" \
             > "$comparison_dir/junction_comparison.log" 2>&1; then
@@ -307,7 +307,7 @@ run_test_case() {
 
     local test_dir="$RESULTS_DIR/${TIMESTAMP}_${name}"
     local star_dir="$test_dir/star"
-    local rustar_dir="$test_dir/rustar"
+    local rustar_aligner_dir="$test_dir/rustar-aligner-aligner"
 
     log "=========================================="
     log "Running test: $name"
@@ -340,9 +340,9 @@ run_test_case() {
         return 1
     fi
 
-    # Run ruSTAR
-    if ! run_rustar "$rustar_dir" "$read_paths" "$extra_args"; then
-        error "ruSTAR execution failed for $name"
+    # Run rustar-aligner
+    if ! run_rustar_aligner "$rustar_aligner_dir" "$read_paths" "$extra_args"; then
+        error "rustar-aligner execution failed for $name"
         echo "FAILED" > "$test_dir/FAILED"
         return 1
     fi
@@ -355,7 +355,7 @@ run_test_case() {
         # Cleanup intermediate files if not keeping all
         if [[ "$KEEP_ALL" == false ]]; then
             rm -f "$star_dir"/_STARtmp "$star_dir"/Log.* "$star_dir"/SJ.out.tab
-            rm -f "$rustar_dir"/Log.*
+            rm -f "$rustar_aligner_dir"/Log.*
         fi
 
         return 0

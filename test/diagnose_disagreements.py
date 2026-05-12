@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnose position disagreements between ruSTAR and STAR.
+Diagnose position disagreements between rustar-aligner and STAR.
 
 For reads where both tools map to different chromosomes with MAPQ=255,
 this script checks the genome sequence at both positions to determine:
@@ -8,7 +8,7 @@ this script checks the genome sequence at both positions to determine:
 - Hypothesis B: Read has a clearly better match at one locus (seed finding bug)
 
 Usage:
-    python3 diagnose_disagreements.py <rustar_dir> <star_dir> <genome_fasta>
+    python3 diagnose_disagreements.py <rustar_aligner_dir> <star_dir> <genome_fasta>
 """
 
 import sys
@@ -157,17 +157,17 @@ def count_mismatches_at_position(read_seq, genome_seq, chrom, pos, cigar, is_rev
 
 def main():
     if len(sys.argv) < 4:
-        print(f"Usage: {sys.argv[0]} <rustar_dir> <star_dir> <genome_fasta>")
+        print(f"Usage: {sys.argv[0]} <rustar_aligner_dir> <star_dir> <genome_fasta>")
         sys.exit(1)
 
-    rustar_dir = sys.argv[1]
+    rustar_aligner_dir = sys.argv[1]
     star_dir = sys.argv[2]
     genome_fasta = sys.argv[3]
 
-    rustar_sam = os.path.join(rustar_dir, "Aligned.out.sam")
+    rustar_aligner_sam = os.path.join(rustar_aligner_dir, "Aligned.out.sam")
     star_sam = os.path.join(star_dir, "Aligned.out.sam")
 
-    for f in [rustar_sam, star_sam, genome_fasta]:
+    for f in [rustar_aligner_sam, star_sam, genome_fasta]:
         if not os.path.exists(f):
             print(f"ERROR: File not found: {f}")
             sys.exit(1)
@@ -185,19 +185,19 @@ def main():
 
     # Parse SAM files
     print("\nParsing SAM files...")
-    rustar_reads = parse_sam(rustar_sam)
+    rustar_aligner_reads = parse_sam(rustar_aligner_sam)
     star_reads = parse_sam(star_sam)
-    print(f"  ruSTAR: {len(rustar_reads)} reads")
+    print(f"  rustar-aligner: {len(rustar_aligner_reads)} reads")
     print(f"  STAR:   {len(star_reads)} reads")
 
     # Find diff-chr disagreements with both MAPQ=255
     diff_chr_both_unique = []
     diff_chr_other = []
 
-    all_reads = set(rustar_reads.keys()) & set(star_reads.keys())
+    all_reads = set(rustar_aligner_reads.keys()) & set(star_reads.keys())
 
     for qname in sorted(all_reads):
-        r_pri = get_primary(rustar_reads[qname])
+        r_pri = get_primary(rustar_aligner_reads[qname])
         s_pri = get_primary(star_reads[qname])
 
         if r_pri is None or s_pri is None:
@@ -226,7 +226,7 @@ def main():
     print("=" * 80)
 
     categories = Counter()
-    examples = {"both_perfect": [], "rustar_better": [], "star_better": [], "both_imperfect": []}
+    examples = {"both_perfect": [], "rustar_aligner_better": [], "star_better": [], "both_imperfect": []}
 
     for qname, r_pri, s_pri in diff_chr_both_unique:
         r_is_rev = bool(r_pri["flag"] & 16)
@@ -249,7 +249,7 @@ def main():
         if r_mismatches == 0 and s_mismatches == 0:
             cat = "both_perfect"
         elif r_mismatches < s_mismatches:
-            cat = "rustar_better"
+            cat = "rustar_aligner_better"
         elif s_mismatches < r_mismatches:
             cat = "star_better"
         else:
@@ -260,12 +260,12 @@ def main():
         if len(examples[cat]) < 5:
             examples[cat].append({
                 "qname": qname,
-                "rustar_chr": r_pri["rname"],
-                "rustar_pos": r_pri["pos"],
-                "rustar_strand": "-" if r_is_rev else "+",
-                "rustar_cigar": r_pri["cigar"],
-                "rustar_mm": r_mismatches,
-                "rustar_compared": r_compared,
+                "rustar_aligner_chr": r_pri["rname"],
+                "rustar_aligner_pos": r_pri["pos"],
+                "rustar_aligner_strand": "-" if r_is_rev else "+",
+                "rustar_aligner_cigar": r_pri["cigar"],
+                "rustar_aligner_mm": r_mismatches,
+                "rustar_aligner_compared": r_compared,
                 "star_chr": s_pri["rname"],
                 "star_pos": s_pri["pos"],
                 "star_strand": "-" if s_is_rev else "+",
@@ -278,7 +278,7 @@ def main():
     print(f"\nOf {len(diff_chr_both_unique)} diff-chr both-MAPQ=255 reads:")
     print(f"\n{'Category':<30} {'Count':>8} {'%':>8}")
     print("-" * 50)
-    for cat in ["both_perfect", "rustar_better", "star_better", "both_imperfect", "invalid_position"]:
+    for cat in ["both_perfect", "rustar_aligner_better", "star_better", "both_imperfect", "invalid_position"]:
         count = categories.get(cat, 0)
         pct = 100.0 * count / max(total_analyzed, 1)
         print(f"  {cat:<28} {count:>8} {pct:>7.1f}%")
@@ -286,7 +286,7 @@ def main():
     # Print examples for each category
     for cat, label in [
         ("both_perfect", "BOTH PERFECT (0 mismatches at both loci)"),
-        ("rustar_better", "ruSTAR BETTER (fewer mismatches)"),
+        ("rustar_aligner_better", "rustar-aligner BETTER (fewer mismatches)"),
         ("star_better", "STAR BETTER (fewer mismatches)"),
         ("both_imperfect", "BOTH IMPERFECT (same # mismatches > 0)"),
     ]:
@@ -294,8 +294,8 @@ def main():
             print(f"\n--- Examples: {label} ---")
             for ex in examples[cat][:5]:
                 print(f"  {ex['qname'][:40]}")
-                print(f"    ruSTAR: {ex['rustar_chr']}:{ex['rustar_pos']}({ex['rustar_strand']}) "
-                      f"CIGAR={ex['rustar_cigar']} mm={ex['rustar_mm']}/{ex['rustar_compared']}")
+                print(f"    rustar-aligner: {ex['rustar_aligner_chr']}:{ex['rustar_aligner_pos']}({ex['rustar_aligner_strand']}) "
+                      f"CIGAR={ex['rustar_aligner_cigar']} mm={ex['rustar_aligner_mm']}/{ex['rustar_aligner_compared']}")
                 print(f"    STAR:   {ex['star_chr']}:{ex['star_pos']}({ex['star_strand']}) "
                       f"CIGAR={ex['star_cigar']} mm={ex['star_mm']}/{ex['star_compared']}")
 
@@ -312,13 +312,13 @@ def main():
         print(f"    perfect matches at BOTH loci.")
         print(f"    These are genuine multi-mappers that should have MAPQ < 255.")
         print(f"    Fix: Ensure cluster_seeds() explores enough positions to find all loci.")
-    elif categories.get("star_better", 0) > categories.get("rustar_better", 0):
+    elif categories.get("star_better", 0) > categories.get("rustar_aligner_better", 0):
         print(f"\n>>> HYPOTHESIS B (STAR better): STAR finds better alignments.")
-        print(f"    Suggests ruSTAR seed finding or scoring has gaps.")
+        print(f"    Suggests rustar-aligner seed finding or scoring has gaps.")
     else:
         print(f"\n>>> MIXED RESULTS: No single dominant pattern.")
         print(f"    Both perfect: {both_perfect_pct:.1f}%")
-        print(f"    ruSTAR better: {100.0 * categories.get('rustar_better', 0) / max(total_analyzed, 1):.1f}%")
+        print(f"    rustar-aligner better: {100.0 * categories.get('rustar_aligner_better', 0) / max(total_analyzed, 1):.1f}%")
         print(f"    STAR better: {100.0 * categories.get('star_better', 0) / max(total_analyzed, 1):.1f}%")
 
     # Additional analysis: which chromosome pairs are most common?
@@ -342,7 +342,7 @@ def main():
 
     same_chr_far = []
     for qname in sorted(all_reads):
-        r_pri = get_primary(rustar_reads[qname])
+        r_pri = get_primary(rustar_aligner_reads[qname])
         s_pri = get_primary(star_reads[qname])
         if r_pri is None or s_pri is None:
             continue
@@ -378,7 +378,7 @@ def main():
             r_str = f"mm={r_mm[0]}/{r_mm[1]}" if r_mm else "invalid"
             s_str = f"mm={s_mm[0]}/{s_mm[1]}" if s_mm else "invalid"
             print(f"  {qname[:40]} diff={pos_diff}bp chr={r_pri['rname']}")
-            print(f"    ruSTAR: pos={r_pri['pos']} {r_str} CIGAR={r_pri['cigar']}")
+            print(f"    rustar-aligner: pos={r_pri['pos']} {r_str} CIGAR={r_pri['cigar']}")
             print(f"    STAR:   pos={s_pri['pos']} {s_str} CIGAR={s_pri['cigar']}")
     else:
         print("\nNo same-chr far-apart disagreements found.")

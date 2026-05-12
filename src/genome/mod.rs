@@ -118,6 +118,37 @@ impl Genome {
         })
     }
 
+    /// Append a splice-junction flanking-sequence buffer (`Gsj`) to the
+    /// forward genome and rebuild the reverse complement over the extended
+    /// forward range. Matches STAR's in-memory layout after
+    /// `sjdbBuildIndex.cpp:293` (`memcpy(G+chrStart[nChrReal], Gsj, nGsj)`):
+    /// the Gsj bytes live immediately after the forward real-genome bytes
+    /// (`chr_start[n_chr_real]` stays pinned at the pre-sjdb forward total,
+    /// matching STAR's `chrStart.txt` — verified against STAR docker output).
+    ///
+    /// `n_genome` grows to include Gsj. `chr_start` / `chr_length` /
+    /// `chr_name` / `n_chr_real` are NOT updated — Gsj lives outside the
+    /// chromosome accounting.
+    pub fn append_sjdb(&mut self, gsj: &[u8]) {
+        let old_n = self.n_genome;
+        let new_n = old_n + gsj.len() as u64;
+
+        let mut new_seq = vec![GENOME_SPACING_CHAR; (new_n * 2) as usize];
+        new_seq[..old_n as usize].copy_from_slice(&self.sequence[..old_n as usize]);
+        new_seq[old_n as usize..new_n as usize].copy_from_slice(gsj);
+
+        // Rebuild RC over the extended forward range (STAR stores Gsj_RC
+        // implicitly — rustar-aligner keeps the explicit `[fwd | RC]` layout).
+        for i in 0..new_n as usize {
+            let base = new_seq[i];
+            let complement = if base < 4 { 3 - base } else { base };
+            new_seq[2 * new_n as usize - 1 - i] = complement;
+        }
+
+        self.sequence = new_seq;
+        self.n_genome = new_n;
+    }
+
     /// Access a base from the genome (forward or reverse strand).
     ///
     /// # Arguments
@@ -205,35 +236,105 @@ impl Genome {
             writeln!(f, "{}\t{}", name, len).map_err(|e| Error::io(e, &chr_name_length_path))?;
         }
 
-        // Write genomeParameters.txt
-        let genome_params_path = dir.join("genomeParameters.txt");
-        let mut f =
-            fs::File::create(&genome_params_path).map_err(|e| Error::io(e, &genome_params_path))?;
+        // Write genomeParameters.txt — byte-for-byte matching STAR's
+        // `genomeParametersWrite.cpp` layout (order, tab/space separators,
+        // trailing whitespace on vector values). STAR's loader reads these
+        // keys via `<<` streaming; the leading `###` comment lines are
+        // skipped.
+        self.write_genome_parameters_txt(dir, params)?;
 
-        writeln!(f, "### STAR genome generation parameters").unwrap();
-        writeln!(f, "versionGenome\t2.7.11b").unwrap(); // ruSTAR version (we can bump this)
+        Ok(())
+    }
 
-        // genomeFastaFiles (space-separated)
-        write!(f, "genomeFastaFiles").unwrap();
-        for path in &params.genome_fasta_files {
-            write!(f, "\t{}", path.display()).unwrap();
+    fn write_genome_parameters_txt(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+        use std::fs;
+        use std::io::Write;
+
+        let path = dir.join("genomeParameters.txt");
+        let mut f = fs::File::create(&path).map_err(|e| Error::io(e, &path))?;
+
+        // STAR writes: `### <commandLineFull>\n` where commandLineFull is
+        // "<argv[0]>   --<name1> <val1>   --<name2> <val2> ...".  We emit
+        // the same skeleton using our known-at-invocation parameters.
+        // Not exposed for retrospective exact-byte match against an arbitrary
+        // STAR run's commandLineFull — see `docs/genome_params_divergence.md`
+        // for the short list of parameters we echo.
+        let fasta_list = params
+            .genome_fasta_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let gtf = params
+            .sjdb_gtf_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        writeln!(
+            f,
+            "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}      --genomeSAindexNbases {sai}   --sjdbGTFfile {gtf}   --sjdbOverhang {ov}",
+            thr = params.run_thread_n,
+            dir = dir.display(),
+            fa = fasta_list,
+            sai = params.genome_sa_index_nbases,
+            gtf = gtf,
+            ov = params.sjdb_overhang,
+        )
+        .map_err(|e| Error::io(e, &path))?;
+
+        // GstrandBit: floor(log2(nGenome + limitSjdbInsertNsj*sjdbLength))+1,
+        // clamped at a minimum of 32. STAR's default limitSjdbInsertNsj is
+        // 1e6, so the log-derived value is always >= 32 for sane genomes;
+        // use the clamped minimum directly.
+        writeln!(f, "### GstrandBit 32").map_err(|e| Error::io(e, &path))?;
+
+        // Value lines — exact order + tab/space separators match STAR's
+        // genomeParametersWrite.cpp:11-42.
+        writeln!(f, "versionGenome\t2.7.4a").map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "genomeType\tFull").map_err(|e| Error::io(e, &path))?;
+
+        // Vectors: `key\t<v1> <v2> ... \n` with trailing space after each
+        // value (STAR emits one ostream `<<` per element).
+        write!(f, "genomeFastaFiles\t").map_err(|e| Error::io(e, &path))?;
+        for p in &params.genome_fasta_files {
+            write!(f, "{} ", p.display()).map_err(|e| Error::io(e, &path))?;
         }
-        writeln!(f).unwrap();
+        writeln!(f).map_err(|e| Error::io(e, &path))?;
 
-        writeln!(f, "genomeSAindexNbases\t{}", params.genome_sa_index_nbases).unwrap();
-        writeln!(f, "genomeChrBinNbits\t{}", params.genome_chr_bin_nbits).unwrap();
-        writeln!(f, "genomeSAsparseD\t{}", params.genome_sa_sparse_d).unwrap();
+        writeln!(f, "genomeSAindexNbases\t{}", params.genome_sa_index_nbases)
+            .map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "genomeChrBinNbits\t{}", params.genome_chr_bin_nbits)
+            .map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "genomeSAsparseD\t{}", params.genome_sa_sparse_d)
+            .map_err(|e| Error::io(e, &path))?;
 
-        // sjdb parameters
-        if let Some(ref gtf) = params.sjdb_gtf_file {
-            writeln!(f, "sjdbGTFfile\t{}", gtf.display()).unwrap();
-        } else {
-            writeln!(f, "sjdbGTFfile\t-").unwrap();
-        }
-        writeln!(f, "sjdbOverhang\t{}", params.sjdb_overhang).unwrap();
+        writeln!(f, "genomeTransformType\tNone").map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "genomeTransformVCF\t-").map_err(|e| Error::io(e, &path))?;
 
-        // genomeFileSizes: <genome_size> <SA_size> (SA is 0 for now since we haven't built it)
-        writeln!(f, "genomeFileSizes\t{}\t0", self.n_genome).unwrap();
+        writeln!(f, "sjdbOverhang\t{}", params.sjdb_overhang).map_err(|e| Error::io(e, &path))?;
+
+        // sjdbFileChrStartEnd: empty vector → `-` plus STAR's trailing space.
+        writeln!(f, "sjdbFileChrStartEnd\t- ").map_err(|e| Error::io(e, &path))?;
+
+        let gtf_str = params
+            .sjdb_gtf_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        writeln!(f, "sjdbGTFfile\t{}", gtf_str).map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbGTFchrPrefix\t-").map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbGTFfeatureExon\texon").map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbGTFtagExonParentTranscript\ttranscript_id")
+            .map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbGTFtagExonParentGene\tgene_id").map_err(|e| Error::io(e, &path))?;
+
+        writeln!(f, "sjdbInsertSave\tBasic").map_err(|e| Error::io(e, &path))?;
+
+        // genomeFileSizes: tab before the FIRST value, spaces between
+        // subsequent values (STAR's pattern of `<< "\t"` then `<< " "`).
+        // SA is 0 at this point because `Genome::write_index_files` runs
+        // before SA is known; `GenomeIndex::write` patches it after.
+        writeln!(f, "genomeFileSizes\t{} 0", self.n_genome).map_err(|e| Error::io(e, &path))?;
 
         Ok(())
     }
@@ -247,7 +348,7 @@ mod tests {
 
     fn make_params(fasta_paths: Vec<std::path::PathBuf>, bin_nbits: u32) -> Parameters {
         use clap::Parser;
-        let mut args = vec!["ruSTAR", "--runMode", "genomeGenerate"];
+        let mut args = vec!["rustar-aligner", "--runMode", "genomeGenerate"];
 
         for path in &fasta_paths {
             args.push("--genomeFastaFiles");
@@ -381,5 +482,50 @@ mod tests {
         assert_eq!(genome.position_to_chr(9), Some((1, 1)));
         assert_eq!(genome.position_to_chr(10), Some((1, 2)));
         assert_eq!(genome.position_to_chr(11), None); // padding
+    }
+
+    #[test]
+    fn append_sjdb_extends_forward_and_rebuilds_rc() {
+        // Forward "ACGT" + spacer padding (bin 3 → 8 bytes padded).
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, ">chr1").unwrap();
+        writeln!(file, "ACGT").unwrap();
+        let params = make_params(vec![file.path().to_path_buf()], 3);
+        let mut genome = Genome::from_fasta(&params).unwrap();
+        assert_eq!(genome.n_genome, 8);
+
+        // Gsj bytes: donor "AC" + acceptor "GT" + spacer 5 (five total).
+        let gsj: Vec<u8> = vec![0, 1, 2, 3, 5];
+        let gsj_len = gsj.len();
+        genome.append_sjdb(&gsj);
+
+        // n_genome grows by gsj_len; chr_start pinned at pre-sjdb boundary.
+        assert_eq!(genome.n_genome, 8 + gsj_len as u64);
+        assert_eq!(genome.chr_start, vec![0, 8]);
+        assert_eq!(genome.n_chr_real, 1);
+
+        // Forward is [real 0..8 | gsj 8..13].
+        assert_eq!(&genome.sequence[..4], &[0, 1, 2, 3]);
+        assert_eq!(&genome.sequence[8..13], gsj.as_slice());
+
+        // RC over the extended forward range. sequence[2n-1-i] = complement(sequence[i]).
+        let new_n = genome.n_genome as usize;
+        assert_eq!(genome.sequence[2 * new_n - 1 - 8], 3); // complement of A at fwd[8]=0
+        assert_eq!(genome.sequence[2 * new_n - 1 - 12], 5); // spacer stays 5
+        assert_eq!(genome.sequence.len(), 2 * new_n);
+    }
+
+    #[test]
+    fn append_sjdb_with_empty_gsj_is_noop() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, ">chr1").unwrap();
+        writeln!(file, "ACGT").unwrap();
+        let params = make_params(vec![file.path().to_path_buf()], 3);
+        let mut genome = Genome::from_fasta(&params).unwrap();
+        let before = genome.sequence.clone();
+        let before_n = genome.n_genome;
+        genome.append_sjdb(&[]);
+        assert_eq!(genome.n_genome, before_n);
+        assert_eq!(genome.sequence, before);
     }
 }

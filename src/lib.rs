@@ -22,7 +22,7 @@ use crate::params::{Parameters, RunMode};
 pub fn run(params: &Parameters) -> anyhow::Result<()> {
     params.validate()?;
 
-    info!("ruSTAR {}", env!("CARGO_PKG_VERSION"));
+    info!("rustar-aligner {}", env!("CARGO_PKG_VERSION"));
     info!("{}", env!("VERSION_BODY"));
     info!("{}", cpu::cpu_detected_line());
     if let Some(hint) = cpu::upgrade_hint() {
@@ -60,12 +60,16 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Trait for alignment output writers (SAM or BAM)
+/// Trait for alignment output writers (SAM or BAM).
+/// `finish` flushes/sorts/closes the output; default is a no-op for streaming writers.
 trait AlignmentWriter {
     fn write_batch(
         &mut self,
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
     ) -> Result<(), error::Error>;
+    fn finish(&mut self) -> Result<(), error::Error> {
+        Ok(())
+    }
 }
 
 /// Null writer that discards all output (for two-pass mode pass 1)
@@ -95,6 +99,54 @@ impl AlignmentWriter for crate::io::bam::BamWriter {
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
+    }
+}
+
+impl AlignmentWriter for crate::io::bam::SortedBamWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        self.write_batch(batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
+    }
+}
+
+impl AlignmentWriter for crate::io::sam::SamStdoutWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        self.write_batch(batch)
+    }
+}
+
+impl AlignmentWriter for crate::io::bam::BamStdoutWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        self.write_batch(batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
+    }
+}
+
+impl AlignmentWriter for crate::io::bam::SortedBamStdoutWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        self.write_batch(batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
     }
 }
 
@@ -148,8 +200,36 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
                 "quantMode GeneCounts: building gene annotation from {}",
                 gtf_path.display()
             );
-            let ctx = crate::quant::QuantContext::build(gtf_path, &index.genome)?;
+            let ctx = crate::quant::QuantContext::build(
+                gtf_path,
+                &index.genome,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+                &params.sjdb_gtf_tag_exon_parent_gene,
+            )?;
             Some(std::sync::Arc::new(ctx))
+        } else {
+            None
+        };
+
+    // Use the transcriptome index loaded alongside the genome (populated
+    // from transcriptInfo.tab / exonInfo.tab / geneInfo.tab at load time
+    // — see GenomeIndex::load). Only wire it through to the pipeline when
+    // `--quantMode TranscriptomeSAM` is requested.
+    let tr_idx: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
+        if params.quant_transcriptome_sam() {
+            let tr = index.transcriptome.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--quantMode TranscriptomeSAM requires a GTF-aware index; \
+                     re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
+                     at alignReads so transcriptInfo.tab can be (re)built"
+                )
+            })?;
+            info!(
+                "quantMode TranscriptomeSAM: using {} transcripts from genome index",
+                tr.n_transcripts()
+            );
+            Some(std::sync::Arc::new(tr.clone()))
         } else {
             None
         };
@@ -160,11 +240,11 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let stats = match params.twopass_mode {
         TwopassMode::None => {
             info!("Running single-pass alignment");
-            run_single_pass(&index, &params, quant_ctx.as_ref())?
+            run_single_pass(&index, &params, quant_ctx.as_ref(), tr_idx.as_ref())?
         }
         TwopassMode::Basic => {
             info!("Running two-pass alignment mode");
-            run_two_pass(&index, &params, quant_ctx.as_ref())?
+            run_two_pass(&index, &params, quant_ctx.as_ref(), tr_idx.as_ref())?
         }
     };
 
@@ -194,8 +274,9 @@ fn run_single_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
+    tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
-    use crate::io::bam::BamWriter;
+    use crate::io::bam::{BamWriter, SortedBamWriter};
     use crate::io::sam::SamWriter;
     use crate::params::OutSamFormat;
     use std::sync::Arc;
@@ -206,84 +287,145 @@ fn run_single_pass(
 
     // Clone the quant Arc so each dispatch call can own a reference.
     let quant = quant_ctx.map(Arc::clone);
+    let tr = tr_idx.map(Arc::clone);
 
-    // 4. Route to SAM or BAM output based on --outSAMtype
+    // Open transcriptome BAM writer if requested.
+    let mut tr_writer: Option<BamWriter> = if let Some(tidx) = tr.as_ref() {
+        let path = params
+            .out_file_name_prefix
+            .join("Aligned.toTranscriptome.out.bam");
+        info!("Writing transcriptome BAM to {}", path.display());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Some(BamWriter::create_transcriptome(&path, tidx, params)?)
+    } else {
+        None
+    };
+
+    // Create unmapped FASTQ writers if --outReadsUnmapped Fastx
+    use crate::io::fastq::UnmappedFastqWriter;
+    use crate::params::OutReadsUnmapped;
+
+    let is_paired = params.read_files_in.len() == 2;
+    let mut unmapped_w1: Option<UnmappedFastqWriter> =
+        if params.out_reads_unmapped == OutReadsUnmapped::Fastx {
+            let path = params.out_file_name_prefix.join("Unmapped.out.mate1");
+            info!("Writing unmapped reads to {}", path.display());
+            Some(UnmappedFastqWriter::create(&path)?)
+        } else {
+            None
+        };
+    let mut unmapped_w2: Option<UnmappedFastqWriter> =
+        if params.out_reads_unmapped == OutReadsUnmapped::Fastx && is_paired {
+            let path = params.out_file_name_prefix.join("Unmapped.out.mate2");
+            info!("Writing unmapped mate2 reads to {}", path.display());
+            Some(UnmappedFastqWriter::create(&path)?)
+        } else {
+            None
+        };
+
+    // 4. Route to SAM or BAM output based on --outSAMtype / --outStd
+    use crate::params::{OutSamSortOrder, OutStd};
+
     let out_type = params
         .out_sam_type()
         .map_err(|e| anyhow::anyhow!("Invalid --outSAMtype: {}", e))?;
 
-    match out_type.format {
-        OutSamFormat::Sam => {
-            let output_path = params.out_file_name_prefix.join("Aligned.out.sam");
-            info!("Writing SAM to {}", output_path.display());
-
-            // Create output directory if it doesn't exist
-            if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent)?;
+    // Build boxed writer — stdout takes precedence over file output.
+    let mut writer: Box<dyn AlignmentWriter> = match params.out_std {
+        OutStd::Sam => {
+            info!("Writing SAM to stdout (--outStd SAM)");
+            Box::new(crate::io::sam::SamStdoutWriter::create(
+                &index.genome,
+                params,
+            )?)
+        }
+        OutStd::BamUnsorted => {
+            info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
+            Box::new(crate::io::bam::BamStdoutWriter::create(
+                &index.genome,
+                params,
+            )?)
+        }
+        OutStd::BamSortedByCoordinate => {
+            info!("Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)");
+            Box::new(crate::io::bam::SortedBamStdoutWriter::create(
+                &index.genome,
+                params,
+            )?)
+        }
+        OutStd::None => match out_type.format {
+            OutSamFormat::Sam => {
+                let output_path = params.out_file_name_prefix.join("Aligned.out.sam");
+                info!("Writing SAM to {}", output_path.display());
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Box::new(SamWriter::create(&output_path, &index.genome, params)?)
             }
-
-            let mut writer = SamWriter::create(&output_path, &index.genome, params)?;
-
-            // Route to single-end or paired-end mode
-            match params.read_files_in.len() {
-                1 => align_reads_single_end(
-                    params,
-                    index,
-                    &mut writer,
-                    &stats,
-                    &sj_stats,
-                    quant.as_ref(),
-                ),
-                2 => align_reads_paired_end(
-                    params,
-                    index,
-                    &mut writer,
-                    &stats,
-                    &sj_stats,
-                    quant.as_ref(),
-                ),
-                n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
-            }?;
-        }
-        OutSamFormat::Bam => {
-            let output_path = params.out_file_name_prefix.join("Aligned.out.bam");
-            info!("Writing BAM to {}", output_path.display());
-
-            // Create output directory if it doesn't exist
-            if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            OutSamFormat::Bam => {
+                let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
+                let output_path = if sorted {
+                    params
+                        .out_file_name_prefix
+                        .join("Aligned.sortedByCoord.out.bam")
+                } else {
+                    params.out_file_name_prefix.join("Aligned.out.bam")
+                };
+                info!("Writing BAM to {}", output_path.display());
+                if let Some(parent) = output_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if sorted {
+                    Box::new(SortedBamWriter::create(
+                        &output_path,
+                        &index.genome,
+                        params,
+                    )?)
+                } else {
+                    Box::new(BamWriter::create(&output_path, &index.genome, params)?)
+                }
             }
+            OutSamFormat::None => {
+                anyhow::bail!("Output format 'None' not yet implemented");
+            }
+        },
+    };
 
-            let mut writer = BamWriter::create(&output_path, &index.genome, params)?;
+    // Align reads through the boxed writer.
+    match params.read_files_in.len() {
+        1 => align_reads_single_end(
+            params,
+            index,
+            writer.as_mut(),
+            &stats,
+            &sj_stats,
+            quant.as_ref(),
+            tr.as_ref(),
+            tr_writer.as_mut(),
+            unmapped_w1.as_mut(),
+        ),
+        2 => align_reads_paired_end(
+            params,
+            index,
+            writer.as_mut(),
+            &stats,
+            &sj_stats,
+            quant.as_ref(),
+            tr.as_ref(),
+            tr_writer.as_mut(),
+            unmapped_w1.as_mut(),
+            unmapped_w2.as_mut(),
+        ),
+        n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
+    }?;
 
-            // Route to single-end or paired-end mode (same functions as SAM, generic!)
-            match params.read_files_in.len() {
-                1 => align_reads_single_end(
-                    params,
-                    index,
-                    &mut writer,
-                    &stats,
-                    &sj_stats,
-                    quant.as_ref(),
-                ),
-                2 => align_reads_paired_end(
-                    params,
-                    index,
-                    &mut writer,
-                    &stats,
-                    &sj_stats,
-                    quant.as_ref(),
-                ),
-                n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
-            }?;
+    writer.finish()?;
 
-            // Finish BAM file (flush BGZF buffers)
-            writer.finish()?;
-        }
-        OutSamFormat::None => {
-            info!("Output format set to None, skipping alignment output");
-            anyhow::bail!("Output format 'None' not yet implemented");
-        }
+    // Flush transcriptome BAM.
+    if let Some(ref mut w) = tr_writer {
+        w.finish()?;
     }
 
     // 5. Write SJ.out.tab file
@@ -307,6 +449,7 @@ fn run_two_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
+    tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
     use std::sync::Arc;
 
@@ -341,7 +484,7 @@ fn run_two_pass(
 
     // PASS 2: Re-alignment with merged DB (quant counts happen here)
     info!("Two-pass mode: Pass 2 - Re-alignment");
-    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx)?;
+    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx, tr_idx)?;
 
     Ok(stats)
 }
@@ -383,6 +526,9 @@ fn run_pass1(
             &stats,
             &sj_stats,
             None,
+            None,
+            None,
+            None,
         )?,
         2 => align_reads_paired_end(
             &params_pass1,
@@ -390,6 +536,10 @@ fn run_pass1(
             &mut null_writer,
             &stats,
             &sj_stats,
+            None,
+            None,
+            None,
+            None,
             None,
         )?,
         n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
@@ -406,6 +556,46 @@ fn run_pass1(
     Ok((sj_stats, novel_junctions))
 }
 
+/// Reverse-complement an encoded read (A=0,C=1,G=2,T=3,N=4).  Shared by the
+/// SE and PE transcriptome builders for the STAR `Read1[2]` soft-clip path.
+fn rc_encode(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .rev()
+        .map(|&b| crate::io::fastq::complement_base(b))
+        .collect()
+}
+
+/// Pick a random primary-hit index and compute the MAPQ for a set of
+/// transcriptome projections.  Shared by the SE and PE builders.
+fn pick_primary_and_mapq(
+    n_alignments: usize,
+    n_for_mapq: usize,
+    read_name: &str,
+    params: &Parameters,
+) -> (usize, u8) {
+    use crate::align::read_align::per_read_seed;
+    use crate::mapq::calculate_mapq;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(per_read_seed(params.run_rng_seed, read_name));
+    let primary_hit = rng.gen_range(0..n_alignments);
+    let mapq = calculate_mapq(n_alignments.max(n_for_mapq), params.out_sam_mapq_unique);
+    (primary_hit, mapq)
+}
+
+/// Per-read metadata for BySJout disk-buffered mode.
+/// SAM records are written to a temp file; only small metadata stays in memory.
+struct BySJReadMeta {
+    /// Number of SAM records written to the temp file for this read.
+    n_sam_records: u32,
+    /// Junction keys from primary alignment. Empty if unmapped or no junctions.
+    junction_keys: Vec<crate::junction::SjKey>,
+    /// Chimeric alignments — kept in memory because they're rare (~0.1% of reads).
+    chimeric_alns: Vec<crate::chimeric::ChimericAlignment>,
+    /// Transcriptome SAM records (kept in memory — optional feature).
+    transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf>,
+}
+
 /// Helper struct to hold alignment results from parallel processing
 struct AlignmentBatchResults {
     sam_records: crate::io::sam::BufferedSamRecords,
@@ -413,6 +603,177 @@ struct AlignmentBatchResults {
     /// Junction keys from the primary (best) alignment for BySJout filtering.
     /// Empty if unmapped or no junctions.
     primary_junction_keys: Vec<crate::junction::SjKey>,
+    /// Transcriptome-space SAM records for `--quantMode TranscriptomeSAM`.
+    /// Empty unless that mode is enabled.
+    transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf>,
+    /// Unmapped reads for `--outReadsUnmapped Fastx` (name, encoded_seq, qual).
+    /// mate1 file (also used for SE). Empty unless that mode is enabled.
+    unmapped_mate1: Vec<(String, Vec<u8>, Vec<u8>)>,
+    /// Unmapped mate2 reads (PE only). Empty unless outReadsUnmapped=Fastx.
+    unmapped_mate2: Vec<(String, Vec<u8>, Vec<u8>)>,
+}
+
+/// Build transcriptome-space records for a single-end read.  Projects every
+/// surviving genome-space alignment onto all compatible transcripts, picks one
+/// projected alignment at random as the primary (seeded by `per_read_seed`),
+/// and emits SAM records with the transcriptome header.
+#[allow(clippy::too_many_arguments)]
+fn build_transcriptome_records_se(
+    transcripts: &[crate::align::transcript::Transcript],
+    read_name: &str,
+    read_seq: &[u8],
+    read_qual: &[u8],
+    genome: &crate::genome::Genome,
+    tr_idx: &crate::quant::transcriptome::TranscriptomeIndex,
+    params: &Parameters,
+    n_for_mapq: usize,
+) -> Result<Vec<noodles::sam::alignment::record_buf::RecordBuf>, error::Error> {
+    use crate::io::sam::SamWriter;
+    use crate::quant::transcriptome::filter_and_project;
+
+    if transcripts.is_empty() || tr_idx.n_transcripts() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mode = params.quant_transcriptome_sam_output;
+    let lread = read_seq.len() as u32;
+    // STAR passes the RC read to soft-clip extension on reverse-strand
+    // alignments (`Read1[2]`); we mirror that here.
+    let rc = rc_encode(read_seq);
+
+    let mut projected_all: Vec<crate::align::transcript::Transcript> = Vec::new();
+    for aln in transcripts {
+        let bases: &[u8] = if aln.is_reverse { &rc } else { read_seq };
+        projected_all.extend(filter_and_project(
+            aln, bases, genome, tr_idx, lread, mode, params,
+        ));
+    }
+
+    if projected_all.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (primary_hit, mapq) =
+        pick_primary_and_mapq(projected_all.len(), n_for_mapq, read_name, params);
+
+    SamWriter::build_transcriptome_records(
+        read_name,
+        read_seq,
+        read_qual,
+        &projected_all,
+        mapq,
+        params,
+        primary_hit,
+    )
+}
+
+/// Paired-end version of `build_transcriptome_records_se`.
+///
+/// For each `PairedAlignment`, project mate1 and mate2 onto all transcripts
+/// and keep only transcripts where both mates project successfully.  Emit one
+/// SAM record per projected pair per mate (2 records per projected hit, in
+/// mate1-then-mate2 order).
+#[allow(clippy::too_many_arguments)]
+fn build_transcriptome_records_pe<'a, I>(
+    both_mapped: I,
+    read_name: &str,
+    m1_seq: &[u8],
+    m1_qual: &[u8],
+    m2_seq: &[u8],
+    m2_qual: &[u8],
+    genome: &crate::genome::Genome,
+    tr_idx: &crate::quant::transcriptome::TranscriptomeIndex,
+    params: &Parameters,
+    n_for_mapq: usize,
+) -> Result<Vec<noodles::sam::alignment::record_buf::RecordBuf>, error::Error>
+where
+    I: IntoIterator<Item = &'a crate::align::read_align::PairedAlignment>,
+{
+    use crate::io::sam::SamWriter;
+    use crate::quant::transcriptome::filter_and_project;
+    use std::collections::HashMap;
+
+    if tr_idx.n_transcripts() == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mode = params.quant_transcriptome_sam_output;
+    let lread1 = m1_seq.len() as u32;
+    let lread2 = m2_seq.len() as u32;
+    let m1_rc = rc_encode(m1_seq);
+    let m2_rc = rc_encode(m2_seq);
+
+    // For each both-mapped pair, project each mate onto transcripts and pair
+    // up projections that land on the same transcript.
+    let mut all_projected: Vec<(
+        crate::align::transcript::Transcript,
+        crate::align::transcript::Transcript,
+    )> = Vec::new();
+    for pair in both_mapped {
+        let m1 = &pair.mate1_transcript;
+        let m2 = &pair.mate2_transcript;
+        let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
+        let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
+        let proj_m1 = filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params);
+        let proj_m2 = filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params);
+
+        let mut by_tr1: HashMap<usize, Vec<&crate::align::transcript::Transcript>> = HashMap::new();
+        for p in &proj_m1 {
+            by_tr1.entry(p.chr_idx).or_default().push(p);
+        }
+        for p2 in &proj_m2 {
+            if let Some(p1s) = by_tr1.get(&p2.chr_idx) {
+                for p1 in p1s {
+                    all_projected.push(((*p1).clone(), p2.clone()));
+                }
+            }
+        }
+    }
+
+    if all_projected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let n_alignments = all_projected.len();
+    let (primary_hit, mapq) = pick_primary_and_mapq(n_alignments, n_for_mapq, read_name, params);
+
+    // Build one record per mate per projected pair in a single call each,
+    // then stamp paired flags and interleave as mate1, mate2, mate1, mate2…
+    let (p1s, p2s): (Vec<_>, Vec<_>) = all_projected.into_iter().unzip();
+    let mut rec1s = SamWriter::build_transcriptome_records(
+        read_name,
+        m1_seq,
+        m1_qual,
+        &p1s,
+        mapq,
+        params,
+        primary_hit,
+    )?;
+    let mut rec2s = SamWriter::build_transcriptome_records(
+        read_name,
+        m2_seq,
+        m2_qual,
+        &p2s,
+        mapq,
+        params,
+        primary_hit,
+    )?;
+
+    use noodles::sam::alignment::record::Flags;
+    for r in rec1s.iter_mut() {
+        *r.flags_mut() |= Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+    }
+    for r in rec2s.iter_mut() {
+        *r.flags_mut() |= Flags::SEGMENTED | Flags::LAST_SEGMENT;
+    }
+
+    let mut out: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
+        Vec::with_capacity(n_alignments * 2);
+    for (r1, r2) in rec1s.into_iter().zip(rec2s) {
+        out.push(r1);
+        out.push(r2);
+    }
+    Ok(out)
 }
 
 /// Extract SjKey junction identifiers from a transcript's CIGAR.
@@ -467,13 +828,17 @@ fn extract_junction_keys(
 }
 
 /// Align single-end reads
-fn align_reads_single_end<W: AlignmentWriter>(
+#[allow(clippy::too_many_arguments)]
+fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     params: &Parameters,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     writer: &mut W,
     stats: &std::sync::Arc<crate::stats::AlignmentStats>,
     sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
+    tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
+    mut tr_writer: Option<&mut crate::io::bam::BamWriter>,
+    mut unmapped_writer: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::align_read;
     use crate::io::fastq::{FastqReader, clip_read};
@@ -483,6 +848,7 @@ fn align_reads_single_end<W: AlignmentWriter>(
     use std::sync::Arc;
 
     let quant = quant_ctx.map(Arc::clone);
+    let tr = tr_idx.map(Arc::clone);
 
     let read_file = &params.read_files_in[0];
     info!("Reading single-end from {}", read_file.display());
@@ -490,7 +856,7 @@ fn align_reads_single_end<W: AlignmentWriter>(
     let mut reader = FastqReader::open(read_file, params.read_files_command.as_deref())?;
 
     // Create chimeric output writer if enabled
-    let mut chimeric_writer = if params.chim_segment_min > 0 {
+    let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
         let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
@@ -516,15 +882,30 @@ fn align_reads_single_end<W: AlignmentWriter>(
     let clip3p = params.clip3p_nbases as usize;
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+    let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
     let rg_id_owned = params.primary_rg_id()?;
 
-    // Buffer for BySJout mode: accumulate all results before filtering
-    let mut bysj_buffer: Vec<AlignmentBatchResults> = Vec::new();
-
-    if by_sjout {
-        info!("outFilterType=BySJout: buffering reads for post-alignment junction filtering");
-    }
+    // BySJout disk buffer: SAM records written to a temp file; only compact metadata kept in RAM.
+    // For 100M reads this avoids ~60 GB of Vec<RecordBuf> in memory.
+    let bysj_temp = if by_sjout {
+        info!("outFilterType=BySJout: disk-buffering reads for post-alignment junction filtering");
+        let tf = tempfile::NamedTempFile::new()
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+        Some(tf)
+    } else {
+        None
+    };
+    let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
+        let write_file = tf
+            .reopen()
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+        let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
+        (Some(hdr), Some(w))
+    } else {
+        (None, None)
+    };
+    let mut bysj_meta: Vec<BySJReadMeta> = Vec::new();
 
     info!("Aligning reads...");
     loop {
@@ -561,6 +942,7 @@ fn align_reads_single_end<W: AlignmentWriter>(
 
                 let mut buffer = BufferedSamRecords::new();
                 let mut chimeric_alns = Vec::new();
+                let tr_local = tr.as_ref().map(Arc::clone);
 
                 // Record read bases for Log.final.out
                 stats.record_read_bases(clipped_seq.len() as u64);
@@ -581,10 +963,18 @@ fn align_reads_single_end<W: AlignmentWriter>(
                         )?;
                         buffer.push(record);
                     }
+                    let unmapped_m1 = if write_unmapped_fastq {
+                        vec![(read.name.clone(), clipped_seq.clone(), clipped_qual.clone())]
+                    } else {
+                        Vec::new()
+                    };
                     return Ok(AlignmentBatchResults {
                         sam_records: buffer,
                         chimeric_alns,
                         primary_junction_keys: Vec::new(),
+                        transcriptome_records: Vec::new(),
+                        unmapped_mate1: unmapped_m1,
+                        unmapped_mate2: Vec::new(),
                     });
                 }
 
@@ -638,7 +1028,8 @@ fn align_reads_single_end<W: AlignmentWriter>(
                     };
 
                 // Build SAM records (no I/O, just construction)
-                if transcripts.is_empty() {
+                let is_unmapped_se = transcripts.is_empty();
+                if is_unmapped_se {
                     // Unmapped
                     if output_unmapped {
                         let record = SamWriter::build_unmapped_record(
@@ -666,18 +1057,61 @@ fn align_reads_single_end<W: AlignmentWriter>(
                 }
                 // else: too many loci, skip output
 
+                // Transcriptome SAM projection for --quantMode TranscriptomeSAM.
+                let transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
+                    if let Some(ref tidx) = tr_local {
+                        build_transcriptome_records_se(
+                            &transcripts,
+                            &read.name,
+                            &clipped_seq,
+                            &clipped_qual,
+                            &index.genome,
+                            tidx,
+                            params,
+                            n_for_mapq,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+
+                let unmapped_m1 = if write_unmapped_fastq && is_unmapped_se {
+                    vec![(read.name.clone(), clipped_seq.clone(), clipped_qual.clone())]
+                } else {
+                    Vec::new()
+                };
+
                 Ok(AlignmentBatchResults {
                     sam_records: buffer,
                     chimeric_alns,
                     primary_junction_keys,
+                    transcriptome_records,
+                    unmapped_mate1: unmapped_m1,
+                    unmapped_mate2: Vec::new(),
                 })
             })
             .collect();
 
         if by_sjout {
-            // Buffer all results for post-alignment filtering
             for result in batch_results {
-                bysj_buffer.push(result?);
+                let batch = result?;
+                // Write SAM records to temp file (disk, not RAM)
+                let n_sam_records = batch.sam_records.records.len() as u32;
+                if let (Some(tw), Some(hdr)) = (&mut bysj_temp_writer, &bysj_sam_header) {
+                    crate::io::sam::bysj_write_records(tw, hdr, &batch.sam_records.records)?;
+                }
+                // Write unmapped reads immediately — they always pass BySJout (no junctions)
+                if let Some(ref mut uw) = unmapped_writer {
+                    for (name, seq, qual) in &batch.unmapped_mate1 {
+                        uw.write_record(name, seq, qual)?;
+                    }
+                }
+                // Store compact metadata in memory (chimeric kept here — rare, ~0.1%)
+                bysj_meta.push(BySJReadMeta {
+                    n_sam_records,
+                    junction_keys: batch.primary_junction_keys,
+                    chimeric_alns: batch.chimeric_alns,
+                    transcriptome_records: batch.transcriptome_records,
+                });
             }
         } else {
             // Normal mode: sequential writing (merge buffers in chunk order)
@@ -687,6 +1121,11 @@ fn align_reads_single_end<W: AlignmentWriter>(
                 // Write SAM/BAM records
                 writer.write_batch(&batch.sam_records.records)?;
 
+                // Write transcriptome-space records (if enabled)
+                if let Some(ref mut tw) = tr_writer {
+                    tw.write_batch(&batch.transcriptome_records)?;
+                }
+
                 // Write chimeric alignments
                 if let Some(ref mut chim_writer) = chimeric_writer {
                     for chim_aln in &batch.chimeric_alns {
@@ -695,6 +1134,20 @@ fn align_reads_single_end<W: AlignmentWriter>(
                             &index.genome.chr_name,
                             &chim_aln.read_name,
                         )?;
+                    }
+                }
+                if params.chim_out_within_bam() {
+                    use crate::chimeric::build_within_bam_records;
+                    for chim_aln in &batch.chimeric_alns {
+                        let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                        writer.write_batch(&supp)?;
+                    }
+                }
+
+                // Write unmapped FASTQ records
+                if let Some(ref mut uw) = unmapped_writer {
+                    for (name, seq, qual) in &batch.unmapped_mate1 {
+                        uw.write_record(name, seq, qual)?;
                     }
                 }
             }
@@ -712,7 +1165,7 @@ fn align_reads_single_end<W: AlignmentWriter>(
         }
     }
 
-    // BySJout post-alignment filtering
+    // BySJout post-alignment filtering (disk-buffered reads)
     if by_sjout {
         let surviving_junctions = sj_stats.compute_surviving_junctions(params);
         info!(
@@ -721,34 +1174,61 @@ fn align_reads_single_end<W: AlignmentWriter>(
             sj_stats.len()
         );
 
-        let mut filtered_count = 0u64;
-        for batch in &bysj_buffer {
-            if !batch.primary_junction_keys.is_empty() {
-                // Read has junctions — check if ALL survive
-                let all_survive = batch
-                    .primary_junction_keys
-                    .iter()
-                    .all(|key| surviving_junctions.contains(key));
+        // Flush and close the temp writer before re-opening for reading
+        drop(bysj_temp_writer);
 
-                if !all_survive {
-                    // Filter this read: skip writing, adjust stats
+        let mut filtered_count = 0u64;
+        if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
+            let read_file = tf
+                .reopen()
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+            let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
+            reader.read_header()?;
+
+            for meta in &bysj_meta {
+                let all_survive = meta.junction_keys.is_empty()
+                    || meta
+                        .junction_keys
+                        .iter()
+                        .all(|key| surviving_junctions.contains(key));
+
+                if all_survive {
+                    let records = crate::io::sam::bysj_read_n_records(
+                        &mut reader,
+                        hdr,
+                        meta.n_sam_records,
+                        true,
+                    )?;
+                    writer.write_batch(&records)?;
+                    if let Some(ref mut tw) = tr_writer {
+                        tw.write_batch(&meta.transcriptome_records)?;
+                    }
+                    if let Some(ref mut chim_writer) = chimeric_writer {
+                        for chim_aln in &meta.chimeric_alns {
+                            chim_writer.write_alignment(
+                                chim_aln,
+                                &index.genome.chr_name,
+                                &chim_aln.read_name,
+                            )?;
+                        }
+                    }
+                    if params.chim_out_within_bam() {
+                        use crate::chimeric::build_within_bam_records;
+                        for chim_aln in &meta.chimeric_alns {
+                            let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                            writer.write_batch(&supp)?;
+                        }
+                    }
+                } else {
+                    // Skip these records in the temp file (advance reader)
+                    crate::io::sam::bysj_read_n_records(
+                        &mut reader,
+                        hdr,
+                        meta.n_sam_records,
+                        false,
+                    )?;
                     filtered_count += 1;
                     stats.undo_mapped_record_bysj();
-                    continue;
-                }
-            }
-
-            // No junctions or all junctions survive — write normally
-            writer.write_batch(&batch.sam_records.records)?;
-
-            // Write chimeric alignments
-            if let Some(ref mut chim_writer) = chimeric_writer {
-                for chim_aln in &batch.chimeric_alns {
-                    chim_writer.write_alignment(
-                        chim_aln,
-                        &index.genome.chr_name,
-                        &chim_aln.read_name,
-                    )?;
                 }
             }
         }
@@ -765,17 +1245,27 @@ fn align_reads_single_end<W: AlignmentWriter>(
         info!("Chimeric junction output complete");
     }
 
+    // Flush unmapped FASTQ writer
+    if let Some(ref mut uw) = unmapped_writer {
+        uw.flush()?;
+    }
+
     Ok(())
 }
 
 /// Align paired-end reads
-fn align_reads_paired_end<W: AlignmentWriter>(
+#[allow(clippy::too_many_arguments)]
+fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     params: &Parameters,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     writer: &mut W,
     stats: &std::sync::Arc<crate::stats::AlignmentStats>,
     sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
+    tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
+    mut tr_writer: Option<&mut crate::io::bam::BamWriter>,
+    mut unmapped_writer1: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
+    mut unmapped_writer2: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::{PairedAlignment, PairedAlignmentResult, align_paired_read};
     use crate::io::fastq::{PairedFastqReader, clip_read};
@@ -785,6 +1275,7 @@ fn align_reads_paired_end<W: AlignmentWriter>(
     use std::sync::Arc;
 
     let quant = quant_ctx.map(Arc::clone);
+    let tr = tr_idx.map(Arc::clone);
 
     info!(
         "Reading paired-end from {} and {}",
@@ -798,12 +1289,12 @@ fn align_reads_paired_end<W: AlignmentWriter>(
         params.read_files_command.as_deref(),
     )?;
 
-    // Create chimeric output writer if enabled (paired-end chimeric detection not yet implemented)
-    let mut chimeric_writer = if params.chim_segment_min > 0 {
+    // Create chimeric output writer if enabled
+    let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
         let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
-            "Chimeric detection enabled (chimSegmentMin={}) - paired-end chimeric detection not yet implemented",
+            "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
         Some(ChimericJunctionWriter::new(prefix)?)
@@ -825,14 +1316,28 @@ fn align_reads_paired_end<W: AlignmentWriter>(
     let clip3p = params.clip3p_nbases as usize;
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+    let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
 
-    // Buffer for BySJout mode
-    let mut bysj_buffer: Vec<AlignmentBatchResults> = Vec::new();
-
-    if by_sjout {
-        info!("outFilterType=BySJout: buffering pairs for post-alignment junction filtering");
-    }
+    // BySJout disk buffer: SAM records to temp file, compact metadata in RAM.
+    let bysj_temp = if by_sjout {
+        info!("outFilterType=BySJout: disk-buffering pairs for post-alignment junction filtering");
+        let tf = tempfile::NamedTempFile::new()
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+        Some(tf)
+    } else {
+        None
+    };
+    let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
+        let write_file = tf
+            .reopen()
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+        let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
+        (Some(hdr), Some(w))
+    } else {
+        (None, None)
+    };
+    let mut bysj_meta: Vec<BySJReadMeta> = Vec::new();
 
     info!("Aligning paired-end reads...");
     loop {
@@ -878,6 +1383,7 @@ fn align_reads_paired_end<W: AlignmentWriter>(
                 );
 
                 let mut buffer = BufferedSamRecords::new();
+                let tr_local = tr.as_ref().map(Arc::clone);
 
                 // Record read bases for Log.final.out (both mates)
                 stats.record_read_bases(m1_seq.len() as u64 + m2_seq.len() as u64);
@@ -902,15 +1408,34 @@ fn align_reads_paired_end<W: AlignmentWriter>(
                             buffer.push(record);
                         }
                     }
+                    let (um1, um2) = if write_unmapped_fastq {
+                        (
+                            vec![(
+                                paired_read.mate1.name.clone(),
+                                m1_seq.clone(),
+                                m1_qual.clone(),
+                            )],
+                            vec![(
+                                paired_read.mate2.name.clone(),
+                                m2_seq.clone(),
+                                m2_qual.clone(),
+                            )],
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                     return Ok(AlignmentBatchResults {
                         sam_records: buffer,
                         chimeric_alns: Vec::new(),
                         primary_junction_keys: Vec::new(),
+                        transcriptome_records: Vec::new(),
+                        unmapped_mate1: um1,
+                        unmapped_mate2: um2,
                     });
                 }
 
                 // Align paired read (CPU-intensive)
-                let (results, n_for_mapq, unmapped_reason) =
+                let (results, pe_chimeric, n_for_mapq, unmapped_reason) =
                     align_paired_read(&m1_seq, &m2_seq, &paired_read.name, &index, params)?;
 
                 // Classify the result for stats and SAM output
@@ -1087,24 +1612,111 @@ fn align_reads_paired_end<W: AlignmentWriter>(
                 }
                 // else: too many loci, skip output
 
+                // Transcriptome SAM projection (both-mapped pairs only)
+                let transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
+                    if let Some(ref tidx) = tr_local {
+                        build_transcriptome_records_pe(
+                            both_mapped.iter().map(|b| b.as_ref()),
+                            &paired_read.name,
+                            &m1_seq,
+                            &m1_qual,
+                            &m2_seq,
+                            &m2_qual,
+                            &index.genome,
+                            tidx,
+                            params,
+                            n_for_mapq,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+
+                // Collect unmapped mates for --outReadsUnmapped Fastx.
+                // Write both mates if: pair is fully unmapped OR half-mapped.
+                // STAR writes both mates of half-mapped pairs to the unmapped files.
+                let (unmapped_mate1, unmapped_mate2) = if write_unmapped_fastq {
+                    let pair_unmapped = results.is_empty() || has_half_mapped;
+                    if pair_unmapped {
+                        (
+                            vec![(
+                                paired_read.mate1.name.clone(),
+                                m1_seq.clone(),
+                                m1_qual.clone(),
+                            )],
+                            vec![(
+                                paired_read.mate2.name.clone(),
+                                m2_seq.clone(),
+                                m2_qual.clone(),
+                            )],
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+
                 Ok(AlignmentBatchResults {
                     sam_records: buffer,
-                    chimeric_alns: Vec::new(),
+                    chimeric_alns: pe_chimeric,
                     primary_junction_keys,
+                    transcriptome_records,
+                    unmapped_mate1,
+                    unmapped_mate2,
                 })
             })
             .collect();
 
         if by_sjout {
-            // Buffer all results for post-alignment filtering
             for result in batch_results {
-                bysj_buffer.push(result?);
+                let batch = result?;
+                let n_sam_records = batch.sam_records.records.len() as u32;
+                if let (Some(tw), Some(hdr)) = (&mut bysj_temp_writer, &bysj_sam_header) {
+                    crate::io::sam::bysj_write_records(tw, hdr, &batch.sam_records.records)?;
+                }
+                // Write unmapped reads immediately — they always pass BySJout
+                if let Some(ref mut uw1) = unmapped_writer1 {
+                    for (name, seq, qual) in &batch.unmapped_mate1 {
+                        uw1.write_record(name, seq, qual)?;
+                    }
+                }
+                if let Some(ref mut uw2) = unmapped_writer2 {
+                    for (name, seq, qual) in &batch.unmapped_mate2 {
+                        uw2.write_record(name, seq, qual)?;
+                    }
+                }
+                bysj_meta.push(BySJReadMeta {
+                    n_sam_records,
+                    junction_keys: batch.primary_junction_keys,
+                    chimeric_alns: batch.chimeric_alns,
+                    transcriptome_records: batch.transcriptome_records,
+                });
             }
         } else {
             // Normal mode: sequential SAM writing
             for result in batch_results {
                 let batch = result?;
                 writer.write_batch(&batch.sam_records.records)?;
+                if let Some(ref mut tw) = tr_writer {
+                    tw.write_batch(&batch.transcriptome_records)?;
+                }
+                if params.chim_out_within_bam() {
+                    use crate::chimeric::build_within_bam_records;
+                    for chim_aln in &batch.chimeric_alns {
+                        let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                        writer.write_batch(&supp)?;
+                    }
+                }
+                if let Some(ref mut uw1) = unmapped_writer1 {
+                    for (name, seq, qual) in &batch.unmapped_mate1 {
+                        uw1.write_record(name, seq, qual)?;
+                    }
+                }
+                if let Some(ref mut uw2) = unmapped_writer2 {
+                    for (name, seq, qual) in &batch.unmapped_mate2 {
+                        uw2.write_record(name, seq, qual)?;
+                    }
+                }
             }
         }
 
@@ -1120,7 +1732,7 @@ fn align_reads_paired_end<W: AlignmentWriter>(
         }
     }
 
-    // BySJout post-alignment filtering
+    // BySJout post-alignment filtering (disk-buffered pairs)
     if by_sjout {
         let surviving_junctions = sj_stats.compute_surviving_junctions(params);
         info!(
@@ -1129,22 +1741,53 @@ fn align_reads_paired_end<W: AlignmentWriter>(
             sj_stats.len()
         );
 
-        let mut filtered_count = 0u64;
-        for batch in &bysj_buffer {
-            if !batch.primary_junction_keys.is_empty() {
-                let all_survive = batch
-                    .primary_junction_keys
-                    .iter()
-                    .all(|key| surviving_junctions.contains(key));
+        // Flush and close the temp writer before re-opening for reading
+        drop(bysj_temp_writer);
 
-                if !all_survive {
+        let mut filtered_count = 0u64;
+        if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
+            let read_file = tf
+                .reopen()
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+            let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
+            reader.read_header()?;
+
+            for meta in &bysj_meta {
+                let all_survive = meta.junction_keys.is_empty()
+                    || meta
+                        .junction_keys
+                        .iter()
+                        .all(|key| surviving_junctions.contains(key));
+
+                if all_survive {
+                    let records = crate::io::sam::bysj_read_n_records(
+                        &mut reader,
+                        hdr,
+                        meta.n_sam_records,
+                        true,
+                    )?;
+                    writer.write_batch(&records)?;
+                    if let Some(ref mut tw) = tr_writer {
+                        tw.write_batch(&meta.transcriptome_records)?;
+                    }
+                    if params.chim_out_within_bam() {
+                        use crate::chimeric::build_within_bam_records;
+                        for chim_aln in &meta.chimeric_alns {
+                            let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                            writer.write_batch(&supp)?;
+                        }
+                    }
+                } else {
+                    crate::io::sam::bysj_read_n_records(
+                        &mut reader,
+                        hdr,
+                        meta.n_sam_records,
+                        false,
+                    )?;
                     filtered_count += 1;
                     stats.undo_mapped_record_bysj();
-                    continue;
                 }
             }
-
-            writer.write_batch(&batch.sam_records.records)?;
         }
 
         info!(
@@ -1153,9 +1796,17 @@ fn align_reads_paired_end<W: AlignmentWriter>(
         );
     }
 
-    // Flush chimeric output if enabled (currently no chimeric alignments from paired-end)
+    // Flush chimeric output if enabled
     if let Some(ref mut chim_writer) = chimeric_writer {
         chim_writer.flush()?;
+    }
+
+    // Flush unmapped FASTQ writers
+    if let Some(ref mut uw1) = unmapped_writer1 {
+        uw1.flush()?;
+    }
+    if let Some(ref mut uw2) = unmapped_writer2 {
+        uw2.flush()?;
     }
 
     Ok(())

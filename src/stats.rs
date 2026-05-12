@@ -774,6 +774,7 @@ mod tests {
                 genome_end: 1204,
                 read_start: 0,
                 read_end: 110,
+                i_frag: 0,
             }],
             cigar: vec![
                 CigarOp::SoftClip(5),
@@ -844,6 +845,7 @@ mod tests {
                 genome_end: 2000,
                 read_start: 0,
                 read_end: 100,
+                i_frag: 0,
             }],
             cigar: vec![CigarOp::Match(100)],
             score: 100,

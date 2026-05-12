@@ -263,7 +263,7 @@ mod tests {
         let bin_nbits_str = bin_nbits.to_string();
         let sa_nbases_str = sa_nbases.to_string();
         let args = vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--runMode",
             "genomeGenerate",
             "--genomeFastaFiles",

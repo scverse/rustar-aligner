@@ -1,6 +1,6 @@
 # Testing Framework Quick Start
 
-Get started with the ruSTAR testing framework in 3 steps.
+Get started with the rustar-aligner testing framework in 3 steps.
 
 ## Step 1: Verify Setup
 
@@ -27,7 +27,7 @@ If any checks fail, follow the suggestions to fix prerequisites.
 
 **What happens:**
 1. Runs STAR on 100 yeast reads → `results/TIMESTAMP_yeast_100/star/`
-2. Runs ruSTAR on same reads → `results/TIMESTAMP_yeast_100/rustar/`
+2. Runs rustar-aligner on same reads → `results/TIMESTAMP_yeast_100/rustar/`
 3. Compares outputs → `results/TIMESTAMP_yeast_100/comparison/`
 4. Prints summary report
 
@@ -36,11 +36,11 @@ If any checks fail, follow the suggestions to fix prerequisites.
 [23:45:12] Running test: yeast_100
 [23:45:15] Running STAR...
 [23:45:18] STAR completed successfully
-[23:45:18] Running ruSTAR...
-[23:45:20] ruSTAR completed successfully
+[23:45:18] Running rustar-aligner...
+[23:45:20] rustar-aligner completed successfully
 [23:45:20] Comparing outputs...
 
-=== Statistics Comparison: ruSTAR vs STAR ===
+=== Statistics Comparison: rustar-aligner vs STAR ===
   Total reads                      100 vs      100  ✓
   Mapped reads                      91 vs       92  ⚠ (+1)
   Unique mapped                     82 vs       82  ✓
@@ -65,7 +65,7 @@ If the test passed and you're satisfied with the results:
 ./save_golden.sh yeast_100
 ```
 
-This saves the ruSTAR output as a golden reference for future regression testing.
+This saves the rustar-aligner output as a golden reference for future regression testing.
 
 **Files created:**
 - `golden/yeast_100/stats.json` — Alignment statistics
@@ -111,7 +111,7 @@ Faster! Runs independent tests concurrently.
 ```
 
 Quick validation for pre-commit or CI/CD:
-1. Build ruSTAR
+1. Build rustar-aligner
 2. Run unit tests
 3. Run yeast_100 integration test
 4. Compare against golden outputs
@@ -142,7 +142,7 @@ cat results/TIMESTAMP_yeast_1k/comparison/summary.txt
 ### 3. Debug with Logging
 
 ```bash
-RUST_LOG=debug ../target/release/ruSTAR \
+RUST_LOG=debug ../target/release/rustar-aligner \
   --runMode alignReads \
   --genomeDir data/small/yeast/indices \
   --readFilesIn debug/discrepant_reads.fq \
@@ -153,7 +153,7 @@ RUST_LOG=debug ../target/release/ruSTAR \
 ### 4. Compare STAR Source
 
 Check `STAR_REFERENCE.md` for:
-- ruSTAR → STAR module mapping
+- rustar-aligner → STAR module mapping
 - Algorithm descriptions
 - Known differences
 
@@ -186,7 +186,7 @@ rm -rf results/2026020*  # Delete old timestamps
 ```bash
 python compare_sam.py \
   --star star_output/Aligned.out.sam \
-  --rustar rustar_output/Aligned.out.sam \
+  --rustar-aligner rustar_aligner_output/Aligned.out.sam \
   --tolerance 0.01 \
   --verbose
 ```
@@ -262,7 +262,7 @@ export STAR_BIN=/path/to/STAR
 ### "Test data not found"
 Check that `test/data/small/yeast/` exists with reads and indices.
 
-### "ruSTAR binary not found"
+### "rustar-aligner binary not found"
 ```bash
 cd .. && cargo build --release
 ```

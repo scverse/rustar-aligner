@@ -53,18 +53,18 @@ log "Found test result: $LATEST_RESULT"
 GOLDEN_TEST_DIR="$GOLDEN_DIR/$TEST_NAME"
 mkdir -p "$GOLDEN_TEST_DIR"
 
-# Extract statistics from ruSTAR output
-RUSTAR_DIR="$LATEST_RESULT/rustar"
+# Extract statistics from rustar-aligner output
+RUSTAR_ALIGNER_DIR="$LATEST_RESULT/rustar-aligner"
 
-if [[ ! -d "$RUSTAR_DIR" ]]; then
-    error "ruSTAR output directory not found: $RUSTAR_DIR"
+if [[ ! -d "$RUSTAR_ALIGNER_DIR" ]]; then
+    error "rustar-aligner output directory not found: $RUSTAR_ALIGNER_DIR"
     exit 1
 fi
 
 log "Extracting statistics..."
 
 # Use Python to extract stats from SAM file
-python3 - <<'EOF' "$RUSTAR_DIR" "$GOLDEN_TEST_DIR"
+python3 - <<'EOF' "$RUSTAR_ALIGNER_DIR" "$GOLDEN_TEST_DIR"
 import sys
 import json
 import os
@@ -163,19 +163,19 @@ def extract_junction_stats(sj_file):
     }
 
 # Main
-rustar_dir = sys.argv[1]
+rustar_aligner_dir = sys.argv[1]
 golden_dir = sys.argv[2]
 
 # Find SAM or BAM file
 sam_file = None
 for filename in ["Aligned.out.sam", "Aligned.out.bam"]:
-    path = os.path.join(rustar_dir, filename)
+    path = os.path.join(rustar_aligner_dir, filename)
     if os.path.exists(path):
         sam_file = path
         break
 
 if not sam_file:
-    print(f"ERROR: No alignment file found in {rustar_dir}", file=sys.stderr)
+    print(f"ERROR: No alignment file found in {rustar_aligner_dir}", file=sys.stderr)
     sys.exit(1)
 
 # Extract stats
@@ -183,7 +183,7 @@ print(f"Extracting from: {sam_file}")
 stats = extract_sam_stats(sam_file)
 
 # Extract junction stats
-sj_file = os.path.join(rustar_dir, "SJ.out.tab")
+sj_file = os.path.join(rustar_aligner_dir, "SJ.out.tab")
 junction_stats = extract_junction_stats(sj_file)
 
 stats["junctions_detected"] = junction_stats["total_junctions"]
@@ -193,7 +193,7 @@ import datetime
 metadata = {
     "test_name": os.path.basename(golden_dir),
     "timestamp": datetime.datetime.now().isoformat(),
-    "source": rustar_dir,
+    "source": rustar_aligner_dir,
 }
 
 # Save to JSON

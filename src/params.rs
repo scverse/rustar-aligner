@@ -150,6 +150,59 @@ impl std::fmt::Display for OutSamType {
 }
 
 // ---------------------------------------------------------------------------
+// Standard output streaming
+// ---------------------------------------------------------------------------
+
+/// STAR's `--outStd` — route primary alignment output to stdout.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutStd {
+    #[default]
+    None,
+    Sam,
+    BamUnsorted,
+    BamSortedByCoordinate,
+}
+
+impl std::str::FromStr for OutStd {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "None" => Ok(Self::None),
+            "SAM" => Ok(Self::Sam),
+            "BAM_Unsorted" => Ok(Self::BamUnsorted),
+            "BAM_SortedByCoordinate" => Ok(Self::BamSortedByCoordinate),
+            _ => Err(format!(
+                "unknown outStd value: '{s}'; expected None, SAM, BAM_Unsorted, or BAM_SortedByCoordinate"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unmapped reads FASTQ output
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutReadsUnmapped {
+    #[default]
+    None,
+    Fastx,
+}
+
+impl std::str::FromStr for OutReadsUnmapped {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "None" => Ok(Self::None),
+            "Fastx" => Ok(Self::Fastx),
+            _ => Err(format!(
+                "unknown outReadsUnmapped value: '{s}'; expected 'None' or 'Fastx'"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SAM unmapped output
 // ---------------------------------------------------------------------------
 
@@ -221,13 +274,13 @@ impl std::str::FromStr for TwopassMode {
 // Parameters struct
 // ---------------------------------------------------------------------------
 
-/// ruSTAR command-line parameters, matching STAR's `--camelCase` argument names.
+/// rustar-aligner command-line parameters, matching STAR's `--camelCase` argument names.
 ///
 /// Only the ~40 most important parameters are included; more will be added
 /// incrementally as later phases need them.
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "ruSTAR",
+    name = "rustar-aligner",
     about = "RNA-seq aligner (Rust reimplementation of STAR)",
     version,
     long_version = concat!(env!("CARGO_PKG_VERSION"), "\n", env!("VERSION_BODY")),
@@ -298,6 +351,23 @@ pub struct Parameters {
     #[arg(long = "outSAMtype", num_args = 1..=2, default_values_t = vec!["SAM".to_string()])]
     pub out_sam_type_raw: Vec<String>,
 
+    /// BAM compression level: -1 = uncompressed, 1 (default) to 9 (maximum)
+    #[arg(
+        long = "outBAMcompression",
+        default_value_t = 1,
+        allow_hyphen_values = true
+    )]
+    pub out_bam_compression: i32,
+
+    /// Maximum RAM (bytes) for coordinate-sorted BAM. 0 = unlimited.
+    #[arg(long = "limitBAMsortRAM", default_value_t = 0)]
+    pub limit_bam_sort_ram: u64,
+
+    /// Route primary alignment output to stdout instead of a file.
+    /// Values: None (default), SAM, BAM_Unsorted, BAM_SortedByCoordinate.
+    #[arg(long = "outStd", default_value = "None")]
+    pub out_std: OutStd,
+
     /// Strand field: None or intronMotif
     #[arg(long = "outSAMstrandField", default_value = "None")]
     pub out_sam_strand_field: String,
@@ -315,6 +385,10 @@ pub struct Parameters {
     /// Unmapped reads in SAM output: None or Within
     #[arg(long = "outSAMunmapped", default_value = "None")]
     pub out_sam_unmapped: OutSamUnmapped,
+
+    /// Output unmapped reads to FASTQ file(s): None or Fastx
+    #[arg(long = "outReadsUnmapped", default_value = "None")]
+    pub out_reads_unmapped: OutReadsUnmapped,
 
     /// MAPQ value for unique mappers
     #[arg(long = "outSAMmapqUnique", default_value_t = 255)]
@@ -533,6 +607,25 @@ pub struct Parameters {
     #[arg(long = "sjdbGTFfile")]
     pub sjdb_gtf_file: Option<PathBuf>,
 
+    /// Prefix to add to chromosome names from GTF file (e.g. "chr" when GTF uses bare numbers)
+    #[arg(long = "sjdbGTFchrPrefix", default_value = "")]
+    pub sjdb_gtf_chr_prefix: String,
+
+    /// Feature type in GTF file to be used as exons for transcript annotation
+    #[arg(long = "sjdbGTFfeatureExon", default_value = "exon")]
+    pub sjdb_gtf_feature_exon: String,
+
+    /// GTF attribute name for parent transcript ID of exon features
+    #[arg(
+        long = "sjdbGTFtagExonParentTranscript",
+        default_value = "transcript_id"
+    )]
+    pub sjdb_gtf_tag_exon_parent_transcript: String,
+
+    /// GTF attribute name for parent gene ID of exon features
+    #[arg(long = "sjdbGTFtagExonParentGene", default_value = "gene_id")]
+    pub sjdb_gtf_tag_exon_parent_gene: String,
+
     /// Overhang length for splice junction database
     #[arg(long = "sjdbOverhang", default_value_t = 100)]
     pub sjdb_overhang: u32,
@@ -546,6 +639,16 @@ pub struct Parameters {
     /// Space-separated, e.g. `--quantMode GeneCounts`.
     #[arg(long = "quantMode", num_args = 0..)]
     pub quant_mode: Vec<String>,
+
+    /// Output format variants for `--quantMode TranscriptomeSAM`:
+    ///   * `BanSingleEnd_BanIndels_ExtendSoftclip` (default, RSEM-compatible)
+    ///   * `BanSingleEnd` — keep indels and soft-clips
+    ///   * `BanSingleEnd_ExtendSoftclip` — keep indels, extend soft-clips
+    #[arg(
+        long = "quantTranscriptomeSAMoutput",
+        default_value = "BanSingleEnd_BanIndels_ExtendSoftclip"
+    )]
+    pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
 
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
@@ -570,6 +673,30 @@ pub struct Parameters {
     /// Min total chimeric score
     #[arg(long = "chimScoreMin", default_value_t = 0)]
     pub chim_score_min: i32,
+
+    /// Max drop in chimeric score vs read length (chimericDetectionOld)
+    #[arg(long = "chimScoreDropMax", default_value_t = 20)]
+    pub chim_score_drop_max: i32,
+
+    /// Min score separation for unique chimeric alignment
+    #[arg(long = "chimScoreSeparation", default_value_t = 10)]
+    pub chim_score_separation: i32,
+
+    /// Max multimapping of main chimeric segment
+    #[arg(long = "chimMainSegmentMultNmax", default_value_t = 10)]
+    pub chim_main_segment_mult_nmax: u32,
+
+    /// Max read gap between chimeric segments
+    #[arg(long = "chimSegmentReadGapMax", default_value_t = 0)]
+    pub chim_segment_read_gap_max: u32,
+
+    /// Min overhang at chimeric junction
+    #[arg(long = "chimJunctionOverhangMin", default_value_t = 20)]
+    pub chim_junction_overhang_min: u32,
+
+    /// Score penalty for non-GT/AG chimeric junction
+    #[arg(long = "chimScoreJunctionNonGTAG", default_value_t = -1, allow_hyphen_values = true)]
+    pub chim_score_junction_non_gtag: i32,
 
     /// Chimeric output type
     #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
@@ -604,6 +731,16 @@ impl Parameters {
             }),
             other => Err(format!("unknown outSAMtype: {:?}", other)),
         }
+    }
+
+    /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
+    pub fn chim_out_junctions(&self) -> bool {
+        self.chim_out_type.iter().any(|s| s == "Junctions")
+    }
+
+    /// Whether `--chimOutType` includes `WithinBAM` (write supplementary BAM records).
+    pub fn chim_out_within_bam(&self) -> bool {
+        self.chim_out_type.iter().any(|s| s == "WithinBAM")
     }
 
     /// Expand `--outSAMattributes` into a set of individual tag names.
@@ -816,12 +953,32 @@ impl Parameters {
         }
         self.rg_ids()?;
 
+        // quantMode TranscriptomeSAM requires transcript annotations —
+        // either via --sjdbGTFfile or pre-generated transcriptInfo.tab
+        // et al in --genomeDir (persisted at genomeGenerate time). At
+        // validation time we can only enforce the genomeGenerate rule;
+        // for alignReads, GenomeIndex::load checks for the on-disk files
+        // and surfaces a clear error if neither source is available.
+        if self.run_mode == RunMode::GenomeGenerate
+            && self.quant_transcriptome_sam()
+            && self.sjdb_gtf_file.is_none()
+        {
+            return Err(crate::error::Error::Parameter(
+                "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate".into(),
+            ));
+        }
+
         Ok(())
     }
 
     /// Returns true if `--quantMode GeneCounts` was requested.
     pub fn quant_gene_counts(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "GeneCounts")
+    }
+
+    /// Returns true if `--quantMode TranscriptomeSAM` was requested.
+    pub fn quant_transcriptome_sam(&self) -> bool {
+        self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
     }
 }
 
@@ -835,7 +992,7 @@ mod tests {
 
     /// Helper: parse a STAR-style command line (without program name).
     fn parse(args: &[&str]) -> Parameters {
-        let mut full = vec!["ruSTAR"];
+        let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::parse_from(full)
     }
@@ -1082,6 +1239,45 @@ mod tests {
     }
 
     #[test]
+    fn chimeric_params_extended() {
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--chimSegmentMin",
+            "20",
+            "--chimScoreDropMax",
+            "30",
+            "--chimScoreSeparation",
+            "15",
+            "--chimMainSegmentMultNmax",
+            "5",
+            "--chimSegmentReadGapMax",
+            "3",
+            "--chimJunctionOverhangMin",
+            "12",
+            "--chimScoreJunctionNonGTAG",
+            "-2",
+        ]);
+        assert_eq!(p.chim_score_drop_max, 30);
+        assert_eq!(p.chim_score_separation, 15);
+        assert_eq!(p.chim_main_segment_mult_nmax, 5);
+        assert_eq!(p.chim_segment_read_gap_max, 3);
+        assert_eq!(p.chim_junction_overhang_min, 12);
+        assert_eq!(p.chim_score_junction_non_gtag, -2);
+    }
+
+    #[test]
+    fn chimeric_params_defaults() {
+        let p = parse(&["--readFilesIn", "r.fq"]);
+        assert_eq!(p.chim_score_drop_max, 20);
+        assert_eq!(p.chim_score_separation, 10);
+        assert_eq!(p.chim_main_segment_mult_nmax, 10);
+        assert_eq!(p.chim_segment_read_gap_max, 0);
+        assert_eq!(p.chim_junction_overhang_min, 20);
+        assert_eq!(p.chim_score_junction_non_gtag, -1);
+    }
+
+    #[test]
     fn win_bin_window_dist_default() {
         let p = parse(&["--readFilesIn", "r.fq"]);
         assert_eq!(p.win_bin_window_dist(), 589_824); // 2^16 * 9
@@ -1192,10 +1388,91 @@ mod tests {
         let err = p.validate().unwrap_err();
         assert!(err.to_string().contains("RG"));
     }
-    
+
     fn run_rng_seed_override() {
         let p = parse(&["--readFilesIn", "r.fq", "--runRNGseed", "42"]);
         assert_eq!(p.run_rng_seed, 42);
+    }
+
+    #[test]
+    fn quant_transcriptome_sam_default() {
+        use crate::quant::transcriptome::QuantTranscriptomeSAMoutput;
+        let p = parse(&["--readFilesIn", "r.fq"]);
+        assert!(!p.quant_transcriptome_sam());
+        assert_eq!(
+            p.quant_transcriptome_sam_output,
+            QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip
+        );
+    }
+
+    #[test]
+    fn quant_transcriptome_sam_enabled() {
+        let p = parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]);
+        assert!(p.quant_transcriptome_sam());
+        assert!(!p.quant_gene_counts());
+    }
+
+    #[test]
+    fn quant_transcriptome_sam_output_override() {
+        use crate::quant::transcriptome::QuantTranscriptomeSAMoutput;
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantTranscriptomeSAMoutput",
+            "BanSingleEnd",
+        ]);
+        assert_eq!(
+            p.quant_transcriptome_sam_output,
+            QuantTranscriptomeSAMoutput::BanSingleEnd
+        );
+
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantTranscriptomeSAMoutput",
+            "BanSingleEnd_ExtendSoftclip",
+        ]);
+        assert_eq!(
+            p.quant_transcriptome_sam_output,
+            QuantTranscriptomeSAMoutput::BanSingleEndExtendSoftclip
+        );
+    }
+
+    #[test]
+    fn validate_transcriptome_sam_at_genome_generate_needs_gtf() {
+        let p = parse(&[
+            "--runMode",
+            "genomeGenerate",
+            "--genomeFastaFiles",
+            "g.fa",
+            "--quantMode",
+            "TranscriptomeSAM",
+        ]);
+        let err = p.validate().unwrap_err();
+        assert!(err.to_string().contains("TranscriptomeSAM"));
+        assert!(err.to_string().contains("sjdbGTFfile"));
+    }
+
+    #[test]
+    fn validate_transcriptome_sam_at_align_reads_tolerates_no_gtf() {
+        // alignReads: if --sjdbGTFfile is absent, the check is deferred to
+        // GenomeIndex::load which will either find transcriptInfo.tab in
+        // --genomeDir or surface a clear error at load time.
+        let p = parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]);
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_transcriptome_sam_with_gtf_ok() {
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--sjdbGTFfile",
+            "genes.gtf",
+        ]);
+        assert!(p.validate().is_ok());
     }
 
     #[test]

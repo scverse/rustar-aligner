@@ -125,14 +125,14 @@ pub fn check_cpu_compat() -> Result<()> {
     #[cfg(target_arch = "x86_64")]
     match binary_target() {
         "x86-64-v4" if !is_x86_feature_detected!("avx512f") => bail!(
-            "This ruSTAR binary was compiled for x86-64-v4 (AVX-512) but your CPU \
+            "This rustar-aligner binary was compiled for x86-64-v4 (AVX-512) but your CPU \
              does not support AVX-512.\nPlease use the x86-64-v3 or baseline build instead.\n\
-             See: https://github.com/Psy-Fer/ruSTAR#installation"
+             See: https://github.com/Psy-Fer/rustar-aligner#installation"
         ),
         "x86-64-v3" if !is_x86_feature_detected!("avx2") => bail!(
-            "This ruSTAR binary was compiled for x86-64-v3 (AVX2) but your CPU \
+            "This rustar-aligner binary was compiled for x86-64-v3 (AVX2) but your CPU \
              does not support AVX2.\nPlease use the baseline build instead.\n\
-             See: https://github.com/Psy-Fer/ruSTAR#installation"
+             See: https://github.com/Psy-Fer/rustar-aligner#installation"
         ),
         _ => {}
     }
@@ -140,9 +140,9 @@ pub fn check_cpu_compat() -> Result<()> {
     #[cfg(target_arch = "aarch64")]
     if binary_target() == "aarch64-neoverse-v1" && !std::arch::is_aarch64_feature_detected!("sve") {
         bail!(
-            "This ruSTAR binary was compiled for aarch64-neoverse-v1 (SVE) but your CPU \
+            "This rustar-aligner binary was compiled for aarch64-neoverse-v1 (SVE) but your CPU \
              does not support SVE.\nPlease use the baseline aarch64 build instead.\n\
-             See: https://github.com/Psy-Fer/ruSTAR#installation"
+             See: https://github.com/Psy-Fer/rustar-aligner#installation"
         );
     }
 

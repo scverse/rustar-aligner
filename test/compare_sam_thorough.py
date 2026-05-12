@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Thorough comparison of ruSTAR vs STAR SAM output.
+Thorough comparison of rustar-aligner vs STAR SAM output.
 
 Usage:
-    python3 compare_sam_thorough.py <rustar_dir> <star_dir>
+    python3 compare_sam_thorough.py <rustar_aligner_dir> <star_dir>
 
 Both directories should contain Aligned.out.sam and SJ.out.tab.
 """
@@ -111,38 +111,38 @@ def parse_sj(path):
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <rustar_dir> <star_dir>")
+        print(f"Usage: {sys.argv[0]} <rustar_aligner_dir> <star_dir>")
         sys.exit(1)
 
-    rustar_dir = sys.argv[1]
+    rustar_aligner_dir = sys.argv[1]
     star_dir = sys.argv[2]
 
-    rustar_sam = os.path.join(rustar_dir, "Aligned.out.sam")
+    rustar_aligner_sam = os.path.join(rustar_aligner_dir, "Aligned.out.sam")
     star_sam = os.path.join(star_dir, "Aligned.out.sam")
-    rustar_sj_path = os.path.join(rustar_dir, "SJ.out.tab")
+    rustar_aligner_sj_path = os.path.join(rustar_aligner_dir, "SJ.out.tab")
     star_sj_path = os.path.join(star_dir, "SJ.out.tab")
 
-    for f in [rustar_sam, star_sam]:
+    for f in [rustar_aligner_sam, star_sam]:
         if not os.path.exists(f):
             print(f"ERROR: File not found: {f}")
             sys.exit(1)
 
-    has_sj = os.path.exists(rustar_sj_path) and os.path.exists(star_sj_path)
+    has_sj = os.path.exists(rustar_aligner_sj_path) and os.path.exists(star_sj_path)
 
     # ============================================================
     # PARSE FILES
     # ============================================================
     print("=" * 80)
-    print("COMPREHENSIVE COMPARISON: ruSTAR vs STAR")
+    print("COMPREHENSIVE COMPARISON: rustar-aligner vs STAR")
     print("=" * 80)
-    print(f"\nruSTAR dir: {rustar_dir}")
+    print(f"\nrustar-aligner dir: {rustar_aligner_dir}")
     print(f"STAR dir:   {star_dir}")
 
     print("\nParsing SAM files...")
-    rustar_reads, rustar_headers = parse_sam(rustar_sam)
+    rustar_aligner_reads, rustar_aligner_headers = parse_sam(rustar_aligner_sam)
     star_reads, star_headers = parse_sam(star_sam)
 
-    print(f"  ruSTAR: {len(rustar_reads)} unique read names, {rustar_headers} header lines")
+    print(f"  rustar-aligner: {len(rustar_aligner_reads)} unique read names, {rustar_aligner_headers} header lines")
     print(f"  STAR:   {len(star_reads)} unique read names, {star_headers} header lines")
 
     # ============================================================
@@ -152,27 +152,27 @@ def main():
     print("1. MAPPING STATS COMPARISON")
     print("=" * 80)
 
-    rustar_class = Counter()
+    rustar_aligner_class = Counter()
     star_class = Counter()
 
-    for qname, records in rustar_reads.items():
-        rustar_class[classify_read(records)] += 1
+    for qname, records in rustar_aligner_reads.items():
+        rustar_aligner_class[classify_read(records)] += 1
 
     for qname, records in star_reads.items():
         star_class[classify_read(records)] += 1
 
-    rustar_total = sum(rustar_class.values())
+    rustar_aligner_total = sum(rustar_aligner_class.values())
     star_total = sum(star_class.values())
 
-    print(f"\n{'Category':<15} {'ruSTAR':>10} {'%':>8} {'STAR':>10} {'%':>8} {'Diff':>8}")
+    print(f"\n{'Category':<15} {'rustar-aligner':>10} {'%':>8} {'STAR':>10} {'%':>8} {'Diff':>8}")
     print("-" * 65)
     for cat in ["unique", "multi", "unmapped"]:
-        rc = rustar_class[cat]
+        rc = rustar_aligner_class[cat]
         sc = star_class[cat]
-        rp = 100.0 * rc / rustar_total if rustar_total else 0
+        rp = 100.0 * rc / rustar_aligner_total if rustar_aligner_total else 0
         sp = 100.0 * sc / star_total if star_total else 0
         print(f"{cat:<15} {rc:>10} {rp:>7.1f}% {sc:>10} {sp:>7.1f}% {rc - sc:>+8}")
-    print(f"{'TOTAL':<15} {rustar_total:>10} {'':>8} {star_total:>10}")
+    print(f"{'TOTAL':<15} {rustar_aligner_total:>10} {'':>8} {star_total:>10}")
 
     # ============================================================
     # 2. PER-READ AGREEMENT
@@ -181,13 +181,13 @@ def main():
     print("2. PER-READ AGREEMENT")
     print("=" * 80)
 
-    all_reads = set(rustar_reads.keys()) | set(star_reads.keys())
+    all_reads = set(rustar_aligner_reads.keys()) | set(star_reads.keys())
 
     both_mapped_agree_pos = 0
     both_mapped_agree_exact = 0
     both_mapped_disagree_pos = 0
     star_only_mapped = 0
-    rustar_only_mapped = 0
+    rustar_aligner_only_mapped = 0
     both_unmapped = 0
     both_mapped_agree_strand = 0
     both_mapped_agree_cigar = 0
@@ -208,7 +208,7 @@ def main():
     disagree_same_chr_far_examples = []       # 51+bp
 
     for qname in sorted(all_reads):
-        r_records = rustar_reads.get(qname, [])
+        r_records = rustar_aligner_reads.get(qname, [])
         s_records = star_reads.get(qname, [])
 
         r_class = classify_read(r_records) if r_records else "missing"
@@ -241,12 +241,12 @@ def main():
                     # Build example record
                     ex = {
                         "qname": qname,
-                        "rustar_chr": r_pri["rname"],
-                        "rustar_pos": r_pri["pos"],
-                        "rustar_strand": "-" if (r_pri["flag"] & 16) else "+",
-                        "rustar_cigar": r_pri["cigar"],
-                        "rustar_mapq": r_pri["mapq"],
-                        "rustar_class": classify_read(r_records),
+                        "rustar_aligner_chr": r_pri["rname"],
+                        "rustar_aligner_pos": r_pri["pos"],
+                        "rustar_aligner_strand": "-" if (r_pri["flag"] & 16) else "+",
+                        "rustar_aligner_cigar": r_pri["cigar"],
+                        "rustar_aligner_mapq": r_pri["mapq"],
+                        "rustar_aligner_class": classify_read(r_records),
                         "star_chr": s_pri["rname"],
                         "star_pos": s_pri["pos"],
                         "star_strand": "-" if (s_pri["flag"] & 16) else "+",
@@ -290,7 +290,7 @@ def main():
                 both_mapped_disagree_pos += 1
                 disagree_diff_chr += 1  # Can't compare, count as different
         elif r_mapped and not s_mapped:
-            rustar_only_mapped += 1
+            rustar_aligner_only_mapped += 1
         elif not r_mapped and s_mapped:
             star_only_mapped += 1
         else:
@@ -306,7 +306,7 @@ def main():
     print(f"{'  ...of which agree ALL (chr+pos+strand+cigar)':<48} {both_mapped_agree_exact:>8} {100.0 * both_mapped_agree_exact / max(both_mapped_agree_pos, 1):>7.1f}%")
     print(f"{'Both mapped, DISAGREE position':<48} {both_mapped_disagree_pos:>8} {100.0 * both_mapped_disagree_pos / len(all_reads):>7.1f}%")
     print(f"{'STAR only mapped':<48} {star_only_mapped:>8} {100.0 * star_only_mapped / len(all_reads):>7.1f}%")
-    print(f"{'ruSTAR only mapped':<48} {rustar_only_mapped:>8} {100.0 * rustar_only_mapped / len(all_reads):>7.1f}%")
+    print(f"{'rustar-aligner only mapped':<48} {rustar_aligner_only_mapped:>8} {100.0 * rustar_aligner_only_mapped / len(all_reads):>7.1f}%")
     print(f"{'Both unmapped':<48} {both_unmapped:>8} {100.0 * both_unmapped / len(all_reads):>7.1f}%")
     print("-" * 68)
     print(f"{'Total reads':<48} {len(all_reads):>8}")
@@ -336,11 +336,11 @@ def main():
     # MAPQ breakdown for different-chromosome disagreements
     if disagree_diff_chr_examples:
         diff_chr_both_unique = sum(1 for ex in disagree_diff_chr_examples
-                                   if ex["rustar_mapq"] == 255 and ex["star_mapq"] == 255)
+                                   if ex["rustar_aligner_mapq"] == 255 and ex["star_mapq"] == 255)
         # Count across ALL diff-chr, not just examples
         mapq_counter = Counter()
         for qname in sorted(all_reads):
-            r_records = rustar_reads.get(qname, [])
+            r_records = rustar_aligner_reads.get(qname, [])
             s_records = star_reads.get(qname, [])
             r_class = classify_read(r_records) if r_records else "missing"
             s_class = classify_read(s_records) if s_records else "missing"
@@ -350,17 +350,17 @@ def main():
                 if r_pri and s_pri and r_pri["rname"] != s_pri["rname"]:
                     r_mapq_cat = "unique" if r_pri["mapq"] == 255 else "multi"
                     s_mapq_cat = "unique" if s_pri["mapq"] == 255 else "multi"
-                    mapq_counter[f"ruSTAR={r_mapq_cat}, STAR={s_mapq_cat}"] += 1
+                    mapq_counter[f"rustar-aligner={r_mapq_cat}, STAR={s_mapq_cat}"] += 1
 
         print(f"\nDifferent-chromosome MAPQ breakdown ({disagree_diff_chr} reads):")
         for key, count in mapq_counter.most_common():
             print(f"  {key:<40} {count:>6} ({100.0 * count / max(disagree_diff_chr, 1):.1f}%)")
 
         # Are these reads that have multiple equally-good alignment loci?
-        # Check if the ruSTAR-chosen locus appears in STAR's multi-alignments or vice versa
+        # Check if the rustar-aligner-chosen locus appears in STAR's multi-alignments or vice versa
         print(f"\nDifferent-chromosome examples (first 10):")
         for ex in disagree_diff_chr_examples[:10]:
-            print(f"  {ex['qname'][:30]:<32} ruSTAR={ex['rustar_chr']}:{ex['rustar_pos']}({ex['rustar_strand']}) MAPQ={ex['rustar_mapq']} CIGAR={ex['rustar_cigar']}")
+            print(f"  {ex['qname'][:30]:<32} rustar-aligner={ex['rustar_aligner_chr']}:{ex['rustar_aligner_pos']}({ex['rustar_aligner_strand']}) MAPQ={ex['rustar_aligner_mapq']} CIGAR={ex['rustar_aligner_cigar']}")
             print(f"  {'':>32} STAR  ={ex['star_chr']}:{ex['star_pos']}({ex['star_strand']}) MAPQ={ex['star_mapq']} CIGAR={ex['star_cigar']}")
 
     # Same-chr close disagreement examples
@@ -368,7 +368,7 @@ def main():
         print(f"\nSame-chr close disagreement examples (6-50bp, first 10):")
         for ex in disagree_same_chr_close_examples[:10]:
             print(f"  {ex['qname'][:30]:<32} diff={ex['pos_diff']}bp")
-            print(f"  {'':>32} ruSTAR={ex['rustar_chr']}:{ex['rustar_pos']}({ex['rustar_strand']}) CIGAR={ex['rustar_cigar']}")
+            print(f"  {'':>32} rustar-aligner={ex['rustar_aligner_chr']}:{ex['rustar_aligner_pos']}({ex['rustar_aligner_strand']}) CIGAR={ex['rustar_aligner_cigar']}")
             print(f"  {'':>32} STAR  ={ex['star_chr']}:{ex['star_pos']}({ex['star_strand']}) CIGAR={ex['star_cigar']}")
 
     # Same-chr far disagreement examples
@@ -376,7 +376,7 @@ def main():
         print(f"\nSame-chr far disagreement examples (51+bp, first 10):")
         for ex in disagree_same_chr_far_examples[:10]:
             print(f"  {ex['qname'][:30]:<32} diff={ex['pos_diff']}bp")
-            print(f"  {'':>32} ruSTAR={ex['rustar_chr']}:{ex['rustar_pos']}({ex['rustar_strand']}) CIGAR={ex['rustar_cigar']}")
+            print(f"  {'':>32} rustar-aligner={ex['rustar_aligner_chr']}:{ex['rustar_aligner_pos']}({ex['rustar_aligner_strand']}) CIGAR={ex['rustar_aligner_cigar']}")
             print(f"  {'':>32} STAR  ={ex['star_chr']}:{ex['star_pos']}({ex['star_strand']}) CIGAR={ex['star_cigar']}")
 
     if total_both_mapped > 0:
@@ -391,23 +391,23 @@ def main():
         print("3. JUNCTION COMPARISON (SJ.out.tab)")
         print("=" * 80)
 
-        rustar_sj = parse_sj(rustar_sj_path)
+        rustar_aligner_sj = parse_sj(rustar_aligner_sj_path)
         star_sj = parse_sj(star_sj_path)
 
-        rustar_keys = set(rustar_sj.keys())
+        rustar_aligner_keys = set(rustar_aligner_sj.keys())
         star_keys = set(star_sj.keys())
 
-        shared = rustar_keys & star_keys
-        rustar_only_sj = rustar_keys - star_keys
-        star_only_sj = star_keys - rustar_keys
+        shared = rustar_aligner_keys & star_keys
+        rustar_aligner_only_sj = rustar_aligner_keys - star_keys
+        star_only_sj = star_keys - rustar_aligner_keys
 
         print(f"\n{'Category':<30} {'Count':>8}")
         print("-" * 40)
         print(f"{'Shared junctions':<30} {len(shared):>8}")
         print(f"{'STAR-only junctions':<30} {len(star_only_sj):>8}")
-        print(f"{'ruSTAR-only junctions':<30} {len(rustar_only_sj):>8}")
+        print(f"{'rustar-aligner-only junctions':<30} {len(rustar_aligner_only_sj):>8}")
         print(f"{'Total STAR junctions':<30} {len(star_keys):>8}")
-        print(f"{'Total ruSTAR junctions':<30} {len(rustar_keys):>8}")
+        print(f"{'Total rustar-aligner junctions':<30} {len(rustar_aligner_keys):>8}")
 
         # Motif comparison for shared junctions
         motif_names = {0: "non-canonical", 1: "GT/AG", 2: "CT/AC", 3: "GC/AG", 4: "CT/GC", 5: "AT/AC", 6: "GT/AT"}
@@ -416,7 +416,7 @@ def main():
         motif_disagree_examples = []
 
         for key in shared:
-            r_motif = rustar_sj[key]["motif"]
+            r_motif = rustar_aligner_sj[key]["motif"]
             s_motif = star_sj[key]["motif"]
             if r_motif == s_motif:
                 motif_agree += 1
@@ -430,7 +430,7 @@ def main():
             if motif_disagree_examples:
                 print("\nMotif disagreements (first 5):")
                 for key, rm, sm in motif_disagree_examples:
-                    print(f"  {key[0]}:{key[1]}-{key[2]}  ruSTAR={motif_names.get(rm, str(rm))}  STAR={motif_names.get(sm, str(sm))}")
+                    print(f"  {key[0]}:{key[1]}-{key[2]}  rustar-aligner={motif_names.get(rm, str(rm))}  STAR={motif_names.get(sm, str(sm))}")
 
         # Coverage comparison for shared junctions
         if shared:
@@ -439,7 +439,7 @@ def main():
             print("  " + "-" * 78)
             shared_sorted = sorted(shared, key=lambda k: star_sj[k]["uniq_count"], reverse=True)
             for key in shared_sorted[:20]:
-                r = rustar_sj[key]
+                r = rustar_aligner_sj[key]
                 s = star_sj[key]
                 jstr = f"{key[0]}:{key[1]}-{key[2]}"
                 print(f"  {jstr:<30} {r['uniq_count']:>11} {s['uniq_count']:>11} {r['multi_count']:>12} {s['multi_count']:>11}")
@@ -453,21 +453,21 @@ def main():
                 jstr = f"{key[0]}:{key[1]}-{key[2]}"
                 print(f"  {jstr:<30} motif={motif_names.get(s['motif'], str(s['motif'])):<15} uniq={s['uniq_count']:<5} multi={s['multi_count']:<5} annot={s['annotated']}")
 
-        # Show ruSTAR-only junctions (first 20 by count)
-        if rustar_only_sj:
-            print(f"\nruSTAR-only junctions (top 20 of {len(rustar_only_sj)} by unique count):")
-            rustar_only_sorted = sorted(rustar_only_sj, key=lambda k: rustar_sj[k]["uniq_count"], reverse=True)
-            for key in rustar_only_sorted[:20]:
-                r = rustar_sj[key]
+        # Show rustar-aligner-only junctions (first 20 by count)
+        if rustar_aligner_only_sj:
+            print(f"\nrustar-aligner-only junctions (top 20 of {len(rustar_aligner_only_sj)} by unique count):")
+            rustar_aligner_only_sorted = sorted(rustar_aligner_only_sj, key=lambda k: rustar_aligner_sj[k]["uniq_count"], reverse=True)
+            for key in rustar_aligner_only_sorted[:20]:
+                r = rustar_aligner_sj[key]
                 jstr = f"{key[0]}:{key[1]}-{key[2]}"
                 print(f"  {jstr:<30} motif={motif_names.get(r['motif'], str(r['motif'])):<15} uniq={r['uniq_count']:<5} multi={r['multi_count']:<5} annot={r['annotated']}")
 
-        # Summarize ruSTAR-only by motif
-        if rustar_only_sj:
+        # Summarize rustar-aligner-only by motif
+        if rustar_aligner_only_sj:
             motif_counter = Counter()
-            for key in rustar_only_sj:
-                motif_counter[rustar_sj[key]["motif"]] += 1
-            print(f"\nruSTAR-only junctions by motif:")
+            for key in rustar_aligner_only_sj:
+                motif_counter[rustar_aligner_sj[key]["motif"]] += 1
+            print(f"\nrustar-aligner-only junctions by motif:")
             for motif_id, count in motif_counter.most_common():
                 print(f"  {motif_names.get(motif_id, f'unknown({motif_id})'):<20} {count:>5}")
     else:
@@ -480,7 +480,7 @@ def main():
     print("4. CIGAR PATTERN DISTRIBUTION")
     print("=" * 80)
 
-    for label, reads in [("ruSTAR", rustar_reads), ("STAR", star_reads)]:
+    for label, reads in [("rustar-aligner", rustar_aligner_reads), ("STAR", star_reads)]:
         cats = Counter()
         total_mapped = 0
         for qname, records in reads.items():
@@ -511,13 +511,13 @@ def main():
     else:
         for i, ex in enumerate(disagree_examples[:10]):
             print(f"\n--- Read {i+1}: {ex['qname']} ---")
-            print(f"  ruSTAR: {ex['rustar_chr']}:{ex['rustar_pos']} ({ex['rustar_strand']}) MAPQ={ex['rustar_mapq']} CIGAR={ex['rustar_cigar']}")
+            print(f"  rustar-aligner: {ex['rustar_aligner_chr']}:{ex['rustar_aligner_pos']} ({ex['rustar_aligner_strand']}) MAPQ={ex['rustar_aligner_mapq']} CIGAR={ex['rustar_aligner_cigar']}")
             print(f"  STAR:   {ex['star_chr']}:{ex['star_pos']} ({ex['star_strand']}) MAPQ={ex['star_mapq']} CIGAR={ex['star_cigar']}")
 
-            if ex['rustar_chr'] != ex['star_chr']:
+            if ex['rustar_aligner_chr'] != ex['star_chr']:
                 print(f"  >> Different chromosome!")
             else:
-                diff = abs(ex['rustar_pos'] - ex['star_pos'])
+                diff = abs(ex['rustar_aligner_pos'] - ex['star_pos'])
                 print(f"  >> Same chr, position difference: {diff}bp")
 
     # ============================================================
@@ -529,11 +529,11 @@ def main():
 
     mapq_agree = 0
     mapq_disagree = 0
-    mapq_inflation = 0  # ruSTAR=255, STAR<255
-    mapq_deflation = 0  # ruSTAR<255, STAR=255
+    mapq_inflation = 0  # rustar-aligner=255, STAR<255
+    mapq_deflation = 0  # rustar-aligner<255, STAR=255
 
     for qname in sorted(all_reads):
-        r_records = rustar_reads.get(qname, [])
+        r_records = rustar_aligner_reads.get(qname, [])
         s_records = star_reads.get(qname, [])
         r_class = classify_read(r_records) if r_records else "missing"
         s_class = classify_read(s_records) if s_records else "missing"
@@ -572,7 +572,7 @@ def main():
     # both with MAPQ < 255 (multi-mappers where primary locus is a tie-break)
     diff_chr_multimap_ties = 0
     for qname in sorted(all_reads):
-        r_records = rustar_reads.get(qname, [])
+        r_records = rustar_aligner_reads.get(qname, [])
         s_records = star_reads.get(qname, [])
         r_class = classify_read(r_records) if r_records else "missing"
         s_class = classify_read(s_records) if s_records else "missing"
@@ -593,7 +593,7 @@ def main():
     print(f"\nDiff-chr multi-mapper ties:    {diff_chr_multimap_ties}  (unavoidable tie-breaking)")
     if adjusted_total > 0:
         print(f"Adjusted position agreement:   {adjusted_agree}/{adjusted_total} ({100.0*adjusted_agree/adjusted_total:.1f}%)")
-    print(f"Actionable disagreements:      {actionable_same_chr} same-chr + {actionable_diff_chr} diff-chr-unique + {star_only_mapped} STAR-only + {rustar_only_mapped} ruSTAR-only = {actionable_same_chr + actionable_diff_chr + star_only_mapped + rustar_only_mapped}")
+    print(f"Actionable disagreements:      {actionable_same_chr} same-chr + {actionable_diff_chr} diff-chr-unique + {star_only_mapped} STAR-only + {rustar_aligner_only_mapped} rustar-aligner-only = {actionable_same_chr + actionable_diff_chr + star_only_mapped + rustar_aligner_only_mapped}")
 
     # ============================================================
     # SUMMARY
@@ -608,13 +608,13 @@ Total reads:               {total}
 Both mapped, agree:        {both_mapped_agree_pos} ({100.0*both_mapped_agree_pos/total:.1f}%)
 Both mapped, disagree:     {both_mapped_disagree_pos} ({100.0*both_mapped_disagree_pos/total:.1f}%)
 STAR only mapped:          {star_only_mapped} ({100.0*star_only_mapped/total:.1f}%)
-ruSTAR only mapped:        {rustar_only_mapped} ({100.0*rustar_only_mapped/total:.1f}%)
+rustar-aligner only mapped:        {rustar_aligner_only_mapped} ({100.0*rustar_aligner_only_mapped/total:.1f}%)
 Both unmapped:             {both_unmapped} ({100.0*both_unmapped/total:.1f}%)""")
 
     if has_sj:
         print(f"""
 Junctions shared:          {len(shared)}/{len(star_keys)} STAR junctions ({100.0*len(shared)/max(len(star_keys),1):.1f}%)
-ruSTAR extra junctions:    {len(rustar_only_sj)} (potential false positives)""")
+rustar-aligner extra junctions:    {len(rustar_aligner_only_sj)} (potential false positives)""")
     print()
 
 

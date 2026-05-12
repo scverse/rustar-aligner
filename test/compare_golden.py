@@ -6,7 +6,7 @@ compare_golden.py - Compare current test output against golden reference
 Used by CI to detect regressions.
 
 Usage:
-    python compare_golden.py --golden golden/yeast_100/stats.json --current results/.../rustar --tolerance 0.01
+    python compare_golden.py --golden golden/yeast_100/stats.json --current results/.../rustar_aligner --tolerance 0.01
 """
 
 import argparse

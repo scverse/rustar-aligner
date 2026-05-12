@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-/// Errors that can occur in ruSTAR.
+/// Errors that can occur in rustar-aligner.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid parameter: {0}")]

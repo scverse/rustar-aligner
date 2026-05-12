@@ -277,8 +277,8 @@ impl AlignmentScorer {
     pub fn find_best_junction_position(
         &self,
         read_seq: &[u8],
-        r_a_end: usize, // prev.read_end (exclusive, ruSTAR convention)
-        g_a_end: u64,   // prev.genome_end (exclusive, ruSTAR convention)
+        r_a_end: usize, // prev.read_end (exclusive, rustar-aligner convention)
+        g_a_end: u64,   // prev.genome_end (exclusive, rustar-aligner convention)
         r_gap: i64,     // read gap between seeds
         g_gap: i64,     // genome gap between seeds
         genome: &Genome,
@@ -291,7 +291,7 @@ impl AlignmentScorer {
         debug_assert!(del > 0);
 
         // Convert to STAR-style inclusive coordinates for the scanning algorithm
-        // ruSTAR: r_a_end is exclusive (one past last base of seed A)
+        // rustar-aligner: r_a_end is exclusive (one past last base of seed A)
         // STAR:   rAend is inclusive (last base of seed A)
         let g_a_end_inc = g_a_end - 1; // last genome base of seed A (inclusive)
         let r_a_end_inc = r_a_end - 1; // last read base of seed A (inclusive)
@@ -502,64 +502,15 @@ impl AlignmentScorer {
         )
     }
 
-    /// Detect splice junction motif
-    ///
-    /// # Arguments
-    /// - `donor_pos`: Position of the donor site (first base after exon)
-    /// - `intron_len`: Length of the intron
-    /// - `genome`: Genome reference
-    ///
-    /// # Returns
-    /// The detected splice motif
+    /// Detect splice junction motif (thin wrapper over the free function
+    /// so `AlignmentScorer` callers keep working).
     pub fn detect_splice_motif(
         &self,
         donor_pos: u64,
         intron_len: u32,
         genome: &Genome,
     ) -> SpliceMotif {
-        // Read 2bp donor and 2bp acceptor from the FORWARD genome
-        // Donor: donor_pos, donor_pos+1
-        // Acceptor: donor_pos+intron_len-2, donor_pos+intron_len-1
-        // Always read forward strand — motif pattern determines the strand
-        let d1 = genome.get_base(donor_pos);
-        let d2 = genome.get_base(donor_pos + 1);
-        let a1 = genome.get_base(donor_pos + intron_len as u64 - 2);
-        let a2 = genome.get_base(donor_pos + intron_len as u64 - 1);
-
-        // Check if all bases are valid
-        // A=0, C=1, G=2, T=3
-        match (d1, d2, a1, a2) {
-            (Some(d1), Some(d2), Some(a1), Some(a2)) => {
-                // Forward-strand motifs
-                // GT-AG: (2,3,0,2)
-                if d1 == 2 && d2 == 3 && a1 == 0 && a2 == 2 {
-                    return SpliceMotif::GtAg;
-                }
-                // GC-AG: (2,1,0,2)
-                if d1 == 2 && d2 == 1 && a1 == 0 && a2 == 2 {
-                    return SpliceMotif::GcAg;
-                }
-                // AT-AC: (0,3,0,1)
-                if d1 == 0 && d2 == 3 && a1 == 0 && a2 == 1 {
-                    return SpliceMotif::AtAc;
-                }
-                // Reverse-strand motifs (reverse complement on forward genome)
-                // CT-AC: (1,3,0,1) — reverse complement of GT-AG
-                if d1 == 1 && d2 == 3 && a1 == 0 && a2 == 1 {
-                    return SpliceMotif::CtAc;
-                }
-                // CT-GC: (1,3,2,1) — reverse complement of GC-AG
-                if d1 == 1 && d2 == 3 && a1 == 2 && a2 == 1 {
-                    return SpliceMotif::CtGc;
-                }
-                // GT-AT: (2,3,0,3) — reverse complement of AT-AC
-                if d1 == 2 && d2 == 3 && a1 == 0 && a2 == 3 {
-                    return SpliceMotif::GtAt;
-                }
-                SpliceMotif::NonCanonical
-            }
-            _ => SpliceMotif::NonCanonical,
-        }
+        detect_splice_motif(donor_pos, intron_len, genome)
     }
 
     /// Score a splice junction based on motif
@@ -570,6 +521,31 @@ impl AlignmentScorer {
             SpliceMotif::AtAc | SpliceMotif::GtAt => self.score_gap_atac,
             SpliceMotif::NonCanonical => self.score_gap_noncan,
         }
+    }
+}
+
+/// Detect splice junction motif from forward-strand bases at the intron
+/// boundaries. Stateless — exposed as a free function so both alignment
+/// scoring and `genomeGenerate` splice-junction insertion can share one
+/// truth table.
+///
+/// `donor_pos` is the 0-based position of the intron's first base on the
+/// forward strand; `intron_len` is the intron length in bases.
+pub fn detect_splice_motif(donor_pos: u64, intron_len: u32, genome: &Genome) -> SpliceMotif {
+    let d1 = genome.get_base(donor_pos);
+    let d2 = genome.get_base(donor_pos + 1);
+    let a1 = genome.get_base(donor_pos + intron_len as u64 - 2);
+    let a2 = genome.get_base(donor_pos + intron_len as u64 - 1);
+
+    // Base encoding: A=0, C=1, G=2, T=3.
+    match (d1, d2, a1, a2) {
+        (Some(2), Some(3), Some(0), Some(2)) => SpliceMotif::GtAg,
+        (Some(2), Some(1), Some(0), Some(2)) => SpliceMotif::GcAg,
+        (Some(0), Some(3), Some(0), Some(1)) => SpliceMotif::AtAc,
+        (Some(1), Some(3), Some(0), Some(1)) => SpliceMotif::CtAc,
+        (Some(1), Some(3), Some(2), Some(1)) => SpliceMotif::CtGc,
+        (Some(2), Some(3), Some(0), Some(3)) => SpliceMotif::GtAt,
+        _ => SpliceMotif::NonCanonical,
     }
 }
 
@@ -1072,7 +1048,7 @@ mod tests {
         // STAR's stitchAlignToTranscript.cpp: `if (Del>alignIntronMax && alignIntronMax>0)`
         // meaning alignIntronMax=0 disables the check entirely.
         use clap::Parser;
-        let params = crate::params::Parameters::try_parse_from(vec!["ruSTAR"]).unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
         assert_eq!(params.align_intron_max, 0);
         let scorer = AlignmentScorer::from_params(&params);
         assert_eq!(scorer.align_intron_max, u32::MAX);
@@ -1082,9 +1058,12 @@ mod tests {
     fn test_align_intron_max_custom() {
         // Custom alignIntronMax should be passed through directly
         use clap::Parser;
-        let params =
-            crate::params::Parameters::try_parse_from(vec!["ruSTAR", "--alignIntronMax", "100000"])
-                .unwrap();
+        let params = crate::params::Parameters::try_parse_from(vec![
+            "rustar-aligner",
+            "--alignIntronMax",
+            "100000",
+        ])
+        .unwrap();
         assert_eq!(params.align_intron_max, 100_000);
         let scorer = AlignmentScorer::from_params(&params);
         assert_eq!(scorer.align_intron_max, 100_000);

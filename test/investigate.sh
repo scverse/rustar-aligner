@@ -60,7 +60,7 @@ with open(comparison_file, 'r') as f:
             continue
 
         if in_discrepancies:
-            # Look for lines like: "  read_137: Different chromosome (ruSTAR=chr1, STAR=chr2)"
+            # Look for lines like: "  read_137: Different chromosome (rustar-aligner=chr1, STAR=chr2)"
             match = re.match(r'\s+(\S+):\s+(.+)', line)
             if match:
                 read_name = match.group(1)
@@ -208,41 +208,41 @@ with open(discrepant_file, 'r') as f:
 if categories['different_chromosome']:
     print(f"\n{len(categories['different_chromosome'])} reads mapped to different chromosomes")
     print("  Likely cause: Seed clustering or multi-mapping selection difference")
-    print("  Check ruSTAR: src/align/stitch.rs (cluster_seeds, select_best_alignment)")
+    print("  Check rustar-aligner: src/align/stitch.rs (cluster_seeds, select_best_alignment)")
     print("  Check STAR:   source/stitchWindowAligns.cpp (stitchWindowSeeds)")
     print("  Suggested action: Compare seed positions for these reads")
 
 if categories['mapping_status']:
     print(f"\n{len(categories['mapping_status'])} reads have different mapping status")
     print("  Likely cause: Filtering threshold difference")
-    print("  Check ruSTAR: src/align/read_align.rs (transcript filtering)")
+    print("  Check rustar-aligner: src/align/read_align.rs (transcript filtering)")
     print("  Check STAR:   source/ReadAlign_outputAlignments.cpp (outFilterScoreMin)")
     print("  Suggested action: Check outFilterScoreMin, outFilterMatchNmin parameters")
 
 if categories['position_diff']:
     print(f"\n{len(categories['position_diff'])} reads have different positions")
     print("  Likely cause: Tie-breaking in multi-mapping reads")
-    print("  Check ruSTAR: src/align/stitch.rs (best alignment selection)")
+    print("  Check rustar-aligner: src/align/stitch.rs (best alignment selection)")
     print("  Check STAR:   source/ReadAlign_outputAlignments.cpp")
     print("  Suggested action: Check if MAPQ < 10 (expected for ties)")
 
 if categories['cigar_diff']:
     print(f"\n{len(categories['cigar_diff'])} reads have different CIGAR strings")
     print("  Likely cause: DP stitching or gap penalty difference")
-    print("  Check ruSTAR: src/align/stitch.rs (stitch_seeds_dp)")
+    print("  Check rustar-aligner: src/align/stitch.rs (stitch_seeds_dp)")
     print("  Check STAR:   source/stitchWindowAligns.cpp")
     print("  Suggested action: Re-run with debug logging (RUST_LOG=debug)")
 
 if categories['strand_diff']:
     print(f"\n{len(categories['strand_diff'])} reads have different strand assignments")
     print("  Likely cause: Reverse complement handling")
-    print("  Check ruSTAR: src/align/read_align.rs (reverse complement logic)")
+    print("  Check rustar-aligner: src/align/read_align.rs (reverse complement logic)")
     print("  Check STAR:   source/ReadAlign.cpp")
 
 if categories['mapq_diff']:
     print(f"\n{len(categories['mapq_diff'])} reads have different MAPQ values")
     print("  Likely cause: Different multi-mapping count or MAPQ calculation")
-    print("  Check ruSTAR: src/mapq.rs")
+    print("  Check rustar-aligner: src/mapq.rs")
     print("  Check STAR:   source/ReadAlign_outputAlignments.cpp")
     print("  Note: Small MAPQ differences for multi-mappers are expected")
 
@@ -261,7 +261,7 @@ print("  source/SuffixArrayFuns.cpp         - Suffix array search")
 EOF
 
 # ==============================================================================
-# Re-run ruSTAR with debug logging
+# Re-run rustar-aligner with debug logging
 # ==============================================================================
 
 log ""
@@ -270,9 +270,9 @@ log "Debug Re-run"
 log "=========================================="
 
 if [[ -f "$DEBUG_DIR/discrepant_reads.fq" ]]; then
-    log "To re-run ruSTAR with debug logging on discrepant reads:"
+    log "To re-run rustar-aligner with debug logging on discrepant reads:"
     log ""
-    log "  RUST_LOG=debug $PROJECT_ROOT/target/release/ruSTAR \\"
+    log "  RUST_LOG=debug $PROJECT_ROOT/target/release/rustar-aligner \\"
     log "    --runMode alignReads \\"
     log "    --genomeDir $DATA_DIR/genome_index \\"
     log "    --readFilesIn $DEBUG_DIR/discrepant_reads.fq \\"

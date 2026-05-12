@@ -12,6 +12,7 @@ use crate::index::sa_index::SaIndex;
 use crate::index::suffix_array::SuffixArray;
 use crate::junction::SpliceJunctionDb;
 use crate::params::Parameters;
+use crate::quant::transcriptome::TranscriptomeIndex;
 
 impl GenomeIndex {
     /// Load a genome index from disk.
@@ -42,7 +43,13 @@ impl GenomeIndex {
 
         // Load GTF annotations if provided
         let junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            SpliceJunctionDb::from_gtf(gtf_path, &genome)?
+            SpliceJunctionDb::from_gtf_configured(
+                gtf_path,
+                &genome,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+                &params.sjdb_gtf_tag_exon_parent_transcript,
+            )?
         } else {
             log::info!("No GTF file provided, all junctions will be novel");
             SpliceJunctionDb::empty()
@@ -53,13 +60,76 @@ impl GenomeIndex {
             junction_db.len()
         );
 
+        // Prefer STAR-compatible transcriptInfo.tab / exonInfo.tab /
+        // geneInfo.tab over re-parsing the GTF at align time. If the files
+        // aren't present (legacy rustar-aligner index), fall back to on-the-fly
+        // construction from the GTF when one is supplied — this matches
+        // STAR's behavior in `sjdbInsertJunctions.cpp` (re-parse and regenerate).
+        let transcriptome = if genome_dir.join("transcriptInfo.tab").exists() {
+            log::info!(
+                "Loading transcriptome index files from {}",
+                genome_dir.display()
+            );
+            Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
+        } else if let Some(ref gtf_path) = params.sjdb_gtf_file {
+            log::warn!(
+                "transcriptInfo.tab not found in {}; re-parsing GTF at align time",
+                genome_dir.display()
+            );
+            let exons = crate::junction::gtf::parse_gtf_configured(
+                gtf_path,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+            )?;
+            Some(TranscriptomeIndex::from_gtf_exons_configured(
+                &exons,
+                &genome,
+                &params.sjdb_gtf_tag_exon_parent_transcript,
+                &params.sjdb_gtf_tag_exon_parent_gene,
+            )?)
+        } else {
+            None
+        };
+
+        if let Some(ref tr) = transcriptome {
+            log::info!(
+                "Transcriptome index ready: {} transcripts, {} genes",
+                tr.n_transcripts(),
+                tr.gene_ids.len()
+            );
+        }
+
         Ok(GenomeIndex {
             genome,
             suffix_array,
             sa_index,
             junction_db,
+            transcriptome,
+            prepared_junctions: Vec::new(),
         })
     }
+}
+
+/// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
+/// and return the first field (total genome byte count, including Gsj if
+/// sjdb was baked in). Returns `Ok(None)` if the file or line is absent,
+/// leaving the caller to fall back to the chr_start boundary.
+fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(e, &path)),
+    };
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("genomeFileSizes\t")
+            && let Some(first) = rest.split_whitespace().next()
+            && let Ok(v) = first.parse::<u64>()
+        {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// Load genome from disk.
@@ -87,7 +157,14 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
         .collect();
 
     let n_chr_real = chr_name.len();
-    let n_genome = chr_start[n_chr_real]; // Last entry is total size
+
+    // `chr_start[n_chr_real]` is the forward boundary of REAL chromosomes
+    // only — it stays pinned at the pre-sjdb value in STAR (`chrStart.txt`).
+    // When sjdb has been baked into the index, the total genome size
+    // (real + Gsj) lives in `genomeParameters.txt` under `genomeFileSizes`.
+    // Prefer that value; fall back to the chr_start boundary for indices
+    // built without a GTF.
+    let n_genome = read_genome_file_size(genome_dir)?.unwrap_or(chr_start[n_chr_real]);
 
     // Load Genome sequence file
     let genome_path = genome_dir.join("Genome");
@@ -210,7 +287,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let args = vec![
-            "ruSTAR",
+            "rustar-aligner",
             "--runMode",
             "genomeGenerate",
             "--genomeFastaFiles",
