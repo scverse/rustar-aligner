@@ -344,7 +344,7 @@ pub struct Parameters {
     // ── Output ──────────────────────────────────────────────────────────
     /// Output file name prefix (including path)
     #[arg(long = "outFileNamePrefix", default_value = "./")]
-    pub out_file_name_prefix: PathBuf,
+    pub out_file_name_prefix: String,
 
     /// Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None.
     /// Provide as space-separated tokens, e.g. "BAM SortedByCoordinate".
@@ -704,6 +704,11 @@ pub struct Parameters {
 }
 
 impl Parameters {
+    /// Build an output path by concatenating `suffix` onto `out_file_name_prefix`.
+    pub fn output_path(&self, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}{suffix}", self.out_file_name_prefix))
+    }
+
     /// Parse the raw `--outSAMtype` tokens into a structured `OutSamType`.
     pub fn out_sam_type(&self) -> Result<OutSamType, String> {
         match self
@@ -1010,7 +1015,7 @@ mod tests {
         assert_eq!(p.read_map_number, -1);
         assert_eq!(p.clip5p_nbases, 0);
         assert_eq!(p.clip3p_nbases, 0);
-        assert_eq!(p.out_file_name_prefix, PathBuf::from("./"));
+        assert_eq!(p.out_file_name_prefix, "./");
         assert_eq!(p.out_sam_type_raw, vec!["SAM".to_string()]);
         assert_eq!(p.out_sam_strand_field, "None");
         assert_eq!(p.out_sam_attributes, vec!["Standard".to_string()]);
@@ -1147,7 +1152,7 @@ mod tests {
             sam_type.sort_order,
             Some(OutSamSortOrder::SortedByCoordinate)
         );
-        assert_eq!(p.out_file_name_prefix, PathBuf::from("/out/sample1_"));
+        assert_eq!(p.out_file_name_prefix, "/out/sample1_");
         assert_eq!(p.out_filter_multimap_nmax, 20);
         assert_eq!(p.align_intron_max, 1_000_000);
         assert_eq!(p.sjdb_gtf_file, Some(PathBuf::from("gencode.gtf")));
@@ -1487,5 +1492,51 @@ mod tests {
             "3",
         ]);
         assert_eq!(p.align_sj_stitch_mismatch_nmax, vec![1, -1, 2, 3]);
+    }
+
+    #[test]
+    fn output_path_bare_dot_prefix() {
+        let p = parse(&["--readFilesIn", "r.fq", "--outFileNamePrefix", "SAMPLE."]);
+        assert_eq!(p.out_file_name_prefix, "SAMPLE.");
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("SAMPLE.Aligned.out.bam")
+        );
+        assert_eq!(
+            p.output_path("Log.final.out"),
+            PathBuf::from("SAMPLE.Log.final.out")
+        );
+    }
+
+    #[test]
+    fn output_path_trailing_slash_prefix() {
+        let p = parse(&["--readFilesIn", "r.fq", "--outFileNamePrefix", "out/"]);
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("out/Aligned.out.bam")
+        );
+    }
+
+    #[test]
+    fn output_path_default_prefix() {
+        let p = parse(&["--readFilesIn", "r.fq"]);
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("./Aligned.out.bam")
+        );
+    }
+
+    #[test]
+    fn output_path_path_with_underscore() {
+        let p = parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "/out/sample1_",
+        ]);
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("/out/sample1_Aligned.out.bam")
+        );
     }
 }

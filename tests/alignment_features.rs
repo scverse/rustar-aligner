@@ -799,3 +799,87 @@ fn test_two_pass_mode() {
         "expected at least 1 alignment record, got {record_count}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 9 — bare-dot prefix is treated as a literal string prefix (issue #26)
+//
+// STAR treats `--outFileNamePrefix SAMPLE.` as a literal prefix concatenated
+// onto each output filename (SAMPLE.Aligned.out.bam at the top level), not as
+// a directory name. This test asserts rustar-aligner matches that behaviour.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bare_dot_prefix_is_literal_string() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for i in 0..50usize {
+            let start = 100 + i * 100;
+            let seq = &genome[start..start + 50];
+            writeln!(f, "@read{}", i + 1).unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "+").unwrap();
+            writeln!(f, "{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let run_dir = tmpdir.path().join("bare_dot_run");
+    fs::create_dir_all(&run_dir).unwrap();
+    // SAMPLE. is a bare-dot prefix; STAR writes SAMPLE.Aligned.out.bam at the top level.
+    let prefix = format!("{}/SAMPLE.", run_dir.display());
+
+    Command::cargo_bin("rustar-aligner")
+        .unwrap()
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let bam_path = run_dir.join("SAMPLE.Aligned.out.bam");
+    let log_path = run_dir.join("SAMPLE.Log.final.out");
+    let bam_as_dir = run_dir.join("SAMPLE.").join("Aligned.out.bam");
+
+    assert!(
+        bam_path.exists(),
+        "expected literal prefix file at {}, but it was not created",
+        bam_path.display()
+    );
+    assert!(
+        log_path.exists(),
+        "expected literal prefix file at {}, but it was not created",
+        log_path.display()
+    );
+    assert!(
+        !bam_as_dir.exists(),
+        "bare-dot prefix was treated as a directory: {} should not exist",
+        bam_as_dir.display()
+    );
+
+    let mut reader = bam::io::Reader::new(fs::File::open(&bam_path).unwrap());
+    let _header = reader.read_header().expect("BAM header readable");
+    let mut count = 0usize;
+    for rec in reader.records() {
+        rec.expect("valid BAM record");
+        count += 1;
+    }
+    assert!(count >= 1, "expected at least 1 BAM record, got {count}");
+}
