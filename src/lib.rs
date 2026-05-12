@@ -767,6 +767,15 @@ where
         *r.flags_mut() |= Flags::SEGMENTED | Flags::LAST_SEGMENT;
     }
 
+    for (((r1, r2), p1), p2) in rec1s
+        .iter_mut()
+        .zip(rec2s.iter_mut())
+        .zip(p1s.iter())
+        .zip(p2s.iter())
+    {
+        crate::io::sam::apply_pe_transcriptome_mate_fields(r1, r2, p1, p2)?;
+    }
+
     let mut out: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
         Vec::with_capacity(n_alignments * 2);
     for (r1, r2) in rec1s.into_iter().zip(rec2s) {
