@@ -25,6 +25,12 @@ pub struct Genome {
     /// Total length of the forward (padded) genome.
     pub n_genome: u64,
 
+    /// Length of the real-genome forward strand, excluding any appended
+    /// Gsj splice-junction buffer. Equals `n_genome` before `append_sjdb`
+    /// and stays pinned at that value afterwards; matches STAR's
+    /// `mapGen.nGenomeReal`.
+    pub n_genome_real: u64,
+
     /// Number of real chromosomes (not including scaffold/contigs if excluded).
     pub n_chr_real: usize,
 
@@ -111,6 +117,7 @@ impl Genome {
         Ok(Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real,
             chr_name,
             chr_length,

@@ -316,6 +316,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -367,6 +368,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -445,6 +447,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -476,6 +479,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -522,6 +526,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -605,6 +610,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
