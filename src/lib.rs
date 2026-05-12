@@ -793,8 +793,8 @@ fn extract_junction_keys(
         match op {
             CigarOp::RefSkip(len) => {
                 let intron_len = *len;
-                let intron_start = genome_pos + 1;
-                let intron_end = genome_pos + intron_len as u64;
+                let intron_start = genome_pos;
+                let intron_end = genome_pos + intron_len as u64 - 1;
 
                 let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);
                 let strand = match motif.implied_strand() {
@@ -1857,8 +1857,8 @@ fn record_transcript_junctions(
             CigarOp::RefSkip(len) => {
                 // This is a splice junction
                 let intron_len = *len;
-                let intron_start = genome_pos + 1; // 1-based, first intronic base
-                let intron_end = genome_pos + intron_len as u64; // 1-based, last intronic base
+                let intron_start = genome_pos;
+                let intron_end = genome_pos + intron_len as u64 - 1;
 
                 // Detect splice motif
                 let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);

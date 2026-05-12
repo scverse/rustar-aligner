@@ -21,7 +21,11 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Key for junction statistics
+/// Key for junction statistics.
+///
+/// `intron_start` / `intron_end` are genome-absolute 0-based positions of
+/// the first and last intronic bases, matching `SpliceJunctionDb` and
+/// `PreparedJunction`.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub(crate) struct SjKey {
     pub chr_idx: usize,
@@ -74,12 +78,12 @@ impl SpliceJunctionStats {
         }
     }
 
-    /// Record a junction from alignment (thread-safe)
+    /// Record a junction from alignment (thread-safe).
     ///
     /// # Arguments
     /// * `chr_idx` - Chromosome index
-    /// * `start` - Intron start (1-based)
-    /// * `end` - Intron end (1-based)
+    /// * `start` - Genome-absolute 0-based position of the first intronic base
+    /// * `end` - Genome-absolute 0-based position of the last intronic base
     /// * `strand` - Strand (0=unknown, 1=+, 2=-)
     /// * `motif` - Splice motif
     /// * `is_unique` - True if from unique mapping, false if multi-mapping
@@ -260,8 +264,8 @@ impl SpliceJunctionStats {
                 .ok_or_else(|| Error::Index("Invalid chromosome index in junction".to_string()))?;
 
             let chr_start_pos = genome.chr_start[key.chr_idx];
-            let chr_pos_start = key.intron_start - chr_start_pos;
-            let chr_pos_end = key.intron_end - chr_start_pos;
+            let chr_pos_start = key.intron_start - chr_start_pos + 1;
+            let chr_pos_end = key.intron_end - chr_start_pos + 1;
 
             writeln!(
                 writer,
@@ -538,8 +542,8 @@ mod tests {
         // First junction (sorted by position)
         let fields1: Vec<&str> = lines[0].split('\t').collect();
         assert_eq!(fields1[0], "chr1"); // chr
-        assert_eq!(fields1[1], "100"); // start
-        assert_eq!(fields1[2], "200"); // end
+        assert_eq!(fields1[1], "101"); // chr-local 1-based start
+        assert_eq!(fields1[2], "201"); // chr-local 1-based end
         assert_eq!(fields1[3], "1"); // strand
         assert_eq!(fields1[4], "1"); // motif (GT/AG)
         assert_eq!(fields1[5], "0"); // not annotated
@@ -550,8 +554,8 @@ mod tests {
         // Second junction (annotated, bypasses filters)
         let fields2: Vec<&str> = lines[1].split('\t').collect();
         assert_eq!(fields2[0], "chr1");
-        assert_eq!(fields2[1], "300");
-        assert_eq!(fields2[2], "400");
+        assert_eq!(fields2[1], "301");
+        assert_eq!(fields2[2], "401");
         assert_eq!(fields2[3], "2"); // - strand
         assert_eq!(fields2[4], "3"); // motif (GC/AG, direct encoding)
         assert_eq!(fields2[5], "1"); // annotated
@@ -597,7 +601,7 @@ mod tests {
         // Canonical (overhang 20 >= 12) should pass
         assert_eq!(lines.len(), 1);
         let fields: Vec<&str> = lines[0].split('\t').collect();
-        assert_eq!(fields[1], "300"); // Only the canonical junction remains
+        assert_eq!(fields[1], "301"); // Only the canonical junction remains
     }
 
     #[test]

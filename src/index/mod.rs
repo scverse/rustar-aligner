@@ -83,20 +83,13 @@ impl GenomeIndex {
             log::info!("Extracted {} annotated junctions from GTF", raw.len());
             let jdb = SpliceJunctionDb::from_raw_junctions(&raw);
 
-            // `extract_junctions_from_exons` returns chromosome-local 1-based
-            // intron coordinates (matching STAR's `sjdbList.fromGTF.out.tab`).
-            // `prepare_junction` + `sjdbInfo.txt` expect 0-based absolute
-            // genome offsets (matching STAR's `sjdbPrepare.cpp` and
-            // `detect_splice_motif`'s `genome.sequence[donor_pos]` access),
-            // so convert here.
             let prepared: Vec<PreparedJunction> = raw
                 .iter()
-                .map(|&(chr_idx, start_local_1b, end_local_1b, strand)| {
-                    let chr_off = genome.chr_start[chr_idx];
+                .map(|&(chr_idx, intron_start, intron_end, strand)| {
                     sjdb_insert::prepare_junction(
                         chr_idx,
-                        chr_off + start_local_1b - 1,
-                        chr_off + end_local_1b - 1,
+                        intron_start,
+                        intron_end,
                         strand,
                         &genome,
                         n_genome_real,
