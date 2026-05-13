@@ -1281,9 +1281,7 @@ mod tests {
         seq[6] = 2; // G
         seq[7] = 3; // T
         // Fill intron body
-        for i in 8..28 {
-            seq[i] = 1; // C
-        }
+        seq[8..28].fill(1); // C
         // AG acceptor for jR=1 position (donor at pos 6, del=24, acceptor at 28,29)
         seq[28] = 0; // A
         seq[29] = 2; // G

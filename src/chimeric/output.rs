@@ -491,7 +491,6 @@ mod tests {
 
     #[test]
     fn test_within_bam_donor_not_supplementary() {
-        use noodles::sam::alignment::record::Flags;
         let donor = ChimericSegment {
             chr_idx: 0,
             genome_start: 100,

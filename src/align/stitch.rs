@@ -3044,7 +3044,7 @@ mod tests {
 
     #[test]
     fn test_wa_entry_sorting() {
-        let mut entries = vec![
+        let mut entries = [
             WindowAlignment {
                 seed_idx: 0,
                 read_pos: 10,

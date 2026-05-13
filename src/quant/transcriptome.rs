@@ -1999,7 +1999,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.chr_idx, 0); // transcript index
-        assert_eq!(r.is_reverse, false);
+        assert!(!r.is_reverse);
         assert_eq!(r.exons.len(), 1);
         // t-space offset = 0 (ex_len_cum) + (110 - 100) = 10
         assert_eq!(r.exons[0].genome_start, 10);
@@ -2086,7 +2086,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let r = &results[0];
         // is_reverse flipped (transcript strand == 2, align was false → result true)
-        assert_eq!(r.is_reverse, true);
+        assert!(r.is_reverse);
         // t-space position after flip:
         //   pre-flip: genome_start=20, length=40 → new_g = 100 - (20 + 40) = 40
         //   read_start=0, read_len=40 → new_r = 40 - (0 + 40) = 0
@@ -2259,13 +2259,9 @@ mod tests {
         // read whose soft-clipped bases match the adjacent genome.
         let mut seq = vec![4u8; 1000];
         // Place pattern "AAAA" at genome [100, 104) — clip region
-        for i in 100..104 {
-            seq[i] = 0; // A
-        }
+        seq[100..104].fill(0); // A
         // Aligned region [104, 144) — fill with zeros (A) so read bases match
-        for i in 104..144 {
-            seq[i] = 0;
-        }
+        seq[104..144].fill(0);
         let genome = Genome {
             sequence: seq,
             n_genome: 1000,
@@ -2314,13 +2310,9 @@ mod tests {
         // With very tight out_filter_mismatch_nmax, the alignment is rejected.
         let mut seq = vec![4u8; 1000];
         // Clip region [100, 104): all zeros (A)
-        for i in 100..104 {
-            seq[i] = 0;
-        }
+        seq[100..104].fill(0);
         // Aligned region [104, 144): all zeros
-        for i in 104..144 {
-            seq[i] = 0;
-        }
+        seq[104..144].fill(0);
         let genome = Genome {
             sequence: seq,
             n_genome: 1000,
