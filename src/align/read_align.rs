@@ -749,7 +749,7 @@ pub fn align_paired_read(
     combined_seeds.extend(m2_seeds);
     // mate_id: positions 0..len1 → mate1(0); positions len1+1.. → RC(mate2)(1).
     for s in &mut combined_seeds {
-        s.mate_id = if s.read_pos < len1 { 0 } else { 1 };
+        s.mate_id = u8::from(s.read_pos >= len1);
     }
 
     // Cluster combined seeds using the combined read length
@@ -831,135 +831,132 @@ pub fn align_paired_read(
         for wt in &wts {
             let split_result =
                 split_combined_wt(wt, len1, len2, stitch_is_reverse, scorer.align_intron_min);
-            match split_result {
-                Some((m1_wt, m2_wt)) => {
-                    let (m1_read_slice, m1_orig_rev, m2_read_slice, m2_orig_rev) =
-                        if stitch_is_reverse {
-                            // stitch_read = [mate2(0..len2) | SPACER | RC(mate1)(len2+1..)]
-                            (
-                                &stitch_read[len2 + 1..], // RC(mate1_seq)
-                                true,                     // mate1 5' at right in RC
-                                &stitch_read[..len2],     // mate2_seq
-                                false,                    // mate2 5' at left
-                            )
-                        } else {
-                            // stitch_read = [mate1(0..len1) | SPACER | RC(mate2)(len1+1..)]
-                            (
-                                &stitch_read[..len1],     // mate1_seq
-                                false,                    // mate1 5' at left
-                                &stitch_read[len1 + 1..], // RC(mate2_seq)
-                                true,                     // mate2 5' at right in RC
-                            )
-                        };
+            if let Some((m1_wt, m2_wt)) = split_result {
+                let (m1_read_slice, m1_orig_rev, m2_read_slice, m2_orig_rev) = if stitch_is_reverse
+                {
+                    // stitch_read = [mate2(0..len2) | SPACER | RC(mate1)(len2+1..)]
+                    (
+                        &stitch_read[len2 + 1..], // RC(mate1_seq)
+                        true,                     // mate1 5' at right in RC
+                        &stitch_read[..len2],     // mate2_seq
+                        false,                    // mate2 5' at left
+                    )
+                } else {
+                    // stitch_read = [mate1(0..len1) | SPACER | RC(mate2)(len1+1..)]
+                    (
+                        &stitch_read[..len1],     // mate1_seq
+                        false,                    // mate1 5' at left
+                        &stitch_read[len1 + 1..], // RC(mate2_seq)
+                        true,                     // mate2 5' at right in RC
+                    )
+                };
 
-                    // Suppress inner-side extensions for each mate.
-                    // Inner = 3' end: right for forward (orig_is_rev=false), left for reverse.
-                    let Some(mut t1) = finalize_transcript(
-                        &m1_wt,
-                        m1_read_slice,
-                        index,
-                        &scorer,
-                        &stitch_cluster,
-                        m1_orig_rev,
-                        m1_orig_rev, // no_left_ext = inner for reverse (orig_is_rev=true)
-                        !m1_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    ) else {
-                        continue;
-                    };
-                    let Some(mut t2) = finalize_transcript(
-                        &m2_wt,
-                        m2_read_slice,
-                        index,
-                        &scorer,
-                        &stitch_cluster,
-                        m2_orig_rev,
-                        m2_orig_rev, // no_left_ext = inner for reverse (orig_is_rev=true)
-                        !m2_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    ) else {
-                        continue;
-                    };
+                // Suppress inner-side extensions for each mate.
+                // Inner = 3' end: right for forward (orig_is_rev=false), left for reverse.
+                let Some(mut t1) = finalize_transcript(
+                    &m1_wt,
+                    m1_read_slice,
+                    index,
+                    &scorer,
+                    &stitch_cluster,
+                    m1_orig_rev,
+                    m1_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
+                    !m1_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
+                ) else {
+                    continue;
+                };
+                let Some(mut t2) = finalize_transcript(
+                    &m2_wt,
+                    m2_read_slice,
+                    index,
+                    &scorer,
+                    &stitch_cluster,
+                    m2_orig_rev,
+                    m2_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
+                    !m2_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
+                ) else {
+                    continue;
+                };
 
-                    if stitch_is_reverse {
-                        t1.is_reverse = true;
-                        t2.is_reverse = false;
-                    } else {
-                        t1.is_reverse = false;
-                        t2.is_reverse = true;
-                    }
-                    t1.read_seq = mate1_seq.to_vec();
-                    t2.read_seq = mate2_seq.to_vec();
-
-                    if params.chim_segment_min > 0 {
-                        all_m1_transcripts.push(t1.clone());
-                        all_m2_transcripts.push(t2.clone());
-                    }
-
-                    let combined_span =
-                        t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
-                    let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
-
-                    if let Some(pair) = try_pair_transcripts(
-                        &t1,
-                        &t2,
-                        len1,
-                        len2,
-                        params,
-                        combined_score_threshold,
-                        combined_wt_score,
-                    ) {
-                        joint_pairs.push(pair);
-                    }
+                if stitch_is_reverse {
+                    t1.is_reverse = true;
+                    t2.is_reverse = false;
+                } else {
+                    t1.is_reverse = false;
+                    t2.is_reverse = true;
                 }
-                None => {
-                    // Single-mate WT: save for half-mapped fallback
-                    let all_m1 = wt.exons.iter().all(|e| e.mate_id == 0);
-                    let all_m2 = wt.exons.iter().all(|e| e.mate_id == 1);
-                    if all_m1 {
-                        let (read_slice, orig_rev) = if stitch_is_reverse {
-                            (&stitch_read[len2 + 1..], true)
-                        } else {
-                            (&stitch_read[..len1], false)
-                        };
-                        if let Some(mut t) = finalize_transcript(
-                            wt,
-                            read_slice,
-                            index,
-                            &scorer,
-                            &stitch_cluster,
-                            orig_rev,
-                            false,
-                            false,
-                        ) {
-                            t.is_reverse = stitch_is_reverse;
-                            t.read_seq = mate1_seq.to_vec();
-                            if params.chim_segment_min > 0 {
-                                all_m1_transcripts.push(t.clone());
-                            }
-                            single_mate1_transcripts.push(t);
+                t1.read_seq = mate1_seq.to_vec();
+                t2.read_seq = mate2_seq.to_vec();
+
+                if params.chim_segment_min > 0 {
+                    all_m1_transcripts.push(t1.clone());
+                    all_m2_transcripts.push(t2.clone());
+                }
+
+                let combined_span =
+                    t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
+                let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
+
+                if let Some(pair) = try_pair_transcripts(
+                    &t1,
+                    &t2,
+                    len1,
+                    len2,
+                    params,
+                    combined_score_threshold,
+                    combined_wt_score,
+                ) {
+                    joint_pairs.push(pair);
+                }
+            } else {
+                // Single-mate WT: save for half-mapped fallback
+                let all_m1 = wt.exons.iter().all(|e| e.mate_id == 0);
+                let all_m2 = wt.exons.iter().all(|e| e.mate_id == 1);
+                if all_m1 {
+                    let (read_slice, orig_rev) = if stitch_is_reverse {
+                        (&stitch_read[len2 + 1..], true)
+                    } else {
+                        (&stitch_read[..len1], false)
+                    };
+                    if let Some(mut t) = finalize_transcript(
+                        wt,
+                        read_slice,
+                        index,
+                        &scorer,
+                        &stitch_cluster,
+                        orig_rev,
+                        false,
+                        false,
+                    ) {
+                        t.is_reverse = stitch_is_reverse;
+                        t.read_seq = mate1_seq.to_vec();
+                        if params.chim_segment_min > 0 {
+                            all_m1_transcripts.push(t.clone());
                         }
-                    } else if all_m2 {
-                        let (read_slice, orig_rev) = if stitch_is_reverse {
-                            (&stitch_read[..len2], false)
-                        } else {
-                            (&stitch_read[len1 + 1..], true)
-                        };
-                        if let Some(mut t) = finalize_transcript(
-                            wt,
-                            read_slice,
-                            index,
-                            &scorer,
-                            &stitch_cluster,
-                            orig_rev,
-                            false,
-                            false,
-                        ) {
-                            t.is_reverse = !stitch_is_reverse;
-                            t.read_seq = mate2_seq.to_vec();
-                            if params.chim_segment_min > 0 {
-                                all_m2_transcripts.push(t.clone());
-                            }
-                            single_mate2_transcripts.push(t);
+                        single_mate1_transcripts.push(t);
+                    }
+                } else if all_m2 {
+                    let (read_slice, orig_rev) = if stitch_is_reverse {
+                        (&stitch_read[..len2], false)
+                    } else {
+                        (&stitch_read[len1 + 1..], true)
+                    };
+                    if let Some(mut t) = finalize_transcript(
+                        wt,
+                        read_slice,
+                        index,
+                        &scorer,
+                        &stitch_cluster,
+                        orig_rev,
+                        false,
+                        false,
+                    ) {
+                        t.is_reverse = !stitch_is_reverse;
+                        t.read_seq = mate2_seq.to_vec();
+                        if params.chim_segment_min > 0 {
+                            all_m2_transcripts.push(t.clone());
                         }
+                        single_mate2_transcripts.push(t);
                     }
                 }
             }
@@ -2144,7 +2141,7 @@ mod tests {
         assert_eq!(items[4], (40, 4));
         // Tied prefix contains the original three items in some order.
         let mut top: Vec<u32> = items[..3].iter().map(|t| t.1).collect();
-        top.sort();
+        top.sort_unstable();
         assert_eq!(top, vec![0, 1, 2]);
     }
 

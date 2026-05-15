@@ -709,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_empty_stats() {
         let stats = AlignmentStats::new();
         assert_eq!(stats.unique_percent(), 0.0);
@@ -893,8 +894,8 @@ mod tests {
         stats.multi_mapped.store(500, Ordering::Relaxed);
         stats.too_many_loci.store(50, Ordering::Relaxed);
         stats.unmapped.store(1150, Ordering::Relaxed);
-        stats.read_bases.store(1500000, Ordering::Relaxed);
-        stats.mapped_bases.store(1200000, Ordering::Relaxed);
+        stats.read_bases.store(1_500_000, Ordering::Relaxed);
+        stats.mapped_bases.store(1_200_000, Ordering::Relaxed);
         stats.mapped_mismatches.store(4800, Ordering::Relaxed);
         stats.mapped_ins_count.store(100, Ordering::Relaxed);
         stats.mapped_ins_bases.store(150, Ordering::Relaxed);

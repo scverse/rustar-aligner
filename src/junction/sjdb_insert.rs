@@ -731,11 +731,11 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
             },
-            // Non-canonical: stored = shifted (139187..139217).
+            // Non-canonical: stored = shifted (139_187..139_217).
             PreparedJunction {
                 chr_idx: 0,
-                start_pos: 139187,
-                end_pos: 139217,
+                start_pos: 139_187,
+                end_pos: 139_217,
                 motif: 0,
                 shift_left: 0,
                 shift_right: 0,
@@ -769,8 +769,8 @@ mod tests {
         // `stored + shift_left + 1`, which is `original + 1`.
         let noncan = PreparedJunction {
             chr_idx: 0,
-            start_pos: 139184, // shifted
-            end_pos: 139214,
+            start_pos: 139_184, // shifted
+            end_pos: 139_214,
             motif: 0,
             shift_left: 3,
             shift_right: 0,

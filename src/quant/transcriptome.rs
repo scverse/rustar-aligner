@@ -289,17 +289,14 @@ impl TranscriptomeIndex {
             // name/biotype slot. Subsequent transcripts with a richer name or
             // biotype do NOT overwrite (STAR's Transcriptome writer is
             // first-seen-wins too).
-            let gene_idx = match gene_id_to_idx.get(&gene_id) {
-                Some(&i) => i,
-                None => {
-                    let i = gene_ids.len() as u32;
-                    gene_id_to_idx.insert(gene_id.clone(), i);
-                    gene_ids.push(gene_id.clone());
-                    gene_names.push(gene_name);
-                    gene_biotypes.push(gene_biotype);
-                    i
-                }
-            };
+            let gene_idx = gene_id_to_idx.get(&gene_id).copied().unwrap_or_else(|| {
+                let i = gene_ids.len() as u32;
+                gene_id_to_idx.insert(gene_id.clone(), i);
+                gene_ids.push(gene_id.clone());
+                gene_names.push(gene_name);
+                gene_biotypes.push(gene_biotype);
+                i
+            });
 
             tr_ids.push(tid.clone());
             tr_chr_idx.push(chr_idx);
@@ -1089,7 +1086,7 @@ fn align_to_one_transcript(
     if tr_strand == 2 {
         let tr_len = tr_length as u64;
         let lread_u = lread as u64;
-        for e in proj_exons.iter_mut() {
+        for e in &mut proj_exons {
             let len = e.genome_end - e.genome_start;
             let new_g = tr_len - (e.genome_start + len);
             e.genome_start = new_g;
@@ -1116,8 +1113,8 @@ fn align_to_one_transcript(
     }
 
     // Projected genome bounds = outermost t-space exon positions.
-    let proj_start = proj_exons.first().map(|e| e.genome_start).unwrap_or(0);
-    let proj_end = proj_exons.last().map(|e| e.genome_end).unwrap_or(0);
+    let proj_start = proj_exons.first().map_or(0, |e| e.genome_start);
+    let proj_end = proj_exons.last().map_or(0, |e| e.genome_end);
 
     Some(Transcript {
         chr_idx: tr_idx,
@@ -1335,7 +1332,7 @@ fn find_containing_exon(tr_exons: &[TrExon], pos: u64) -> Option<usize> {
     let mut lo = 0usize;
     let mut hi = tr_exons.len();
     while lo < hi {
-        let mid = (lo + hi) / 2;
+        let mid = usize::midpoint(lo, hi);
         if tr_exons[mid].genome_end <= pos {
             lo = mid + 1;
         } else {
@@ -1967,8 +1964,8 @@ mod tests {
                 i_frag: 0,
             })
             .collect();
-        let gs = proj_exons.first().map(|e| e.genome_start).unwrap_or(0);
-        let ge = proj_exons.last().map(|e| e.genome_end).unwrap_or(0);
+        let gs = proj_exons.first().map_or(0, |e| e.genome_start);
+        let ge = proj_exons.last().map_or(0, |e| e.genome_end);
         Transcript {
             chr_idx,
             genome_start: gs,
@@ -2403,7 +2400,7 @@ mod tests {
         // tr_order must be sorted by (start, end)
         let sorted_starts: Vec<u64> = idx.tr_starts_sorted.clone();
         let mut check = sorted_starts.clone();
-        check.sort();
+        check.sort_unstable();
         assert_eq!(sorted_starts, check);
 
         // tr_end_max_sorted must be monotonically non-decreasing

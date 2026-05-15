@@ -179,14 +179,9 @@ pub fn extract_junctions_configured(
 
         // Get chromosome index
         let chr_name = &exons[0].seqname;
-        let chr_idx = genome.chr_name.iter().position(|name| name == chr_name);
-
-        let chr_idx = match chr_idx {
-            Some(idx) => idx,
-            None => {
-                log::warn!("Skipping transcript on unknown chromosome: {}", chr_name);
-                continue;
-            }
+        let Some(chr_idx) = genome.chr_name.iter().position(|name| name == chr_name) else {
+            log::warn!("Skipping transcript on unknown chromosome: {chr_name}");
+            continue;
         };
 
         // Convert strand

@@ -272,6 +272,7 @@ impl PairedFastqReader {
 ///
 /// # Returns
 /// Base name with mate suffix removed
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // false positive
 pub fn strip_mate_suffix(name: &str) -> String {
     // First, strip space and everything after (Illumina format)
     let name = if let Some(pos) = name.find(' ') {
