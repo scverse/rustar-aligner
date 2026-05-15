@@ -1,7 +1,7 @@
 //! Seed clustering and stitching via dynamic programming
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
-use crate::align::transcript::Transcript;
+use crate::align::transcript::{CigarOpExt, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use noodles::sam::alignment::record::cigar;
@@ -1754,6 +1754,16 @@ pub(crate) fn finalize_transcript(
 
     use cigar::op::{Kind, Op};
 
+    fn append_match(ops: &mut Vec<Op>, len: usize) {
+        if let Some(op) = ops.last_mut()
+            && op.kind() == Kind::Match
+        {
+            *op = op.with_added_len(len);
+        } else {
+            ops.push(Op::new(Kind::Match, len));
+        }
+    }
+
     // Build final CIGAR from exon blocks
     let mut final_cigar: Vec<Op> = Vec::new();
 
@@ -1779,14 +1789,7 @@ pub(crate) fn finalize_transcript(
                 // Shared match bases before the gap
                 let shared = read_gap.max(0) as usize;
                 if shared > 0 {
-                    // TODO: replace with “extend_or_push_match” function call
-                    if let Some(op) = final_cigar.last_mut()
-                        && op.kind() == Kind::Match
-                    {
-                        *op = Op::new(Kind::Match, op.len() + shared);
-                    } else {
-                        final_cigar.push(Op::new(Kind::Match, shared));
-                    }
+                    append_match(&mut final_cigar, shared);
                 }
                 let del = (genome_gap - read_gap.max(0)) as usize;
                 if del >= scorer.align_intron_min as usize
@@ -1800,14 +1803,7 @@ pub(crate) fn finalize_transcript(
                 // Insertion
                 let shared = genome_gap.max(0) as usize;
                 if shared > 0 {
-                    // TODO: replace with “extend_or_push_match” function call
-                    if let Some(op) = final_cigar.last_mut()
-                        && op.kind() == Kind::Match
-                    {
-                        *op = Op::new(Kind::Match, op.len() + shared);
-                    } else {
-                        final_cigar.push(Op::new(Kind::Match, shared));
-                    }
+                    append_match(&mut final_cigar, shared);
                 }
                 let ins = (read_gap - genome_gap.max(0)) as usize;
                 final_cigar.push(Op::new(Kind::Insertion, ins));
@@ -1818,27 +1814,13 @@ pub(crate) fn finalize_transcript(
         // This exon's match region
         let match_len = exon.read_end - exon.read_start;
         if match_len > 0 {
-            // TODO: replace with “extend_or_push_match” function call
-            if let Some(op) = final_cigar.last_mut()
-                && op.kind() == Kind::Match
-            {
-                *op = Op::new(Kind::Match, op.len() + match_len);
-            } else {
-                final_cigar.push(Op::new(Kind::Match, match_len));
-            }
+            append_match(&mut final_cigar, match_len);
         }
     }
 
     // Right extension match
     if right_extend.extend_len > 0 {
-        // TODO: replace with “extend_or_push_match” function call
-        if let Some(op) = final_cigar.last_mut()
-            && op.kind() == Kind::Match
-        {
-            *op = Op::new(Kind::Match, op.len() + right_extend.extend_len);
-        } else {
-            final_cigar.push(Op::new(Kind::Match, right_extend.extend_len));
-        }
+        append_match(&mut final_cigar, right_extend.extend_len);
     }
 
     // Right soft clip

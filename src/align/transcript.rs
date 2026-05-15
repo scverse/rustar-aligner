@@ -55,6 +55,15 @@ pub struct Exon {
     pub i_frag: u8,
 }
 
+pub(crate) trait CigarOpExt {
+    fn with_added_len(&self, len: usize) -> Self;
+}
+impl CigarOpExt for cigar::Op {
+    fn with_added_len(&self, len: usize) -> Self {
+        cigar::Op::new(self.kind(), self.len() + len)
+    }
+}
+
 fn cigar_char(kind: cigar::op::Kind) -> char {
     use cigar::op::Kind;
     match kind {
