@@ -78,8 +78,8 @@ impl ChimericJunctionWriter {
         let acceptor_start = alignment.acceptor.genome_start + 1;
 
         // Convert CIGAR to string
-        let donor_cigar = cigar_to_string(&alignment.donor.cigar);
-        let acceptor_cigar = cigar_to_string(&alignment.acceptor.cigar);
+        let donor_cigar = alignment.donor.cigar_string();
+        let acceptor_cigar = alignment.acceptor.cigar_string();
 
         // Write line
         writeln!(
@@ -162,7 +162,7 @@ fn format_sa_entry(
     let chr_start = chr_starts[seg.chr_idx];
     let pos = seg.genome_start - chr_start + 1; // 1-based per-chr
     let strand = if seg.is_reverse { '-' } else { '+' };
-    let cigar = cigar_to_string(&seg.cigar);
+    let cigar = seg.cigar_string();
     format!(
         "{},{},{},{},{},{};",
         chr, pos, strand, cigar, mapq, seg.n_mismatch
@@ -233,26 +233,6 @@ fn build_segment_record(
     Ok(record)
 }
 
-/// Convert CIGAR operations to CIGAR string
-fn cigar_to_string(cigar: &[crate::align::transcript::CigarOp]) -> String {
-    use crate::align::transcript::CigarOp;
-
-    let mut result = String::new();
-    for op in cigar {
-        match op {
-            CigarOp::Match(len) => result.push_str(&format!("{}M", len)),
-            CigarOp::Equal(len) => result.push_str(&format!("{}=", len)),
-            CigarOp::Diff(len) => result.push_str(&format!("{}X", len)),
-            CigarOp::Ins(len) => result.push_str(&format!("{}I", len)),
-            CigarOp::Del(len) => result.push_str(&format!("{}D", len)),
-            CigarOp::RefSkip(len) => result.push_str(&format!("{}N", len)),
-            CigarOp::SoftClip(len) => result.push_str(&format!("{}S", len)),
-            CigarOp::HardClip(len) => result.push_str(&format!("{}H", len)),
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,19 +240,6 @@ mod tests {
     use crate::chimeric::segment::{ChimericAlignment, ChimericSegment};
     use std::io::Read;
     use tempfile::tempdir;
-
-    #[test]
-    fn test_cigar_to_string() {
-        let cigar = vec![
-            CigarOp::Match(50),
-            CigarOp::Ins(2),
-            CigarOp::Del(3),
-            CigarOp::RefSkip(1000),
-            CigarOp::SoftClip(5),
-        ];
-
-        assert_eq!(cigar_to_string(&cigar), "50M2I3D1000N5S");
-    }
 
     #[test]
     fn test_chimeric_junction_writer_creation() {

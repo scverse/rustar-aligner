@@ -323,7 +323,6 @@ pub fn align_read(
                 } else {
                     "unknown"
                 };
-                let cigar_str: String = t.cigar.iter().map(|op| format!("{}", op)).collect();
                 eprintln!(
                     "  transcript[{}]: chr={}:{}-{} ({}) score={} mm={} junctions={} cigar={}",
                     ti,
@@ -334,7 +333,7 @@ pub fn align_read(
                     t.score,
                     t.n_mismatch,
                     t.n_junction,
-                    cigar_str
+                    t.cigar_string()
                 );
             }
         }
@@ -633,7 +632,6 @@ pub fn align_read(
             } else {
                 "unknown"
             };
-            let cigar_str: String = t.cigar.iter().map(|op| format!("{}", op)).collect();
             eprintln!(
                 "  FINAL[{}]: chr={}:{}-{} ({}) score={} mm={} junctions={} cigar={}",
                 i,
@@ -644,7 +642,7 @@ pub fn align_read(
                 t.score,
                 t.n_mismatch,
                 t.n_junction,
-                cigar_str
+                t.cigar_string()
             );
         }
     }

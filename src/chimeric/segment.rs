@@ -1,6 +1,6 @@
 // ChimericSegment and ChimericAlignment data structures
 
-use crate::align::transcript::CigarOp;
+use crate::align::transcript::{CigarOp, cigar_to_string};
 
 /// A single segment of a chimeric alignment
 #[derive(Debug, Clone)]
@@ -30,6 +30,11 @@ impl ChimericSegment {
     /// Check if segment meets minimum length requirement
     pub fn meets_min_length(&self, min_len: u32) -> bool {
         self.read_length() >= min_len as usize
+    }
+
+    /// Format CIGAR string
+    pub fn cigar_string(&self) -> String {
+        cigar_to_string(&self.cigar)
     }
 }
 

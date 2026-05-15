@@ -149,10 +149,10 @@ impl SamWriter {
                     .name()
                     .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
                     .unwrap_or_default();
-                let cigar_str: String = cigar_ops
-                    .iter()
-                    .map(|op| format!("{}{:?}", op.len(), op.kind()))
-                    .collect::<String>();
+                let cigar_str = cigar_ops.iter().fold(String::new(), |mut c, op| {
+                    let _ = write!(c, "{}{:?}", op.len(), op.kind()); // infallible
+                    c
+                });
                 panic!(
                     "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
                     name,

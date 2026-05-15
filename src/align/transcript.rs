@@ -1,5 +1,5 @@
 /// Transcript data structures for storing alignment results
-use std::fmt;
+use std::fmt::Write as _;
 
 /// A complete alignment of a read to the genome
 #[derive(Debug, Clone)]
@@ -134,16 +134,18 @@ impl CigarOp {
     }
 }
 
-impl fmt::Display for CigarOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.len(), self.op_char())
-    }
+/// Convert CIGAR operations to CIGAR string
+pub(crate) fn cigar_to_string(cigar: &[CigarOp]) -> String {
+    cigar.iter().fold(String::new(), |mut c, op| {
+        let _ = write!(c, "{}{}", op.len(), op.op_char()); // infallible
+        c
+    })
 }
 
 impl Transcript {
     /// Format CIGAR string
     pub fn cigar_string(&self) -> String {
-        self.cigar.iter().map(|op| op.to_string()).collect()
+        cigar_to_string(&self.cigar)
     }
 
     /// Calculate number of matched bases (for filtering)
@@ -201,12 +203,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cigar_op_display() {
-        assert_eq!(CigarOp::Match(50).to_string(), "50M");
-        assert_eq!(CigarOp::Ins(3).to_string(), "3I");
-        assert_eq!(CigarOp::Del(2).to_string(), "2D");
-        assert_eq!(CigarOp::RefSkip(1000).to_string(), "1000N");
-        assert_eq!(CigarOp::SoftClip(5).to_string(), "5S");
+    fn test_cigar_to_string() {
+        let cigar = vec![
+            CigarOp::Match(50),
+            CigarOp::Ins(2),
+            CigarOp::Del(3),
+            CigarOp::RefSkip(1000),
+            CigarOp::SoftClip(5),
+        ];
+
+        assert_eq!(cigar_to_string(&cigar), "50M2I3D1000N5S");
     }
 
     #[test]

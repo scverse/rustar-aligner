@@ -7,8 +7,6 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
     clippy::doc_markdown,
-    clippy::format_collect,
-    clippy::format_push_string,
     clippy::items_after_statements,
     clippy::match_same_arms,
     clippy::missing_errors_doc,
