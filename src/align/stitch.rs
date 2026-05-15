@@ -236,9 +236,8 @@ fn extend_alignment(
         };
 
         // Get genome base (with strand offset)
-        let genome_base = match index.genome.get_base(genome_pos + genome_offset) {
-            Some(b) => b,
-            None => break,
+        let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset) else {
+            break;
         };
 
         // Stop at chromosome boundary (padding = 5)
@@ -878,7 +877,7 @@ pub fn cluster_seeds(
 
     // Phase 5: Build SeedCluster output
     let mut clusters = Vec::with_capacity(windows.len());
-    for window in windows.iter() {
+    for window in &windows {
         if !window.alive || window.alignments.is_empty() {
             continue;
         }
@@ -1946,12 +1945,10 @@ pub(crate) fn finalize_transcript(
 
     let t_genome_start = merged_exons
         .first()
-        .map(|e| e.genome_start)
-        .unwrap_or(forward_genome_start);
+        .map_or(forward_genome_start, |e| e.genome_start);
     let t_genome_end = merged_exons
         .last()
-        .map(|e| e.genome_end)
-        .unwrap_or(forward_genome_end);
+        .map_or(forward_genome_end, |e| e.genome_end);
 
     // Apply genomic length penalty
     let genomic_span = t_genome_end - t_genome_start;
@@ -2650,7 +2647,7 @@ pub(crate) fn stitch_seeds_core(
         let mut keep_indices = std::collections::HashSet::new();
         for (_diag, mut seeds) in diag_seeds {
             // Sort by start position
-            seeds.sort();
+            seeds.sort_unstable();
             // Merge intervals, keeping the index of the longest seed in each merged group
             let mut merged_end = seeds[0].1;
             let mut best_idx = seeds[0].2;

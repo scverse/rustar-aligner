@@ -748,7 +748,7 @@ impl Parameters {
     /// - `"Standard"` → {NH, HI, AS, NM, nM}
     /// - `"All"`      → {NH, HI, AS, NM, nM, MD, jM, jI, XS}
     /// - `"None"`     → {} (empty)
-    /// - Explicit list (e.g. ["NH", "AS"]) → collected as-is
+    /// - Explicit list (e.g. `["NH", "AS"]`) → collected as-is
     ///
     /// `RG` is auto-appended when `--outSAMattrRGline` is set (STAR behavior,
     /// `Parameters_samAttributes.cpp:201`).
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(p.out_sj_filter_dist_to_other_sjmin, vec![10, 0, 5, 10]);
         assert_eq!(
             p.out_sj_filter_intron_max_vs_read_n,
-            vec![50000, 100000, 200000]
+            vec![50_000, 100_000, 200_000]
         );
     }
 

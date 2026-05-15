@@ -366,14 +366,11 @@ fn find_seed_at_position(
         .sa_index
         .hierarchical_lookup(kmer_idx, actual_len as u32, n_sa);
 
-    let (sa_start, sa_end, matched_level, bounds_tight) = match result {
-        Some(r) => r,
-        None => {
-            return Ok(MmpResult {
-                seed: None,
-                advance: 1,
-            });
-        }
+    let Some((sa_start, sa_end, matched_level, bounds_tight)) = result else {
+        return Ok(MmpResult {
+            seed: None,
+            advance: 1,
+        });
     };
 
     if sa_start >= sa_end {
@@ -440,7 +437,7 @@ fn find_seed_at_position(
 /// Overflow-safe median of two unsigned integers.
 /// Equivalent to STAR's medianUint2: a/2 + b/2 + (a%2 + b%2)/2
 fn median_uint2(a: usize, b: usize) -> usize {
-    a / 2 + b / 2 + (a % 2 + b % 2) / 2
+    a / 2 + b / 2 + usize::midpoint(a % 2, b % 2)
 }
 
 /// Compare read to genome at a specific SA position, starting from offset l_start.

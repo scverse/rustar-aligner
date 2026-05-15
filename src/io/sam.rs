@@ -152,8 +152,7 @@ impl SamWriter {
                 let cigar_str: String = cigar_ops
                     .iter()
                     .map(|op| format!("{}{:?}", op.len(), op.kind()))
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .collect::<String>();
                 panic!(
                     "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
                     name,
@@ -799,7 +798,7 @@ where
     let mut builder = sam::Header::builder();
 
     // @HD line (default version and unsorted)
-    builder = builder.set_header(Default::default());
+    builder = builder.set_header(Map::default());
 
     // @SQ lines for each reference
     for (name, length) in refs {

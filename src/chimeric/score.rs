@@ -108,7 +108,7 @@ pub fn calculate_repeat_length(
 
     // Calculate how far we can check
     let donor_idx = chr_start + donor_pos;
-    let _acceptor_idx = chr_start + acceptor_pos;
+    //let acceptor_idx = chr_start + acceptor_pos;
 
     let mut repeat_len_donor = 0u32;
     let mut repeat_len_acceptor = 0u32;

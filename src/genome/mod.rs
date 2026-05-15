@@ -268,8 +268,7 @@ impl Genome {
         let gtf = params
             .sjdb_gtf_file
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
+            .map_or_else(|| "-".to_string(), |p| p.display().to_string());
         writeln!(
             f,
             "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}      --genomeSAindexNbases {sai}   --sjdbGTFfile {gtf}   --sjdbOverhang {ov}",
@@ -319,8 +318,7 @@ impl Genome {
         let gtf_str = params
             .sjdb_gtf_file
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
+            .map_or_else(|| "-".to_string(), |p| p.display().to_string());
         writeln!(f, "sjdbGTFfile\t{}", gtf_str).map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFchrPrefix\t-").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFfeatureExon\texon").map_err(|e| Error::io(e, &path))?;

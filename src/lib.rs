@@ -1,3 +1,33 @@
+#![warn(clippy::pedantic)]
+// TODO: enable these warnings eventually
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::format_collect,
+    clippy::format_push_string,
+    clippy::items_after_statements,
+    clippy::match_same_arms,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_wraps
+)]
+// These should stay disabled
+#![allow(
+    // we have a bunch of “`if !reverse`”
+    clippy::if_not_else,
+)]
+
 pub mod error;
 pub mod params;
 
@@ -758,10 +788,10 @@ where
     )?;
 
     use noodles::sam::alignment::record::Flags;
-    for r in rec1s.iter_mut() {
+    for r in &mut rec1s {
         *r.flags_mut() |= Flags::SEGMENTED | Flags::FIRST_SEGMENT;
     }
-    for r in rec2s.iter_mut() {
+    for r in &mut rec2s {
         *r.flags_mut() |= Flags::SEGMENTED | Flags::LAST_SEGMENT;
     }
 
@@ -1154,7 +1184,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         read_count += reads_to_process as u64;
 
         // Progress logging
-        if read_count % 100000 < batch_size as u64 {
+        if read_count % 100_000 < batch_size as u64 {
             info!("Processed {} reads...", read_count);
         }
 
@@ -1721,7 +1751,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         read_count += pairs_to_process as u64;
 
         // Progress logging
-        if read_count % 100000 < batch_size as u64 {
+        if read_count % 100_000 < batch_size as u64 {
             info!("Processed {} pairs...", read_count);
         }
 

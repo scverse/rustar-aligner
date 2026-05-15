@@ -297,8 +297,8 @@ mod tests {
         // Create mock chimeric alignment (chr9 -> chr22, BCR-ABL fusion)
         let donor = ChimericSegment {
             chr_idx: 0,
-            genome_start: 133738300,
-            genome_end: 133738363,
+            genome_start: 133_738_300,
+            genome_end: 133_738_363,
             is_reverse: false,
             read_start: 0,
             read_end: 63,
@@ -309,8 +309,8 @@ mod tests {
 
         let acceptor = ChimericSegment {
             chr_idx: 1,
-            genome_start: 23632600,
-            genome_end: 23632637,
+            genome_start: 23_632_600,
+            genome_end: 23_632_637,
             is_reverse: false,
             read_start: 63,
             read_end: 100,

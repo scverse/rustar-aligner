@@ -187,9 +187,9 @@ fn compare_suffixes(
         }
 
         // Normal byte comparison
-        match byte_a.cmp(&byte_b) {
-            Ordering::Equal => continue,
-            other => return other,
+        let byte_cmp = byte_a.cmp(&byte_b);
+        if byte_cmp != Ordering::Equal {
+            return byte_cmp;
         }
     }
 

@@ -390,7 +390,7 @@ impl<'a> ChimericDetector<'a> {
         // Find cluster pairs with chimeric signatures
         for i in 0..clusters.len() {
             for j in (i + 1)..clusters.len() {
-                if self.is_chimeric_signature(&clusters[i], &clusters[j]) {
+                if is_chimeric_signature(&clusters[i], &clusters[j]) {
                     // Try to build chimeric alignment from these clusters
                     if let Some(chim) = self.build_chimeric_from_clusters(
                         &clusters[i],
@@ -406,27 +406,6 @@ impl<'a> ChimericDetector<'a> {
         }
 
         Ok(chimeras)
-    }
-
-    /// Check if two clusters represent a chimeric signature
-    fn is_chimeric_signature(&self, c1: &SeedCluster, c2: &SeedCluster) -> bool {
-        // Different chromosomes
-        if c1.chr_idx != c2.chr_idx {
-            return true;
-        }
-
-        // Different strands (same chromosome)
-        if c1.is_reverse != c2.is_reverse {
-            return true;
-        }
-
-        // Large genomic distance (same chr/strand)
-        let distance = genomic_distance(c1, c2);
-        if distance > 1_000_000 {
-            return true;
-        }
-
-        false
     }
 
     /// Build chimeric alignment from two clusters
@@ -527,6 +506,27 @@ fn genomic_distance(c1: &SeedCluster, c2: &SeedCluster) -> u64 {
     } else {
         c1.genome_start.saturating_sub(c2.genome_end)
     }
+}
+
+/// Check if two clusters represent a chimeric signature
+fn is_chimeric_signature(c1: &SeedCluster, c2: &SeedCluster) -> bool {
+    // Different chromosomes
+    if c1.chr_idx != c2.chr_idx {
+        return true;
+    }
+
+    // Different strands (same chromosome)
+    if c1.is_reverse != c2.is_reverse {
+        return true;
+    }
+
+    // Large genomic distance (same chr/strand)
+    let distance = genomic_distance(c1, c2);
+    if distance > 1_000_000 {
+        return true;
+    }
+
+    false
 }
 
 /// Detect inter-mate chimeric alignment from two single-mate transcripts.
@@ -837,9 +837,8 @@ pub fn detect_chimeric_old(
     }
 
     // No chimeric partner found
-    let tr2 = match best_tr2 {
-        Some(t) => t,
-        None => return Ok(vec![]),
+    let Some(tr2) = best_tr2 else {
+        return Ok(vec![]);
     };
 
     // Score filters
@@ -1115,46 +1114,34 @@ mod tests {
 
     #[test]
     fn test_is_chimeric_signature_different_chr() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(1, 1000, 1100, false);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_strand_break() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 1200, 1300, true);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_large_distance() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 2_000_000, 2_000_100, false);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_close_same_strand() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 1200, 1300, false);
 
-        assert!(!detector.is_chimeric_signature(&c1, &c2));
+        assert!(!is_chimeric_signature(&c1, &c2));
     }
 
     // --- transcript_to_segment tests ---
