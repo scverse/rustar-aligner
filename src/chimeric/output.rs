@@ -180,7 +180,6 @@ fn build_segment_record(
     sa_tag: &str,
 ) -> Result<RecordBuf, Error> {
     use crate::io::fastq::{complement_base, decode_base};
-    use crate::io::sam::convert_cigar;
     use noodles::sam::alignment::record::data::field::Tag;
 
     let mut record = RecordBuf::default();
@@ -206,7 +205,7 @@ fn build_segment_record(
 
     *record.mapping_quality_mut() = MappingQuality::new(mapq);
 
-    *record.cigar_mut() = convert_cigar(&seg.cigar)?;
+    *record.cigar_mut() = seg.cigar.iter().copied().collect();
 
     // Primary record carries the full read sequence; supplementary uses * (empty).
     if !is_supplementary {
@@ -236,8 +235,8 @@ fn build_segment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::transcript::CigarOp;
     use crate::chimeric::segment::{ChimericAlignment, ChimericSegment};
+    use noodles::sam::alignment::record::cigar;
     use std::io::Read;
     use tempfile::tempdir;
 
@@ -256,6 +255,7 @@ mod tests {
 
     #[test]
     fn test_write_inter_chromosomal() {
+        use cigar::op::{Kind, Op};
         let dir = tempdir().unwrap();
         let prefix = dir.path().to_str().unwrap();
 
@@ -269,7 +269,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![CigarOp::Match(63)],
+            cigar: vec![Op::new(Kind::Match, 63)],
             score: 100,
             n_mismatch: 2,
         };
@@ -281,7 +281,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![CigarOp::Match(37)],
+            cigar: vec![Op::new(Kind::Match, 37)],
             score: 80,
             n_mismatch: 1,
         };
@@ -335,6 +335,7 @@ mod tests {
 
     #[test]
     fn test_write_strand_break() {
+        use cigar::op::{Kind, Op};
         let dir = tempdir().unwrap();
         let prefix = dir.path().to_str().unwrap();
 
@@ -348,7 +349,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 50,
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 1,
         };
@@ -360,7 +361,7 @@ mod tests {
             is_reverse: true,
             read_start: 50,
             read_end: 100,
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 1,
         };
@@ -419,6 +420,7 @@ mod tests {
 
     #[test]
     fn test_within_bam_returns_two_records() {
+        use cigar::op::{Kind, Op};
         let donor = ChimericSegment {
             chr_idx: 0,
             genome_start: 100,
@@ -426,7 +428,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![CigarOp::Match(63)],
+            cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
         };
@@ -437,7 +439,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![CigarOp::Match(37)],
+            cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
         };
@@ -458,6 +460,7 @@ mod tests {
 
     #[test]
     fn test_within_bam_donor_not_supplementary() {
+        use cigar::op::{Kind, Op};
         let donor = ChimericSegment {
             chr_idx: 0,
             genome_start: 100,
@@ -465,7 +468,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![CigarOp::Match(63)],
+            cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
         };
@@ -476,7 +479,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![CigarOp::Match(37)],
+            cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
         };
@@ -507,6 +510,7 @@ mod tests {
 
     #[test]
     fn test_within_bam_sa_tag_format() {
+        use cigar::op::{Kind, Op};
         use noodles::sam::alignment::record::data::field::Tag;
         let donor = ChimericSegment {
             chr_idx: 0,
@@ -515,7 +519,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![CigarOp::Match(63)],
+            cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 2,
         };
@@ -526,7 +530,7 @@ mod tests {
             is_reverse: true,
             read_start: 63,
             read_end: 100,
-            cigar: vec![CigarOp::Match(37)],
+            cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
         };
@@ -571,6 +575,7 @@ mod tests {
 
     #[test]
     fn test_within_bam_donor_has_sequence() {
+        use cigar::op::{Kind, Op};
         let donor = ChimericSegment {
             chr_idx: 0,
             genome_start: 100,
@@ -578,7 +583,7 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![CigarOp::Match(63)],
+            cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
         };
@@ -589,7 +594,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![CigarOp::Match(37)],
+            cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 0,
         };

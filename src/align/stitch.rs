@@ -1,9 +1,10 @@
-/// Seed clustering and stitching via dynamic programming
+//! Seed clustering and stitching via dynamic programming
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
-use crate::align::transcript::{CigarOp, Transcript};
+use crate::align::transcript::Transcript;
 use crate::error::Error;
 use crate::index::GenomeIndex;
+use noodles::sam::alignment::record::cigar;
 
 /// STAR's MARK_FRAG_SPACER_BASE (IncludeDefine.h:174).
 /// Separates mate1 and mate2 fragments in the combined PE read.
@@ -104,12 +105,13 @@ fn score_region(
 
 fn count_mismatches(
     read_seq: &[u8],
-    cigar_ops: &[CigarOp],
+    cigar_ops: &[cigar::Op],
     genome_start: u64,
     read_start: usize,
     index: &GenomeIndex,
     is_reverse: bool,
 ) -> u32 {
+    use cigar::op::Kind;
     // Add n_genome offset for reverse-strand genome access
     let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
 
@@ -118,9 +120,9 @@ fn count_mismatches(
     let mut genome_pos = genome_start;
 
     for op in cigar_ops {
-        match op {
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                for _i in 0..*len {
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for _i in 0..op.len() {
                     if read_pos < read_seq.len() {
                         let read_base = read_seq[read_pos];
                         if let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset)
@@ -135,16 +137,13 @@ fn count_mismatches(
                     genome_pos += 1;
                 }
             }
-            CigarOp::Ins(len) => {
-                read_pos += *len as usize;
+            Kind::Insertion | Kind::SoftClip => {
+                read_pos += op.len();
             }
-            CigarOp::Del(len) | CigarOp::RefSkip(len) => {
-                genome_pos += *len as u64;
+            Kind::Deletion | Kind::Skip => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::SoftClip(len) => {
-                read_pos += *len as usize;
-            }
-            CigarOp::HardClip(_) => {}
+            Kind::HardClip | Kind::Pad => {}
         }
     }
 
@@ -1753,18 +1752,20 @@ pub(crate) fn finalize_transcript(
         }
     }
 
+    use cigar::op::{Kind, Op};
+
     // Build final CIGAR from exon blocks
-    let mut final_cigar: Vec<CigarOp> = Vec::new();
+    let mut final_cigar: Vec<Op> = Vec::new();
 
     // Left soft clip
     let remaining_left_clip = alignment_start - left_extend.extend_len;
     if remaining_left_clip > 0 {
-        final_cigar.push(CigarOp::SoftClip(remaining_left_clip as u32));
+        final_cigar.push(Op::new(Kind::SoftClip, remaining_left_clip));
     }
 
     // Left extension match
     if left_extend.extend_len > 0 {
-        final_cigar.push(CigarOp::Match(left_extend.extend_len as u32));
+        final_cigar.push(Op::new(Kind::Match, left_extend.extend_len));
     }
 
     // Walk exon blocks to build CIGAR
@@ -1776,69 +1777,83 @@ pub(crate) fn finalize_transcript(
 
             if genome_gap > read_gap && genome_gap > 0 {
                 // Shared match bases before the gap
-                let shared = read_gap.max(0) as u32;
+                let shared = read_gap.max(0) as usize;
                 if shared > 0 {
-                    if let Some(CigarOp::Match(prev_len)) = final_cigar.last_mut() {
-                        *prev_len += shared;
+                    // TODO: replace with “extend_or_push_match” function call
+                    if let Some(op) = final_cigar.last_mut()
+                        && op.kind() == Kind::Match
+                    {
+                        *op = Op::new(Kind::Match, op.len() + shared);
                     } else {
-                        final_cigar.push(CigarOp::Match(shared));
+                        final_cigar.push(Op::new(Kind::Match, shared));
                     }
                 }
-                let del = (genome_gap - read_gap.max(0)) as u32;
-                if del >= scorer.align_intron_min && del <= scorer.align_intron_max {
-                    final_cigar.push(CigarOp::RefSkip(del));
+                let del = (genome_gap - read_gap.max(0)) as usize;
+                if del >= scorer.align_intron_min as usize
+                    && del <= scorer.align_intron_max as usize
+                {
+                    final_cigar.push(Op::new(Kind::Skip, del));
                 } else {
-                    final_cigar.push(CigarOp::Del(del));
+                    final_cigar.push(Op::new(Kind::Deletion, del));
                 }
             } else if read_gap > genome_gap && read_gap > 0 {
                 // Insertion
-                let shared = genome_gap.max(0) as u32;
+                let shared = genome_gap.max(0) as usize;
                 if shared > 0 {
-                    if let Some(CigarOp::Match(prev_len)) = final_cigar.last_mut() {
-                        *prev_len += shared;
+                    // TODO: replace with “extend_or_push_match” function call
+                    if let Some(op) = final_cigar.last_mut()
+                        && op.kind() == Kind::Match
+                    {
+                        *op = Op::new(Kind::Match, op.len() + shared);
                     } else {
-                        final_cigar.push(CigarOp::Match(shared));
+                        final_cigar.push(Op::new(Kind::Match, shared));
                     }
                 }
-                let ins = (read_gap - genome_gap.max(0)) as u32;
-                final_cigar.push(CigarOp::Ins(ins));
+                let ins = (read_gap - genome_gap.max(0)) as usize;
+                final_cigar.push(Op::new(Kind::Insertion, ins));
             }
             // Equal gap case is handled by extended exon blocks in stitch_align_to_transcript
         }
 
         // This exon's match region
-        let match_len = (exon.read_end - exon.read_start) as u32;
+        let match_len = exon.read_end - exon.read_start;
         if match_len > 0 {
-            if let Some(CigarOp::Match(prev_len)) = final_cigar.last_mut() {
-                *prev_len += match_len;
+            // TODO: replace with “extend_or_push_match” function call
+            if let Some(op) = final_cigar.last_mut()
+                && op.kind() == Kind::Match
+            {
+                *op = Op::new(Kind::Match, op.len() + match_len);
             } else {
-                final_cigar.push(CigarOp::Match(match_len));
+                final_cigar.push(Op::new(Kind::Match, match_len));
             }
         }
     }
 
     // Right extension match
     if right_extend.extend_len > 0 {
-        if let Some(CigarOp::Match(prev_len)) = final_cigar.last_mut() {
-            *prev_len += right_extend.extend_len as u32;
+        // TODO: replace with “extend_or_push_match” function call
+        if let Some(op) = final_cigar.last_mut()
+            && op.kind() == Kind::Match
+        {
+            *op = Op::new(Kind::Match, op.len() + right_extend.extend_len);
         } else {
-            final_cigar.push(CigarOp::Match(right_extend.extend_len as u32));
+            final_cigar.push(Op::new(Kind::Match, right_extend.extend_len));
         }
     }
 
     // Right soft clip
     let remaining_right_clip = (read_seq.len() - alignment_end) - right_extend.extend_len;
     if remaining_right_clip > 0 {
-        final_cigar.push(CigarOp::SoftClip(remaining_right_clip as u32));
+        final_cigar.push(Op::new(Kind::SoftClip, remaining_right_clip));
     }
 
     // Validate CIGAR read-consuming length
-    let cigar_read_len: u32 = final_cigar
+    let cigar_read_len: usize = final_cigar
         .iter()
-        .filter(|op| op.consumes_query())
+        .filter(|op| op.kind().consumes_read())
         .map(|op| op.len())
         .sum();
-    if cigar_read_len != read_seq.len() as u32 {
+    if cigar_read_len != read_seq.len() {
         // Invalid CIGAR: exon block geometry is inconsistent with read length.
         // This can occur when a combined PE read's WorkingTranscript has exon
         // positions that span both mates or include the spacer region. Silently
@@ -1870,13 +1885,13 @@ pub(crate) fn finalize_transcript(
     // Compute total reference-consuming length from CIGAR
     let mut ref_len = 0u64;
     for op in &final_cigar {
-        match op {
-            CigarOp::Match(len)
-            | CigarOp::Equal(len)
-            | CigarOp::Diff(len)
-            | CigarOp::Del(len)
-            | CigarOp::RefSkip(len) => {
-                ref_len += *len as u64;
+        match op.kind() {
+            Kind::Match
+            | Kind::SequenceMatch
+            | Kind::SequenceMismatch
+            | Kind::Deletion
+            | Kind::Skip => {
+                ref_len += op.len() as u64;
             }
             _ => {}
         }
@@ -1898,9 +1913,9 @@ pub(crate) fn finalize_transcript(
     let mut genome_pos_e = forward_genome_start;
 
     for op in &final_cigar {
-        match op {
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                let len = *len as usize;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let len = op.len();
                 exons.push(Exon {
                     genome_start: genome_pos_e,
                     genome_end: genome_pos_e + len as u64,
@@ -1913,19 +1928,13 @@ pub(crate) fn finalize_transcript(
                 read_pos_e += len;
                 genome_pos_e += len as u64;
             }
-            CigarOp::Ins(len) => {
-                read_pos_e += *len as usize;
+            Kind::Insertion | Kind::SoftClip => {
+                read_pos_e += op.len();
             }
-            CigarOp::Del(len) => {
-                genome_pos_e += *len as u64;
+            Kind::Deletion | Kind::Skip => {
+                genome_pos_e += op.len() as u64;
             }
-            CigarOp::RefSkip(len) => {
-                genome_pos_e += *len as u64;
-            }
-            CigarOp::SoftClip(len) => {
-                read_pos_e += *len as usize;
-            }
-            CigarOp::HardClip(_) => {}
+            Kind::HardClip | Kind::Pad => {}
         }
     }
 

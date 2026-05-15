@@ -461,8 +461,9 @@ impl SortedBamStdoutWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::transcript::{CigarOp, Exon, Transcript};
+    use crate::align::transcript::{Exon, Transcript};
     use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 
     fn create_test_genome() -> Genome {
@@ -518,6 +519,8 @@ mod tests {
 
     #[test]
     fn test_bam_alignment_write() {
+        use cigar::op::{Kind, Op};
+
         let genome = create_test_genome();
         let params = create_test_params();
         let temp_file = NamedTempFile::new().unwrap();
@@ -537,7 +540,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 0,
             n_mismatch: 0,
             n_gap: 0,

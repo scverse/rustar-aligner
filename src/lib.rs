@@ -8,7 +8,6 @@
     clippy::cast_sign_loss,
     clippy::doc_markdown,
     clippy::items_after_statements,
-    clippy::match_same_arms,
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
@@ -41,6 +40,7 @@ pub mod quant;
 pub mod stats;
 
 use log::info;
+use noodles::sam::alignment::record::cigar;
 
 use crate::params::{Parameters, RunMode};
 
@@ -809,20 +809,21 @@ fn extract_junction_keys(
     index: &crate::index::GenomeIndex,
 ) -> Vec<crate::junction::SjKey> {
     use crate::align::score::AlignmentScorer;
-    use crate::align::transcript::CigarOp;
+    use cigar::op::Kind;
 
     let scorer = AlignmentScorer::from_params_minimal();
     let mut keys = Vec::new();
     let mut genome_pos = transcript.genome_start;
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::RefSkip(len) => {
-                let intron_len = *len;
+        match op.kind() {
+            Kind::Skip => {
+                let intron_len = op.len();
                 let intron_start = genome_pos + 1;
                 let intron_end = genome_pos + intron_len as u64;
 
-                let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);
+                let motif =
+                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
                 let strand = match motif.implied_strand() {
                     Some('+') => 1u8,
                     Some('-') => 2u8,
@@ -840,13 +841,10 @@ fn extract_junction_keys(
 
                 genome_pos += intron_len as u64;
             }
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                genome_pos += *len as u64;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::Del(len) => {
-                genome_pos += *len as u64;
-            }
-            CigarOp::Ins(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
 
@@ -1846,7 +1844,7 @@ fn record_transcript_junctions(
     is_unique: bool,
 ) {
     use crate::align::score::AlignmentScorer;
-    use crate::align::transcript::CigarOp;
+    use cigar::op::Kind;
 
     // First pass: compute exon segment lengths (query-consuming bases between N operations)
     // An "exon segment" is the query bases on each side of a splice junction.
@@ -1854,20 +1852,17 @@ fn record_transcript_junctions(
     let mut current_exon_len = 0u32;
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                current_exon_len += *len;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion => {
+                current_exon_len += op.len() as u32;
             }
-            CigarOp::Ins(len) => {
-                current_exon_len += *len;
-            }
-            CigarOp::RefSkip(_) => {
+            Kind::Skip => {
                 exon_lengths.push(current_exon_len);
                 current_exon_len = 0;
             }
             // Soft clips, deletions, hard clips do not contribute to overhang
             // STAR counts only matched/inserted bases (not soft-clipped bases)
-            CigarOp::SoftClip(_) | CigarOp::Del(_) | CigarOp::HardClip(_) => {}
+            Kind::Deletion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
     exon_lengths.push(current_exon_len); // Final exon segment
@@ -1879,15 +1874,16 @@ fn record_transcript_junctions(
     let scorer = AlignmentScorer::from_params_minimal();
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::RefSkip(len) => {
+        match op.kind() {
+            Kind::Skip => {
                 // This is a splice junction
-                let intron_len = *len;
+                let intron_len = op.len();
                 let intron_start = genome_pos + 1; // 1-based, first intronic base
                 let intron_end = genome_pos + intron_len as u64; // 1-based, last intronic base
 
                 // Detect splice motif
-                let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);
+                let motif =
+                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
 
                 // Compute overhang: min(left_exon_length, right_exon_length)
                 let left_exon = exon_lengths[junction_idx];
@@ -1923,14 +1919,10 @@ fn record_transcript_junctions(
                 genome_pos += intron_len as u64;
                 junction_idx += 1;
             }
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                genome_pos += *len as u64;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::Ins(_) => {}
-            CigarOp::Del(len) => {
-                genome_pos += *len as u64;
-            }
-            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
 }

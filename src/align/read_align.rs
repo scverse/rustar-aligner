@@ -355,14 +355,14 @@ pub fn align_read(
             a.genome_start,
             a.genome_end,
             a.is_reverse,
-            &a.cigar,
+            //&a.cigar,
         )
             .cmp(&(
                 b.chr_idx,
                 b.genome_start,
                 b.genome_end,
                 b.is_reverse,
-                &b.cigar,
+                //&b.cigar,
             ))
             .then_with(|| b.score.cmp(&a.score))
     });
@@ -466,13 +466,13 @@ pub fn align_read(
 
         // Absolute matched bases
         let n_matched = t.n_matched();
-        if n_matched < params.out_filter_match_nmin {
+        if n_matched < params.out_filter_match_nmin as usize {
             *filter_reasons.entry("match_min").or_insert(0) += 1;
             return false;
         }
 
         // Relative matched bases: STAR casts to uint (u32)
-        if n_matched < (params.out_filter_match_nmin_over_lread * lread_m1) as u32 {
+        if (n_matched as f64) < params.out_filter_match_nmin_over_lread * lread_m1 {
             *filter_reasons.entry("match_min_relative").or_insert(0) += 1;
             return false;
         }
@@ -518,7 +518,6 @@ pub fn align_read(
                 match motif.implied_strand() {
                     Some('+') => has_plus = true,
                     Some('-') => has_minus = true,
-                    None => {}
                     _ => {}
                 }
             }
@@ -985,10 +984,9 @@ pub fn align_paired_read(
         if pos_cmp != std::cmp::Ordering::Equal {
             return pos_cmp;
         }
-        b.combined_wt_score
-            .cmp(&a.combined_wt_score)
-            .then_with(|| a.mate1_transcript.cigar.cmp(&b.mate1_transcript.cigar))
-            .then_with(|| a.mate2_transcript.cigar.cmp(&b.mate2_transcript.cigar))
+        b.combined_wt_score.cmp(&a.combined_wt_score)
+        //.then_with(|| a.mate1_transcript.cigar.cmp(&b.mate1_transcript.cigar))
+        //.then_with(|| a.mate2_transcript.cigar.cmp(&b.mate2_transcript.cigar))
     });
     joint_pairs.dedup_by(|a, b| {
         a.mate1_transcript.chr_idx == b.mate1_transcript.chr_idx
@@ -1414,18 +1412,18 @@ fn extract_junctions_from_cigar(t: &Transcript) -> Vec<(u64, u64)> {
     let mut junctions = Vec::new();
     let mut genome_pos = t.genome_start;
     for op in &t.cigar {
-        use crate::align::transcript::CigarOp;
-        match op {
-            CigarOp::Match(n) | CigarOp::Equal(n) | CigarOp::Diff(n) | CigarOp::Del(n) => {
-                genome_pos += *n as u64;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::RefSkip(n) => {
+            Kind::Skip => {
                 let donor = genome_pos;
-                let acceptor = genome_pos + *n as u64;
+                let acceptor = genome_pos + op.len() as u64;
                 junctions.push((donor, acceptor));
                 genome_pos = acceptor;
             }
-            CigarOp::Ins(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
     junctions
@@ -1477,6 +1475,7 @@ mod tests {
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
     use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
 
     fn make_test_params() -> Parameters {
         // Parse empty args to get default parameters
@@ -1535,8 +1534,7 @@ mod tests {
 
     #[test]
     fn combined_transcript_for_projection_rewrites_mate2_ifrag() {
-        use crate::align::transcript::CigarOp;
-
+        use cigar::op::{Kind, Op};
         let make_tr = |gs: u64, ge: u64, rs: usize, re: usize| Transcript {
             chr_idx: 0,
             genome_start: gs,
@@ -1549,7 +1547,7 @@ mod tests {
                 read_end: re,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match((ge - gs) as u32)],
+            cigar: vec![Op::new(Kind::Match, (ge - gs) as usize)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1652,7 +1650,8 @@ mod tests {
 
     #[test]
     fn test_check_proper_pair_distance() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let params = make_test_params();
 
@@ -1669,7 +1668,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1691,7 +1690,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1707,7 +1706,8 @@ mod tests {
 
     #[test]
     fn test_check_proper_pair_too_far() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let mut params = make_test_params();
         params.align_mates_gap_max = 100;
@@ -1724,7 +1724,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1746,7 +1746,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1762,7 +1762,8 @@ mod tests {
 
     #[test]
     fn test_calculate_insert_size_positive() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         // Mate1 is leftmost
         let t1 = Transcript {
@@ -1777,7 +1778,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1799,7 +1800,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1815,8 +1816,9 @@ mod tests {
 
     #[test]
     fn test_strand_consistency_filter() {
-        use crate::align::transcript::{CigarOp, Exon, Transcript};
+        use crate::align::transcript::{Exon, Transcript};
         use crate::params::IntronStrandFilter;
+        use cigar::op::{Kind, Op};
 
         // Create a transcript with conflicting strand motifs (mixed + and - within one transcript)
         let t_inconsistent = Transcript {
@@ -1831,7 +1833,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1854,7 +1856,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1915,7 +1917,8 @@ mod tests {
 
     #[test]
     fn test_calculate_insert_size_negative() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         // RF pair: mate1 reverse (right side), mate2 forward (left side).
         // STAR reverse cluster: tlen = mate1.genome_end - mate2.genome_start = 1300 - 1000 = 300.
@@ -1932,7 +1935,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1954,7 +1957,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1971,7 +1974,8 @@ mod tests {
     #[test]
     fn test_noncanonical_unannotated_filter() {
         use crate::align::score::SpliceMotif;
-        use crate::align::transcript::{CigarOp, Exon, Transcript};
+        use crate::align::transcript::{Exon, Transcript};
+        use cigar::op::{Kind, Op};
 
         // Helper: check if a transcript would be filtered by RemoveNoncanonicalUnannotated
         // (mirrors the logic in the retain closure)
@@ -1994,7 +1998,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2065,7 +2069,8 @@ mod tests {
 
     #[test]
     fn test_paired_alignment_result_enum_variants() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let transcript = Transcript {
             chr_idx: 0,
@@ -2079,7 +2084,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,

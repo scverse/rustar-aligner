@@ -43,7 +43,7 @@ impl<'a> ChimericDetector<'a> {
         }
 
         let read_len = read_seq.len();
-        let (left_clip, right_clip) = transcript.count_soft_clips();
+        let [left_clip, right_clip] = transcript.count_soft_clips();
         let score_min = params.chim_score_min;
         let score_drop_max = params.chim_score_drop_max;
         let non_gtag_penalty = params.chim_score_junction_non_gtag;
@@ -51,7 +51,7 @@ impl<'a> ChimericDetector<'a> {
         let overhang_min = params.chim_junction_overhang_min as usize;
 
         // Try right clip first, then left (match STAR's ordering)
-        let candidates = [(right_clip as usize, true), (left_clip as usize, false)];
+        let candidates = [(right_clip, true), (left_clip, false)];
 
         for (clip_len, is_right) in candidates {
             if clip_len < min_seg {
@@ -980,7 +980,7 @@ pub(crate) fn transcript_to_segment(transcript: &Transcript) -> Result<ChimericS
 mod tests {
     use super::*;
     use crate::align::WindowAlignment;
-    use crate::align::transcript::{CigarOp, Exon, Transcript};
+    use crate::align::transcript::{Exon, Transcript};
     use crate::genome::Genome;
     use crate::index::GenomeIndex;
     use crate::index::packed_array::PackedArray;
@@ -988,6 +988,7 @@ mod tests {
     use crate::index::suffix_array::SuffixArray;
     use crate::junction::SpliceJunctionDb;
     use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
 
     /// Minimal two-chromosome genome for chimeric tests.
     /// Each chromosome has 200 bases of A (=0), padded to 256-byte bins.
@@ -1035,6 +1036,7 @@ mod tests {
         genome_end: u64,
         is_reverse: bool,
     ) -> Transcript {
+        use cigar::op::{Kind, Op};
         let read_len = (genome_end - genome_start) as usize;
         Transcript {
             chr_idx,
@@ -1048,7 +1050,7 @@ mod tests {
                 read_end: read_len,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(read_len as u32)],
+            cigar: vec![Op::new(Kind::Match, read_len)],
             score: read_len as i32,
             n_mismatch: 0,
             n_gap: 0,
@@ -1290,14 +1292,15 @@ mod tests {
         left_clip: usize,
         right_clip: usize,
     ) -> Transcript {
+        use cigar::op::{Kind, Op};
         let aligned_len = read_len - left_clip - right_clip;
         let mut cigar = vec![];
         if left_clip > 0 {
-            cigar.push(CigarOp::SoftClip(left_clip as u32));
+            cigar.push(Op::new(Kind::SoftClip, left_clip));
         }
-        cigar.push(CigarOp::Match(aligned_len as u32));
+        cigar.push(Op::new(Kind::Match, aligned_len));
         if right_clip > 0 {
-            cigar.push(CigarOp::SoftClip(right_clip as u32));
+            cigar.push(Op::new(Kind::SoftClip, right_clip));
         }
         Transcript {
             chr_idx,

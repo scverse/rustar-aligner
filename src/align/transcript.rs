@@ -1,4 +1,5 @@
-/// Transcript data structures for storing alignment results
+//! Transcript data structures for storing alignment results
+use noodles::sam::alignment::record::cigar;
 use std::fmt::Write as _;
 
 /// A complete alignment of a read to the genome
@@ -15,7 +16,7 @@ pub struct Transcript {
     /// Exon segments
     pub exons: Vec<Exon>,
     /// CIGAR operations
-    pub cigar: Vec<CigarOp>,
+    pub cigar: Vec<cigar::Op>,
     /// Alignment score
     pub score: i32,
     /// Number of mismatches
@@ -54,90 +55,25 @@ pub struct Exon {
     pub i_frag: u8,
 }
 
-/// CIGAR operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CigarOp {
-    /// M: match/mismatch (default mode)
-    Match(u32),
-    /// =: exact match (optional)
-    Equal(u32),
-    /// X: mismatch (optional)
-    Diff(u32),
-    /// I: insertion to reference
-    Ins(u32),
-    /// D: deletion from reference
-    Del(u32),
-    /// N: splice junction (skipped reference region)
-    RefSkip(u32),
-    /// S: soft clip (clipped sequence present in read)
-    SoftClip(u32),
-    /// H: hard clip (clipped sequence not present)
-    HardClip(u32),
-}
-
-impl CigarOp {
-    /// Get the operation character
-    pub fn op_char(&self) -> char {
-        match self {
-            CigarOp::Match(_) => 'M',
-            CigarOp::Equal(_) => '=',
-            CigarOp::Diff(_) => 'X',
-            CigarOp::Ins(_) => 'I',
-            CigarOp::Del(_) => 'D',
-            CigarOp::RefSkip(_) => 'N',
-            CigarOp::SoftClip(_) => 'S',
-            CigarOp::HardClip(_) => 'H',
-        }
-    }
-
-    /// Get the operation length
-    pub fn len(&self) -> u32 {
-        match self {
-            CigarOp::Match(n)
-            | CigarOp::Equal(n)
-            | CigarOp::Diff(n)
-            | CigarOp::Ins(n)
-            | CigarOp::Del(n)
-            | CigarOp::RefSkip(n)
-            | CigarOp::SoftClip(n)
-            | CigarOp::HardClip(n) => *n,
-        }
-    }
-
-    /// Check if operation is empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Check if operation consumes query bases
-    pub fn consumes_query(&self) -> bool {
-        matches!(
-            self,
-            CigarOp::Match(_)
-                | CigarOp::Equal(_)
-                | CigarOp::Diff(_)
-                | CigarOp::Ins(_)
-                | CigarOp::SoftClip(_)
-        )
-    }
-
-    /// Check if operation consumes reference bases
-    pub fn consumes_reference(&self) -> bool {
-        matches!(
-            self,
-            CigarOp::Match(_)
-                | CigarOp::Equal(_)
-                | CigarOp::Diff(_)
-                | CigarOp::Del(_)
-                | CigarOp::RefSkip(_)
-        )
+fn cigar_char(kind: cigar::op::Kind) -> char {
+    use cigar::op::Kind;
+    match kind {
+        Kind::Match => 'M',
+        Kind::Insertion => 'I',
+        Kind::Deletion => 'D',
+        Kind::Skip => 'N',
+        Kind::SoftClip => 'S',
+        Kind::HardClip => 'H',
+        Kind::Pad => 'P',
+        Kind::SequenceMatch => '=',
+        Kind::SequenceMismatch => 'X',
     }
 }
 
 /// Convert CIGAR operations to CIGAR string
-pub(crate) fn cigar_to_string(cigar: &[CigarOp]) -> String {
+pub(crate) fn cigar_to_string(cigar: &[cigar::Op]) -> String {
     cigar.iter().fold(String::new(), |mut c, op| {
-        let _ = write!(c, "{}{}", op.len(), op.op_char()); // infallible
+        let _ = write!(c, "{}{}", op.len(), cigar_char(op.kind())); // infallible
         c
     })
 }
@@ -149,52 +85,43 @@ impl Transcript {
     }
 
     /// Calculate number of matched bases (for filtering)
-    pub fn n_matched(&self) -> u32 {
+    pub fn n_matched(&self) -> usize {
+        use cigar::op::Kind;
         self.cigar
             .iter()
-            .filter_map(|op| match op {
-                CigarOp::Match(n) | CigarOp::Equal(n) => Some(*n),
+            .filter_map(|op| match op.kind() {
+                Kind::Match | Kind::SequenceMatch => Some(op.len()),
                 _ => None,
             })
             .sum()
     }
 
     /// Calculate read length from CIGAR
-    pub fn read_length(&self) -> u32 {
+    pub fn read_length(&self) -> usize {
         self.cigar
             .iter()
-            .filter(|op| op.consumes_query())
+            .filter(|op| op.kind().consumes_read())
             .map(|op| op.len())
             .sum()
     }
 
     /// Calculate reference length from CIGAR
-    pub fn reference_length(&self) -> u32 {
+    pub fn reference_length(&self) -> usize {
         self.cigar
             .iter()
-            .filter(|op| op.consumes_reference())
+            .filter(|op| op.kind().consumes_reference())
             .map(|op| op.len())
             .sum()
     }
 
     /// Count soft-clipped bases on left and right ends
     ///
-    /// Returns (left_clip, right_clip) in bases
-    pub fn count_soft_clips(&self) -> (u32, u32) {
-        let mut left_clip = 0u32;
-        let mut right_clip = 0u32;
-
-        // Check first operation for left clip
-        if let Some(CigarOp::SoftClip(n)) = self.cigar.first() {
-            left_clip = *n;
-        }
-
-        // Check last operation for right clip
-        if let Some(CigarOp::SoftClip(n)) = self.cigar.last() {
-            right_clip = *n;
-        }
-
-        (left_clip, right_clip)
+    /// Returns `[left_clip, right_clip]` in bases
+    pub fn count_soft_clips(&self) -> [usize; 2] {
+        [self.cigar.first(), self.cigar.last()].map(|c| {
+            c.filter(|c| c.kind() == cigar::op::Kind::SoftClip)
+                .map_or(0, |c| c.len())
+        })
     }
 }
 
@@ -204,12 +131,13 @@ mod tests {
 
     #[test]
     fn test_cigar_to_string() {
+        use cigar::op::{Kind, Op};
         let cigar = vec![
-            CigarOp::Match(50),
-            CigarOp::Ins(2),
-            CigarOp::Del(3),
-            CigarOp::RefSkip(1000),
-            CigarOp::SoftClip(5),
+            Op::new(Kind::Match, 50),
+            Op::new(Kind::Insertion, 2),
+            Op::new(Kind::Deletion, 3),
+            Op::new(Kind::Skip, 1000),
+            Op::new(Kind::SoftClip, 5),
         ];
 
         assert_eq!(cigar_to_string(&cigar), "50M2I3D1000N5S");
@@ -217,6 +145,7 @@ mod tests {
 
     #[test]
     fn test_cigar_string() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
@@ -224,9 +153,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(50),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(50),
+                Op::new(Kind::Match, 50),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 50),
             ],
             score: 100,
             n_mismatch: 0,
@@ -242,24 +171,27 @@ mod tests {
 
     #[test]
     fn test_cigar_consumes() {
-        assert!(CigarOp::Match(10).consumes_query());
-        assert!(CigarOp::Match(10).consumes_reference());
+        use cigar::op::Kind;
 
-        assert!(CigarOp::Ins(5).consumes_query());
-        assert!(!CigarOp::Ins(5).consumes_reference());
+        assert!(Kind::Match.consumes_read());
+        assert!(Kind::Match.consumes_reference());
 
-        assert!(!CigarOp::Del(3).consumes_query());
-        assert!(CigarOp::Del(3).consumes_reference());
+        assert!(Kind::Insertion.consumes_read());
+        assert!(!Kind::Insertion.consumes_reference());
 
-        assert!(!CigarOp::RefSkip(1000).consumes_query());
-        assert!(CigarOp::RefSkip(1000).consumes_reference());
+        assert!(!Kind::Deletion.consumes_read());
+        assert!(Kind::Deletion.consumes_reference());
 
-        assert!(CigarOp::SoftClip(5).consumes_query());
-        assert!(!CigarOp::SoftClip(5).consumes_reference());
+        assert!(!Kind::Skip.consumes_read());
+        assert!(Kind::Skip.consumes_reference());
+
+        assert!(Kind::SoftClip.consumes_read());
+        assert!(!Kind::SoftClip.consumes_reference());
     }
 
     #[test]
     fn test_transcript_lengths() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
@@ -267,11 +199,11 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(45),
-                CigarOp::Ins(3),
-                CigarOp::Match(2),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(50),
+                Op::new(Kind::Match, 45),
+                Op::new(Kind::Insertion, 3),
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 50),
             ],
             score: 100,
             n_mismatch: 0,
@@ -310,6 +242,7 @@ mod tests {
 
     #[test]
     fn test_count_soft_clips_both_ends() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
@@ -317,9 +250,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::SoftClip(10),
-                CigarOp::Match(50),
-                CigarOp::SoftClip(15),
+                Op::new(Kind::SoftClip, 10),
+                Op::new(Kind::Match, 50),
+                Op::new(Kind::SoftClip, 15),
             ],
             score: 100,
             n_mismatch: 0,
@@ -330,20 +263,21 @@ mod tests {
             read_seq: vec![],
         };
 
-        let (left, right) = transcript.count_soft_clips();
+        let [left, right] = transcript.count_soft_clips();
         assert_eq!(left, 10);
         assert_eq!(right, 15);
     }
 
     #[test]
     fn test_count_soft_clips_left_only() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
             genome_end: 150,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::SoftClip(20), CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::SoftClip, 20), Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -353,20 +287,21 @@ mod tests {
             read_seq: vec![],
         };
 
-        let (left, right) = transcript.count_soft_clips();
+        let [left, right] = transcript.count_soft_clips();
         assert_eq!(left, 20);
         assert_eq!(right, 0);
     }
 
     #[test]
     fn test_count_soft_clips_none() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
             genome_end: 150,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -376,7 +311,7 @@ mod tests {
             read_seq: vec![],
         };
 
-        let (left, right) = transcript.count_soft_clips();
+        let [left, right] = transcript.count_soft_clips();
         assert_eq!(left, 0);
         assert_eq!(right, 0);
     }

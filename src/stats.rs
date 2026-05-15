@@ -1,10 +1,11 @@
-/// Alignment statistics tracking and reporting
+//! Alignment statistics tracking and reporting
 use log::info;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::align::transcript::{CigarOp, Transcript};
+use crate::align::transcript::Transcript;
 use crate::junction::encode_motif;
+use noodles::sam::alignment::record::cigar;
 
 /// Reason a read could not be mapped
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,23 +145,25 @@ impl AlignmentStats {
     /// Walks the CIGAR to extract mapped bases, ins/del counts, and splice motif counts.
     /// Only call this for unique mappers (n_alignments == 1).
     pub fn record_transcript_stats(&self, transcript: &Transcript) {
+        use cigar::op::Kind;
         // Walk CIGAR for mapped bases, ins/del
         for op in &transcript.cigar {
-            match op {
-                CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                    self.mapped_bases.fetch_add(*len as u64, Ordering::Relaxed);
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    self.mapped_bases
+                        .fetch_add(op.len() as u64, Ordering::Relaxed);
                 }
-                CigarOp::Ins(len) => {
+                Kind::Insertion => {
                     self.mapped_ins_count.fetch_add(1, Ordering::Relaxed);
                     self.mapped_ins_bases
-                        .fetch_add(*len as u64, Ordering::Relaxed);
+                        .fetch_add(op.len() as u64, Ordering::Relaxed);
                 }
-                CigarOp::Del(len) => {
+                Kind::Deletion => {
                     self.mapped_del_count.fetch_add(1, Ordering::Relaxed);
                     self.mapped_del_bases
-                        .fetch_add(*len as u64, Ordering::Relaxed);
+                        .fetch_add(op.len() as u64, Ordering::Relaxed);
                 }
-                CigarOp::RefSkip(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+                Kind::Skip | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
             }
         }
 
@@ -761,6 +764,7 @@ mod tests {
     fn test_record_transcript_stats() {
         use crate::align::score::SpliceMotif;
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let stats = AlignmentStats::new();
 
@@ -778,14 +782,14 @@ mod tests {
                 i_frag: 0,
             }],
             cigar: vec![
-                CigarOp::SoftClip(5),
-                CigarOp::Match(45),
-                CigarOp::Ins(3),
-                CigarOp::Match(2),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(50),
-                CigarOp::Del(2),
-                CigarOp::Match(5),
+                Op::new(Kind::SoftClip, 5),
+                Op::new(Kind::Match, 45),
+                Op::new(Kind::Insertion, 3),
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 50),
+                Op::new(Kind::Deletion, 2),
+                Op::new(Kind::Match, 5),
             ],
             score: 100,
             n_mismatch: 3,
@@ -832,6 +836,7 @@ mod tests {
     fn test_splice_motif_aggregation() {
         use crate::align::score::SpliceMotif;
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let stats = AlignmentStats::new();
 
@@ -848,7 +853,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
