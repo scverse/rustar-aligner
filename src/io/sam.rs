@@ -1,6 +1,6 @@
 //! SAM/BAM output writer with noodles
 use crate::align::read_align::PairedAlignment;
-use crate::align::transcript::Transcript;
+use crate::align::transcript::{Transcript, cigar_to_string};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::io::fastq::{complement_base, decode_base};
@@ -150,17 +150,13 @@ impl SamWriter {
                     .name()
                     .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
                     .unwrap_or_default();
-                let cigar_str = cigar_ops.iter().fold(String::new(), |mut c, op| {
-                    let _ = write!(c, "{}{:?}", op.len(), op.kind()); // infallible
-                    c
-                });
                 panic!(
                     "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
                     name,
                     cigar_query_len,
                     seq_len,
                     record.flags(),
-                    cigar_str
+                    cigar_to_string(cigar_ops)
                 );
             }
             self.writer.write_alignment_record(&self.header, record)?;
