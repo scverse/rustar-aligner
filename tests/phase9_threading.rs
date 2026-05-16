@@ -1,5 +1,5 @@
 /// Phase 9: Threading integration tests
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use std::fs;
 use std::io::Write;
@@ -67,8 +67,7 @@ fn test_single_thread_alignment() {
     let genome_dir = tmpdir.path().join("genome");
 
     // Generate genome index
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("genomeGenerate")
         .arg("--genomeDir")
@@ -85,8 +84,7 @@ fn test_single_thread_alignment() {
     let output_dir = tmpdir.path().join("output_1t");
 
     // Align with 1 thread
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("alignReads")
         .arg("--genomeDir")
@@ -128,8 +126,7 @@ fn test_multi_thread_alignment() {
     let genome_dir = tmpdir.path().join("genome");
 
     // Generate genome index
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("genomeGenerate")
         .arg("--genomeDir")
@@ -146,8 +143,7 @@ fn test_multi_thread_alignment() {
     let output_dir = tmpdir.path().join("output_4t");
 
     // Align with 4 threads
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("alignReads")
         .arg("--genomeDir")
@@ -186,8 +182,7 @@ fn test_thread_count_consistency() {
     let genome_dir = tmpdir.path().join("genome");
 
     // Generate genome index
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("genomeGenerate")
         .arg("--genomeDir")
@@ -204,8 +199,7 @@ fn test_thread_count_consistency() {
 
     // Run with 1 thread
     let output_1t = tmpdir.path().join("output_1t");
-    let result_1t = Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    let result_1t = cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("alignReads")
         .arg("--genomeDir")
@@ -223,8 +217,7 @@ fn test_thread_count_consistency() {
 
     // Run with 4 threads
     let output_4t = tmpdir.path().join("output_4t");
-    let result_4t = Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    let result_4t = cargo_bin_cmd!("rustar-aligner")
         .arg("--runMode")
         .arg("alignReads")
         .arg("--genomeDir")
