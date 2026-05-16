@@ -33,13 +33,13 @@ log = "0.4"
 env_logger = "0.11"
 memmap2 = "0.9"
 byteorder = "1"
-noodles = { version = "0.80", features = ["fastq", "sam", "bam", "bgzf"] }
+noodles = { version = "0.109", features = ["fastq", "sam", "bam", "bgzf"] }
 bstr = "1"
 flate2 = "1"
 rayon = "1"
 dashmap = "6"
 chrono = "0.4"
-rand = "0.8"
+rand = "0.10"
 tempfile = "3"
 
 [dev-dependencies]

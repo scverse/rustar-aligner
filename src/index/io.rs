@@ -138,7 +138,7 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     let chr_name_path = genome_dir.join("chrName.txt");
     let chr_name_contents =
         std::fs::read_to_string(&chr_name_path).map_err(|e| Error::io(e, &chr_name_path))?;
-    let chr_name: Vec<String> = chr_name_contents.lines().map(|s| s.to_string()).collect();
+    let chr_name: Vec<String> = chr_name_contents.lines().map(ToString::to_string).collect();
 
     let chr_length_path = genome_dir.join("chrLength.txt");
     let chr_length_contents =
