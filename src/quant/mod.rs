@@ -64,9 +64,8 @@ impl GeneAnnotation {
                 idx
             };
 
-            let chr_idx = match genome.chr_name.iter().position(|n| n == &exon.seqname) {
-                Some(i) => i,
-                None => continue,
+            let Some(chr_idx) = genome.chr_name.iter().position(|n| n == &exon.seqname) else {
+                continue;
             };
             if chr_idx >= n_chrs {
                 continue;
@@ -363,7 +362,7 @@ impl QuantContext {
         let exons = crate::junction::gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
         let gene_ann = GeneAnnotation::from_gtf_exons_configured(&exons, genome, gene_tag);
         let n = gene_ann.n_genes();
-        log::info!("quantMode GeneCounts: {} genes loaded from GTF", n);
+        log::info!("quantMode GeneCounts: {n} genes loaded from GTF");
         let counts = GeneCounts::new(n);
         Ok(QuantContext { gene_ann, counts })
     }

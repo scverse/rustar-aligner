@@ -565,17 +565,17 @@ mod tests {
     // Callers who only exercise compute_shifts / prepare_junction don't
     // need a valid reverse complement; we fill the RC half with padding.
     fn make_test_genome(forward: Vec<u8>) -> Genome {
-        let n = forward.len() as u64;
-        let mut seq = vec![5u8; (n * 2) as usize];
-        seq[..forward.len()].copy_from_slice(&forward);
+        let n = forward.len();
+        let mut seq = forward;
+        seq.extend(std::iter::repeat_n(5u8, n));
         Genome {
             sequence: seq,
-            n_genome: n,
-            n_genome_real: n,
+            n_genome: n as u64,
+            n_genome_real: n as u64,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
-            chr_length: vec![n],
-            chr_start: vec![0, n],
+            chr_length: vec![n as u64],
+            chr_start: vec![0, n as u64],
         }
     }
 
@@ -888,7 +888,7 @@ mod tests {
         let g = make_test_genome(vec![0u8; 300]);
         let bad = pj(0, 3, 200, 1, 0, 1); // original_start=3; overhang 10 underflows
         let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
-        assert!(format!("{}", err).contains("underflows"));
+        assert!(format!("{err}").contains("underflows"));
     }
 
     #[test]
@@ -898,7 +898,7 @@ mod tests {
         // original_end = 295, overhang = 10 → acceptor region [296..306), exceeds n_genome=300.
         let bad = pj(0, 100, 295, 1, 0, 1);
         let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
-        assert!(format!("{}", err).contains("overruns"));
+        assert!(format!("{err}").contains("overruns"));
     }
 
     #[test]
@@ -917,11 +917,11 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
             },
-            // Non-canonical: stored = shifted (139187..139217).
+            // Non-canonical: stored = shifted (139_187..139_217).
             PreparedJunction {
                 chr_idx: 0,
-                start_pos: 139187,
-                end_pos: 139217,
+                start_pos: 139_187,
+                end_pos: 139_217,
                 motif: 0,
                 shift_left: 0,
                 shift_right: 0,
@@ -955,8 +955,8 @@ mod tests {
         // `stored + shift_left + 1`, which is `original + 1`.
         let noncan = PreparedJunction {
             chr_idx: 0,
-            start_pos: 139184, // shifted
-            end_pos: 139214,
+            start_pos: 139_184, // shifted
+            end_pos: 139_214,
             motif: 0,
             shift_left: 3,
             shift_right: 0,

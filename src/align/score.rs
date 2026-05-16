@@ -206,7 +206,7 @@ impl AlignmentScorer {
                         genome_pos
                     };
                     let motif = self.detect_splice_motif(donor, len, genome);
-                    let score = self.score_splice_junction(&motif);
+                    let score = self.score_splice_junction(motif);
                     (
                         score,
                         GapType::SpliceJunction {
@@ -224,35 +224,39 @@ impl AlignmentScorer {
             // Score the net indel portion
             (gg, rg) if gg > 0 && rg > 0 => {
                 let excess = gg - rg;
-                if excess > 0 {
-                    let del_len = excess as u32;
-                    if del_len >= self.align_intron_min && del_len <= self.align_intron_max {
-                        let rc_donor = genome_pos + rg as u64;
-                        let donor = if is_reverse {
-                            n_genome - rc_donor - del_len as u64
+                match excess {
+                    1.. => {
+                        let del_len = excess as u32;
+                        if del_len >= self.align_intron_min && del_len <= self.align_intron_max {
+                            let rc_donor = genome_pos + rg as u64;
+                            let donor = if is_reverse {
+                                n_genome - rc_donor - del_len as u64
+                            } else {
+                                rc_donor
+                            };
+                            let motif = self.detect_splice_motif(donor, del_len, genome);
+                            let score = self.score_splice_junction(motif);
+                            (
+                                score,
+                                GapType::SpliceJunction {
+                                    intron_len: del_len,
+                                    motif,
+                                },
+                            )
                         } else {
-                            rc_donor
-                        };
-                        let motif = self.detect_splice_motif(donor, del_len, genome);
-                        let score = self.score_splice_junction(&motif);
-                        (
-                            score,
-                            GapType::SpliceJunction {
-                                intron_len: del_len,
-                                motif,
-                            },
-                        )
-                    } else {
-                        let score = self.score_del_open + self.score_del_base * del_len as i32;
-                        (score, GapType::Deletion(del_len))
+                            let score = self.score_del_open + self.score_del_base * del_len as i32;
+                            (score, GapType::Deletion(del_len))
+                        }
                     }
-                } else if excess < 0 {
-                    let ins_len = (-excess) as u32;
-                    let score = self.score_ins_open + self.score_ins_base * ins_len as i32;
-                    (score, GapType::Insertion(ins_len))
-                } else {
-                    // Equal gaps: no net indel
-                    (0, GapType::Deletion(0))
+                    ..=-1 => {
+                        let ins_len = (-excess) as u32;
+                        let score = self.score_ins_open + self.score_ins_base * ins_len as i32;
+                        (score, GapType::Insertion(ins_len))
+                    }
+                    0 => {
+                        // Equal gaps: no net indel
+                        (0, GapType::Deletion(0))
+                    }
                 }
             }
             // Other cases (negative gaps, etc.)
@@ -385,7 +389,7 @@ impl AlignmentScorer {
                     donor_sa
                 };
                 let motif = self.detect_splice_motif(donor_fwd, del as u32, genome);
-                let motif_score = self.score_splice_junction(&motif);
+                let motif_score = self.score_splice_junction(motif);
                 let score2 = score1 + motif_score;
 
                 if score2 > max_score2 {
@@ -489,7 +493,7 @@ impl AlignmentScorer {
                     donor_sa
                 };
                 best_motif = self.detect_splice_motif(donor_fwd, del as u32, genome);
-                best_motif_score = self.score_splice_junction(&best_motif);
+                best_motif_score = self.score_splice_junction(best_motif);
             }
         }
 
@@ -514,7 +518,7 @@ impl AlignmentScorer {
     }
 
     /// Score a splice junction based on motif
-    pub(crate) fn score_splice_junction(&self, motif: &SpliceMotif) -> i32 {
+    pub(crate) fn score_splice_junction(&self, motif: SpliceMotif) -> i32 {
         match motif {
             SpliceMotif::GtAg | SpliceMotif::CtAc => self.score_gap,
             SpliceMotif::GcAg | SpliceMotif::CtGc => self.score_gap_gcag,
@@ -692,7 +696,7 @@ mod tests {
         let motif = scorer.detect_splice_motif(2, 12, &genome);
         assert_eq!(motif, SpliceMotif::GtAg);
 
-        let score = scorer.score_splice_junction(&motif);
+        let score = scorer.score_splice_junction(motif);
         assert_eq!(score, 0); // Canonical
     }
 
@@ -735,7 +739,7 @@ mod tests {
         let motif = scorer.detect_splice_motif(2, 12, &genome);
         assert_eq!(motif, SpliceMotif::GcAg);
 
-        let score = scorer.score_splice_junction(&motif);
+        let score = scorer.score_splice_junction(motif);
         assert_eq!(score, -4);
     }
 
@@ -778,7 +782,7 @@ mod tests {
         let motif = scorer.detect_splice_motif(2, 12, &genome);
         assert_eq!(motif, SpliceMotif::AtAc);
 
-        let score = scorer.score_splice_junction(&motif);
+        let score = scorer.score_splice_junction(motif);
         assert_eq!(score, -8);
     }
 
@@ -819,7 +823,7 @@ mod tests {
         let motif = scorer.detect_splice_motif(2, 12, &genome);
         assert_eq!(motif, SpliceMotif::NonCanonical);
 
-        let score = scorer.score_splice_junction(&motif);
+        let score = scorer.score_splice_junction(motif);
         assert_eq!(score, -8);
     }
 
@@ -1014,7 +1018,7 @@ mod tests {
         let motif = scorer.detect_splice_motif(2, 12, &genome_ctac);
         assert_eq!(motif, SpliceMotif::CtAc);
         // Should score same as canonical GT-AG
-        assert_eq!(scorer.score_splice_junction(&motif), 0);
+        assert_eq!(scorer.score_splice_junction(motif), 0);
 
         // CT-GC motif: (1,3,2,1) — reverse complement of GC-AG
         let seq_ctgc = vec![
@@ -1027,7 +1031,7 @@ mod tests {
         let genome_ctgc = make_test_genome(&seq_ctgc);
         let motif = scorer.detect_splice_motif(2, 12, &genome_ctgc);
         assert_eq!(motif, SpliceMotif::CtGc);
-        assert_eq!(scorer.score_splice_junction(&motif), -4);
+        assert_eq!(scorer.score_splice_junction(motif), -4);
 
         // GT-AT motif: (2,3,0,3) — reverse complement of AT-AC
         let seq_gtat = vec![
@@ -1040,7 +1044,7 @@ mod tests {
         let genome_gtat = make_test_genome(&seq_gtat);
         let motif = scorer.detect_splice_motif(2, 12, &genome_gtat);
         assert_eq!(motif, SpliceMotif::GtAt);
-        assert_eq!(scorer.score_splice_junction(&motif), -8);
+        assert_eq!(scorer.score_splice_junction(motif), -8);
     }
 
     #[test]
@@ -1282,9 +1286,7 @@ mod tests {
         seq[6] = 2; // G
         seq[7] = 3; // T
         // Fill intron body
-        for i in 8..28 {
-            seq[i] = 1; // C
-        }
+        seq[8..28].fill(1); // C
         // AG acceptor for jR=1 position (donor at pos 6, del=24, acceptor at 28,29)
         seq[28] = 0; // A
         seq[29] = 2; // G
