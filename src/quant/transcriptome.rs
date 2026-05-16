@@ -10,7 +10,7 @@
 //! only substantive divergence that rustar-aligner builds the transcript tables on
 //! the fly from the input GTF instead of loading persisted
 //! `transcriptInfo.tab`/`exonInfo.tab` files.
-use crate::align::transcript::{CigarOpExt, Exon, Transcript};
+use crate::align::transcript::{CigarOpExt as _, Exon, Transcript};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::junction::gtf::GtfRecord;
@@ -1301,7 +1301,7 @@ fn rebuild_cigar_without_softclips(
         if i == 0 && left_clip > 0 {
             // Fold left_clip into the first op if it's match-like.
             match op.kind() {
-                Kind::Match | Kind::SequenceMatch => out.push(op.with_added_len(left_clip)),
+                Kind::Match | Kind::SequenceMatch => out.push(op.add_len(left_clip)),
                 _ => {
                     // Extension landed on a non-match op (shouldn't normally
                     // happen).  Emit as Match.
@@ -1312,7 +1312,7 @@ fn rebuild_cigar_without_softclips(
         } else if i + 1 == body.len() && right_clip > 0 {
             match op.kind() {
                 Kind::Match | Kind::SequenceMatch => {
-                    out.push(op.with_added_len(right_clip));
+                    out.push(op.add_len(right_clip));
                 }
                 _ => {
                     out.push(*op);

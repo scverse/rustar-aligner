@@ -5,12 +5,14 @@ use crate::align::stitch::{
     PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
     stitch_seeds_with_jdb_debug,
 };
-use crate::align::transcript::{Exon, Transcript};
+use crate::align::transcript::{Exon, KindExt as _, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::{IntronMotifFilter, IntronStrandFilter, Parameters};
 use crate::stats::UnmappedReason;
+use noodles::sam::alignment::record::cigar;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Derive a deterministic per-read RNG seed from `run_rng_seed` + the read name.
@@ -350,20 +352,9 @@ pub fn align_read(
 
     // Deduplicate transcripts with identical genomic coordinates AND CIGAR.
     transcripts.sort_by(|a, b| {
-        (
-            a.chr_idx,
-            a.genome_start,
-            a.genome_end,
-            a.is_reverse,
-            //&a.cigar,
-        )
-            .cmp(&(
-                b.chr_idx,
-                b.genome_start,
-                b.genome_end,
-                b.is_reverse,
-                //&b.cigar,
-            ))
+        (a.chr_idx, a.genome_start, a.genome_end, a.is_reverse)
+            .cmp(&(b.chr_idx, b.genome_start, b.genome_end, b.is_reverse))
+            .then_with(|| cmp_cigar(&a.cigar, &b.cigar))
             .then_with(|| b.score.cmp(&a.score))
     });
     transcripts.dedup_by(|a, b| {
@@ -984,9 +975,10 @@ pub fn align_paired_read(
         if pos_cmp != std::cmp::Ordering::Equal {
             return pos_cmp;
         }
-        b.combined_wt_score.cmp(&a.combined_wt_score)
-        //.then_with(|| a.mate1_transcript.cigar.cmp(&b.mate1_transcript.cigar))
-        //.then_with(|| a.mate2_transcript.cigar.cmp(&b.mate2_transcript.cigar))
+        b.combined_wt_score
+            .cmp(&a.combined_wt_score)
+            .then_with(|| cmp_cigar(&a.mate1_transcript.cigar, &b.mate1_transcript.cigar))
+            .then_with(|| cmp_cigar(&a.mate2_transcript.cigar, &b.mate2_transcript.cigar))
     });
     joint_pairs.dedup_by(|a, b| {
         a.mate1_transcript.chr_idx == b.mate1_transcript.chr_idx
@@ -1228,6 +1220,18 @@ pub fn align_paired_read(
         }
         (None, None) => Ok((Vec::new(), pe_chimeric, 0, Some(UnmappedReason::TooShort))),
     }
+}
+
+/// Comparator for deduplicating structs containing CIGAR ops via sort→dedup
+fn cmp_cigar(a: &[cigar::Op], b: &[cigar::Op]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| {
+        (a.iter().zip(b.iter()))
+            .find_map(|(a, b)| {
+                let ord = (a.char(), a.len()).cmp(&(b.char(), b.len()));
+                (ord != Ordering::Equal).then_some(ord)
+            })
+            .unwrap_or(Ordering::Equal)
+    })
 }
 
 /// Attempt to pair two per-mate transcripts into a PairedAlignment.

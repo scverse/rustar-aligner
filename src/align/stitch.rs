@@ -1,7 +1,7 @@
 //! Seed clustering and stitching via dynamic programming
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
-use crate::align::transcript::{CigarOpExt, Transcript};
+use crate::align::transcript::{CigarOpExt as _, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use noodles::sam::alignment::record::cigar;
@@ -1758,7 +1758,7 @@ pub(crate) fn finalize_transcript(
         if let Some(op) = ops.last_mut()
             && op.kind() == Kind::Match
         {
-            *op = op.with_added_len(len);
+            *op = op.add_len(len);
         } else {
             ops.push(Op::new(Kind::Match, len));
         }

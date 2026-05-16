@@ -56,33 +56,43 @@ pub struct Exon {
 }
 
 pub(crate) trait CigarOpExt {
-    fn with_added_len(&self, len: usize) -> Self;
+    fn add_len(&self, len: usize) -> Self;
 }
 impl CigarOpExt for cigar::Op {
-    fn with_added_len(&self, len: usize) -> Self {
+    fn add_len(&self, len: usize) -> Self {
         cigar::Op::new(self.kind(), self.len() + len)
     }
 }
 
-fn cigar_char(kind: cigar::op::Kind) -> char {
-    use cigar::op::Kind;
-    match kind {
-        Kind::Match => 'M',
-        Kind::Insertion => 'I',
-        Kind::Deletion => 'D',
-        Kind::Skip => 'N',
-        Kind::SoftClip => 'S',
-        Kind::HardClip => 'H',
-        Kind::Pad => 'P',
-        Kind::SequenceMatch => '=',
-        Kind::SequenceMismatch => 'X',
+pub(crate) trait KindExt {
+    fn char(self) -> char;
+}
+impl KindExt for cigar::op::Kind {
+    fn char(self) -> char {
+        use cigar::op::Kind;
+        match self {
+            Kind::Match => 'M',
+            Kind::Insertion => 'I',
+            Kind::Deletion => 'D',
+            Kind::Skip => 'N',
+            Kind::SoftClip => 'S',
+            Kind::HardClip => 'H',
+            Kind::Pad => 'P',
+            Kind::SequenceMatch => '=',
+            Kind::SequenceMismatch => 'X',
+        }
+    }
+}
+impl KindExt for cigar::Op {
+    fn char(self) -> char {
+        self.kind().char()
     }
 }
 
 /// Convert CIGAR operations to CIGAR string
 pub(crate) fn cigar_to_string(cigar: &[cigar::Op]) -> String {
     cigar.iter().fold(String::new(), |mut c, op| {
-        let _ = write!(c, "{}{}", op.len(), cigar_char(op.kind())); // infallible
+        let _ = write!(c, "{}{}", op.len(), op.char()); // infallible
         c
     })
 }
