@@ -206,8 +206,7 @@ impl TranscriptomeIndex {
             }
             if inconsistent {
                 log::warn!(
-                    "quantMode TranscriptomeSAM: transcript {} has inconsistent chromosome/strand across exons — skipping",
-                    tid
+                    "quantMode TranscriptomeSAM: transcript {tid} has inconsistent chromosome/strand across exons — skipping"
                 );
                 continue;
             }
@@ -217,9 +216,7 @@ impl TranscriptomeIndex {
                 Some(i) if i < genome.n_chr_real => i,
                 _ => {
                     log::warn!(
-                        "quantMode TranscriptomeSAM: transcript {} on unknown chromosome {} — skipping",
-                        tid,
-                        chr_name
+                        "quantMode TranscriptomeSAM: transcript {tid} on unknown chromosome {chr_name} — skipping"
                     );
                     continue;
                 }
@@ -388,8 +385,7 @@ impl TranscriptomeIndex {
         let sum_exn: u64 = tr_exn.iter().map(|&n| n as u64).sum();
         if sum_exn != n_exons_total as u64 {
             return Err(Error::Index(format!(
-                "transcriptome index inconsistent: sum(trExN)={} but exonInfo has {} rows",
-                sum_exn, n_exons_total
+                "transcriptome index inconsistent: sum(trExN)={sum_exn} but exonInfo has {n_exons_total} rows"
             )));
         }
 
@@ -634,7 +630,7 @@ impl TranscriptomeIndex {
 
         // Flatten (exStart, exEnd_inclusive, strand, gene_idx, tr_insertion_idx).
         let mut records: Vec<(u64, u64, u8, u32, u32)> =
-            Vec::with_capacity(self.tr_exons.iter().map(|e| e.len()).sum());
+            Vec::with_capacity(self.tr_exons.iter().map(Vec::len).sum());
         for (tr_idx, exs) in self.tr_exons.iter().enumerate() {
             let strand = self.tr_strand[tr_idx];
             let gene_idx = self.tr_gene_idx[tr_idx];
@@ -654,8 +650,7 @@ impl TranscriptomeIndex {
         for (ex_start, ex_end, strand, gene_idx, tr_idx) in records {
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
-                ex_start, ex_end, strand, gene_idx, tr_idx
+                "{ex_start}\t{ex_end}\t{strand}\t{gene_idx}\t{tr_idx}"
             )
             .map_err(|e| Error::io(e, &path))?;
         }
@@ -684,7 +679,7 @@ impl TranscriptomeIndex {
             .zip(&self.gene_names)
             .zip(&self.gene_biotypes)
         {
-            writeln!(out, "{}\t{}\t{}", id, name, biotype).map_err(|e| Error::io(e, &path))?;
+            writeln!(out, "{id}\t{name}\t{biotype}").map_err(|e| Error::io(e, &path))?;
         }
 
         Ok(())
@@ -705,7 +700,7 @@ impl TranscriptomeIndex {
         let file = std::fs::File::create(&path).map_err(|e| Error::io(e, &path))?;
         let mut out = std::io::BufWriter::new(file);
 
-        let total_exons: usize = self.tr_exons.iter().map(|e| e.len()).sum();
+        let total_exons: usize = self.tr_exons.iter().map(Vec::len).sum();
         writeln!(out, "{total_exons}").map_err(|e| Error::io(e, &path))?;
 
         for &i in &self.tr_order {

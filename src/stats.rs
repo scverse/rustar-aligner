@@ -228,7 +228,7 @@ impl AlignmentStats {
         }
 
         info!("=== Alignment Summary ===");
-        info!("Number of input reads: {}", total_reads);
+        info!("Number of input reads: {total_reads}");
         info!(
             "Uniquely mapped reads: {} ({:.2}%)",
             uniquely_mapped,
@@ -999,8 +999,7 @@ mod tests {
         for field in &required_fields {
             assert!(
                 content.contains(field),
-                "Missing MultiQC field: '{}'",
-                field
+                "Missing MultiQC field: '{field}'"
             );
         }
     }

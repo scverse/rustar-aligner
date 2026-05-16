@@ -165,9 +165,9 @@ impl<'a> ChimericDetector<'a> {
             }
 
             let donor_seg = transcript_to_segment(tr_donor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip donor: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("soft-clip donor: {e}")))?;
             let acceptor_seg = transcript_to_segment(tr_acceptor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {e}")))?;
 
             let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
                 &index.genome,
@@ -292,7 +292,7 @@ impl<'a> ChimericDetector<'a> {
             };
 
             let new_seg = transcript_to_segment(&clip_tr)
-                .map_err(|e| Error::Chimeric(format!("tier3 segment: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("tier3 segment: {e}")))?;
 
             // Donor / acceptor ordered by read position
             let (donor_seg, acceptor_seg): (&ChimericSegment, &ChimericSegment) =
@@ -897,9 +897,9 @@ pub fn detect_chimeric_old(
 
     // Build chimeric segments
     let donor_seg = transcript_to_segment(tr_donor)
-        .map_err(|e| Error::Chimeric(format!("chimeric donor segment: {}", e)))?;
+        .map_err(|e| Error::Chimeric(format!("chimeric donor segment: {e}")))?;
     let acceptor_seg = transcript_to_segment(tr_acceptor)
-        .map_err(|e| Error::Chimeric(format!("chimeric acceptor segment: {}", e)))?;
+        .map_err(|e| Error::Chimeric(format!("chimeric acceptor segment: {e}")))?;
 
     // Minimum segment length check
     if !donor_seg.meets_min_length(params.chim_segment_min)

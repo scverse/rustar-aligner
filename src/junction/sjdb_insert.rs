@@ -702,7 +702,7 @@ mod tests {
         let g = make_test_genome(vec![0u8; 300]);
         let bad = pj(0, 3, 200, 1, 0, 1); // original_start=3; overhang 10 underflows
         let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
-        assert!(format!("{}", err).contains("underflows"));
+        assert!(format!("{err}").contains("underflows"));
     }
 
     #[test]
@@ -712,7 +712,7 @@ mod tests {
         // original_end = 295, overhang = 10 → acceptor region [296..306), exceeds n_genome=300.
         let bad = pj(0, 100, 295, 1, 0, 1);
         let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
-        assert!(format!("{}", err).contains("overruns"));
+        assert!(format!("{err}").contains("overruns"));
     }
 
     #[test]

@@ -362,7 +362,7 @@ impl QuantContext {
         let exons = crate::junction::gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
         let gene_ann = GeneAnnotation::from_gtf_exons_configured(&exons, genome, gene_tag);
         let n = gene_ann.n_genes();
-        log::info!("quantMode GeneCounts: {} genes loaded from GTF", n);
+        log::info!("quantMode GeneCounts: {n} genes loaded from GTF");
         let counts = GeneCounts::new(n);
         Ok(QuantContext { gene_ann, counts })
     }

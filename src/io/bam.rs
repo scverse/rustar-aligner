@@ -281,7 +281,7 @@ fn write_bam_header_lenient<W: Write>(
     writer.write_i32::<LittleEndian>(n_ref)?;
     for (name, rs) in refs {
         let c_name = CString::new(name.to_vec()).map_err(|e| {
-            Error::Index(format!("reference name contains interior NUL byte: {}", e))
+            Error::Index(format!("reference name contains interior NUL byte: {e}"))
         })?;
         let name_bytes = c_name.as_bytes_with_nul();
         let l_name = u32::try_from(name_bytes.len()).map_err(|_| {

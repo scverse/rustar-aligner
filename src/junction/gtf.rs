@@ -38,7 +38,7 @@ pub fn parse_gtf_configured(
     chr_prefix: &str,
 ) -> Result<Vec<GtfRecord>, Error> {
     let file =
-        File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {}", e)))?;
+        File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
     let reader = BufReader::new(file);
 
     let mut exons = Vec::new();
@@ -47,7 +47,7 @@ pub fn parse_gtf_configured(
     for line in reader.lines() {
         line_num += 1;
         let line =
-            line.map_err(|e| Error::Gtf(format!("Failed to read line {}: {}", line_num, e)))?;
+            line.map_err(|e| Error::Gtf(format!("Failed to read line {line_num}: {e}")))?;
 
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -64,7 +64,7 @@ pub fn parse_gtf_configured(
                 }
             }
             Err(e) => {
-                log::warn!("Skipping malformed GTF line {}: {}", line_num, e);
+                log::warn!("Skipping malformed GTF line {line_num}: {e}");
             }
         }
     }
@@ -93,10 +93,10 @@ fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
     let feature = fields[2].to_string();
     let start = fields[3]
         .parse::<u64>()
-        .map_err(|e| Error::Gtf(format!("Invalid start position: {}", e)))?;
+        .map_err(|e| Error::Gtf(format!("Invalid start position: {e}")))?;
     let end = fields[4]
         .parse::<u64>()
-        .map_err(|e| Error::Gtf(format!("Invalid end position: {}", e)))?;
+        .map_err(|e| Error::Gtf(format!("Invalid end position: {e}")))?;
     let strand = fields[6]
         .chars()
         .next()
@@ -162,7 +162,7 @@ pub fn extract_junctions_configured(
         let transcript_id = exon
             .attributes
             .get(transcript_tag)
-            .ok_or_else(|| Error::Gtf(format!("Exon missing {} attribute", transcript_tag)))?
+            .ok_or_else(|| Error::Gtf(format!("Exon missing {transcript_tag} attribute")))?
             .clone();
 
         transcripts.entry(transcript_id).or_default().push(exon);
@@ -206,9 +206,7 @@ pub fn extract_junctions_configured(
             // Validate junction
             if intron_end <= intron_start {
                 log::warn!(
-                    "Invalid junction coordinates: {}-{} (possibly overlapping exons)",
-                    intron_start,
-                    intron_end
+                    "Invalid junction coordinates: {intron_start}-{intron_end} (possibly overlapping exons)"
                 );
                 continue;
             }

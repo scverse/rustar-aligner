@@ -84,23 +84,9 @@ impl ChimericJunctionWriter {
         // Write line
         writeln!(
             self.writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            donor_chr,
-            donor_bp,
-            donor_strand,
-            acceptor_chr,
-            acceptor_bp,
-            acceptor_strand,
-            junction_type,
-            repeat_donor,
-            repeat_acceptor,
-            read_name,
-            donor_start,
-            donor_cigar,
-            acceptor_start,
-            acceptor_cigar,
+            "{donor_chr}\t{donor_bp}\t{donor_strand}\t{acceptor_chr}\t{acceptor_bp}\t{acceptor_strand}\t{junction_type}\t{repeat_donor}\t{repeat_acceptor}\t{read_name}\t{donor_start}\t{donor_cigar}\t{acceptor_start}\t{acceptor_cigar}",
         )
-        .map_err(|e| Error::Chimeric(format!("Failed to write chimeric junction: {}", e)))?;
+        .map_err(|e| Error::Chimeric(format!("Failed to write chimeric junction: {e}")))?;
 
         Ok(())
     }
@@ -109,7 +95,7 @@ impl ChimericJunctionWriter {
     pub fn flush(&mut self) -> Result<(), Error> {
         self.writer
             .flush()
-            .map_err(|e| Error::Chimeric(format!("Failed to flush chimeric junction file: {}", e)))
+            .map_err(|e| Error::Chimeric(format!("Failed to flush chimeric junction file: {e}")))
     }
 }
 
@@ -200,7 +186,7 @@ fn build_segment_record(
     let pos = (seg.genome_start - chr_start + 1) as usize;
     *record.alignment_start_mut() = Some(
         pos.try_into()
-            .map_err(|e| Error::Chimeric(format!("invalid chimeric position {}: {}", pos, e)))?,
+            .map_err(|e| Error::Chimeric(format!("invalid chimeric position {pos}: {e}")))?,
     );
 
     *record.mapping_quality_mut() = MappingQuality::new(mapq);
@@ -549,7 +535,7 @@ mod tests {
         // Donor record's SA tag should point to acceptor
         let sa_tag = Tag::new(b'S', b'A');
         let donor_sa = records[0].data().get(&sa_tag).unwrap();
-        let donor_sa_str = format!("{:?}", donor_sa);
+        let donor_sa_str = format!("{donor_sa:?}");
         // SA tag: chr22,89,-,37M,255,1; (pos = 600-512+1=89, strand=-, nm=1)
         assert!(
             donor_sa_str.contains("chr22"),
@@ -566,7 +552,7 @@ mod tests {
 
         // Acceptor record's SA tag should point to donor
         let acceptor_sa = records[1].data().get(&sa_tag).unwrap();
-        let acceptor_sa_str = format!("{:?}", acceptor_sa);
+        let acceptor_sa_str = format!("{acceptor_sa:?}");
         assert!(
             acceptor_sa_str.contains("chr9"),
             "SA tag must name donor chr"

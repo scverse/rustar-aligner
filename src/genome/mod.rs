@@ -210,7 +210,7 @@ impl Genome {
         let chr_name_path = dir.join("chrName.txt");
         let mut f = fs::File::create(&chr_name_path).map_err(|e| Error::io(e, &chr_name_path))?;
         for name in &self.chr_name {
-            writeln!(f, "{}", name).map_err(|e| Error::io(e, &chr_name_path))?;
+            writeln!(f, "{name}").map_err(|e| Error::io(e, &chr_name_path))?;
         }
 
         // Write chrLength.txt
@@ -218,14 +218,14 @@ impl Genome {
         let mut f =
             fs::File::create(&chr_length_path).map_err(|e| Error::io(e, &chr_length_path))?;
         for &len in &self.chr_length {
-            writeln!(f, "{}", len).map_err(|e| Error::io(e, &chr_length_path))?;
+            writeln!(f, "{len}").map_err(|e| Error::io(e, &chr_length_path))?;
         }
 
         // Write chrStart.txt (includes the extra n_genome entry)
         let chr_start_path = dir.join("chrStart.txt");
         let mut f = fs::File::create(&chr_start_path).map_err(|e| Error::io(e, &chr_start_path))?;
         for &start in &self.chr_start {
-            writeln!(f, "{}", start).map_err(|e| Error::io(e, &chr_start_path))?;
+            writeln!(f, "{start}").map_err(|e| Error::io(e, &chr_start_path))?;
         }
 
         // Write chrNameLength.txt (tab-separated)
@@ -233,7 +233,7 @@ impl Genome {
         let mut f = fs::File::create(&chr_name_length_path)
             .map_err(|e| Error::io(e, &chr_name_length_path))?;
         for (name, &len) in self.chr_name.iter().zip(&self.chr_length) {
-            writeln!(f, "{}\t{}", name, len).map_err(|e| Error::io(e, &chr_name_length_path))?;
+            writeln!(f, "{name}\t{len}").map_err(|e| Error::io(e, &chr_name_length_path))?;
         }
 
         // Write genomeParameters.txt — byte-for-byte matching STAR's
@@ -319,7 +319,7 @@ impl Genome {
             .sjdb_gtf_file
             .as_ref()
             .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-        writeln!(f, "sjdbGTFfile\t{}", gtf_str).map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbGTFfile\t{gtf_str}").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFchrPrefix\t-").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFfeatureExon\texon").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFtagExonParentTranscript\ttranscript_id")

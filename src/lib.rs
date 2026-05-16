@@ -11,10 +11,8 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
-    clippy::redundant_closure_for_method_calls,
     clippy::similar_names,
     clippy::too_many_lines,
-    clippy::uninlined_format_args,
     // trailing comment because of https://github.com/rust-lang/rustfmt/issues/3277
 )]
 // These should stay disabled
@@ -191,7 +189,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             .num_threads(params.run_thread_n)
             .build_global()
             .map_err(|e| {
-                error::Error::Parameter(format!("Failed to configure thread pool: {}", e))
+                error::Error::Parameter(format!("Failed to configure thread pool: {e}"))
             })?;
         info!("Using {} threads for alignment", params.run_thread_n);
     } else {
@@ -354,7 +352,7 @@ fn run_single_pass(
 
     let out_type = params
         .out_sam_type()
-        .map_err(|e| anyhow::anyhow!("Invalid --outSAMtype: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Invalid --outSAMtype: {e}"))?;
 
     // Build boxed writer — stdout takes precedence over file output.
     let mut writer: Box<dyn AlignmentWriter> = match params.out_std {
@@ -442,7 +440,7 @@ fn run_single_pass(
             unmapped_w1.as_mut(),
             unmapped_w2.as_mut(),
         ),
-        n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
+        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }?;
 
     writer.finish()?;
@@ -566,7 +564,7 @@ fn run_pass1(
             None,
             None,
         )?,
-        n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
+        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }
 
     info!("Pass 1 aligned {} reads", stats.total_reads());
@@ -913,7 +911,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let bysj_temp = if by_sjout {
         info!("outFilterType=BySJout: disk-buffering reads for post-alignment junction filtering");
         let tf = tempfile::NamedTempFile::new()
-            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {e}"))?;
         Some(tf)
     } else {
         None
@@ -921,7 +919,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
         let write_file = tf
             .reopen()
-            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
         let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
         (Some(hdr), Some(w))
     } else {
@@ -1179,7 +1177,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
         // Progress logging
         if read_count % 100_000 < batch_size as u64 {
-            info!("Processed {} reads...", read_count);
+            info!("Processed {read_count} reads...");
         }
 
         if read_count >= max_reads {
@@ -1203,7 +1201,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
             let read_file = tf
                 .reopen()
-                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {e}"))?;
             let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
             reader.read_header()?;
 
@@ -1256,8 +1254,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         }
 
         info!(
-            "BySJout: filtered {} reads with non-surviving junctions",
-            filtered_count
+            "BySJout: filtered {filtered_count} reads with non-surviving junctions"
         );
     }
 
@@ -1345,7 +1342,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let bysj_temp = if by_sjout {
         info!("outFilterType=BySJout: disk-buffering pairs for post-alignment junction filtering");
         let tf = tempfile::NamedTempFile::new()
-            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {e}"))?;
         Some(tf)
     } else {
         None
@@ -1353,7 +1350,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
         let write_file = tf
             .reopen()
-            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
         let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
         (Some(hdr), Some(w))
     } else {
@@ -1506,7 +1503,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 if let Some(ref q) = quant {
                     // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
                     let bm_deref: Vec<&crate::align::read_align::PairedAlignment> =
-                        both_mapped.iter().map(|b| b.as_ref()).collect();
+                        both_mapped.iter().map(AsRef::as_ref).collect();
                     q.counts.count_pe_read(
                         &bm_deref,
                         results.is_empty(),
@@ -1638,7 +1635,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 let transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
                     if let Some(ref tidx) = tr_local {
                         build_transcriptome_records_pe(
-                            both_mapped.iter().map(|b| b.as_ref()),
+                            both_mapped.iter().map(AsRef::as_ref),
                             &paired_read.name,
                             &m1_seq,
                             &m1_qual,
@@ -1746,7 +1743,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
 
         // Progress logging
         if read_count % 100_000 < batch_size as u64 {
-            info!("Processed {} pairs...", read_count);
+            info!("Processed {read_count} pairs...");
         }
 
         if read_count >= max_reads {
@@ -1770,7 +1767,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
             let read_file = tf
                 .reopen()
-                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {e}"))?;
             let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
             reader.read_header()?;
 
@@ -1813,8 +1810,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         }
 
         info!(
-            "BySJout: filtered {} pairs with non-surviving junctions",
-            filtered_count
+            "BySJout: filtered {filtered_count} pairs with non-surviving junctions"
         );
     }
 

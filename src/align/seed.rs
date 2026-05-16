@@ -669,7 +669,7 @@ mod tests {
     fn make_test_index(sequence: &str) -> GenomeIndex {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">chr1").unwrap();
-        writeln!(file, "{}", sequence).unwrap();
+        writeln!(file, "{sequence}").unwrap();
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -888,8 +888,7 @@ mod tests {
         // R→L search should find seeds because RC(read) = AACCTTGG matches genome
         assert!(
             !rc_seeds.is_empty(),
-            "R→L search should find seeds (RC of read matches genome). All seeds: {:?}",
-            seeds
+            "R→L search should find seeds (RC of read matches genome). All seeds: {seeds:?}"
         );
 
         // Verify R→L seeds have valid read positions

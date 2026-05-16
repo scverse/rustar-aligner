@@ -205,7 +205,7 @@ pub fn align_read(
 
     if seeds.is_empty() {
         if debug_read {
-            eprintln!("[DEBUG {}] No seeds found — unmapped", read_name);
+            eprintln!("[DEBUG {read_name}] No seeds found — unmapped");
         }
         return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
     }
@@ -266,7 +266,7 @@ pub fn align_read(
 
     if clusters.is_empty() {
         if debug_read {
-            eprintln!("[DEBUG {}] No clusters — unmapped", read_name);
+            eprintln!("[DEBUG {read_name}] No clusters — unmapped");
         }
         return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
     }
@@ -525,11 +525,7 @@ pub fn align_read(
     if pre_filter_count > transcripts.len() {
         let filtered = pre_filter_count - transcripts.len();
         log::debug!(
-            "Read {}: Filtered {}/{} transcripts: {:?}",
-            read_name,
-            filtered,
-            pre_filter_count,
-            filter_reasons
+            "Read {read_name}: Filtered {filtered}/{pre_filter_count} transcripts: {filter_reasons:?}"
         );
     }
 
@@ -2165,8 +2161,7 @@ mod tests {
         }
         assert!(
             firsts.len() >= 2,
-            "expected different seeds to pick different primaries, got {:?}",
-            firsts
+            "expected different seeds to pick different primaries, got {firsts:?}"
         );
     }
 

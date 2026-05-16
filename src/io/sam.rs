@@ -418,7 +418,7 @@ impl SamWriter {
         *mapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *mapped_rec.alignment_start_mut() =
             Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {}: {}", mapped_pos, e))
+                Error::Alignment(format!("invalid position {mapped_pos}: {e}"))
             })?);
         *mapped_rec.mapping_quality_mut() = MappingQuality::new(mapq);
         *mapped_rec.cigar_mut() = mapped_transcript.cigar.iter().copied().collect();
@@ -426,7 +426,7 @@ impl SamWriter {
         // RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate)
         *mapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *mapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {}: {}", mapped_pos, e))
+            Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
         })?);
         *mapped_rec.template_length_mut() = 0;
 
@@ -514,14 +514,14 @@ impl SamWriter {
         *unmapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *unmapped_rec.alignment_start_mut() =
             Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {}: {}", mapped_pos, e))
+                Error::Alignment(format!("invalid position {mapped_pos}: {e}"))
             })?);
         *unmapped_rec.mapping_quality_mut() = MappingQuality::new(0);
         // CIGAR = * (default empty cigar)
         // RNEXT = mapped mate's chr
         *unmapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *unmapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {}: {}", mapped_pos, e))
+            Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
         })?);
         *unmapped_rec.template_length_mut() = 0;
 
@@ -604,7 +604,7 @@ impl SamWriter {
             // POS = t-space position + 1 (1-based).
             let pos = (t.genome_start + 1) as usize;
             *record.alignment_start_mut() = Some(pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid t-space position {}: {}", pos, e))
+                Error::Alignment(format!("invalid t-space position {pos}: {e}"))
             })?);
 
             // MAPQ
@@ -800,7 +800,7 @@ where
     // @SQ lines for each reference
     for (name, length) in refs {
         let length_nz = NonZeroUsize::new(length)
-            .ok_or_else(|| Error::Index(format!("reference {} has zero length", name)))?;
+            .ok_or_else(|| Error::Index(format!("reference {name} has zero length")))?;
 
         builder = builder.add_reference_sequence(
             name,
@@ -817,7 +817,7 @@ where
         let id = fields
             .next()
             .and_then(|f| f.strip_prefix("ID:"))
-            .ok_or_else(|| Error::Parameter(format!("malformed RG line '{}'", line)))?;
+            .ok_or_else(|| Error::Parameter(format!("malformed RG line '{line}'")))?;
         if !seen_ids.insert(id.to_string()) {
             continue;
         }
@@ -825,8 +825,7 @@ where
         for field in fields {
             if field.len() < 3 || &field[2..3] != ":" {
                 return Err(Error::Parameter(format!(
-                    "RG field '{}' is not TAG:value",
-                    field
+                    "RG field '{field}' is not TAG:value"
                 )));
             }
             let tag_bytes: [u8; 2] = field.as_bytes()[..2].try_into().unwrap();
@@ -900,7 +899,7 @@ fn transcript_to_record(
     let pos = (transcript.genome_start - chr_start + 1) as usize;
     *record.alignment_start_mut() = Some(
         pos.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid alignment position {}: {}", pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid alignment position {pos}: {e}")))?,
     );
 
     // MAPQ
@@ -1096,7 +1095,7 @@ fn build_md_tag(
                     if ref_base == read_base {
                         match_count += 1;
                     } else {
-                        write!(md, "{}", match_count).unwrap();
+                        write!(md, "{match_count}").unwrap();
                         match_count = 0;
                         md.push(decode_base(ref_base) as char);
                     }
@@ -1105,7 +1104,7 @@ fn build_md_tag(
                 }
             }
             Kind::Deletion => {
-                write!(md, "{}", match_count).unwrap();
+                write!(md, "{match_count}").unwrap();
                 match_count = 0;
                 md.push('^');
                 for _ in 0..op.len() {
@@ -1124,7 +1123,7 @@ fn build_md_tag(
         }
     }
     // Emit trailing match count
-    write!(md, "{}", match_count).unwrap();
+    write!(md, "{match_count}").unwrap();
     md
 }
 
@@ -1195,7 +1194,7 @@ fn build_paired_mate_record(
     let pos = (transcript.genome_start - chr_start + 1) as usize;
     *record.alignment_start_mut() = Some(
         pos.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid alignment position {}: {}", pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid alignment position {pos}: {e}")))?,
     );
 
     // MAPQ
@@ -1213,7 +1212,7 @@ fn build_paired_mate_record(
     *record.mate_alignment_start_mut() = Some(
         mate_pos
             .try_into()
-            .map_err(|e| Error::Alignment(format!("invalid mate position {}: {}", mate_pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid mate position {mate_pos}: {e}")))?,
     );
 
     // TLEN (insert size)
@@ -1292,7 +1291,7 @@ mod tests {
     fn all_attrs() -> HashSet<String> {
         ["NH", "HI", "AS", "NM", "nM", "XS", "jM", "jI", "MD"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -1300,7 +1299,7 @@ mod tests {
     fn standard_attrs() -> HashSet<String> {
         ["NH", "HI", "AS", "NM", "nM"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -1473,7 +1472,7 @@ mod tests {
 
         let record = record.unwrap();
         assert_eq!(
-            record.name().map(|n| n.to_string()),
+            record.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert_eq!(record.reference_sequence_id(), Some(0));
@@ -1505,7 +1504,7 @@ mod tests {
         // Check mate1 record
         let rec1 = &records[0];
         assert_eq!(
-            rec1.name().map(|n| n.to_string()),
+            rec1.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert!(rec1.flags().is_segmented());
@@ -1516,7 +1515,7 @@ mod tests {
         // Check mate2 record
         let rec2 = &records[1];
         assert_eq!(
-            rec2.name().map(|n| n.to_string()),
+            rec2.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert!(rec2.flags().is_segmented());
@@ -3209,7 +3208,7 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3];
         let read_qual = vec![30, 30, 30, 30];
 
-        let attrs: HashSet<String> = ["NH", "MD"].iter().map(|s| s.to_string()).collect();
+        let attrs: HashSet<String> = ["NH", "MD"].iter().map(ToString::to_string).collect();
         let record = transcript_to_record(
             &transcript,
             "read1",

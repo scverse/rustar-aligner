@@ -65,10 +65,7 @@ impl SaIndex {
         let num_indices = Self::calculate_num_indices(nbases);
 
         log::info!(
-            "Building SA index: nbases={}, num_indices={}, word_length={}",
-            nbases,
-            num_indices,
-            word_length
+            "Building SA index: nbases={nbases}, num_indices={num_indices}, word_length={word_length}"
         );
 
         // Initialize packed array with "absent" markers
@@ -258,7 +255,7 @@ mod tests {
     fn make_test_index_with_sa(sequence: &str, bin_nbits: u32, sa_nbases: u32) -> (SaIndex, usize) {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">test").unwrap();
-        writeln!(file, "{}", sequence).unwrap();
+        writeln!(file, "{sequence}").unwrap();
 
         let bin_nbits_str = bin_nbits.to_string();
         let sa_nbases_str = sa_nbases.to_string();
@@ -423,13 +420,11 @@ mod tests {
                 let (new_sa_start, _, matched_level, _) = new_result.unwrap();
                 assert_eq!(
                     new_sa_start, old_sa_pos as usize,
-                    "SA start should match for k-mer {}",
-                    kmer_idx
+                    "SA start should match for k-mer {kmer_idx}"
                 );
                 assert_eq!(
                     matched_level, 2,
-                    "Should match at full level for k-mer {}",
-                    kmer_idx
+                    "Should match at full level for k-mer {kmer_idx}"
                 );
             }
         }
