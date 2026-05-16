@@ -828,8 +828,7 @@ fn test_bare_dot_prefix_is_literal_string() {
     // SAMPLE. is a bare-dot prefix; STAR writes SAMPLE.Aligned.out.bam at the top level.
     let prefix = format!("{}/SAMPLE.", run_dir.display());
 
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .args([
             "--runMode",
             "alignReads",
