@@ -729,7 +729,7 @@ impl Parameters {
                 format: OutSamFormat::Bam,
                 sort_order: Some(OutSamSortOrder::SortedByCoordinate),
             }),
-            other => Err(format!("unknown outSAMtype: {:?}", other)),
+            other => Err(format!("unknown outSAMtype: {other:?}")),
         }
     }
 
@@ -748,7 +748,7 @@ impl Parameters {
     /// - `"Standard"` → {NH, HI, AS, NM, nM}
     /// - `"All"`      → {NH, HI, AS, NM, nM, MD, jM, jI, XS}
     /// - `"None"`     → {} (empty)
-    /// - Explicit list (e.g. ["NH", "AS"]) → collected as-is
+    /// - Explicit list (e.g. `["NH", "AS"]`) → collected as-is
     ///
     /// `RG` is auto-appended when `--outSAMattrRGline` is set (STAR behavior,
     /// `Parameters_samAttributes.cpp:201`).
@@ -762,14 +762,14 @@ impl Parameters {
         {
             ["Standard"] => ["NH", "HI", "AS", "NM", "nM"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect(),
             ["All"] => ["NH", "HI", "AS", "NM", "nM", "MD", "jM", "jI", "XS"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect(),
             ["None"] => HashSet::new(),
-            tags => tags.iter().map(|s| s.to_string()).collect(),
+            tags => tags.iter().map(ToString::to_string).collect(),
         };
         if self.rg_line_set() {
             attrs.insert("RG".to_string());
@@ -801,8 +801,7 @@ impl Parameters {
                 })?;
                 if !first.starts_with("ID:") {
                     return Err(crate::error::Error::Parameter(format!(
-                        "--outSAMattrRGline: first field of each RG line must start with 'ID:', got '{}'",
-                        first
+                        "--outSAMattrRGline: first field of each RG line must start with 'ID:', got '{first}'"
                     )));
                 }
                 Ok(block.join("\t"))
@@ -870,8 +869,7 @@ impl Parameters {
             // STAR: no redefinition when both are 0. Log effective max intron.
             let max_intron = (1u64 << self.win_bin_nbits) * self.win_anchor_dist_nbins as u64;
             log::info!(
-                "alignIntronMax=alignMatesGapMax=0, max intron ~= (2^winBinNbits)*winAnchorDistNbins={}",
-                max_intron
+                "alignIntronMax=alignMatesGapMax=0, max intron ~= (2^winBinNbits)*winAnchorDistNbins={max_intron}"
             );
             return;
         }
@@ -1072,7 +1070,7 @@ mod tests {
         assert_eq!(p.out_sj_filter_dist_to_other_sjmin, vec![10, 0, 5, 10]);
         assert_eq!(
             p.out_sj_filter_intron_max_vs_read_n,
-            vec![50000, 100000, 200000]
+            vec![50_000, 100_000, 200_000]
         );
     }
 
@@ -1389,6 +1387,7 @@ mod tests {
         assert!(err.to_string().contains("RG"));
     }
 
+    #[test]
     fn run_rng_seed_override() {
         let p = parse(&["--readFilesIn", "r.fq", "--runRNGseed", "42"]);
         assert_eq!(p.run_rng_seed, 42);
