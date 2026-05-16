@@ -1413,7 +1413,8 @@ mod tests {
 
     #[test]
     fn rg_line_missing_id_prefix_errors() {
-        let err = try_parse(&["--readFilesIn", "r.fq", "--outSAMattrRGline", "SM:oops"]).unwrap_err();
+        let err =
+            try_parse(&["--readFilesIn", "r.fq", "--outSAMattrRGline", "SM:oops"]).unwrap_err();
         assert!(err.to_string().contains("ID:"));
     }
 
@@ -1434,7 +1435,8 @@ mod tests {
 
     #[test]
     fn validate_rg_attr_without_line_errors() {
-        let err = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "RG"]).unwrap_err();
+        let err =
+            try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "RG"]).unwrap_err();
         assert!(err.to_string().contains("RG"));
     }
 
