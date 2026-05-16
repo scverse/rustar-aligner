@@ -273,7 +273,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let time_finish = chrono::Local::now();
 
     // Write Log.final.out
-    let log_path = params.out_file_name_prefix.join("Log.final.out");
+    let log_path = params.output_path("Log.final.out");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -282,7 +282,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 
     // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
     if let Some(ref ctx) = quant_ctx {
-        let quant_path = params.out_file_name_prefix.join("ReadsPerGene.out.tab");
+        let quant_path = params.output_path("ReadsPerGene.out.tab");
         ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
         info!("Wrote {}", quant_path.display());
     }
@@ -313,9 +313,7 @@ fn run_single_pass(
 
     // Open transcriptome BAM writer if requested.
     let mut tr_writer: Option<BamWriter> = if let Some(tidx) = tr.as_ref() {
-        let path = params
-            .out_file_name_prefix
-            .join("Aligned.toTranscriptome.out.bam");
+        let path = params.output_path("Aligned.toTranscriptome.out.bam");
         info!("Writing transcriptome BAM to {}", path.display());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -332,7 +330,7 @@ fn run_single_pass(
     let is_paired = params.read_files_in.len() == 2;
     let mut unmapped_w1: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx {
-            let path = params.out_file_name_prefix.join("Unmapped.out.mate1");
+            let path = params.output_path("Unmapped.out.mate1");
             info!("Writing unmapped reads to {}", path.display());
             Some(UnmappedFastqWriter::create(&path)?)
         } else {
@@ -340,7 +338,7 @@ fn run_single_pass(
         };
     let mut unmapped_w2: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx && is_paired {
-            let path = params.out_file_name_prefix.join("Unmapped.out.mate2");
+            let path = params.output_path("Unmapped.out.mate2");
             info!("Writing unmapped mate2 reads to {}", path.display());
             Some(UnmappedFastqWriter::create(&path)?)
         } else {
@@ -379,7 +377,7 @@ fn run_single_pass(
         }
         OutStd::None => match out_type.format {
             OutSamFormat::Sam => {
-                let output_path = params.out_file_name_prefix.join("Aligned.out.sam");
+                let output_path = params.output_path("Aligned.out.sam");
                 info!("Writing SAM to {}", output_path.display());
                 if let Some(parent) = output_path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -389,11 +387,9 @@ fn run_single_pass(
             OutSamFormat::Bam => {
                 let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
                 let output_path = if sorted {
-                    params
-                        .out_file_name_prefix
-                        .join("Aligned.sortedByCoord.out.bam")
+                    params.output_path("Aligned.sortedByCoord.out.bam")
                 } else {
-                    params.out_file_name_prefix.join("Aligned.out.bam")
+                    params.output_path("Aligned.out.bam")
                 };
                 info!("Writing BAM to {}", output_path.display());
                 if let Some(parent) = output_path.parent() {
@@ -451,7 +447,7 @@ fn run_single_pass(
     }
 
     // 5. Write SJ.out.tab file
-    let sj_output_path = params.out_file_name_prefix.join("SJ.out.tab");
+    let sj_output_path = params.output_path("SJ.out.tab");
     if !sj_stats.is_empty() {
         info!(
             "Writing splice junction statistics to {}",
@@ -480,7 +476,7 @@ fn run_two_pass(
     let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
 
     // Write SJ.pass1.out.tab
-    let pass1_path = params.out_file_name_prefix.join("SJ.pass1.out.tab");
+    let pass1_path = params.output_path("SJ.pass1.out.tab");
 
     // Create output directory if it doesn't exist
     if let Some(parent) = pass1_path.parent() {
@@ -887,12 +883,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     // Create chimeric output writer if enabled
     let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
-        let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(prefix)?)
+        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
     } else {
         None
     };
@@ -1318,12 +1313,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     // Create chimeric output writer if enabled
     let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
-        let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(prefix)?)
+        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
     } else {
         None
     };

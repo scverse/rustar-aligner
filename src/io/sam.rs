@@ -1162,11 +1162,11 @@ pub(crate) fn apply_pe_transcriptome_mate_fields(
     let pos2 = (t2.genome_start + 1) as usize;
     *rec1.mate_alignment_start_mut() = Some(
         pos2.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid mate position {}: {}", pos2, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid mate position {pos2}: {e}")))?,
     );
     *rec2.mate_alignment_start_mut() = Some(
         pos1.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid mate position {}: {}", pos1, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid mate position {pos1}: {e}")))?,
     );
 
     let tlen = calculate_insert_size(t1, t2);
