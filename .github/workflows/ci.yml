@@ -120,3 +120,20 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
+  # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
+  check:
+    name: Checks pass
+    if: always()
+    needs:
+      - test
+      - fmt 
+      - clippy
+      - msrv
+      - audit
+    runs-on: ubuntu-latest
+    steps:
+        - uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # ratchet:re-actors/alls-green@v1.2.2
+          with:
+            jobs: ${{ toJSON(needs) }}
