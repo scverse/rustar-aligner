@@ -311,7 +311,7 @@ pub fn align_read(
             junction_db,
             params.align_transcripts_per_window_nmax,
             debug_name,
-        )?;
+        );
         if debug_read {
             eprintln!(
                 "[DEBUG {}] Cluster[{}]: {} transcripts from DP",
@@ -814,7 +814,7 @@ pub fn align_paired_read(
             params.align_transcripts_per_window_nmax,
             params.align_mates_gap_max.into(),
             debug_name,
-        )?;
+        );
 
         for wt in &wts {
             let split_result =

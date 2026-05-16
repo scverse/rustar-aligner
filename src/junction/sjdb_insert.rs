@@ -380,16 +380,16 @@ mod tests {
     // Callers who only exercise compute_shifts / prepare_junction don't
     // need a valid reverse complement; we fill the RC half with padding.
     fn make_test_genome(forward: Vec<u8>) -> Genome {
-        let n = forward.len() as u64;
-        let mut seq = vec![5u8; (n * 2) as usize];
-        seq[..forward.len()].copy_from_slice(&forward);
+        let n = forward.len();
+        let mut seq = forward;
+        seq.extend(std::iter::repeat_n(5u8, n));
         Genome {
             sequence: seq,
-            n_genome: n,
+            n_genome: n as u64,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
-            chr_length: vec![n],
-            chr_start: vec![0, n],
+            chr_length: vec![n as u64],
+            chr_start: vec![0, n as u64],
         }
     }
 

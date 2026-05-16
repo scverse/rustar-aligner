@@ -344,11 +344,11 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    fn make_params(fasta_paths: Vec<std::path::PathBuf>, bin_nbits: u32) -> Parameters {
+    fn make_params(fasta_paths: &[std::path::PathBuf], bin_nbits: u32) -> Parameters {
         use clap::Parser;
         let mut args = vec!["rustar-aligner", "--runMode", "genomeGenerate"];
 
-        for path in &fasta_paths {
+        for path in fasta_paths {
             args.push("--genomeFastaFiles");
             args.push(path.to_str().unwrap());
         }
@@ -365,7 +365,7 @@ mod tests {
         writeln!(file, ">chr1").unwrap();
         writeln!(file, "ACGT").unwrap(); // 4 bases
 
-        let params = make_params(vec![file.path().to_path_buf()], 3); // bin_size = 8
+        let params = make_params(&[file.path().to_path_buf()], 3); // bin_size = 8
         let genome = Genome::from_fasta(&params).unwrap();
 
         // Padding formula: n=4, then ((4+1)/8 + 1)*8 = (0+1)*8 = 8
@@ -401,7 +401,7 @@ mod tests {
         writeln!(file, ">chr2").unwrap();
         writeln!(file, "TT").unwrap(); // 2 bases
 
-        let params = make_params(vec![file.path().to_path_buf()], 2); // bin_size = 4
+        let params = make_params(&[file.path().to_path_buf()], 2); // bin_size = 4
         let genome = Genome::from_fasta(&params).unwrap();
 
         // chr1 starts at 0, length 2
@@ -431,7 +431,7 @@ mod tests {
         writeln!(file, ">test").unwrap();
         writeln!(file, "ACGTN").unwrap(); // A=0, C=1, G=2, T=3, N=4
 
-        let params = make_params(vec![file.path().to_path_buf()], 3); // bin_size = 8
+        let params = make_params(&[file.path().to_path_buf()], 3); // bin_size = 8
         let genome = Genome::from_fasta(&params).unwrap();
 
         let n = genome.n_genome as usize;
@@ -460,7 +460,7 @@ mod tests {
         writeln!(file, ">chr2").unwrap();
         writeln!(file, "TTT").unwrap();
 
-        let params = make_params(vec![file.path().to_path_buf()], 2); // bin_size = 4
+        let params = make_params(&[file.path().to_path_buf()], 2); // bin_size = 4
         let genome = Genome::from_fasta(&params).unwrap();
 
         // chr1: positions 0-2 (starts at 0, length 3)
@@ -488,7 +488,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">chr1").unwrap();
         writeln!(file, "ACGT").unwrap();
-        let params = make_params(vec![file.path().to_path_buf()], 3);
+        let params = make_params(&[file.path().to_path_buf()], 3);
         let mut genome = Genome::from_fasta(&params).unwrap();
         assert_eq!(genome.n_genome, 8);
 
@@ -518,7 +518,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">chr1").unwrap();
         writeln!(file, "ACGT").unwrap();
-        let params = make_params(vec![file.path().to_path_buf()], 3);
+        let params = make_params(&[file.path().to_path_buf()], 3);
         let mut genome = Genome::from_fasta(&params).unwrap();
         let before = genome.sequence.clone();
         let before_n = genome.n_genome;

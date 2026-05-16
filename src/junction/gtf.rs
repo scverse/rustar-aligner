@@ -103,7 +103,7 @@ fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
         .ok_or_else(|| Error::Gtf("Empty strand field".to_string()))?;
 
     // Parse attributes (semicolon-separated key-value pairs)
-    let attributes = parse_attributes(fields[8])?;
+    let attributes = parse_attributes(fields[8]);
 
     Ok(GtfRecord {
         seqname,
@@ -118,7 +118,7 @@ fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
 /// Parse GTF attributes field
 ///
 /// Format: key1 "value1"; key2 "value2";
-fn parse_attributes(attr_str: &str) -> Result<HashMap<String, String>, Error> {
+fn parse_attributes(attr_str: &str) -> HashMap<String, String> {
     let mut attributes = HashMap::new();
 
     for pair in attr_str.split(';') {
@@ -142,7 +142,7 @@ fn parse_attributes(attr_str: &str) -> Result<HashMap<String, String>, Error> {
         attributes.insert(key, value);
     }
 
-    Ok(attributes)
+    attributes
 }
 
 /// Extract junctions from exon records, grouping by `transcript_tag`.
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_parse_attributes() {
         let attr = r#"gene_id "ENSG001"; transcript_id "ENST001"; gene_name "MYC";"#;
-        let attrs = parse_attributes(attr).unwrap();
+        let attrs = parse_attributes(attr);
 
         assert_eq!(attrs.get("gene_id"), Some(&"ENSG001".to_string()));
         assert_eq!(attrs.get("transcript_id"), Some(&"ENST001".to_string()));
@@ -252,7 +252,7 @@ mod tests {
     #[test]
     fn test_parse_attributes_no_trailing_semicolon() {
         let attr = r#"gene_id "ENSG001"; transcript_id "ENST001""#;
-        let attrs = parse_attributes(attr).unwrap();
+        let attrs = parse_attributes(attr);
 
         assert_eq!(attrs.get("gene_id"), Some(&"ENSG001".to_string()));
         assert_eq!(attrs.get("transcript_id"), Some(&"ENST001".to_string()));

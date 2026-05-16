@@ -82,7 +82,7 @@ impl<'a> ChimericDetector<'a> {
             } else {
                 Some(&index.junction_db)
             };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1)?;
+            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
 
             let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
                 continue;
@@ -269,7 +269,7 @@ impl<'a> ChimericDetector<'a> {
             } else {
                 Some(&index.junction_db)
             };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1)?;
+            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
 
             let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
                 continue;
@@ -425,8 +425,8 @@ impl<'a> ChimericDetector<'a> {
         use crate::align::score::AlignmentScorer;
         let scorer = AlignmentScorer::from_params(self.params);
 
-        let transcripts1 = stitch_seeds(cluster1, read_seq, index, &scorer)?;
-        let transcripts2 = stitch_seeds(cluster2, read_seq, index, &scorer)?;
+        let transcripts1 = stitch_seeds(cluster1, read_seq, index, &scorer);
+        let transcripts2 = stitch_seeds(cluster2, read_seq, index, &scorer);
 
         if transcripts1.is_empty() || transcripts2.is_empty() {
             return Ok(None);

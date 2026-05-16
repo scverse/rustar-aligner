@@ -11,13 +11,11 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
-    clippy::needless_pass_by_value,
     clippy::redundant_closure_for_method_calls,
     clippy::similar_names,
     clippy::too_many_lines,
-    clippy::trivially_copy_pass_by_ref,
     clippy::uninlined_format_args,
-    clippy::unnecessary_wraps
+    // trailing comment because of https://github.com/rust-lang/rustfmt/issues/3277
 )]
 // These should stay disabled
 #![allow(

@@ -2,7 +2,6 @@
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::transcript::{CigarOpExt as _, Transcript};
-use crate::error::Error;
 use crate::index::GenomeIndex;
 use noodles::sam::alignment::record::cigar;
 
@@ -1500,7 +1499,7 @@ pub fn stitch_seeds(
     read_seq: &[u8],
     index: &GenomeIndex,
     scorer: &AlignmentScorer,
-) -> Result<Vec<Transcript>, Error> {
+) -> Vec<Transcript> {
     stitch_seeds_with_jdb(cluster, read_seq, index, scorer, None, 1)
 }
 
@@ -1519,7 +1518,7 @@ pub fn stitch_seeds_with_jdb(
     scorer: &AlignmentScorer,
     junction_db: Option<&crate::junction::SpliceJunctionDb>,
     max_transcripts_per_window: usize,
-) -> Result<Vec<Transcript>, Error> {
+) -> Vec<Transcript> {
     stitch_seeds_with_jdb_debug(
         cluster,
         read_seq,
@@ -2469,7 +2468,7 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
     junction_db: Option<&crate::junction::SpliceJunctionDb>,
     max_transcripts_per_window: usize,
     debug_read_name: &str,
-) -> Result<Vec<Transcript>, Error> {
+) -> Vec<Transcript> {
     let (working_transcripts, stitch_cluster, stitch_is_reverse, stitch_read) = stitch_seeds_core(
         cluster,
         read_seq,
@@ -2479,7 +2478,7 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
         max_transcripts_per_window,
         0,
         debug_read_name,
-    )?;
+    );
 
     // Finalize working transcripts → Transcript (filtering by overhang+repeat check)
     let mut transcripts: Vec<Transcript> = Vec::with_capacity(working_transcripts.len());
@@ -2583,7 +2582,7 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
     });
     transcripts.truncate(max_transcripts_per_window);
 
-    Ok(transcripts)
+    transcripts
 }
 
 /// Shared core: preprocessing + recursive stitcher, returns working transcripts + context.
@@ -2597,7 +2596,7 @@ pub(crate) fn stitch_seeds_core(
     max_transcripts_per_window: usize,
     align_mates_gap_max: u64,
     debug_read_name: &str,
-) -> Result<(Vec<WorkingTranscript>, SeedCluster, bool, Vec<u8>), Error> {
+) -> (Vec<WorkingTranscript>, SeedCluster, bool, Vec<u8>) {
     let debug = !debug_read_name.is_empty();
 
     // Include ALL seeds (anchor and non-anchor) in the stitcher.
@@ -2730,12 +2729,12 @@ pub(crate) fn stitch_seeds_core(
     }
 
     if wa_entries.is_empty() {
-        return Ok((
+        return (
             Vec::new(),
             stitch_cluster,
             stitch_is_reverse,
             stitch_read_owned,
-        ));
+        );
     }
 
     if debug {
@@ -2924,12 +2923,12 @@ pub(crate) fn stitch_seeds_core(
         );
     }
 
-    Ok((
+    (
         working_transcripts,
         stitch_cluster,
         stitch_is_reverse,
         stitch_read_owned,
-    ))
+    )
 }
 
 #[cfg(test)]
