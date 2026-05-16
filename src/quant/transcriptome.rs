@@ -648,11 +648,8 @@ impl TranscriptomeIndex {
 
         writeln!(out, "{}", records.len()).map_err(|e| Error::io(e, &path))?;
         for (ex_start, ex_end, strand, gene_idx, tr_idx) in records {
-            writeln!(
-                out,
-                "{ex_start}\t{ex_end}\t{strand}\t{gene_idx}\t{tr_idx}"
-            )
-            .map_err(|e| Error::io(e, &path))?;
+            writeln!(out, "{ex_start}\t{ex_end}\t{strand}\t{gene_idx}\t{tr_idx}")
+                .map_err(|e| Error::io(e, &path))?;
         }
 
         Ok(())

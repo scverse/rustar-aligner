@@ -37,8 +37,7 @@ pub fn parse_gtf_configured(
     feature_exon: &str,
     chr_prefix: &str,
 ) -> Result<Vec<GtfRecord>, Error> {
-    let file =
-        File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
+    let file = File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
     let reader = BufReader::new(file);
 
     let mut exons = Vec::new();
@@ -46,8 +45,7 @@ pub fn parse_gtf_configured(
 
     for line in reader.lines() {
         line_num += 1;
-        let line =
-            line.map_err(|e| Error::Gtf(format!("Failed to read line {line_num}: {e}")))?;
+        let line = line.map_err(|e| Error::Gtf(format!("Failed to read line {line_num}: {e}")))?;
 
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {

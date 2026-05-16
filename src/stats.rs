@@ -997,10 +997,7 @@ mod tests {
         ];
 
         for field in &required_fields {
-            assert!(
-                content.contains(field),
-                "Missing MultiQC field: '{field}'"
-            );
+            assert!(content.contains(field), "Missing MultiQC field: '{field}'");
         }
     }
 

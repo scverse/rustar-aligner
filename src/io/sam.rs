@@ -416,18 +416,20 @@ impl SamWriter {
         *mapped_rec.flags_mut() = mapped_flags;
 
         *mapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {mapped_pos}: {e}"))
-            })?);
+        *mapped_rec.alignment_start_mut() = Some(
+            mapped_pos
+                .try_into()
+                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
+        );
         *mapped_rec.mapping_quality_mut() = MappingQuality::new(mapq);
         *mapped_rec.cigar_mut() = mapped_transcript.cigar.iter().copied().collect();
 
         // RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate)
         *mapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
-        })?);
+        *mapped_rec.mate_alignment_start_mut() =
+            Some(mapped_pos.try_into().map_err(|e| {
+                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
+            })?);
         *mapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL
@@ -512,17 +514,19 @@ impl SamWriter {
 
         // Co-locate unmapped mate at mapped mate's position
         *unmapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {mapped_pos}: {e}"))
-            })?);
+        *unmapped_rec.alignment_start_mut() = Some(
+            mapped_pos
+                .try_into()
+                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
+        );
         *unmapped_rec.mapping_quality_mut() = MappingQuality::new(0);
         // CIGAR = * (default empty cigar)
         // RNEXT = mapped mate's chr
         *unmapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
-        })?);
+        *unmapped_rec.mate_alignment_start_mut() =
+            Some(mapped_pos.try_into().map_err(|e| {
+                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
+            })?);
         *unmapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL: forward orientation (no RC for unmapped)
@@ -603,9 +607,10 @@ impl SamWriter {
 
             // POS = t-space position + 1 (1-based).
             let pos = (t.genome_start + 1) as usize;
-            *record.alignment_start_mut() = Some(pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid t-space position {pos}: {e}"))
-            })?);
+            *record.alignment_start_mut() =
+                Some(pos.try_into().map_err(|e| {
+                    Error::Alignment(format!("invalid t-space position {pos}: {e}"))
+                })?);
 
             // MAPQ
             *record.mapping_quality_mut() = MappingQuality::new(mapq);

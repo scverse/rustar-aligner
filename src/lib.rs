@@ -1253,9 +1253,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             }
         }
 
-        info!(
-            "BySJout: filtered {filtered_count} reads with non-surviving junctions"
-        );
+        info!("BySJout: filtered {filtered_count} reads with non-surviving junctions");
     }
 
     // Flush chimeric output if enabled
@@ -1809,9 +1807,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             }
         }
 
-        info!(
-            "BySJout: filtered {filtered_count} pairs with non-surviving junctions"
-        );
+        info!("BySJout: filtered {filtered_count} pairs with non-surviving junctions");
     }
 
     // Flush chimeric output if enabled
