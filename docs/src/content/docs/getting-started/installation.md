@@ -27,11 +27,11 @@ To upgrade later, repeat the same command — `cargo install` overwrites in plac
 
 ## 2. Docker image from GHCR
 
-Pre-built multi-arch images are published to the [GitHub Container Registry](https://github.com/Psy-Fer/rustar-aligner/pkgs/container/rustar-aligner) for every release. Linux x86_64 and aarch64 are both supported.
+Pre-built multi-arch images are published to the [GitHub Container Registry](https://github.com/scverse/rustar-aligner/pkgs/container/rustar-aligner) for every release. Linux x86_64 and aarch64 are both supported.
 
 ```bash
-docker pull ghcr.io/psy-fer/rustar-aligner:latest
-docker run --rm ghcr.io/psy-fer/rustar-aligner:latest --version
+docker pull ghcr.io/scverse/rustar-aligner:latest
+docker run --rm ghcr.io/scverse/rustar-aligner:latest --version
 ```
 
 ### Available tags
@@ -52,7 +52,7 @@ docker run --rm \
   -v /local/genome_index:/genome \
   -v /local/reads:/reads \
   -v /local/output:/output \
-  ghcr.io/psy-fer/rustar-aligner:latest \
+  ghcr.io/scverse/rustar-aligner:latest \
     --genomeDir /genome \
     --readFilesIn /reads/sample_1.fq.gz /reads/sample_2.fq.gz \
     --readFilesCommand zcat \
@@ -73,7 +73,7 @@ For development work, or when you want a build tuned for your specific machine, 
 ### Clone and build
 
 ```bash
-git clone https://github.com/Psy-Fer/rustar-aligner.git
+git clone https://github.com/scverse/rustar-aligner.git
 cd rustar-aligner
 cargo build --release
 ```
@@ -87,9 +87,9 @@ target/release/rustar-aligner --version
 ### Verify the build
 
 ```bash
-cargo test            # full test suite (~396 tests)
-cargo clippy          # lint (zero warnings expected)
-cargo fmt --check     # formatting check
+cargo test                  # full test suite (~396 tests)
+cargo clippy --all-targets  # lint (zero warnings expected)
+cargo fmt --check           # formatting check
 ```
 
 ### Debug builds

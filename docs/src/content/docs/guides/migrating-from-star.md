@@ -98,7 +98,7 @@ Then compare with your favourite SAM/BAM diff tool. The repository's `test/compa
 
 ## Reporting incompatibilities
 
-If you find a divergence from STAR that isn't documented in [STAR compatibility](/rustar-aligner/reference/star-compatibility/), please [open an issue](https://github.com/Psy-Fer/rustar-aligner/issues) with:
+If you find a divergence from STAR that isn't documented in [STAR compatibility](/rustar-aligner/reference/star-compatibility/), please [open an issue](https://github.com/scverse/rustar-aligner/issues) with:
 
 - The STAR command line you ran
 - A small input dataset (or pointer to one) that reproduces the divergence

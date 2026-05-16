@@ -155,10 +155,10 @@ See [ROADMAP.md](ROADMAP.md) for detailed implementation tracking.
 Requires Rust 2024 edition (rustc 1.85+).
 
 ```bash
-cargo build --release    # Release build
-cargo test               # Run tests
-cargo clippy             # Lint
-cargo fmt                # Format
+cargo build --release       # Release build
+cargo test                  # Run tests
+cargo clippy --all-targets  # Lint
+cargo fmt                   # Format
 ```
 
 ## Development

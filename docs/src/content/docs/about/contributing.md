@@ -3,18 +3,18 @@ title: Contributing
 description: How to build, test, and contribute to rustar-aligner.
 ---
 
-Contributions are welcome. The repository is on GitHub at [Psy-Fer/rustar-aligner](https://github.com/Psy-Fer/rustar-aligner).
+Contributions are welcome. The repository is on GitHub at [scverse/rustar-aligner](https://github.com/scverse/rustar-aligner).
 
 ## Building and testing
 
 Rust 2024 edition. Standard Cargo commands:
 
 ```bash
-cargo build            # debug build
-cargo build --release  # release build
-cargo test             # run all tests
-cargo clippy           # lint (zero warnings expected)
-cargo fmt --check      # formatting check
+cargo build                 # debug build
+cargo build --release       # release build
+cargo test                  # run all tests
+cargo clippy --all-targets  # lint (zero warnings expected)
+cargo fmt --check           # formatting check
 ```
 
 CI runs on Linux (x86_64, x86-64-v3, aarch64), macOS (aarch64), and Windows (x86_64). PRs must pass all CI checks before merging.
