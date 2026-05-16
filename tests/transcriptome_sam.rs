@@ -6,7 +6,7 @@
 //! and contains at least one record.  Acts as a smoke test for the
 //! end-to-end pipeline.
 
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -154,8 +154,7 @@ fn transcriptome_sam_end_to_end_smoke_test() {
 
     // Build genome index, passing the GTF so transcriptInfo.tab + friends
     // are persisted (matches STAR's workflow).
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .args([
             "--runMode",
             "genomeGenerate",
@@ -172,8 +171,7 @@ fn transcriptome_sam_end_to_end_smoke_test() {
         .success();
 
     // Run alignment with --quantMode TranscriptomeSAM.
-    Command::cargo_bin("rustar-aligner")
-        .unwrap()
+    cargo_bin_cmd!("rustar-aligner")
         .args([
             "--runMode",
             "alignReads",

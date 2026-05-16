@@ -15,11 +15,10 @@
 /// MAPQ score (0-255)
 pub fn calculate_mapq(n_alignments: usize, mapq_unique: u8) -> u8 {
     match n_alignments {
-        0 => 0,
         1 => mapq_unique,
         2 => 3,
         3 | 4 => 1,
-        _ => 0, // >= 5
+        _ => 0, // 0 or >= 5
     }
 }
 
