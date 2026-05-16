@@ -3598,6 +3598,7 @@ mod tests {
     }
 
     fn spliced_gtag_transcript() -> Transcript {
+        use cigar::op::{Kind, Op};
         Transcript {
             chr_idx: 0,
             genome_start: 0,
@@ -3605,9 +3606,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
