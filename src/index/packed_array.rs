@@ -196,12 +196,12 @@ mod tests {
     fn round_trip_cross_byte_boundary() {
         let mut arr = PackedArray::new(33, 100); // Human genome SA width
 
-        let test_values = vec![
-            0x1FFFFFFFF, // All 33 bits set
-            0x100000000, // Bit 32 set (strand bit)
-            0x0FFFFFFFF, // Bits 0-31 set (max forward position)
+        let test_values = [
+            0x0001_FFFF_FFFF, // All 33 bits set
+            0x0001_0000_0000, // Bit 32 set (strand bit)
+            0x0000_FFFF_FFFF, // Bits 0-31 set (max forward position)
             0,
-            12345678,
+            12_345_678,
         ];
 
         for (i, &val) in test_values.iter().enumerate() {
@@ -226,13 +226,13 @@ mod tests {
     fn bit_width_32() {
         let mut arr = PackedArray::new(32, 10);
 
-        arr.write(0, 0xDEADBEEF);
-        arr.write(1, 0x12345678);
-        arr.write(5, 0xCAFEBABE);
+        arr.write(0, 0xDEAD_BEEF);
+        arr.write(1, 0x1234_5678);
+        arr.write(5, 0xCAFE_BABE);
 
-        assert_eq!(arr.read(0), 0xDEADBEEF);
-        assert_eq!(arr.read(1), 0x12345678);
-        assert_eq!(arr.read(5), 0xCAFEBABE);
+        assert_eq!(arr.read(0), 0xDEAD_BEEF);
+        assert_eq!(arr.read(1), 0x1234_5678);
+        assert_eq!(arr.read(5), 0xCAFE_BABE);
     }
 
     #[test]

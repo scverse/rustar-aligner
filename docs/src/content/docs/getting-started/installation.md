@@ -87,9 +87,9 @@ target/release/rustar-aligner --version
 ### Verify the build
 
 ```bash
-cargo test            # full test suite (~396 tests)
-cargo clippy          # lint (zero warnings expected)
-cargo fmt --check     # formatting check
+cargo test                  # full test suite (~396 tests)
+cargo clippy --all-targets  # lint (zero warnings expected)
+cargo fmt --check           # formatting check
 ```
 
 ### Debug builds

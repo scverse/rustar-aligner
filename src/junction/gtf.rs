@@ -37,8 +37,7 @@ pub fn parse_gtf_configured(
     feature_exon: &str,
     chr_prefix: &str,
 ) -> Result<Vec<GtfRecord>, Error> {
-    let file =
-        File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {}", e)))?;
+    let file = File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
     let reader = BufReader::new(file);
 
     let mut exons = Vec::new();
@@ -46,8 +45,7 @@ pub fn parse_gtf_configured(
 
     for line in reader.lines() {
         line_num += 1;
-        let line =
-            line.map_err(|e| Error::Gtf(format!("Failed to read line {}: {}", line_num, e)))?;
+        let line = line.map_err(|e| Error::Gtf(format!("Failed to read line {line_num}: {e}")))?;
 
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -64,7 +62,7 @@ pub fn parse_gtf_configured(
                 }
             }
             Err(e) => {
-                log::warn!("Skipping malformed GTF line {}: {}", line_num, e);
+                log::warn!("Skipping malformed GTF line {line_num}: {e}");
             }
         }
     }
@@ -93,17 +91,17 @@ fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
     let feature = fields[2].to_string();
     let start = fields[3]
         .parse::<u64>()
-        .map_err(|e| Error::Gtf(format!("Invalid start position: {}", e)))?;
+        .map_err(|e| Error::Gtf(format!("Invalid start position: {e}")))?;
     let end = fields[4]
         .parse::<u64>()
-        .map_err(|e| Error::Gtf(format!("Invalid end position: {}", e)))?;
+        .map_err(|e| Error::Gtf(format!("Invalid end position: {e}")))?;
     let strand = fields[6]
         .chars()
         .next()
         .ok_or_else(|| Error::Gtf("Empty strand field".to_string()))?;
 
     // Parse attributes (semicolon-separated key-value pairs)
-    let attributes = parse_attributes(fields[8])?;
+    let attributes = parse_attributes(fields[8]);
 
     Ok(GtfRecord {
         seqname,
@@ -118,7 +116,7 @@ fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
 /// Parse GTF attributes field
 ///
 /// Format: key1 "value1"; key2 "value2";
-fn parse_attributes(attr_str: &str) -> Result<HashMap<String, String>, Error> {
+fn parse_attributes(attr_str: &str) -> HashMap<String, String> {
     let mut attributes = HashMap::new();
 
     for pair in attr_str.split(';') {
@@ -142,7 +140,7 @@ fn parse_attributes(attr_str: &str) -> Result<HashMap<String, String>, Error> {
         attributes.insert(key, value);
     }
 
-    Ok(attributes)
+    attributes
 }
 
 /// Extract junctions from exon records, grouping by `transcript_tag`.
@@ -165,7 +163,7 @@ pub fn extract_junctions_configured(
         let transcript_id = exon
             .attributes
             .get(transcript_tag)
-            .ok_or_else(|| Error::Gtf(format!("Exon missing {} attribute", transcript_tag)))?
+            .ok_or_else(|| Error::Gtf(format!("Exon missing {transcript_tag} attribute")))?
             .clone();
 
         transcripts.entry(transcript_id).or_default().push(exon);
@@ -182,14 +180,9 @@ pub fn extract_junctions_configured(
 
         // Get chromosome index
         let chr_name = &exons[0].seqname;
-        let chr_idx = genome.chr_name.iter().position(|name| name == chr_name);
-
-        let chr_idx = match chr_idx {
-            Some(idx) => idx,
-            None => {
-                log::warn!("Skipping transcript on unknown chromosome: {}", chr_name);
-                continue;
-            }
+        let Some(chr_idx) = genome.chr_name.iter().position(|name| name == chr_name) else {
+            log::warn!("Skipping transcript on unknown chromosome: {chr_name}");
+            continue;
         };
 
         // Convert strand
@@ -213,9 +206,7 @@ pub fn extract_junctions_configured(
 
             if intron_end_local_1b <= intron_start_local_1b {
                 log::warn!(
-                    "Invalid junction coordinates: {}-{} (possibly overlapping exons)",
-                    intron_start_local_1b,
-                    intron_end_local_1b
+                    "Invalid junction coordinates: {intron_start_local_1b}-{intron_end_local_1b} (possibly overlapping exons)"
                 );
                 continue;
             }
@@ -252,7 +243,7 @@ mod tests {
     #[test]
     fn test_parse_attributes() {
         let attr = r#"gene_id "ENSG001"; transcript_id "ENST001"; gene_name "MYC";"#;
-        let attrs = parse_attributes(attr).unwrap();
+        let attrs = parse_attributes(attr);
 
         assert_eq!(attrs.get("gene_id"), Some(&"ENSG001".to_string()));
         assert_eq!(attrs.get("transcript_id"), Some(&"ENST001".to_string()));
@@ -262,7 +253,7 @@ mod tests {
     #[test]
     fn test_parse_attributes_no_trailing_semicolon() {
         let attr = r#"gene_id "ENSG001"; transcript_id "ENST001""#;
-        let attrs = parse_attributes(attr).unwrap();
+        let attrs = parse_attributes(attr);
 
         assert_eq!(attrs.get("gene_id"), Some(&"ENSG001".to_string()));
         assert_eq!(attrs.get("transcript_id"), Some(&"ENST001".to_string()));
