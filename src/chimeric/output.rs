@@ -22,8 +22,7 @@ impl ChimericJunctionWriter {
     ///
     /// Creates file: {prefix}Chimeric.out.junction
     pub fn new(prefix: &str) -> Result<Self, Error> {
-        let mut path = PathBuf::from(prefix);
-        path.push("Chimeric.out.junction");
+        let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
 
         let file = File::create(&path).map_err(|e| Error::io(e, &path))?;
 
@@ -229,23 +228,39 @@ mod tests {
     #[test]
     fn test_chimeric_junction_writer_creation() {
         let dir = tempdir().unwrap();
-        let prefix = dir.path().to_str().unwrap();
+        let prefix = format!("{}/", dir.path().display());
 
-        let writer = ChimericJunctionWriter::new(prefix);
+        let writer = ChimericJunctionWriter::new(&prefix);
         assert!(writer.is_ok());
 
-        let mut path = PathBuf::from(prefix);
-        path.push("Chimeric.out.junction");
+        let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_chimeric_junction_writer_bare_dot_prefix() {
+        let dir = tempdir().unwrap();
+        let prefix = format!("{}/SAMPLE.", dir.path().display());
+
+        let writer = ChimericJunctionWriter::new(&prefix);
+        assert!(writer.is_ok());
+
+        let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
+        assert!(path.exists(), "expected {} to exist", path.display());
+        assert!(
+            path.file_name().unwrap().to_str().unwrap() == "SAMPLE.Chimeric.out.junction",
+            "expected literal concatenation, got {}",
+            path.display()
+        );
     }
 
     #[test]
     fn test_write_inter_chromosomal() {
         use cigar::op::{Kind, Op};
         let dir = tempdir().unwrap();
-        let prefix = dir.path().to_str().unwrap();
+        let prefix = format!("{}/", dir.path().display());
 
-        let mut writer = ChimericJunctionWriter::new(prefix).unwrap();
+        let mut writer = ChimericJunctionWriter::new(&prefix).unwrap();
 
         // Create mock chimeric alignment (chr9 -> chr22, BCR-ABL fusion)
         let donor = ChimericSegment {
@@ -290,8 +305,7 @@ mod tests {
         writer.flush().unwrap();
 
         // Read file and verify
-        let mut path = PathBuf::from(prefix);
-        path.push("Chimeric.out.junction");
+        let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
 
         let mut content = String::new();
         File::open(&path)
@@ -323,9 +337,9 @@ mod tests {
     fn test_write_strand_break() {
         use cigar::op::{Kind, Op};
         let dir = tempdir().unwrap();
-        let prefix = dir.path().to_str().unwrap();
+        let prefix = format!("{}/", dir.path().display());
 
-        let mut writer = ChimericJunctionWriter::new(prefix).unwrap();
+        let mut writer = ChimericJunctionWriter::new(&prefix).unwrap();
 
         // Create mock chimeric alignment (same chr, opposite strands)
         let donor = ChimericSegment {
@@ -370,8 +384,7 @@ mod tests {
         writer.flush().unwrap();
 
         // Read file and verify
-        let mut path = PathBuf::from(prefix);
-        path.push("Chimeric.out.junction");
+        let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
 
         let mut content = String::new();
         File::open(&path)
