@@ -134,7 +134,7 @@ impl FastqReader {
                     .map_err(|e| {
                         Error::from(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("invalid UTF-8 in read name: {}", e),
+                            format!("invalid UTF-8 in read name: {e}"),
                         ))
                     })?
                     .to_string();
@@ -672,7 +672,7 @@ mod tests {
     fn test_paired_batch_reading() {
         let mut tmpfile1 = NamedTempFile::new().unwrap();
         for i in 1..=5 {
-            writeln!(tmpfile1, "@read{}/1", i).unwrap();
+            writeln!(tmpfile1, "@read{i}/1").unwrap();
             writeln!(tmpfile1, "ACGT").unwrap();
             writeln!(tmpfile1, "+").unwrap();
             writeln!(tmpfile1, "IIII").unwrap();
@@ -681,7 +681,7 @@ mod tests {
 
         let mut tmpfile2 = NamedTempFile::new().unwrap();
         for i in 1..=5 {
-            writeln!(tmpfile2, "@read{}/2", i).unwrap();
+            writeln!(tmpfile2, "@read{i}/2").unwrap();
             writeln!(tmpfile2, "GGCC").unwrap();
             writeln!(tmpfile2, "+").unwrap();
             writeln!(tmpfile2, "JJJJ").unwrap();

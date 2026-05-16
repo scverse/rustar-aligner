@@ -10,4 +10,4 @@ pub use read_align::{
 };
 pub use seed::Seed;
 pub use stitch::{SeedCluster, WindowAlignment, stitch_seeds};
-pub use transcript::{CigarOp, Exon, Transcript};
+pub use transcript::{Exon, Transcript};

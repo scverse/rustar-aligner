@@ -60,10 +60,7 @@ impl SuffixArray {
 
         let sa_length = suffixes.len();
         log::info!(
-            "Building suffix array with {} entries (gstrand_bit={}, word_length={})",
-            sa_length,
-            gstrand_bit,
-            word_length
+            "Building suffix array with {sa_length} entries (gstrand_bit={gstrand_bit}, word_length={word_length})"
         );
 
         // Sort suffixes using custom comparator
@@ -218,7 +215,7 @@ mod tests {
     fn make_test_genome(sequence: &str, bin_nbits: u32) -> Genome {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">test").unwrap();
-        writeln!(file, "{}", sequence).unwrap();
+        writeln!(file, "{sequence}").unwrap();
 
         let bin_nbits_str = bin_nbits.to_string();
         let args = vec![

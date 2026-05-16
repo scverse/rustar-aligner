@@ -10,15 +10,15 @@
 //! only substantive divergence that rustar-aligner builds the transcript tables on
 //! the fly from the input GTF instead of loading persisted
 //! `transcriptInfo.tab`/`exonInfo.tab` files.
-use std::collections::HashMap;
-use std::io::Write as _;
-use std::path::Path;
-
-use crate::align::transcript::{CigarOp, Exon, Transcript};
+use crate::align::transcript::{CigarOpExt as _, Exon, Transcript};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::junction::gtf::GtfRecord;
 use crate::params::Parameters;
+use noodles::sam::alignment::record::cigar;
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::Path;
 
 /// GTF attribute names the transcriptome index reads.
 const GTF_ATTR_TRANSCRIPT_ID: &str = "transcript_id";
@@ -206,8 +206,7 @@ impl TranscriptomeIndex {
             }
             if inconsistent {
                 log::warn!(
-                    "quantMode TranscriptomeSAM: transcript {} has inconsistent chromosome/strand across exons — skipping",
-                    tid
+                    "quantMode TranscriptomeSAM: transcript {tid} has inconsistent chromosome/strand across exons — skipping"
                 );
                 continue;
             }
@@ -217,9 +216,7 @@ impl TranscriptomeIndex {
                 Some(i) if i < genome.n_chr_real => i,
                 _ => {
                     log::warn!(
-                        "quantMode TranscriptomeSAM: transcript {} on unknown chromosome {} — skipping",
-                        tid,
-                        chr_name
+                        "quantMode TranscriptomeSAM: transcript {tid} on unknown chromosome {chr_name} — skipping"
                     );
                     continue;
                 }
@@ -265,9 +262,8 @@ impl TranscriptomeIndex {
             let total_len = ex_len_cum;
 
             let strand_u8 = match strand_char {
-                '+' => 1u8,
                 '-' => 2u8,
-                _ => 1u8, // unknown → treat as forward (STAR default)
+                _ => 1u8, // forward or unknown → treat as forward (STAR default)
             };
 
             let gene_id = first.attributes.get(gene_tag).cloned().unwrap_or_default();
@@ -389,8 +385,7 @@ impl TranscriptomeIndex {
         let sum_exn: u64 = tr_exn.iter().map(|&n| n as u64).sum();
         if sum_exn != n_exons_total as u64 {
             return Err(Error::Index(format!(
-                "transcriptome index inconsistent: sum(trExN)={} but exonInfo has {} rows",
-                sum_exn, n_exons_total
+                "transcriptome index inconsistent: sum(trExN)={sum_exn} but exonInfo has {n_exons_total} rows"
             )));
         }
 
@@ -635,7 +630,7 @@ impl TranscriptomeIndex {
 
         // Flatten (exStart, exEnd_inclusive, strand, gene_idx, tr_insertion_idx).
         let mut records: Vec<(u64, u64, u8, u32, u32)> =
-            Vec::with_capacity(self.tr_exons.iter().map(|e| e.len()).sum());
+            Vec::with_capacity(self.tr_exons.iter().map(Vec::len).sum());
         for (tr_idx, exs) in self.tr_exons.iter().enumerate() {
             let strand = self.tr_strand[tr_idx];
             let gene_idx = self.tr_gene_idx[tr_idx];
@@ -653,12 +648,8 @@ impl TranscriptomeIndex {
 
         writeln!(out, "{}", records.len()).map_err(|e| Error::io(e, &path))?;
         for (ex_start, ex_end, strand, gene_idx, tr_idx) in records {
-            writeln!(
-                out,
-                "{}\t{}\t{}\t{}\t{}",
-                ex_start, ex_end, strand, gene_idx, tr_idx
-            )
-            .map_err(|e| Error::io(e, &path))?;
+            writeln!(out, "{ex_start}\t{ex_end}\t{strand}\t{gene_idx}\t{tr_idx}")
+                .map_err(|e| Error::io(e, &path))?;
         }
 
         Ok(())
@@ -685,7 +676,7 @@ impl TranscriptomeIndex {
             .zip(&self.gene_names)
             .zip(&self.gene_biotypes)
         {
-            writeln!(out, "{}\t{}\t{}", id, name, biotype).map_err(|e| Error::io(e, &path))?;
+            writeln!(out, "{id}\t{name}\t{biotype}").map_err(|e| Error::io(e, &path))?;
         }
 
         Ok(())
@@ -706,7 +697,7 @@ impl TranscriptomeIndex {
         let file = std::fs::File::create(&path).map_err(|e| Error::io(e, &path))?;
         let mut out = std::io::BufWriter::new(file);
 
-        let total_exons: usize = self.tr_exons.iter().map(|e| e.len()).sum();
+        let total_exons: usize = self.tr_exons.iter().map(Vec::len).sum();
         writeln!(out, "{total_exons}").map_err(|e| Error::io(e, &path))?;
 
         for &i in &self.tr_order {
@@ -1102,10 +1093,10 @@ fn align_to_one_transcript(
 
     // Build projected CIGAR: drop N operations (splices collapse in t-space);
     // for reverse-strand transcripts, reverse the resulting op sequence.
-    let mut proj_cigar: Vec<CigarOp> = align
+    let mut proj_cigar: Vec<cigar::Op> = align
         .cigar
         .iter()
-        .filter(|op| !matches!(op, CigarOp::RefSkip(_)))
+        .filter(|op| op.kind() != cigar::op::Kind::Skip)
         .copied()
         .collect();
     if tr_strand == 2 {
@@ -1172,10 +1163,11 @@ pub fn filter_and_project(
 }
 
 fn has_soft_clip(align: &Transcript) -> bool {
+    use cigar::op::Kind;
     align
         .cigar
         .iter()
-        .any(|op| matches!(op, CigarOp::SoftClip(n) if *n > 0))
+        .any(|op| op.kind() == Kind::SoftClip && !op.is_empty())
 }
 
 /// Extend the 5'/3' soft-clips of `align` back into matched bases, counting
@@ -1188,7 +1180,7 @@ fn extend_softclips(
     params: &Parameters,
 ) -> Option<Transcript> {
     // Determine left / right clip sizes from the CIGAR.
-    let (left_clip, right_clip) = align.count_soft_clips();
+    let [left_clip, right_clip] = align.count_soft_clips();
 
     let mut n_mm_extra: u32 = 0;
 
@@ -1198,7 +1190,7 @@ fn extend_softclips(
     if left_clip > 0
         && let Some(first) = align.exons.first()
     {
-        for b in 1..=left_clip as usize {
+        for b in 1..=left_clip {
             if b > first.read_start {
                 break;
             }
@@ -1224,7 +1216,7 @@ fn extend_softclips(
     if right_clip > 0
         && let Some(last) = align.exons.last()
     {
-        for b in 0..right_clip as usize {
+        for b in 0..right_clip {
             let r_idx = last.read_end + b;
             let g_idx = (last.genome_end as usize) + b;
             if r_idx >= read_bases_align_orientation.len() || g_idx >= genome.sequence.len() {
@@ -1263,7 +1255,7 @@ fn extend_softclips(
     if right_clip > 0
         && let Some(last) = ext.exons.last_mut()
     {
-        last.read_end += right_clip as usize;
+        last.read_end += right_clip;
         last.genome_end += right_clip as u64;
     }
 
@@ -1281,17 +1273,18 @@ fn extend_softclips(
 /// adjacent `Match` ops.  Interior soft-clips (rare — only appear in chimeric
 /// contexts) are left alone.
 fn rebuild_cigar_without_softclips(
-    cigar: &[CigarOp],
-    left_clip: u32,
-    right_clip: u32,
-) -> Vec<CigarOp> {
-    let mut out: Vec<CigarOp> = Vec::with_capacity(cigar.len());
+    cigar: &[cigar::Op],
+    left_clip: usize,
+    right_clip: usize,
+) -> Vec<cigar::Op> {
+    use cigar::op::{Kind, Op};
+    let mut out: Vec<Op> = Vec::with_capacity(cigar.len());
     let mut start_idx = 0;
     let mut end_idx = cigar.len();
-    if left_clip > 0 && matches!(cigar.first(), Some(CigarOp::SoftClip(_))) {
+    if left_clip > 0 && cigar.first().is_some_and(|op| op.kind() == Kind::SoftClip) {
         start_idx = 1;
     }
-    if right_clip > 0 && end_idx > start_idx && matches!(cigar[end_idx - 1], CigarOp::SoftClip(_)) {
+    if right_clip > 0 && end_idx > start_idx && cigar[end_idx - 1].kind() == Kind::SoftClip {
         end_idx -= 1;
     }
 
@@ -1299,23 +1292,23 @@ fn rebuild_cigar_without_softclips(
     for (i, op) in body.iter().enumerate() {
         if i == 0 && left_clip > 0 {
             // Fold left_clip into the first op if it's match-like.
-            match op {
-                CigarOp::Match(n) => out.push(CigarOp::Match(n + left_clip)),
-                CigarOp::Equal(n) => out.push(CigarOp::Equal(n + left_clip)),
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch => out.push(op.add_len(left_clip)),
                 _ => {
                     // Extension landed on a non-match op (shouldn't normally
                     // happen).  Emit as Match.
-                    out.push(CigarOp::Match(left_clip));
+                    out.push(Op::new(Kind::Match, left_clip));
                     out.push(*op);
                 }
             }
         } else if i + 1 == body.len() && right_clip > 0 {
-            match op {
-                CigarOp::Match(n) => out.push(CigarOp::Match(n + right_clip)),
-                CigarOp::Equal(n) => out.push(CigarOp::Equal(n + right_clip)),
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch => {
+                    out.push(op.add_len(right_clip));
+                }
                 _ => {
                     out.push(*op);
-                    out.push(CigarOp::Match(right_clip));
+                    out.push(Op::new(Kind::Match, right_clip));
                 }
             }
         } else {
@@ -1382,6 +1375,8 @@ fn is_splice_boundary_before(align: &Transcript, iab: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use noodles::sam::alignment::record::cigar;
+
     use super::*;
 
     fn make_genome() -> Genome {
@@ -1952,7 +1947,7 @@ mod tests {
         chr_idx: usize,
         is_reverse: bool,
         exons: Vec<(u64, u64, usize, usize)>,
-        cigar: Vec<CigarOp>,
+        cigar: Vec<cigar::Op>,
     ) -> Transcript {
         let proj_exons: Vec<Exon> = exons
             .into_iter()
@@ -1985,13 +1980,19 @@ mod tests {
 
     #[test]
     fn project_single_exon_align_into_single_exon_transcript() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         // Transcript: chr1 [100, 200) forward.
         let gtf = vec![make_exon("chr1", 101, 200, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
 
         // Align fully inside exon: genome [110, 150), read [0, 40).
-        let align = make_align(0, false, vec![(110, 150, 0, 40)], vec![CigarOp::Match(40)]);
+        let align = make_align(
+            0,
+            false,
+            vec![(110, 150, 0, 40)],
+            vec![Op::new(Kind::Match, 40)],
+        );
         let results = align_to_transcripts(&align, &idx, 40);
         assert_eq!(results.len(), 1);
         let r = &results[0];
@@ -2004,12 +2005,13 @@ mod tests {
         assert_eq!(r.exons[0].read_start, 0);
         assert_eq!(r.exons[0].read_end, 40);
         // CIGAR must have no N
-        assert!(r.cigar.iter().all(|op| !matches!(op, CigarOp::RefSkip(_))));
+        assert!(r.cigar.iter().all(|op| op.kind() != Kind::Skip));
         assert_eq!(r.cigar.len(), 1);
     }
 
     #[test]
     fn project_two_exon_align_matching_junction() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         // Transcript T1: chr1 [100, 200) + [300, 400) forward. tr_length = 200.
         let gtf = vec![
@@ -2025,9 +2027,9 @@ mod tests {
             false,
             vec![(150, 200, 0, 50), (300, 350, 50, 100)],
             vec![
-                CigarOp::Match(50),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(50),
+                Op::new(Kind::Match, 50),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 50),
             ],
         );
         let results = align_to_transcripts(&align, &idx, 100);
@@ -2042,12 +2044,13 @@ mod tests {
         assert_eq!(r.exons[1].genome_start, 100);
         assert_eq!(r.exons[1].genome_end, 150);
         // CIGAR: no N
-        assert!(r.cigar.iter().all(|op| !matches!(op, CigarOp::RefSkip(_))));
+        assert!(r.cigar.iter().all(|op| op.kind() != Kind::Skip));
         assert_eq!(r.cigar.len(), 2);
     }
 
     #[test]
     fn project_mismatched_junction_fails() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![
             make_exon("chr1", 101, 200, '+', "G1", "T1"),
@@ -2061,9 +2064,9 @@ mod tests {
             false,
             vec![(150, 195, 0, 45), (305, 350, 45, 90)],
             vec![
-                CigarOp::Match(45),
-                CigarOp::RefSkip(110),
-                CigarOp::Match(45),
+                Op::new(Kind::Match, 45),
+                Op::new(Kind::Skip, 110),
+                Op::new(Kind::Match, 45),
             ],
         );
         let results = align_to_transcripts(&align, &idx, 90);
@@ -2072,13 +2075,19 @@ mod tests {
 
     #[test]
     fn project_onto_reverse_strand_transcript() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         // Reverse transcript: chr1 [100, 200) - strand. tr_length = 100.
         let gtf = vec![make_exon("chr1", 101, 200, '-', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
 
         // Align forward on genome [120, 160), read [0, 40).
-        let align = make_align(0, false, vec![(120, 160, 0, 40)], vec![CigarOp::Match(40)]);
+        let align = make_align(
+            0,
+            false,
+            vec![(120, 160, 0, 40)],
+            vec![Op::new(Kind::Match, 40)],
+        );
         let results = align_to_transcripts(&align, &idx, 40);
         assert_eq!(results.len(), 1);
         let r = &results[0];
@@ -2096,6 +2105,7 @@ mod tests {
 
     #[test]
     fn project_multi_exon_align_onto_longer_transcript() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         // 3-exon transcript: [100,200) + [300,400) + [500,600). tr_length = 300.
         let gtf = vec![
@@ -2111,9 +2121,9 @@ mod tests {
             false,
             vec![(350, 400, 0, 50), (500, 550, 50, 100)],
             vec![
-                CigarOp::Match(50),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(50),
+                Op::new(Kind::Match, 50),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 50),
             ],
         );
         let results = align_to_transcripts(&align, &idx, 100);
@@ -2130,6 +2140,7 @@ mod tests {
 
     #[test]
     fn project_past_transcript_end_fails() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![make_exon("chr1", 101, 200, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
@@ -2139,7 +2150,7 @@ mod tests {
             0,
             false,
             vec![(150, 250, 0, 100)],
-            vec![CigarOp::Match(100)],
+            vec![Op::new(Kind::Match, 100)],
         );
         let results = align_to_transcripts(&align, &idx, 100);
         assert_eq!(results.len(), 0);
@@ -2147,17 +2158,24 @@ mod tests {
 
     #[test]
     fn project_before_all_transcripts_returns_empty() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![make_exon("chr1", 501, 600, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
 
-        let align = make_align(0, false, vec![(100, 150, 0, 50)], vec![CigarOp::Match(50)]);
+        let align = make_align(
+            0,
+            false,
+            vec![(100, 150, 0, 50)],
+            vec![Op::new(Kind::Match, 50)],
+        );
         let results = align_to_transcripts(&align, &idx, 50);
         assert_eq!(results.len(), 0);
     }
 
     #[test]
     fn project_onto_multiple_overlapping_transcripts() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         // Two transcripts both containing the align:
         //  T1: [100, 400) single exon
@@ -2168,7 +2186,12 @@ mod tests {
         ];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
 
-        let align = make_align(0, false, vec![(200, 250, 0, 50)], vec![CigarOp::Match(50)]);
+        let align = make_align(
+            0,
+            false,
+            vec![(200, 250, 0, 50)],
+            vec![Op::new(Kind::Match, 50)],
+        );
         let results = align_to_transcripts(&align, &idx, 50);
         assert_eq!(results.len(), 2);
     }
@@ -2210,10 +2233,16 @@ mod tests {
 
     #[test]
     fn filter_default_rejects_indels() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
-        let mut align = make_align(0, false, vec![(110, 150, 0, 40)], vec![CigarOp::Match(40)]);
+        let mut align = make_align(
+            0,
+            false,
+            vec![(110, 150, 0, 40)],
+            vec![Op::new(Kind::Match, 40)],
+        );
         align.n_gap = 1; // simulate insertion/deletion
         let params = default_params();
         let read = vec![0u8; 40];
@@ -2231,10 +2260,16 @@ mod tests {
 
     #[test]
     fn filter_keeps_indels_when_allowed() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
-        let mut align = make_align(0, false, vec![(110, 150, 0, 40)], vec![CigarOp::Match(40)]);
+        let mut align = make_align(
+            0,
+            false,
+            vec![(110, 150, 0, 40)],
+            vec![Op::new(Kind::Match, 40)],
+        );
         align.n_gap = 1;
         let params = default_params();
         let read = vec![0u8; 40];
@@ -2252,6 +2287,7 @@ mod tests {
 
     #[test]
     fn filter_extends_left_softclip_with_zero_mismatches() {
+        use cigar::op::{Kind, Op};
         // Build a custom genome with known content so we can construct a
         // read whose soft-clipped bases match the adjacent genome.
         let mut seq = vec![4u8; 1000];
@@ -2276,7 +2312,7 @@ mod tests {
             0,
             false,
             vec![(104, 144, 4, 44)],
-            vec![CigarOp::SoftClip(4), CigarOp::Match(40)],
+            vec![Op::new(Kind::SoftClip, 4), Op::new(Kind::Match, 40)],
         );
         // Read is 44 bases of A (0s) — matches all of genome [100, 144).
         let read = vec![0u8; 44];
@@ -2295,14 +2331,15 @@ mod tests {
         let r = &results[0];
         // CIGAR should now be a single 44M (4S folded into leading M).
         assert_eq!(r.cigar.len(), 1);
-        match r.cigar[0] {
-            CigarOp::Match(n) => assert_eq!(n, 44),
+        match r.cigar[0].kind() {
+            Kind::Match => assert_eq!(r.cigar[0].len(), 44),
             _ => panic!("expected Match(44)"),
         }
     }
 
     #[test]
     fn filter_extends_softclip_too_many_mismatches_rejects() {
+        use cigar::op::{Kind, Op};
         // Left clip is 4 bases, all mismatches.  n_mismatch = 0 to start.
         // With very tight out_filter_mismatch_nmax, the alignment is rejected.
         let mut seq = vec![4u8; 1000];
@@ -2325,7 +2362,7 @@ mod tests {
             0,
             false,
             vec![(104, 144, 4, 44)],
-            vec![CigarOp::SoftClip(4), CigarOp::Match(40)],
+            vec![Op::new(Kind::SoftClip, 4), Op::new(Kind::Match, 40)],
         );
         // Read clip bases are all T (3) — mismatch against genome A (0)
         let mut read = vec![0u8; 44];
@@ -2350,6 +2387,7 @@ mod tests {
 
     #[test]
     fn filter_mode_single_end_keeps_softclip_as_is() {
+        use cigar::op::{Kind, Op};
         let genome = make_genome();
         let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
         let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
@@ -2358,7 +2396,7 @@ mod tests {
             0,
             false,
             vec![(110, 150, 4, 44)],
-            vec![CigarOp::SoftClip(4), CigarOp::Match(40)],
+            vec![Op::new(Kind::SoftClip, 4), Op::new(Kind::Match, 40)],
         );
         let read = vec![0u8; 44];
         let params = default_params();
@@ -2379,7 +2417,7 @@ mod tests {
             results[0]
                 .cigar
                 .iter()
-                .any(|op| matches!(op, CigarOp::SoftClip(_)))
+                .any(|op| op.kind() == Kind::SoftClip)
         );
     }
 

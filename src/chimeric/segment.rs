@@ -1,6 +1,7 @@
-// ChimericSegment and ChimericAlignment data structures
+//! ChimericSegment and ChimericAlignment data structures
 
-use crate::align::transcript::CigarOp;
+use crate::align::transcript::cigar_to_string;
+use noodles::sam::alignment::record::cigar;
 
 /// A single segment of a chimeric alignment
 #[derive(Debug, Clone)]
@@ -11,7 +12,7 @@ pub struct ChimericSegment {
     pub is_reverse: bool,
     pub read_start: usize,
     pub read_end: usize,
-    pub cigar: Vec<CigarOp>,
+    pub cigar: Vec<cigar::Op>,
     pub score: i32,
     pub n_mismatch: u32,
 }
@@ -30,6 +31,11 @@ impl ChimericSegment {
     /// Check if segment meets minimum length requirement
     pub fn meets_min_length(&self, min_len: u32) -> bool {
         self.read_length() >= min_len as usize
+    }
+
+    /// Format CIGAR string
+    pub fn cigar_string(&self) -> String {
+        cigar_to_string(&self.cigar)
     }
 }
 
@@ -112,6 +118,7 @@ impl ChimericAlignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cigar::op::{Kind, Op};
 
     fn mock_segment(
         chr_idx: usize,
@@ -127,7 +134,7 @@ mod tests {
             is_reverse: false,
             read_start,
             read_end,
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 2,
         }
