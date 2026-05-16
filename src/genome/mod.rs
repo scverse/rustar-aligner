@@ -345,7 +345,6 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn make_params(fasta_paths: &[std::path::PathBuf], bin_nbits: u32) -> Parameters {
-        use clap::Parser;
         let mut args = vec!["rustar-aligner", "--runMode", "genomeGenerate"];
 
         for path in fasta_paths {

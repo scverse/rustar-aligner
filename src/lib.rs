@@ -42,8 +42,6 @@ use crate::params::{Parameters, RunMode};
 
 /// Top-level dispatcher. Called from `main()` after CLI parsing.
 pub fn run(params: &Parameters) -> anyhow::Result<()> {
-    params.validate()?;
-
     info!("rustar-aligner {}", env!("CARGO_PKG_VERSION"));
     info!("{}", env!("VERSION_BODY"));
     info!("{}", cpu::cpu_detected_line());
@@ -184,9 +182,9 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     info!("Starting read alignment...");
 
     // Configure Rayon thread pool based on --runThreadN
-    if params.run_thread_n > 1 {
+    if usize::from(params.run_thread_n) > 1 {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(params.run_thread_n)
+            .num_threads(params.run_thread_n.into())
             .build_global()
             .map_err(|e| {
                 error::Error::Parameter(format!("Failed to configure thread pool: {e}"))
@@ -348,9 +346,7 @@ fn run_single_pass(
     // 4. Route to SAM or BAM output based on --outSAMtype / --outStd
     use crate::params::{OutSamSortOrder, OutStd};
 
-    let out_type = params
-        .out_sam_type()
-        .map_err(|e| anyhow::anyhow!("Invalid --outSAMtype: {e}"))?;
+    let out_type = &params.out_sam_type;
 
     // Build boxed writer — stdout takes precedence over file output.
     let mut writer: Box<dyn AlignmentWriter> = match params.out_std {

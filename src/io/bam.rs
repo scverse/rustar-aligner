@@ -460,7 +460,6 @@ impl SortedBamStdoutWriter {
 mod tests {
     use super::*;
     use crate::align::transcript::{Exon, Transcript};
-    use clap::Parser;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 

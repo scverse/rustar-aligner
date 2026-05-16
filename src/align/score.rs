@@ -621,6 +621,8 @@ pub enum GapType {
 
 #[cfg(test)]
 mod tests {
+    use crate::params::Parameters;
+
     use super::*;
 
     fn make_test_genome(seq: &[u8]) -> Genome {
@@ -1051,8 +1053,7 @@ mod tests {
         // When alignIntronMax=0 (default), scorer uses u32::MAX (no limit) — STAR-faithful.
         // STAR's stitchAlignToTranscript.cpp: `if (Del>alignIntronMax && alignIntronMax>0)`
         // meaning alignIntronMax=0 disables the check entirely.
-        use clap::Parser;
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "reads.fq"]);
         assert_eq!(params.align_intron_max, 0);
         let scorer = AlignmentScorer::from_params(&params);
         assert_eq!(scorer.align_intron_max, u32::MAX);
@@ -1061,13 +1062,13 @@ mod tests {
     #[test]
     fn test_align_intron_max_custom() {
         // Custom alignIntronMax should be passed through directly
-        use clap::Parser;
-        let params = crate::params::Parameters::try_parse_from(vec![
+        let params = Parameters::parse_from([
             "rustar-aligner",
+            "--readFilesIn",
+            "reads.fq",
             "--alignIntronMax",
             "100000",
-        ])
-        .unwrap();
+        ]);
         assert_eq!(params.align_intron_max, 100_000);
         let scorer = AlignmentScorer::from_params(&params);
         assert_eq!(scorer.align_intron_max, 100_000);

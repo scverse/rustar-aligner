@@ -1288,7 +1288,6 @@ mod tests {
     use super::*;
     use crate::align::score::SpliceMotif;
     use crate::genome::Genome;
-    use clap::Parser;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 

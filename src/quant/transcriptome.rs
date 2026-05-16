@@ -2199,8 +2199,7 @@ mod tests {
     // ---- Subtask 3: filter-mode tests ----
 
     fn default_params() -> Parameters {
-        use clap::Parser;
-        Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r.fq"])
+        Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"])
     }
 
     #[test]
