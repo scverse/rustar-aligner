@@ -70,7 +70,7 @@ pub struct PairedRead {
 
 /// FASTQ reader that handles decompression and base encoding
 pub struct FastqReader {
-    inner: fastq::Reader<Box<dyn BufRead + Send>>,
+    inner: fastq::io::Reader<Box<dyn BufRead + Send>>,
 }
 
 impl FastqReader {
@@ -102,7 +102,7 @@ impl FastqReader {
             }
         };
 
-        let fastq_reader = fastq::Reader::new(reader);
+        let fastq_reader = fastq::io::Reader::new(reader);
 
         Ok(Self {
             inner: fastq_reader,
