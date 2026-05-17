@@ -18,7 +18,7 @@ use noodles::sam::alignment::record_buf::data::field::value::Array;
 use noodles::sam::alignment::record_buf::{QualityScores, RecordBuf, Sequence};
 use noodles::sam::header::record::value::{
     Map,
-    map::{Program, ReadGroup, tag::Other as HeaderOtherTag},
+    map::{Program, ReadGroup, program::tag as program_tag, tag::Other as HeaderOtherTag},
 };
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
@@ -843,8 +843,20 @@ where
         builder = builder.add_read_group(id, map);
     }
 
-    // @PG line
-    builder = builder.add_program("rustar-aligner", Map::<Program>::default());
+    let mut pg = Map::<Program>::default();
+    pg.other_fields_mut()
+        .insert(program_tag::NAME, BString::from("rustar-aligner"));
+    pg.other_fields_mut().insert(
+        program_tag::VERSION,
+        BString::from(env!("CARGO_PKG_VERSION")),
+    );
+    let cl = params
+        .command_line
+        .clone()
+        .unwrap_or_else(|| "rustar-aligner".to_string());
+    pg.other_fields_mut()
+        .insert(program_tag::COMMAND_LINE, BString::from(cl));
+    builder = builder.add_program("rustar-aligner", pg);
 
     Ok(builder.build())
 }
@@ -1330,6 +1342,59 @@ mod tests {
 
         // Check that we have a program line (just check header is valid)
         assert_eq!(header.reference_sequences().len(), 1);
+    }
+
+    #[test]
+    fn test_build_sam_header_pg_line_populated() {
+        let genome = make_test_genome();
+        let mut params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        params.command_line =
+            Some("rustar-aligner --readFilesIn test.fq --runThreadN 4".to_string());
+
+        let header = build_sam_header(&genome, &params).unwrap();
+        let programs = header.programs().as_ref();
+        let pg = programs
+            .get(&b"rustar-aligner"[..])
+            .expect("@PG line with ID:rustar-aligner must be present");
+
+        let pn: &[u8] = pg
+            .other_fields()
+            .get(&program_tag::NAME)
+            .expect("PN field must be present")
+            .as_ref();
+        assert_eq!(pn, b"rustar-aligner");
+
+        let vn: &[u8] = pg
+            .other_fields()
+            .get(&program_tag::VERSION)
+            .expect("VN field must be present")
+            .as_ref();
+        assert_eq!(vn, env!("CARGO_PKG_VERSION").as_bytes());
+
+        let cl: &[u8] = pg
+            .other_fields()
+            .get(&program_tag::COMMAND_LINE)
+            .expect("CL field must be present")
+            .as_ref();
+        assert!(!cl.is_empty(), "CL field must be non-empty");
+        assert_eq!(cl, b"rustar-aligner --readFilesIn test.fq --runThreadN 4");
+    }
+
+    #[test]
+    fn test_build_sam_header_pg_line_default_cl_when_unset() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        assert!(params.command_line.is_none());
+
+        let header = build_sam_header(&genome, &params).unwrap();
+        let programs = header.programs().as_ref();
+        let pg = programs.get(&b"rustar-aligner"[..]).unwrap();
+        let cl: &[u8] = pg
+            .other_fields()
+            .get(&program_tag::COMMAND_LINE)
+            .expect("CL field must be present even when command_line is None")
+            .as_ref();
+        assert!(!cl.is_empty());
     }
 
     #[test]

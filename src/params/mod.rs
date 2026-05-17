@@ -631,6 +631,10 @@ pub struct Parameters {
     /// Chimeric output type
     #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
+
+    /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
+    #[arg(skip)]
+    pub command_line: Option<String>,
 }
 
 impl Parameters {
