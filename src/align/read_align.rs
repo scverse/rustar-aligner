@@ -1498,6 +1498,7 @@ mod tests {
         let genome = Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![10],
@@ -1528,6 +1529,7 @@ mod tests {
             junction_db: crate::junction::SpliceJunctionDb::empty(),
             transcriptome: None,
             prepared_junctions: Vec::new(),
+            sjdb_overhang: 0,
         }
     }
 
