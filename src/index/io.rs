@@ -273,7 +273,6 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

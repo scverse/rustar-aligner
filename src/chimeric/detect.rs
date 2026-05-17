@@ -987,7 +987,6 @@ mod tests {
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
     use crate::junction::SpliceJunctionDb;
-    use clap::Parser;
     use noodles::sam::alignment::record::cigar;
 
     /// Minimal two-chromosome genome for chimeric tests.
@@ -1184,11 +1183,16 @@ mod tests {
 
     // --- detect_inter_mate_chimeric tests ---
 
+    fn params(args: &[&str]) -> Parameters {
+        let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
+        full_args.extend_from_slice(args);
+        Parameters::parse_from(full_args)
+    }
+
     #[test]
     fn test_inter_mate_chimeric_concordant_returns_none() {
         // Normal FR pair on the same chromosome, close together → not chimeric
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 forward
@@ -1201,8 +1205,7 @@ mod tests {
 
     #[test]
     fn test_inter_mate_chimeric_different_chromosomes() {
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 chr0
@@ -1219,8 +1222,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_same_strand() {
         // Both mates forward on the same chromosome → chimeric (strand break)
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 forward
@@ -1234,8 +1236,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_too_far() {
         // Opposite-strand pair but >1Mb apart → chimeric
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         // Use large positions — out-of-bounds for sequence but score.rs guards handle this
@@ -1250,8 +1251,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_segment_too_short() {
         // chimSegmentMin=100 but segments are only 20bp → None
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "100"]).unwrap();
+        let params = params(&["--chimSegmentMin", "100"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 30, false);
@@ -1264,8 +1264,7 @@ mod tests {
 
     #[test]
     fn test_inter_mate_chimeric_empty_exons_returns_none() {
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
         let read_seq = vec![0u8; 50];
 
@@ -1328,8 +1327,7 @@ mod tests {
     #[test]
     fn test_detect_chimeric_old_no_chimera_single_transcript() {
         // Only one transcript → no partner → None
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "20"]).unwrap();
+        let params = params(&["--chimSegmentMin", "20"]);
         let index = make_test_index();
         let read_len = 100usize;
         let t1 = make_clipped_transcript(0, 50, false, read_len, 0, 0);
@@ -1350,8 +1348,7 @@ mod tests {
     fn test_detect_chimeric_old_inter_chr_pair() {
         // Primary: covers read[0..80] on chr0; secondary: covers read[80..100] on chr1.
         // With chimSegmentMin=20, scoreDropMax=20, scoreSeparation=10, this should produce a chimera.
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
+        let params = params(&[
             "--chimSegmentMin",
             "15",
             "--chimScoreDropMax",
@@ -1360,8 +1357,7 @@ mod tests {
             "10",
             "--chimJunctionOverhangMin",
             "10",
-        ])
-        .unwrap();
+        ]);
         let index = make_test_index();
         let read_len = 100usize;
         // Primary: chr0, read[0..80], right clip = 20
@@ -1386,14 +1382,7 @@ mod tests {
     #[test]
     fn test_detect_chimeric_old_segment_too_short() {
         // Segments are too short after chimSegmentMin filter
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
-            "--chimSegmentMin",
-            "50",
-            "--chimScoreDropMax",
-            "100",
-        ])
-        .unwrap();
+        let params = params(&["--chimSegmentMin", "50", "--chimScoreDropMax", "100"]);
         let index = make_test_index();
         let read_len = 100usize;
         let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 60); // 40 bp → < 50
@@ -1410,16 +1399,14 @@ mod tests {
         // Score drop is too large: chimScoreDropMax=5 means combined_score + 5 >= read_len=100
         // combined_score = 50 + 50 - 0 = 100, 100 + 5 = 105 >= 100 → should pass
         // But with drop=5, score = 40+40=80, 80+5=85 < 100 → should fail
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
+        let params = params(&[
             "--chimSegmentMin",
             "20",
             "--chimScoreDropMax",
             "5",
             "--chimScoreSeparation",
             "200", // suppress uniqueness filter
-        ])
-        .unwrap();
+        ]);
         let index = make_test_index();
         let read_len = 100usize;
         let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 40); // 60 bp aligned

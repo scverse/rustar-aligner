@@ -3019,10 +3019,8 @@ mod tests {
         ];
 
         // Bin-based windowing with default parameters
-        let params = {
-            use clap::Parser;
-            crate::params::Parameters::parse_from(vec!["rustar-aligner"])
-        };
+        let params =
+            crate::params::Parameters::parse_from(["rustar-aligner", "--readFilesIn", "reads.fq"]);
         let clusters = cluster_seeds(&seeds, &index, &params, 150, false);
 
         // With empty SA ranges, no clusters will be created

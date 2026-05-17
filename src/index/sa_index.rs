@@ -243,7 +243,6 @@ impl SaIndex {
 mod tests {
     use super::*;
     use crate::params::Parameters;
-    use clap::Parser;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

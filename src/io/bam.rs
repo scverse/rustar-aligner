@@ -460,7 +460,6 @@ impl SortedBamStdoutWriter {
 mod tests {
     use super::*;
     use crate::align::transcript::{Exon, Transcript};
-    use clap::Parser;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 
@@ -475,14 +474,14 @@ mod tests {
         }
     }
 
-    fn create_test_params() -> Parameters {
-        Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"])
+    fn default_params() -> Parameters {
+        Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"])
     }
 
     #[test]
     fn test_bam_writer_creation() {
         let genome = create_test_genome();
-        let params = create_test_params();
+        let params = default_params();
         let temp_file = NamedTempFile::new().unwrap();
 
         let writer = BamWriter::create(temp_file.path(), &genome, &params);
@@ -492,7 +491,7 @@ mod tests {
     #[test]
     fn test_bam_unmapped_write() {
         let genome = create_test_genome();
-        let params = create_test_params();
+        let params = default_params();
         let temp_file = NamedTempFile::new().unwrap();
 
         let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -520,7 +519,7 @@ mod tests {
         use cigar::op::{Kind, Op};
 
         let genome = create_test_genome();
-        let params = create_test_params();
+        let params = default_params();
         let temp_file = NamedTempFile::new().unwrap();
 
         let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -593,7 +592,7 @@ mod tests {
         let tr_idx = TranscriptomeIndex::from_gtf_exons(&exons, &genome).unwrap();
         assert_eq!(tr_idx.n_transcripts(), 1);
 
-        let params = create_test_params();
+        let params = default_params();
         let temp_file = NamedTempFile::new().unwrap();
         let writer = BamWriter::create_transcriptome(temp_file.path(), &tr_idx, &params);
         assert!(
@@ -609,7 +608,7 @@ mod tests {
     #[test]
     fn test_bam_batch_write() {
         let genome = create_test_genome();
-        let params = create_test_params();
+        let params = default_params();
         let temp_file = NamedTempFile::new().unwrap();
 
         let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -642,7 +641,7 @@ mod tests {
     #[test]
     fn test_bam_compression_level_zero() {
         let genome = create_test_genome();
-        let mut params = create_test_params();
+        let mut params = default_params();
         params.out_bam_compression = 0;
         let temp_file = NamedTempFile::new().unwrap();
         let writer = BamWriter::create(temp_file.path(), &genome, &params);
@@ -655,7 +654,7 @@ mod tests {
     #[test]
     fn test_sorted_bam_limit_ram_unlimited() {
         let genome = create_test_genome();
-        let mut params = create_test_params();
+        let mut params = default_params();
         params.limit_bam_sort_ram = 0; // unlimited
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = SortedBamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -669,7 +668,7 @@ mod tests {
     #[test]
     fn test_sorted_bam_limit_ram_exceeded() {
         let genome = create_test_genome();
-        let mut params = create_test_params();
+        let mut params = default_params();
         params.limit_bam_sort_ram = 1; // 1 byte — will be exceeded by any records
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = SortedBamWriter::create(temp_file.path(), &genome, &params).unwrap();

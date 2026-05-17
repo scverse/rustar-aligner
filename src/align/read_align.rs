@@ -1474,12 +1474,11 @@ mod tests {
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
-    use clap::Parser;
     use noodles::sam::alignment::record::cigar;
 
-    fn make_test_params() -> Parameters {
+    fn default_params() -> Parameters {
         // Parse empty args to get default parameters
-        Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap()
+        Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"])
     }
 
     fn make_test_index() -> GenomeIndex {
@@ -1578,7 +1577,7 @@ mod tests {
     #[test]
     fn test_align_read_no_seeds() {
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         // Read with all N's (no seeds possible)
         let read_seq = vec![4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
@@ -1596,7 +1595,7 @@ mod tests {
     #[test]
     fn test_transcript_filtering_score() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_score_min = 50;
 
         // Would need actual seeds and alignment to test this properly
@@ -1609,7 +1608,7 @@ mod tests {
     #[test]
     fn test_transcript_filtering_mismatch() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_mismatch_nmax = 2;
 
         let read_seq = vec![0, 1, 2, 3]; // ACGT
@@ -1620,7 +1619,7 @@ mod tests {
     #[test]
     fn test_transcript_multimap_limit() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_multimap_nmax = 5;
 
         let read_seq = vec![0, 1, 2, 3]; // ACGT
@@ -1634,7 +1633,7 @@ mod tests {
     #[test]
     fn test_align_paired_read_no_seeds() {
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         // Both mates with all N's
         let mate1 = vec![4, 4, 4, 4, 4, 4, 4, 4];
@@ -1653,7 +1652,7 @@ mod tests {
         use crate::align::transcript::Exon;
         use cigar::op::{Kind, Op};
 
-        let params = make_test_params();
+        let params = default_params();
 
         // Create two transcripts on same chromosome
         let t1 = Transcript {
@@ -1709,7 +1708,7 @@ mod tests {
         use crate::align::transcript::Exon;
         use cigar::op::{Kind, Op};
 
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.align_mates_gap_max = 100;
 
         let t1 = Transcript {
@@ -2055,7 +2054,7 @@ mod tests {
     fn test_align_paired_both_unmapped() {
         // Both mates are all N's → both unmapped → empty Vec
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         let mate1 = vec![4, 4, 4, 4, 4, 4, 4, 4];
         let mate2 = vec![4, 4, 4, 4, 4, 4, 4, 4];
