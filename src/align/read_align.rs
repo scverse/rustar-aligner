@@ -1336,7 +1336,7 @@ fn check_proper_pair(
 }
 
 /// Calculate signed insert size (TLEN)
-fn calculate_insert_size(mate1_trans: &Transcript, mate2_trans: &Transcript) -> i32 {
+pub(crate) fn calculate_insert_size(mate1_trans: &Transcript, mate2_trans: &Transcript) -> i32 {
     // STAR outSAMtlen=1 (default): tlen is computed from the combined PE transcript span,
     // not from max/min of individual mate endpoints.
     //
