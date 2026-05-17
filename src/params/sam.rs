@@ -87,7 +87,7 @@ impl clap::Args for OutSamType {
                 .default_values(["SAM"])
                 .help(
                     "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None. \
-                     Provide as space-separated tokens, e.g. \"BAM SortedByCoordinate\".",
+                     Provide as space-separated tokens, e.g. `--outSAMtype BAM SortedByCoordinate`.",
                 ),
         )
     }
@@ -146,7 +146,7 @@ impl clap::Args for OutSamUnmapped {
                 .default_values(["None"])
                 .help(
                     "Unmapped reads in SAM output: None, Within, or Within KeepPairs. \
-                     Provide as space-separated tokens.",
+                     Provide as space-separated tokens, e.g. `--outSAMunmapped Within KeepPairs`.",
                 ),
         )
     }
