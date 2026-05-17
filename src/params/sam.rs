@@ -2,8 +2,6 @@
 // SAM output type enums
 // ---------------------------------------------------------------------------
 
-use clap::error::{ContextKind, ContextValue, ErrorKind};
-
 /// STAR's `--outSAMtype` format component.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OutSamFormat {
@@ -161,6 +159,8 @@ impl clap::Args for OutSamUnmapped {
 // Helpers
 
 fn invalid_multi_arg(other: &[&str], valid: &[&str]) -> clap::error::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
     let mut err = clap::Error::new(ErrorKind::InvalidValue);
     err.insert(
         ContextKind::InvalidArg,
