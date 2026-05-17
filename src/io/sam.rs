@@ -588,6 +588,9 @@ impl SamWriter {
         let n_alignments = projected.len();
         let mut records = Vec::with_capacity(n_alignments);
 
+        let rg_id_owned = params.primary_rg_id()?;
+        let rg_id = rg_id_owned.as_deref();
+
         for (hit_idx, t) in projected.iter().enumerate() {
             let mut record = RecordBuf::default();
             record.name_mut().replace(read_name.into());
@@ -653,6 +656,8 @@ impl SamWriter {
             if attrs.contains("NM") || attrs.contains("nM") {
                 data.insert(Tag::new(b'n', b'M'), Value::from(t.n_mismatch as i32));
             }
+
+            maybe_insert_rg_tag(&mut record, rg_id);
 
             records.push(record);
         }
@@ -1483,6 +1488,116 @@ mod tests {
         assert_eq!(record.alignment_start().map(usize::from), Some(11)); // 1-based
         // hit_index=1, so NOT secondary
         assert!(!record.flags().is_secondary());
+    }
+
+    #[test]
+    fn test_build_transcriptome_records_stamps_rg_tag() {
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMattrRGline",
+            "ID:rg0",
+            "SM:sample0",
+        ]);
+
+        let projected = vec![
+            Transcript {
+                chr_idx: 0,
+                genome_start: 0,
+                genome_end: 4,
+                is_reverse: false,
+                exons: vec![],
+                cigar: vec![CigarOp::Match(4)],
+                score: 100,
+                n_mismatch: 0,
+                n_gap: 0,
+                n_junction: 0,
+                junction_motifs: vec![],
+                junction_annotated: vec![],
+                read_seq: vec![0, 1, 2, 3],
+            },
+            Transcript {
+                chr_idx: 0,
+                genome_start: 2,
+                genome_end: 6,
+                is_reverse: true,
+                exons: vec![],
+                cigar: vec![CigarOp::Match(4)],
+                score: 90,
+                n_mismatch: 1,
+                n_gap: 0,
+                n_junction: 0,
+                junction_motifs: vec![],
+                junction_annotated: vec![],
+                read_seq: vec![0, 1, 2, 3],
+            },
+        ];
+
+        let records = SamWriter::build_transcriptome_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &projected,
+            255,
+            &params,
+            0,
+        )
+        .expect("build_transcriptome_records");
+
+        assert_eq!(records.len(), 2, "expected one record per projected hit");
+        for (i, rec) in records.iter().enumerate() {
+            let rg = rec
+                .data()
+                .get(&Tag::READ_GROUP)
+                .unwrap_or_else(|| panic!("record {i} missing RG tag"));
+            match rg {
+                Value::String(s) => assert_eq!(
+                    s.as_slice(),
+                    b"rg0",
+                    "record {i}: expected RG:Z:rg0, got {s:?}"
+                ),
+                other => panic!("record {i}: RG tag is not a string: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_transcriptome_records_no_rg_when_unset() {
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+
+        let projected = vec![Transcript {
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 4,
+            is_reverse: false,
+            exons: vec![],
+            cigar: vec![CigarOp::Match(4)],
+            score: 100,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![0, 1, 2, 3],
+        }];
+
+        let records = SamWriter::build_transcriptome_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &projected,
+            255,
+            &params,
+            0,
+        )
+        .expect("build_transcriptome_records");
+
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].data().get(&Tag::READ_GROUP).is_none(),
+            "RG tag should not be present when --outSAMattrRGline is unset"
+        );
     }
 
     #[test]
