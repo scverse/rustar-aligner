@@ -223,7 +223,6 @@ pub fn filter_novel_junctions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     #[test]
     fn test_junction_db_empty() {
@@ -361,9 +360,7 @@ mod tests {
         // Add an annotated junction (should be excluded from novel list)
         sj_stats.record_junction(0, 500, 600, 1, SpliceMotif::GtAg, true, 20, true);
 
-        // Create minimal params for testing
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "reads.fq"]);
         let novel_junctions = filter_novel_junctions(&sj_stats, &params);
 
         // Should only get the high-quality novel junction
@@ -390,7 +387,7 @@ mod tests {
             sj_stats.record_junction(0, 300, 400, 1, SpliceMotif::NonCanonical, true, 35, false);
         }
 
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "reads.fq"]);
         let novel_junctions = filter_novel_junctions(&sj_stats, &params);
 
         // Only the 35-overhang junction should pass (30bp minimum for non-canonical)

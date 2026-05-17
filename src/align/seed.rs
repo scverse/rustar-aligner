@@ -69,7 +69,7 @@ impl Seed {
             false,
             debug_name,
             &mut seeds,
-        )?;
+        );
 
         // Cap check between directions (STAR: seedPerReadNmax applies across both)
         if seeds.len() >= params.seed_per_read_nmax {
@@ -87,7 +87,7 @@ impl Seed {
             true,
             debug_name,
             &mut seeds,
-        )?;
+        );
 
         // STAR's storeAligns dedup: same rStart + same Length → skip duplicate.
         // Multiple istart chains can find the same (read_pos, length, direction) seed.
@@ -217,7 +217,7 @@ fn search_direction_sparse(
     is_rc: bool,
     debug_name: &str,
     seeds: &mut Vec<Seed>,
-) -> Result<(), Error> {
+) {
     let read_len = read_seq.len();
 
     // STAR (ReadAlign_mapOneRead.cpp lines 41-42):
@@ -262,7 +262,7 @@ fn search_direction_sparse(
             }
 
             let result =
-                find_seed_at_position(read_seq, pos, index, min_seed_length, false, params)?;
+                find_seed_at_position(read_seq, pos, index, min_seed_length, false, params);
 
             if !debug_name.is_empty() {
                 let dir = if is_rc { "RC" } else { "FWD" };
@@ -292,7 +292,7 @@ fn search_direction_sparse(
                 seeds.push(seed);
 
                 if seeds.len() >= params.seed_per_read_nmax {
-                    return Ok(());
+                    return;
                 }
             }
 
@@ -300,8 +300,6 @@ fn search_direction_sparse(
             // Remaining-length check at loop top: stop when < seedMapMin bases remain
         }
     }
-
-    Ok(())
 }
 
 /// Find a seed starting at a specific position in the read.
@@ -317,12 +315,12 @@ fn find_seed_at_position(
     min_seed_length: usize,
     is_reverse: bool,
     params: &Parameters,
-) -> Result<MmpResult, Error> {
+) -> MmpResult {
     if read_pos >= read_seq.len() {
-        return Ok(MmpResult {
+        return MmpResult {
             seed: None,
             advance: 1,
-        });
+        };
     }
 
     // Extract k-mer for SAindex lookup
@@ -330,10 +328,10 @@ fn find_seed_at_position(
     let remaining = read_seq.len() - read_pos;
 
     if remaining < min_seed_length {
-        return Ok(MmpResult {
+        return MmpResult {
             seed: None,
             advance: 1,
-        });
+        };
     }
 
     // Build k-mer for SAindex lookup, stopping at first N base
@@ -351,10 +349,10 @@ fn find_seed_at_position(
     }
 
     if actual_len == 0 {
-        return Ok(MmpResult {
+        return MmpResult {
             seed: None,
             advance: 1,
-        }); // First base is N
+        }; // First base is N
     }
 
     // Hierarchical SAindex lookup (STAR's maxMappableLength2strands approach).
@@ -366,21 +364,18 @@ fn find_seed_at_position(
         .sa_index
         .hierarchical_lookup(kmer_idx, actual_len as u32, n_sa);
 
-    let (sa_start, sa_end, matched_level, bounds_tight) = match result {
-        Some(r) => r,
-        None => {
-            return Ok(MmpResult {
-                seed: None,
-                advance: 1,
-            });
-        }
+    let Some((sa_start, sa_end, matched_level, bounds_tight)) = result else {
+        return MmpResult {
+            seed: None,
+            advance: 1,
+        };
     };
 
     if sa_start >= sa_end {
-        return Ok(MmpResult {
+        return MmpResult {
             seed: None,
             advance: 1,
-        });
+        };
     }
 
     // STAR short-circuit (maxMappableLength2strands.cpp):
@@ -410,14 +405,14 @@ fn find_seed_at_position(
     // Uses narrowed range (accurate loci count, not overestimated k-mer range)
     let n_loci = narrowed_end - narrowed_start;
     if n_loci > params.seed_multimap_nmax {
-        return Ok(MmpResult {
+        return MmpResult {
             seed: None,
             advance,
-        });
+        };
     }
 
     if match_length >= min_seed_length {
-        Ok(MmpResult {
+        MmpResult {
             seed: Some(Seed {
                 read_pos,
                 length: match_length,
@@ -428,19 +423,19 @@ fn find_seed_at_position(
                 mate_id: 2, // Single-end default
             }),
             advance,
-        })
+        }
     } else {
-        Ok(MmpResult {
+        MmpResult {
             seed: None,
             advance,
-        })
+        }
     }
 }
 
 /// Overflow-safe median of two unsigned integers.
 /// Equivalent to STAR's medianUint2: a/2 + b/2 + (a%2 + b%2)/2
 fn median_uint2(a: usize, b: usize) -> usize {
-    a / 2 + b / 2 + (a % 2 + b % 2) / 2
+    a / 2 + b / 2 + usize::midpoint(a % 2, b % 2)
 }
 
 /// Compare read to genome at a specific SA position, starting from offset l_start.
@@ -667,14 +662,13 @@ fn find_mult_range(
 mod tests {
     use super::*;
     use crate::params::Parameters;
-    use clap::Parser;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
     fn make_test_index(sequence: &str) -> GenomeIndex {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">chr1").unwrap();
-        writeln!(file, "{}", sequence).unwrap();
+        writeln!(file, "{sequence}").unwrap();
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -708,13 +702,17 @@ mod tests {
             .collect()
     }
 
+    fn params(args: &[&str]) -> Parameters {
+        let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
+        full_args.extend_from_slice(args);
+        Parameters::parse_from(full_args)
+    }
+
     #[test]
     fn find_exact_match() {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&["--runMode", "alignReads"]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
 
@@ -730,9 +728,7 @@ mod tests {
     fn min_seed_length_filter() {
         let index = make_test_index("AAAAAAAA");
         let read = encode_sequence("AAA");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         // With min_seed_length=4, should find nothing (read is only 3bp)
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
@@ -747,9 +743,7 @@ mod tests {
     fn no_match() {
         let index = make_test_index("ACAC");
         let read = encode_sequence("GGGG");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 2, &params, "").unwrap();
 
@@ -761,9 +755,7 @@ mod tests {
     fn get_genome_positions() {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
         assert!(!seeds.is_empty());
@@ -782,9 +774,7 @@ mod tests {
     fn test_single_end_mate_id() {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
         assert!(!seeds.is_empty());
@@ -800,9 +790,7 @@ mod tests {
         let index = make_test_index("ACGTACGTTTGGCCAA");
         let mate1 = encode_sequence("ACGT");
         let mate2 = encode_sequence("TTGG");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
 
@@ -829,9 +817,7 @@ mod tests {
         let index = make_test_index("ACGTACGT");
         let mate1 = encode_sequence("ACGT");
         let mate2 = encode_sequence("ACGT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
 
@@ -880,9 +866,7 @@ mod tests {
         let index = make_test_index("AACCTTGG");
         // Read is RC of genome: CCAAGGTT
         let read = encode_sequence("CCAAGGTT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
 
@@ -893,8 +877,7 @@ mod tests {
         // R→L search should find seeds because RC(read) = AACCTTGG matches genome
         assert!(
             !rc_seeds.is_empty(),
-            "R→L search should find seeds (RC of read matches genome). All seeds: {:?}",
-            seeds
+            "R→L search should find seeds (RC of read matches genome). All seeds: {seeds:?}"
         );
 
         // Verify R→L seeds have valid read positions
@@ -922,15 +905,7 @@ mod tests {
         // Test that combined L→R + R→L respects seedPerReadNmax
         let index = make_test_index("ACGTACGTACGTACGT");
         let read = encode_sequence("ACGTACGT");
-
-        let args = vec![
-            "rustar-aligner",
-            "--runMode",
-            "alignReads",
-            "--seedPerReadNmax",
-            "3",
-        ];
-        let params = Parameters::parse_from(args);
+        let params = params(&["--seedPerReadNmax", "3"]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
         assert!(
@@ -982,9 +957,7 @@ mod tests {
         // original read coordinates: read_pos = original_read_len - rc_pos - length
         let index = make_test_index("AACCTTGG");
         let read = encode_sequence("CCAAGGTT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
 
@@ -1014,19 +987,16 @@ mod tests {
         // than the old dense (every-position) search
         let genome_seq = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
         let index = make_test_index(genome_seq);
-
         // Use a read that's long enough for multiple start positions
         let read = encode_sequence("ACGTACGTACGTACGTACGTACGT"); // 24bp
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let sparse_seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
 
         // Count how many seeds dense would produce (every position that has a match)
         let mut dense_count = 0;
         for read_pos in 0..read.len() {
-            let result = find_seed_at_position(&read, read_pos, &index, 4, false, &params).unwrap();
+            let result = find_seed_at_position(&read, read_pos, &index, 4, false, &params);
             if result.seed.is_some() {
                 dense_count += 1;
             }
@@ -1034,8 +1004,7 @@ mod tests {
         // Also count R→L dense seeds
         let rc_read = reverse_complement_read(&read);
         for rc_pos in 0..rc_read.len() {
-            let result =
-                find_seed_at_position(&rc_read, rc_pos, &index, 4, false, &params).unwrap();
+            let result = find_seed_at_position(&rc_read, rc_pos, &index, 4, false, &params);
             if result.seed.is_some() {
                 dense_count += 1;
             }
@@ -1055,9 +1024,7 @@ mod tests {
         // RC(read) = AACCTTGG matches forward genome
         let index = make_test_index("AACCTTGG");
         let read = encode_sequence("CCAAGGTT");
-
-        let args = vec!["rustar-aligner", "--runMode", "alignReads"];
-        let params = Parameters::parse_from(args);
+        let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
 

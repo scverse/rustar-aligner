@@ -43,7 +43,7 @@ impl<'a> ChimericDetector<'a> {
         }
 
         let read_len = read_seq.len();
-        let (left_clip, right_clip) = transcript.count_soft_clips();
+        let [left_clip, right_clip] = transcript.count_soft_clips();
         let score_min = params.chim_score_min;
         let score_drop_max = params.chim_score_drop_max;
         let non_gtag_penalty = params.chim_score_junction_non_gtag;
@@ -51,7 +51,7 @@ impl<'a> ChimericDetector<'a> {
         let overhang_min = params.chim_junction_overhang_min as usize;
 
         // Try right clip first, then left (match STAR's ordering)
-        let candidates = [(right_clip as usize, true), (left_clip as usize, false)];
+        let candidates = [(right_clip, true), (left_clip, false)];
 
         for (clip_len, is_right) in candidates {
             if clip_len < min_seg {
@@ -82,7 +82,7 @@ impl<'a> ChimericDetector<'a> {
             } else {
                 Some(&index.junction_db)
             };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1)?;
+            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
 
             let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
                 continue;
@@ -165,9 +165,9 @@ impl<'a> ChimericDetector<'a> {
             }
 
             let donor_seg = transcript_to_segment(tr_donor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip donor: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("soft-clip donor: {e}")))?;
             let acceptor_seg = transcript_to_segment(tr_acceptor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {e}")))?;
 
             let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
                 &index.genome,
@@ -269,7 +269,7 @@ impl<'a> ChimericDetector<'a> {
             } else {
                 Some(&index.junction_db)
             };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1)?;
+            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
 
             let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
                 continue;
@@ -292,7 +292,7 @@ impl<'a> ChimericDetector<'a> {
             };
 
             let new_seg = transcript_to_segment(&clip_tr)
-                .map_err(|e| Error::Chimeric(format!("tier3 segment: {}", e)))?;
+                .map_err(|e| Error::Chimeric(format!("tier3 segment: {e}")))?;
 
             // Donor / acceptor ordered by read position
             let (donor_seg, acceptor_seg): (&ChimericSegment, &ChimericSegment) =
@@ -390,7 +390,7 @@ impl<'a> ChimericDetector<'a> {
         // Find cluster pairs with chimeric signatures
         for i in 0..clusters.len() {
             for j in (i + 1)..clusters.len() {
-                if self.is_chimeric_signature(&clusters[i], &clusters[j]) {
+                if is_chimeric_signature(&clusters[i], &clusters[j]) {
                     // Try to build chimeric alignment from these clusters
                     if let Some(chim) = self.build_chimeric_from_clusters(
                         &clusters[i],
@@ -406,27 +406,6 @@ impl<'a> ChimericDetector<'a> {
         }
 
         Ok(chimeras)
-    }
-
-    /// Check if two clusters represent a chimeric signature
-    fn is_chimeric_signature(&self, c1: &SeedCluster, c2: &SeedCluster) -> bool {
-        // Different chromosomes
-        if c1.chr_idx != c2.chr_idx {
-            return true;
-        }
-
-        // Different strands (same chromosome)
-        if c1.is_reverse != c2.is_reverse {
-            return true;
-        }
-
-        // Large genomic distance (same chr/strand)
-        let distance = genomic_distance(c1, c2);
-        if distance > 1_000_000 {
-            return true;
-        }
-
-        false
     }
 
     /// Build chimeric alignment from two clusters
@@ -446,8 +425,8 @@ impl<'a> ChimericDetector<'a> {
         use crate::align::score::AlignmentScorer;
         let scorer = AlignmentScorer::from_params(self.params);
 
-        let transcripts1 = stitch_seeds(cluster1, read_seq, index, &scorer)?;
-        let transcripts2 = stitch_seeds(cluster2, read_seq, index, &scorer)?;
+        let transcripts1 = stitch_seeds(cluster1, read_seq, index, &scorer);
+        let transcripts2 = stitch_seeds(cluster2, read_seq, index, &scorer);
 
         if transcripts1.is_empty() || transcripts2.is_empty() {
             return Ok(None);
@@ -527,6 +506,27 @@ fn genomic_distance(c1: &SeedCluster, c2: &SeedCluster) -> u64 {
     } else {
         c1.genome_start.saturating_sub(c2.genome_end)
     }
+}
+
+/// Check if two clusters represent a chimeric signature
+fn is_chimeric_signature(c1: &SeedCluster, c2: &SeedCluster) -> bool {
+    // Different chromosomes
+    if c1.chr_idx != c2.chr_idx {
+        return true;
+    }
+
+    // Different strands (same chromosome)
+    if c1.is_reverse != c2.is_reverse {
+        return true;
+    }
+
+    // Large genomic distance (same chr/strand)
+    let distance = genomic_distance(c1, c2);
+    if distance > 1_000_000 {
+        return true;
+    }
+
+    false
 }
 
 /// Detect inter-mate chimeric alignment from two single-mate transcripts.
@@ -837,9 +837,8 @@ pub fn detect_chimeric_old(
     }
 
     // No chimeric partner found
-    let tr2 = match best_tr2 {
-        Some(t) => t,
-        None => return Ok(vec![]),
+    let Some(tr2) = best_tr2 else {
+        return Ok(vec![]);
     };
 
     // Score filters
@@ -898,9 +897,9 @@ pub fn detect_chimeric_old(
 
     // Build chimeric segments
     let donor_seg = transcript_to_segment(tr_donor)
-        .map_err(|e| Error::Chimeric(format!("chimeric donor segment: {}", e)))?;
+        .map_err(|e| Error::Chimeric(format!("chimeric donor segment: {e}")))?;
     let acceptor_seg = transcript_to_segment(tr_acceptor)
-        .map_err(|e| Error::Chimeric(format!("chimeric acceptor segment: {}", e)))?;
+        .map_err(|e| Error::Chimeric(format!("chimeric acceptor segment: {e}")))?;
 
     // Minimum segment length check
     if !donor_seg.meets_min_length(params.chim_segment_min)
@@ -981,14 +980,14 @@ pub(crate) fn transcript_to_segment(transcript: &Transcript) -> Result<ChimericS
 mod tests {
     use super::*;
     use crate::align::WindowAlignment;
-    use crate::align::transcript::{CigarOp, Exon, Transcript};
+    use crate::align::transcript::{Exon, Transcript};
     use crate::genome::Genome;
     use crate::index::GenomeIndex;
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
     use crate::junction::SpliceJunctionDb;
-    use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
 
     /// Minimal two-chromosome genome for chimeric tests.
     /// Each chromosome has 200 bases of A (=0), padded to 256-byte bins.
@@ -1036,6 +1035,7 @@ mod tests {
         genome_end: u64,
         is_reverse: bool,
     ) -> Transcript {
+        use cigar::op::{Kind, Op};
         let read_len = (genome_end - genome_start) as usize;
         Transcript {
             chr_idx,
@@ -1049,7 +1049,7 @@ mod tests {
                 read_end: read_len,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(read_len as u32)],
+            cigar: vec![Op::new(Kind::Match, read_len)],
             score: read_len as i32,
             n_mismatch: 0,
             n_gap: 0,
@@ -1115,46 +1115,34 @@ mod tests {
 
     #[test]
     fn test_is_chimeric_signature_different_chr() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(1, 1000, 1100, false);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_strand_break() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 1200, 1300, true);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_large_distance() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 2_000_000, 2_000_100, false);
 
-        assert!(detector.is_chimeric_signature(&c1, &c2));
+        assert!(is_chimeric_signature(&c1, &c2));
     }
 
     #[test]
     fn test_is_chimeric_signature_close_same_strand() {
-        let params = Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-        let detector = ChimericDetector::new(&params);
-
         let c1 = make_test_cluster(0, 1000, 1100, false);
         let c2 = make_test_cluster(0, 1200, 1300, false);
 
-        assert!(!detector.is_chimeric_signature(&c1, &c2));
+        assert!(!is_chimeric_signature(&c1, &c2));
     }
 
     // --- transcript_to_segment tests ---
@@ -1195,11 +1183,16 @@ mod tests {
 
     // --- detect_inter_mate_chimeric tests ---
 
+    fn params(args: &[&str]) -> Parameters {
+        let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
+        full_args.extend_from_slice(args);
+        Parameters::parse_from(full_args)
+    }
+
     #[test]
     fn test_inter_mate_chimeric_concordant_returns_none() {
         // Normal FR pair on the same chromosome, close together → not chimeric
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 forward
@@ -1212,8 +1205,7 @@ mod tests {
 
     #[test]
     fn test_inter_mate_chimeric_different_chromosomes() {
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 chr0
@@ -1230,8 +1222,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_same_strand() {
         // Both mates forward on the same chromosome → chimeric (strand break)
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 60, false); // mate1 forward
@@ -1245,8 +1236,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_too_far() {
         // Opposite-strand pair but >1Mb apart → chimeric
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
 
         // Use large positions — out-of-bounds for sequence but score.rs guards handle this
@@ -1261,8 +1251,7 @@ mod tests {
     #[test]
     fn test_inter_mate_chimeric_segment_too_short() {
         // chimSegmentMin=100 but segments are only 20bp → None
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "100"]).unwrap();
+        let params = params(&["--chimSegmentMin", "100"]);
         let index = make_test_index();
 
         let t1 = make_transcript(0, 10, 30, false);
@@ -1275,8 +1264,7 @@ mod tests {
 
     #[test]
     fn test_inter_mate_chimeric_empty_exons_returns_none() {
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "10"]).unwrap();
+        let params = params(&["--chimSegmentMin", "10"]);
         let index = make_test_index();
         let read_seq = vec![0u8; 50];
 
@@ -1303,14 +1291,15 @@ mod tests {
         left_clip: usize,
         right_clip: usize,
     ) -> Transcript {
+        use cigar::op::{Kind, Op};
         let aligned_len = read_len - left_clip - right_clip;
         let mut cigar = vec![];
         if left_clip > 0 {
-            cigar.push(CigarOp::SoftClip(left_clip as u32));
+            cigar.push(Op::new(Kind::SoftClip, left_clip));
         }
-        cigar.push(CigarOp::Match(aligned_len as u32));
+        cigar.push(Op::new(Kind::Match, aligned_len));
         if right_clip > 0 {
-            cigar.push(CigarOp::SoftClip(right_clip as u32));
+            cigar.push(Op::new(Kind::SoftClip, right_clip));
         }
         Transcript {
             chr_idx,
@@ -1338,14 +1327,20 @@ mod tests {
     #[test]
     fn test_detect_chimeric_old_no_chimera_single_transcript() {
         // Only one transcript → no partner → None
-        let params =
-            Parameters::try_parse_from(vec!["rustar-aligner", "--chimSegmentMin", "20"]).unwrap();
+        let params = params(&["--chimSegmentMin", "20"]);
         let index = make_test_index();
         let read_len = 100usize;
         let t1 = make_clipped_transcript(0, 50, false, read_len, 0, 0);
         let read_seq = make_read_seq(read_len);
-        let result =
-            detect_chimeric_old(&[t1.clone()], &t1, &read_seq, "r", &params, &index).unwrap();
+        let result = detect_chimeric_old(
+            std::slice::from_ref(&t1),
+            &t1,
+            &read_seq,
+            "r",
+            &params,
+            &index,
+        )
+        .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1353,8 +1348,7 @@ mod tests {
     fn test_detect_chimeric_old_inter_chr_pair() {
         // Primary: covers read[0..80] on chr0; secondary: covers read[80..100] on chr1.
         // With chimSegmentMin=20, scoreDropMax=20, scoreSeparation=10, this should produce a chimera.
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
+        let params = params(&[
             "--chimSegmentMin",
             "15",
             "--chimScoreDropMax",
@@ -1363,8 +1357,7 @@ mod tests {
             "10",
             "--chimJunctionOverhangMin",
             "10",
-        ])
-        .unwrap();
+        ]);
         let index = make_test_index();
         let read_len = 100usize;
         // Primary: chr0, read[0..80], right clip = 20
@@ -1389,14 +1382,7 @@ mod tests {
     #[test]
     fn test_detect_chimeric_old_segment_too_short() {
         // Segments are too short after chimSegmentMin filter
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
-            "--chimSegmentMin",
-            "50",
-            "--chimScoreDropMax",
-            "100",
-        ])
-        .unwrap();
+        let params = params(&["--chimSegmentMin", "50", "--chimScoreDropMax", "100"]);
         let index = make_test_index();
         let read_len = 100usize;
         let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 60); // 40 bp → < 50
@@ -1413,16 +1399,14 @@ mod tests {
         // Score drop is too large: chimScoreDropMax=5 means combined_score + 5 >= read_len=100
         // combined_score = 50 + 50 - 0 = 100, 100 + 5 = 105 >= 100 → should pass
         // But with drop=5, score = 40+40=80, 80+5=85 < 100 → should fail
-        let params = Parameters::try_parse_from(vec![
-            "rustar-aligner",
+        let params = params(&[
             "--chimSegmentMin",
             "20",
             "--chimScoreDropMax",
             "5",
             "--chimScoreSeparation",
             "200", // suppress uniqueness filter
-        ])
-        .unwrap();
+        ]);
         let index = make_test_index();
         let read_len = 100usize;
         let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 40); // 60 bp aligned

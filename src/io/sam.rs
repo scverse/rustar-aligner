@@ -1,6 +1,6 @@
-/// SAM/BAM output writer with noodles
+//! SAM/BAM output writer with noodles
 use crate::align::read_align::PairedAlignment;
-use crate::align::transcript::{CigarOp, Transcript};
+use crate::align::transcript::{Transcript, cigar_to_string};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::io::fastq::{complement_base, decode_base};
@@ -11,6 +11,7 @@ use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
 use noodles::sam::alignment::record::MappingQuality;
+use noodles::sam::alignment::record::cigar;
 use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::data::field::value::Array;
@@ -149,18 +150,13 @@ impl SamWriter {
                     .name()
                     .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
                     .unwrap_or_default();
-                let cigar_str: String = cigar_ops
-                    .iter()
-                    .map(|op| format!("{}{:?}", op.len(), op.kind()))
-                    .collect::<Vec<_>>()
-                    .join("");
                 panic!(
                     "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
                     name,
                     cigar_query_len,
                     seq_len,
                     record.flags(),
-                    cigar_str
+                    cigar_to_string(cigar_ops)
                 );
             }
             self.writer.write_alignment_record(&self.header, record)?;
@@ -420,18 +416,20 @@ impl SamWriter {
         *mapped_rec.flags_mut() = mapped_flags;
 
         *mapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {}: {}", mapped_pos, e))
-            })?);
+        *mapped_rec.alignment_start_mut() = Some(
+            mapped_pos
+                .try_into()
+                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
+        );
         *mapped_rec.mapping_quality_mut() = MappingQuality::new(mapq);
-        *mapped_rec.cigar_mut() = convert_cigar(&mapped_transcript.cigar)?;
+        *mapped_rec.cigar_mut() = mapped_transcript.cigar.iter().copied().collect();
 
         // RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate)
         *mapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {}: {}", mapped_pos, e))
-        })?);
+        *mapped_rec.mate_alignment_start_mut() =
+            Some(mapped_pos.try_into().map_err(|e| {
+                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
+            })?);
         *mapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL
@@ -516,17 +514,19 @@ impl SamWriter {
 
         // Co-locate unmapped mate at mapped mate's position
         *unmapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid position {}: {}", mapped_pos, e))
-            })?);
+        *unmapped_rec.alignment_start_mut() = Some(
+            mapped_pos
+                .try_into()
+                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
+        );
         *unmapped_rec.mapping_quality_mut() = MappingQuality::new(0);
         // CIGAR = * (default empty cigar)
         // RNEXT = mapped mate's chr
         *unmapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.mate_alignment_start_mut() = Some(mapped_pos.try_into().map_err(|e| {
-            Error::Alignment(format!("invalid mate position {}: {}", mapped_pos, e))
-        })?);
+        *unmapped_rec.mate_alignment_start_mut() =
+            Some(mapped_pos.try_into().map_err(|e| {
+                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
+            })?);
         *unmapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL: forward orientation (no RC for unmapped)
@@ -607,15 +607,16 @@ impl SamWriter {
 
             // POS = t-space position + 1 (1-based).
             let pos = (t.genome_start + 1) as usize;
-            *record.alignment_start_mut() = Some(pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid t-space position {}: {}", pos, e))
-            })?);
+            *record.alignment_start_mut() =
+                Some(pos.try_into().map_err(|e| {
+                    Error::Alignment(format!("invalid t-space position {pos}: {e}"))
+                })?);
 
             // MAPQ
             *record.mapping_quality_mut() = MappingQuality::new(mapq);
 
             // CIGAR (already has N ops stripped by align_to_transcripts)
-            *record.cigar_mut() = convert_cigar(&t.cigar)?;
+            *record.cigar_mut() = t.cigar.iter().copied().collect();
 
             // SEQ / QUAL — STAR writes the original-orientation sequence when
             // FLAG 0x10 is unset (forward alignment in t-space) and RC'd seq
@@ -799,12 +800,12 @@ where
     let mut builder = sam::Header::builder();
 
     // @HD line (default version and unsorted)
-    builder = builder.set_header(Default::default());
+    builder = builder.set_header(Map::default());
 
     // @SQ lines for each reference
     for (name, length) in refs {
         let length_nz = NonZeroUsize::new(length)
-            .ok_or_else(|| Error::Index(format!("reference {} has zero length", name)))?;
+            .ok_or_else(|| Error::Index(format!("reference {name} has zero length")))?;
 
         builder = builder.add_reference_sequence(
             name,
@@ -821,7 +822,7 @@ where
         let id = fields
             .next()
             .and_then(|f| f.strip_prefix("ID:"))
-            .ok_or_else(|| Error::Parameter(format!("malformed RG line '{}'", line)))?;
+            .ok_or_else(|| Error::Parameter(format!("malformed RG line '{line}'")))?;
         if !seen_ids.insert(id.to_string()) {
             continue;
         }
@@ -829,8 +830,7 @@ where
         for field in fields {
             if field.len() < 3 || &field[2..3] != ":" {
                 return Err(Error::Parameter(format!(
-                    "RG field '{}' is not TAG:value",
-                    field
+                    "RG field '{field}' is not TAG:value"
                 )));
             }
             let tag_bytes: [u8; 2] = field.as_bytes()[..2].try_into().unwrap();
@@ -904,15 +904,14 @@ fn transcript_to_record(
     let pos = (transcript.genome_start - chr_start + 1) as usize;
     *record.alignment_start_mut() = Some(
         pos.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid alignment position {}: {}", pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid alignment position {pos}: {e}")))?,
     );
 
     // MAPQ
     *record.mapping_quality_mut() = MappingQuality::new(mapq);
 
     // CIGAR
-    let cigar = convert_cigar(&transcript.cigar)?;
-    *record.cigar_mut() = cigar;
+    *record.cigar_mut() = transcript.cigar.iter().copied().collect();
 
     // Sequence and quality scores
     // Per SAM spec: when FLAG & 16 (reverse strand), SEQ is the reverse complement
@@ -981,15 +980,16 @@ fn transcript_to_record(
 /// Not emitted in SAM output (STAR maps NM attribute to 'nM' tag), but kept for tests.
 #[cfg(test)]
 fn compute_edit_distance(transcript: &Transcript) -> i32 {
-    let indel_bases: u32 = transcript
+    use cigar::op::Kind;
+    let indel_bases: usize = transcript
         .cigar
         .iter()
-        .filter_map(|op| match op {
-            CigarOp::Ins(n) | CigarOp::Del(n) => Some(*n),
+        .filter_map(|op| match op.kind() {
+            Kind::Insertion | Kind::Deletion => Some(op.len()),
             _ => None,
         })
         .sum();
-    (transcript.n_mismatch + indel_bases) as i32
+    (transcript.n_mismatch + indel_bases as u32) as i32
 }
 
 /// Derive XS strand tag from transcript junction motifs.
@@ -1039,22 +1039,23 @@ fn build_jm_tag(transcript: &Transcript) -> Option<Value> {
 /// Format: [start1, end1, start2, end2, ...] where start is first intronic base
 /// and end is last intronic base (both 1-based, inclusive).
 fn build_ji_tag(transcript: &Transcript, chr_start: u64) -> Option<Value> {
+    use cigar::op::Kind;
     if transcript.n_junction == 0 {
         return None;
     }
     let mut coords: Vec<i32> = Vec::new();
     let mut genome_pos = transcript.genome_start;
     for op in &transcript.cigar {
-        match op {
-            CigarOp::RefSkip(n) => {
+        match op.kind() {
+            Kind::Skip => {
                 let intron_start = (genome_pos - chr_start + 1) as i32; // 1-based
-                let intron_end = (genome_pos + *n as u64 - chr_start) as i32; // 1-based inclusive
+                let intron_end = (genome_pos + op.len() as u64 - chr_start) as i32; // 1-based inclusive
                 coords.push(intron_start);
                 coords.push(intron_end);
-                genome_pos += *n as u64;
+                genome_pos += op.len() as u64;
             }
-            CigarOp::Match(n) | CigarOp::Equal(n) | CigarOp::Diff(n) | CigarOp::Del(n) => {
-                genome_pos += *n as u64;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
             _ => {} // Ins, SoftClip, HardClip don't consume reference
         }
@@ -1072,6 +1073,8 @@ fn build_md_tag(
     genome: &Genome,
     is_reverse: bool,
 ) -> String {
+    use cigar::op::Kind;
+
     // Build the SAM-order sequence (RC for reverse strand)
     let sam_seq: Vec<u8> = if is_reverse {
         read_seq.iter().rev().map(|&b| complement_base(b)).collect()
@@ -1085,9 +1088,9 @@ fn build_md_tag(
     let mut read_pos: usize = 0;
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::Match(n) | CigarOp::Equal(n) | CigarOp::Diff(n) => {
-                for _ in 0..*n {
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for _ in 0..op.len() {
                     let ref_base = genome.get_base(genome_pos).unwrap_or(4);
                     let read_base = if read_pos < sam_seq.len() {
                         sam_seq[read_pos]
@@ -1097,7 +1100,7 @@ fn build_md_tag(
                     if ref_base == read_base {
                         match_count += 1;
                     } else {
-                        write!(md, "{}", match_count).unwrap();
+                        write!(md, "{match_count}").unwrap();
                         match_count = 0;
                         md.push(decode_base(ref_base) as char);
                     }
@@ -1105,57 +1108,28 @@ fn build_md_tag(
                     read_pos += 1;
                 }
             }
-            CigarOp::Del(n) => {
-                write!(md, "{}", match_count).unwrap();
+            Kind::Deletion => {
+                write!(md, "{match_count}").unwrap();
                 match_count = 0;
                 md.push('^');
-                for _ in 0..*n {
+                for _ in 0..op.len() {
                     let ref_base = genome.get_base(genome_pos).unwrap_or(4);
                     md.push(decode_base(ref_base) as char);
                     genome_pos += 1;
                 }
             }
-            CigarOp::Ins(n) => {
-                read_pos += *n as usize;
+            Kind::Insertion | Kind::SoftClip => {
+                read_pos += op.len();
             }
-            CigarOp::RefSkip(n) => {
-                genome_pos += *n as u64;
+            Kind::Skip => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::SoftClip(n) => {
-                read_pos += *n as usize;
-            }
-            CigarOp::HardClip(_) => {}
+            Kind::HardClip | Kind::Pad => {}
         }
     }
     // Emit trailing match count
-    write!(md, "{}", match_count).unwrap();
+    write!(md, "{match_count}").unwrap();
     md
-}
-
-/// Convert rustar-aligner CigarOp to noodles Cigar
-pub(crate) fn convert_cigar(ops: &[CigarOp]) -> Result<sam::alignment::record_buf::Cigar, Error> {
-    use sam::alignment::record::cigar::op::Kind;
-
-    let mut cigar = sam::alignment::record_buf::Cigar::default();
-
-    for op in ops {
-        let kind = match op {
-            CigarOp::Match(_) => Kind::Match,
-            CigarOp::Equal(_) => Kind::SequenceMatch,
-            CigarOp::Diff(_) => Kind::SequenceMismatch,
-            CigarOp::Ins(_) => Kind::Insertion,
-            CigarOp::Del(_) => Kind::Deletion,
-            CigarOp::RefSkip(_) => Kind::Skip,
-            CigarOp::SoftClip(_) => Kind::SoftClip,
-            CigarOp::HardClip(_) => Kind::HardClip,
-        };
-
-        let len = op.len() as usize;
-        let noodles_op = sam::alignment::record::cigar::Op::new(kind, len);
-        cigar.as_mut().push(noodles_op);
-    }
-
-    Ok(cigar)
 }
 
 /// Build a SAM record for one mate of a paired-end read
@@ -1225,15 +1199,14 @@ fn build_paired_mate_record(
     let pos = (transcript.genome_start - chr_start + 1) as usize;
     *record.alignment_start_mut() = Some(
         pos.try_into()
-            .map_err(|e| Error::Alignment(format!("invalid alignment position {}: {}", pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid alignment position {pos}: {e}")))?,
     );
 
     // MAPQ
     *record.mapping_quality_mut() = MappingQuality::new(mapq);
 
     // CIGAR
-    let cigar = convert_cigar(&transcript.cigar)?;
-    *record.cigar_mut() = cigar;
+    *record.cigar_mut() = transcript.cigar.iter().copied().collect();
 
     // RNEXT (mate reference sequence from the mate's actual alignment)
     *record.mate_reference_sequence_id_mut() = Some(mate_transcript.chr_idx);
@@ -1244,7 +1217,7 @@ fn build_paired_mate_record(
     *record.mate_alignment_start_mut() = Some(
         mate_pos
             .try_into()
-            .map_err(|e| Error::Alignment(format!("invalid mate position {}: {}", mate_pos, e)))?,
+            .map_err(|e| Error::Alignment(format!("invalid mate position {mate_pos}: {e}")))?,
     );
 
     // TLEN (insert size)
@@ -1315,14 +1288,14 @@ mod tests {
     use super::*;
     use crate::align::score::SpliceMotif;
     use crate::genome::Genome;
-    use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 
     /// Build an attribute set with all tags enabled (for tests that don't care about filtering)
     fn all_attrs() -> HashSet<String> {
         ["NH", "HI", "AS", "NM", "nM", "XS", "jM", "jI", "MD"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -1330,7 +1303,7 @@ mod tests {
     fn standard_attrs() -> HashSet<String> {
         ["NH", "HI", "AS", "NM", "nM"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
@@ -1346,23 +1319,9 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_cigar() {
-        let ops = vec![
-            CigarOp::Match(50),
-            CigarOp::Ins(3),
-            CigarOp::Del(2),
-            CigarOp::RefSkip(100),
-            CigarOp::Match(50),
-        ];
-
-        let cigar = convert_cigar(&ops).unwrap();
-        assert_eq!(cigar.as_ref().len(), 5);
-    }
-
-    #[test]
     fn test_build_sam_header() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let header = build_sam_header(&genome, &params).unwrap();
 
@@ -1376,7 +1335,7 @@ mod tests {
     #[test]
     fn test_build_sam_header_with_rg() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec![
+        let params = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "test.fq",
@@ -1402,10 +1361,11 @@ mod tests {
     #[test]
     fn test_sam_output_includes_rg_header_and_tag() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
         use std::io::Read;
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec![
+        let params = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "test.fq",
@@ -1429,7 +1389,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1470,7 +1430,7 @@ mod tests {
     #[test]
     fn test_sam_writer_creation() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let tmpfile = NamedTempFile::new().unwrap();
         let writer = SamWriter::create(tmpfile.path(), &genome, &params);
@@ -1479,6 +1439,7 @@ mod tests {
 
     #[test]
     fn test_transcript_to_record() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -1487,7 +1448,7 @@ mod tests {
             genome_end: 60,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 2,
             n_gap: 0,
@@ -1515,11 +1476,11 @@ mod tests {
 
         let record = record.unwrap();
         assert_eq!(
-            record.name().map(|n| n.to_string()),
+            record.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert_eq!(record.reference_sequence_id(), Some(0));
-        assert_eq!(record.alignment_start().map(|p| usize::from(p)), Some(11)); // 1-based
+        assert_eq!(record.alignment_start().map(usize::from), Some(11)); // 1-based
         // hit_index=1, so NOT secondary
         assert!(!record.flags().is_secondary());
     }
@@ -1530,7 +1491,7 @@ mod tests {
         let mate1_qual = vec![30, 30, 30, 30];
         let mate2_seq = vec![3, 2, 1, 0]; // TGCA
         let mate2_qual = vec![30, 30, 30, 30];
-        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "t.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "t.fq"]);
 
         let records = SamWriter::build_paired_unmapped_records(
             "read1",
@@ -1547,7 +1508,7 @@ mod tests {
         // Check mate1 record
         let rec1 = &records[0];
         assert_eq!(
-            rec1.name().map(|n| n.to_string()),
+            rec1.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert!(rec1.flags().is_segmented());
@@ -1558,7 +1519,7 @@ mod tests {
         // Check mate2 record
         let rec2 = &records[1];
         assert_eq!(
-            rec2.name().map(|n| n.to_string()),
+            rec2.name().map(ToString::to_string),
             Some("read1".to_string())
         );
         assert!(rec2.flags().is_segmented());
@@ -1570,6 +1531,7 @@ mod tests {
     #[test]
     fn test_build_paired_mate_record_flags() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
 
@@ -1585,7 +1547,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1607,7 +1569,7 @@ mod tests {
                 read_end: 3,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(3)],
+            cigar: vec![Op::new(Kind::Match, 3)],
             score: 90,
             n_mismatch: 1,
             n_gap: 0,
@@ -1680,6 +1642,7 @@ mod tests {
     #[test]
     fn test_build_paired_mate_record_mate_fields() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
 
@@ -1696,7 +1659,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 200,
             n_mismatch: 0,
             n_gap: 0,
@@ -1719,7 +1682,7 @@ mod tests {
                 read_end: 3,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(3)],
+            cigar: vec![Op::new(Kind::Match, 3)],
             score: 150,
             n_mismatch: 1,
             n_gap: 0,
@@ -1754,7 +1717,7 @@ mod tests {
         assert_eq!(rec.mate_reference_sequence_id(), Some(0));
 
         // PNEXT = mate's per-chr position (genome_start=4, chr_start=0 → pos=5)
-        assert_eq!(rec.mate_alignment_start().map(|p| usize::from(p)), Some(5));
+        assert_eq!(rec.mate_alignment_start().map(usize::from), Some(5));
 
         // Check TLEN
         assert_eq!(rec.template_length(), 250);
@@ -1775,6 +1738,7 @@ mod tests {
 
     #[test]
     fn test_tags_nh_hi_as_nm() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         // Transcript with 2 mismatches and a 3bp deletion → NM = 2 + 3 = 5
@@ -1784,7 +1748,11 @@ mod tests {
             genome_end: 60,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(20), CigarOp::Del(3), CigarOp::Match(30)],
+            cigar: vec![
+                Op::new(Kind::Match, 20),
+                Op::new(Kind::Deletion, 3),
+                Op::new(Kind::Match, 30),
+            ],
             score: 100,
             n_mismatch: 2,
             n_gap: 1,
@@ -1844,6 +1812,7 @@ mod tests {
 
     #[test]
     fn test_edit_distance_computation() {
+        use cigar::op::{Kind, Op};
         // Pure match: NM = n_mismatch only
         let t1 = Transcript {
             chr_idx: 0,
@@ -1851,7 +1820,7 @@ mod tests {
             genome_end: 50,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 3,
             n_gap: 0,
@@ -1870,11 +1839,11 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(20),
-                CigarOp::Ins(5),
-                CigarOp::Match(10),
-                CigarOp::Del(7),
-                CigarOp::Match(20),
+                Op::new(Kind::Match, 20),
+                Op::new(Kind::Insertion, 5),
+                Op::new(Kind::Match, 10),
+                Op::new(Kind::Deletion, 7),
+                Op::new(Kind::Match, 20),
             ],
             score: 80,
             n_mismatch: 1,
@@ -1894,9 +1863,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(1000),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 1000),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -1916,9 +1885,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::SoftClip(10),
-                CigarOp::Match(40),
-                CigarOp::SoftClip(10),
+                Op::new(Kind::SoftClip, 10),
+                Op::new(Kind::Match, 40),
+                Op::new(Kind::SoftClip, 10),
             ],
             score: 40,
             n_mismatch: 2,
@@ -1933,6 +1902,7 @@ mod tests {
 
     #[test]
     fn test_transcript_to_record_has_tags() {
+        use cigar::op::{Kind, Op};
         // Verify the existing test_transcript_to_record scenario also has tags
         let genome = make_test_genome();
 
@@ -1942,7 +1912,7 @@ mod tests {
             genome_end: 60,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 2,
             n_gap: 0,
@@ -1986,8 +1956,9 @@ mod tests {
 
     #[test]
     fn test_secondary_flag() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let transcripts = vec![
             Transcript {
@@ -1996,7 +1967,7 @@ mod tests {
                 genome_end: 50,
                 is_reverse: false,
                 exons: vec![],
-                cigar: vec![CigarOp::Match(50)],
+                cigar: vec![Op::new(Kind::Match, 50)],
                 score: 100,
                 n_mismatch: 0,
                 n_gap: 0,
@@ -2011,7 +1982,7 @@ mod tests {
                 genome_end: 52,
                 is_reverse: false,
                 exons: vec![],
-                cigar: vec![CigarOp::Match(50)],
+                cigar: vec![Op::new(Kind::Match, 50)],
                 score: 98,
                 n_mismatch: 1,
                 n_gap: 0,
@@ -2026,7 +1997,7 @@ mod tests {
                 genome_end: 54,
                 is_reverse: true,
                 exons: vec![],
-                cigar: vec![CigarOp::Match(50)],
+                cigar: vec![Op::new(Kind::Match, 50)],
                 score: 96,
                 n_mismatch: 2,
                 n_gap: 0,
@@ -2064,6 +2035,7 @@ mod tests {
 
     #[test]
     fn test_xs_tag_spliced() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -2073,9 +2045,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2112,6 +2084,7 @@ mod tests {
 
     #[test]
     fn test_xs_tag_unspliced() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -2120,7 +2093,7 @@ mod tests {
             genome_end: 50,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2156,6 +2129,7 @@ mod tests {
 
     #[test]
     fn test_xs_tag_reverse_strand() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -2165,9 +2139,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2204,6 +2178,7 @@ mod tests {
 
     #[test]
     fn test_xs_tag_conflicting_motifs() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -2213,11 +2188,11 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2254,6 +2229,7 @@ mod tests {
 
     #[test]
     fn test_xs_not_emitted_when_disabled() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
         let transcript = Transcript {
@@ -2263,9 +2239,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2302,8 +2278,9 @@ mod tests {
 
     #[test]
     fn test_out_sam_mult_nmax() {
+        use cigar::op::{Kind, Op};
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec![
+        let params = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "test.fq",
@@ -2318,7 +2295,7 @@ mod tests {
                 genome_end: (i + 50) as u64,
                 is_reverse: false,
                 exons: vec![],
-                cigar: vec![CigarOp::Match(50)],
+                cigar: vec![Op::new(Kind::Match, 50)],
                 score: 100 - i,
                 n_mismatch: 0,
                 n_gap: 0,
@@ -2378,6 +2355,7 @@ mod tests {
 
     #[test]
     fn test_build_jm_tag_basic() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 0,
@@ -2385,9 +2363,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2406,6 +2384,7 @@ mod tests {
 
     #[test]
     fn test_build_jm_tag_annotated() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 0,
@@ -2413,9 +2392,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2434,13 +2413,14 @@ mod tests {
 
     #[test]
     fn test_build_jm_tag_empty() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 50,
             n_mismatch: 0,
             n_gap: 0,
@@ -2455,6 +2435,7 @@ mod tests {
 
     #[test]
     fn test_build_jm_tag_multiple_junctions() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 0,
@@ -2462,11 +2443,11 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
-                CigarOp::RefSkip(100),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2485,6 +2466,7 @@ mod tests {
 
     #[test]
     fn test_build_ji_tag_basic() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 100,
@@ -2492,9 +2474,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(25),
-                CigarOp::RefSkip(200),
-                CigarOp::Match(25),
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 200),
+                Op::new(Kind::Match, 25),
             ],
             score: 50,
             n_mismatch: 0,
@@ -2514,13 +2496,14 @@ mod tests {
 
     #[test]
     fn test_build_ji_tag_empty() {
+        use cigar::op::{Kind, Op};
         let transcript = Transcript {
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(50)],
+            cigar: vec![Op::new(Kind::Match, 50)],
             score: 50,
             n_mismatch: 0,
             n_gap: 0,
@@ -2535,6 +2518,7 @@ mod tests {
 
     #[test]
     fn test_build_md_tag_perfect_match() {
+        use cigar::op::{Kind, Op};
         // Genome: ACGTACGT (A=0,C=1,G=2,T=3)
         let genome = make_test_genome();
         let transcript = Transcript {
@@ -2543,7 +2527,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 4,
             n_mismatch: 0,
             n_gap: 0,
@@ -2561,6 +2545,7 @@ mod tests {
 
     #[test]
     fn test_build_md_tag_mismatches() {
+        use cigar::op::{Kind, Op};
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
@@ -2569,7 +2554,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 2,
             n_mismatch: 2,
             n_gap: 0,
@@ -2588,6 +2573,7 @@ mod tests {
 
     #[test]
     fn test_build_md_tag_deletion() {
+        use cigar::op::{Kind, Op};
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
@@ -2596,7 +2582,11 @@ mod tests {
             genome_end: 6,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(2), CigarOp::Del(2), CigarOp::Match(2)],
+            cigar: vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 2),
+                Op::new(Kind::Match, 2),
+            ],
             score: 4,
             n_mismatch: 0,
             n_gap: 1,
@@ -2614,6 +2604,7 @@ mod tests {
 
     #[test]
     fn test_build_md_tag_insertion() {
+        use cigar::op::{Kind, Op};
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
@@ -2622,7 +2613,11 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(2), CigarOp::Ins(2), CigarOp::Match(2)],
+            cigar: vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Insertion, 2),
+                Op::new(Kind::Match, 2),
+            ],
             score: 4,
             n_mismatch: 0,
             n_gap: 1,
@@ -2640,6 +2635,7 @@ mod tests {
 
     #[test]
     fn test_build_md_tag_soft_clip() {
+        use cigar::op::{Kind, Op};
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
@@ -2649,9 +2645,9 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::SoftClip(2),
-                CigarOp::Match(4),
-                CigarOp::SoftClip(2),
+                Op::new(Kind::SoftClip, 2),
+                Op::new(Kind::Match, 4),
+                Op::new(Kind::SoftClip, 2),
             ],
             score: 4,
             n_mismatch: 0,
@@ -2670,6 +2666,7 @@ mod tests {
 
     #[test]
     fn test_tags_jm_ji_md_in_record() {
+        use cigar::op::{Kind, Op};
         // Verify tags appear in a full transcript_to_record call
         let genome = make_test_genome();
 
@@ -2679,7 +2676,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 4,
             n_mismatch: 0,
             n_gap: 0,
@@ -2719,6 +2716,7 @@ mod tests {
     #[test]
     fn test_build_paired_mate_record_cross_strand() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
 
@@ -2735,7 +2733,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2758,7 +2756,7 @@ mod tests {
                 read_end: 3,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(3)],
+            cigar: vec![Op::new(Kind::Match, 3)],
             score: 90,
             n_mismatch: 0,
             n_gap: 0,
@@ -2792,7 +2790,7 @@ mod tests {
 
         assert!(rec1.flags().is_mate_reverse_complemented());
         assert!(!rec1.flags().is_reverse_complemented());
-        assert_eq!(rec1.mate_alignment_start().map(|p| usize::from(p)), Some(5)); // genome_start=4, chr_start=0 → 5
+        assert_eq!(rec1.mate_alignment_start().map(usize::from), Some(5)); // genome_start=4, chr_start=0 → 5
 
         // Mate2 record: mate is forward → 0x20 NOT set, PNEXT=1
         let rec2 = build_paired_mate_record(
@@ -2815,12 +2813,13 @@ mod tests {
 
         assert!(!rec2.flags().is_mate_reverse_complemented());
         assert!(rec2.flags().is_reverse_complemented());
-        assert_eq!(rec2.mate_alignment_start().map(|p| usize::from(p)), Some(1)); // genome_start=0, chr_start=0 → 1
+        assert_eq!(rec2.mate_alignment_start().map(usize::from), Some(1)); // genome_start=0, chr_start=0 → 1
     }
 
     #[test]
     fn test_build_paired_mate_record_per_mate_tags() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
 
@@ -2837,7 +2836,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2860,7 +2859,11 @@ mod tests {
                 read_end: 3,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(2), CigarOp::Del(1), CigarOp::Match(1)],
+            cigar: vec![
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 1),
+            ],
             score: 80,
             n_mismatch: 2,
             n_gap: 1,
@@ -2939,6 +2942,7 @@ mod tests {
     #[test]
     fn test_build_paired_mate_record_both_forward() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
 
@@ -2955,7 +2959,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2977,7 +2981,7 @@ mod tests {
                 read_end: 3,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(3)],
+            cigar: vec![Op::new(Kind::Match, 3)],
             score: 90,
             n_mismatch: 0,
             n_gap: 0,
@@ -3034,6 +3038,7 @@ mod tests {
 
     #[test]
     fn test_out_sam_attributes_standard() {
+        use cigar::op::{Kind, Op};
         // Default (Standard) → NH, HI, AS, NM present; XS, jM, jI, MD absent
         let genome = make_test_genome();
 
@@ -3043,7 +3048,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 1,
             n_gap: 0,
@@ -3109,6 +3114,7 @@ mod tests {
 
     #[test]
     fn test_out_sam_attributes_none() {
+        use cigar::op::{Kind, Op};
         // None → no optional tags at all
         let genome = make_test_genome();
 
@@ -3118,7 +3124,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 1,
             n_gap: 0,
@@ -3183,6 +3189,7 @@ mod tests {
 
     #[test]
     fn test_out_sam_attributes_explicit() {
+        use cigar::op::{Kind, Op};
         // Explicit ["NH", "MD"] → only NH and MD present
         let genome = make_test_genome();
 
@@ -3192,7 +3199,7 @@ mod tests {
             genome_end: 4,
             is_reverse: false,
             exons: vec![],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -3205,7 +3212,7 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3];
         let read_qual = vec![30, 30, 30, 30];
 
-        let attrs: HashSet<String> = ["NH", "MD"].iter().map(|s| s.to_string()).collect();
+        let attrs: HashSet<String> = ["NH", "MD"].iter().map(ToString::to_string).collect();
         let record = transcript_to_record(
             &transcript,
             "read1",
@@ -3262,7 +3269,7 @@ mod tests {
         use crate::params::Parameters;
 
         // Standard
-        let p = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r.fq"]);
+        let p = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
         let attrs = p.sam_attribute_set();
         assert_eq!(attrs.len(), 5);
         assert!(attrs.contains("NH"));
@@ -3272,7 +3279,7 @@ mod tests {
         assert!(attrs.contains("nM"));
 
         // All
-        let p = Parameters::parse_from(vec![
+        let p = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "r.fq",
@@ -3288,7 +3295,7 @@ mod tests {
         assert!(attrs.contains("jI"));
 
         // None
-        let p = Parameters::parse_from(vec![
+        let p = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "r.fq",
@@ -3299,7 +3306,7 @@ mod tests {
         assert!(attrs.is_empty());
 
         // Explicit subset
-        let p = Parameters::parse_from(vec![
+        let p = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
             "r.fq",
@@ -3318,6 +3325,7 @@ mod tests {
 
     #[test]
     fn test_nm_vs_nm_mismatch_difference() {
+        use cigar::op::{Kind, Op};
         // Verify NM (edit distance) ≠ nM (mismatches only) when indels present
         let genome = make_test_genome();
 
@@ -3328,11 +3336,11 @@ mod tests {
             is_reverse: false,
             exons: vec![],
             cigar: vec![
-                CigarOp::Match(20),
-                CigarOp::Ins(5),
-                CigarOp::Match(10),
-                CigarOp::Del(3),
-                CigarOp::Match(20),
+                Op::new(Kind::Match, 20),
+                Op::new(Kind::Insertion, 5),
+                Op::new(Kind::Match, 10),
+                Op::new(Kind::Deletion, 3),
+                Op::new(Kind::Match, 20),
             ],
             score: 80,
             n_mismatch: 2,
@@ -3377,10 +3385,10 @@ mod tests {
     #[test]
     fn test_build_half_mapped_flags() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params =
-            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3394,7 +3402,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -3446,10 +3454,10 @@ mod tests {
     #[test]
     fn test_build_half_mapped_rnext_pnext() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params =
-            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3463,7 +3471,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -3499,13 +3507,13 @@ mod tests {
         let mapped = &records[0];
         assert_eq!(mapped.reference_sequence_id(), Some(0));
         assert_eq!(
-            mapped.alignment_start().map(|p| usize::from(p)),
+            mapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
         // RNEXT and PNEXT should point to own position (STAR convention)
         assert_eq!(mapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
-            mapped.mate_alignment_start().map(|p| usize::from(p)),
+            mapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
         );
 
@@ -3513,12 +3521,12 @@ mod tests {
         let unmapped = &records[1];
         assert_eq!(unmapped.reference_sequence_id(), Some(0));
         assert_eq!(
-            unmapped.alignment_start().map(|p| usize::from(p)),
+            unmapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
         assert_eq!(unmapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
-            unmapped.mate_alignment_start().map(|p| usize::from(p)),
+            unmapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
         );
         // MAPQ = 0 for unmapped
@@ -3528,10 +3536,10 @@ mod tests {
     #[test]
     fn test_build_half_mapped_mate_order() {
         use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params =
-            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             chr_idx: 0,
@@ -3545,7 +3553,7 @@ mod tests {
                 read_end: 4,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(4)],
+            cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,

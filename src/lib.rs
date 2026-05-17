@@ -1,4 +1,25 @@
-#![allow(non_snake_case)]
+#![warn(clippy::pedantic)]
+// TODO: enable these warnings eventually
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    // trailing comment because of https://github.com/rust-lang/rustfmt/issues/3277
+)]
+// These should stay disabled
+#![allow(
+    // we have a bunch of “`if !reverse`”
+    clippy::if_not_else,
+)]
 
 pub mod error;
 pub mod params;
@@ -15,13 +36,12 @@ pub mod quant;
 pub mod stats;
 
 use log::info;
+use noodles::sam::alignment::record::cigar;
 
 use crate::params::{Parameters, RunMode};
 
 /// Top-level dispatcher. Called from `main()` after CLI parsing.
 pub fn run(params: &Parameters) -> anyhow::Result<()> {
-    params.validate()?;
-
     info!("rustar-aligner {}", env!("CARGO_PKG_VERSION"));
     info!("{}", env!("VERSION_BODY"));
     info!("{}", cpu::cpu_detected_line());
@@ -169,12 +189,12 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     info!("Starting read alignment...");
 
     // Configure Rayon thread pool based on --runThreadN
-    if params.run_thread_n > 1 {
+    if usize::from(params.run_thread_n) > 1 {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(params.run_thread_n)
+            .num_threads(params.run_thread_n.into())
             .build_global()
             .map_err(|e| {
-                error::Error::Parameter(format!("Failed to configure thread pool: {}", e))
+                error::Error::Parameter(format!("Failed to configure thread pool: {e}"))
             })?;
         info!("Using {} threads for alignment", params.run_thread_n);
     } else {
@@ -258,7 +278,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let time_finish = chrono::Local::now();
 
     // Write Log.final.out
-    let log_path = params.out_file_name_prefix.join("Log.final.out");
+    let log_path = params.output_path("Log.final.out");
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -267,7 +287,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 
     // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
     if let Some(ref ctx) = quant_ctx {
-        let quant_path = params.out_file_name_prefix.join("ReadsPerGene.out.tab");
+        let quant_path = params.output_path("ReadsPerGene.out.tab");
         ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
         info!("Wrote {}", quant_path.display());
     }
@@ -298,9 +318,7 @@ fn run_single_pass(
 
     // Open transcriptome BAM writer if requested.
     let mut tr_writer: Option<BamWriter> = if let Some(tidx) = tr.as_ref() {
-        let path = params
-            .out_file_name_prefix
-            .join("Aligned.toTranscriptome.out.bam");
+        let path = params.output_path("Aligned.toTranscriptome.out.bam");
         info!("Writing transcriptome BAM to {}", path.display());
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -317,7 +335,7 @@ fn run_single_pass(
     let is_paired = params.read_files_in.len() == 2;
     let mut unmapped_w1: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx {
-            let path = params.out_file_name_prefix.join("Unmapped.out.mate1");
+            let path = params.output_path("Unmapped.out.mate1");
             info!("Writing unmapped reads to {}", path.display());
             Some(UnmappedFastqWriter::create(&path)?)
         } else {
@@ -325,7 +343,7 @@ fn run_single_pass(
         };
     let mut unmapped_w2: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx && is_paired {
-            let path = params.out_file_name_prefix.join("Unmapped.out.mate2");
+            let path = params.output_path("Unmapped.out.mate2");
             info!("Writing unmapped mate2 reads to {}", path.display());
             Some(UnmappedFastqWriter::create(&path)?)
         } else {
@@ -335,9 +353,7 @@ fn run_single_pass(
     // 4. Route to SAM or BAM output based on --outSAMtype / --outStd
     use crate::params::{OutSamSortOrder, OutStd};
 
-    let out_type = params
-        .out_sam_type()
-        .map_err(|e| anyhow::anyhow!("Invalid --outSAMtype: {}", e))?;
+    let out_type = &params.out_sam_type;
 
     // Build boxed writer — stdout takes precedence over file output.
     let mut writer: Box<dyn AlignmentWriter> = match params.out_std {
@@ -364,7 +380,7 @@ fn run_single_pass(
         }
         OutStd::None => match out_type.format {
             OutSamFormat::Sam => {
-                let output_path = params.out_file_name_prefix.join("Aligned.out.sam");
+                let output_path = params.output_path("Aligned.out.sam");
                 info!("Writing SAM to {}", output_path.display());
                 if let Some(parent) = output_path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -374,11 +390,9 @@ fn run_single_pass(
             OutSamFormat::Bam => {
                 let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
                 let output_path = if sorted {
-                    params
-                        .out_file_name_prefix
-                        .join("Aligned.sortedByCoord.out.bam")
+                    params.output_path("Aligned.sortedByCoord.out.bam")
                 } else {
-                    params.out_file_name_prefix.join("Aligned.out.bam")
+                    params.output_path("Aligned.out.bam")
                 };
                 info!("Writing BAM to {}", output_path.display());
                 if let Some(parent) = output_path.parent() {
@@ -425,7 +439,7 @@ fn run_single_pass(
             unmapped_w1.as_mut(),
             unmapped_w2.as_mut(),
         ),
-        n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
+        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }?;
 
     writer.finish()?;
@@ -436,7 +450,7 @@ fn run_single_pass(
     }
 
     // 5. Write SJ.out.tab file
-    let sj_output_path = params.out_file_name_prefix.join("SJ.out.tab");
+    let sj_output_path = params.output_path("SJ.out.tab");
     if !sj_stats.is_empty() {
         info!(
             "Writing splice junction statistics to {}",
@@ -465,7 +479,7 @@ fn run_two_pass(
     let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
 
     // Write SJ.pass1.out.tab
-    let pass1_path = params.out_file_name_prefix.join("SJ.pass1.out.tab");
+    let pass1_path = params.output_path("SJ.pass1.out.tab");
 
     // Create output directory if it doesn't exist
     if let Some(parent) = pass1_path.parent() {
@@ -549,7 +563,7 @@ fn run_pass1(
             None,
             None,
         )?,
-        n => anyhow::bail!("Invalid number of read files: {} (expected 1 or 2)", n),
+        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }
 
     info!("Pass 1 aligned {} reads", stats.total_reads());
@@ -582,10 +596,10 @@ fn pick_primary_and_mapq(
 ) -> (usize, u8) {
     use crate::align::read_align::per_read_seed;
     use crate::mapq::calculate_mapq;
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     let mut rng = StdRng::seed_from_u64(per_read_seed(params.run_rng_seed, read_name));
-    let primary_hit = rng.gen_range(0..n_alignments);
+    let primary_hit = rng.random_range(0..n_alignments);
     let mapq = calculate_mapq(n_alignments.max(n_for_mapq), params.out_sam_mapq_unique);
     (primary_hit, mapq)
 }
@@ -767,10 +781,10 @@ where
     )?;
 
     use noodles::sam::alignment::record::Flags;
-    for r in rec1s.iter_mut() {
+    for r in &mut rec1s {
         *r.flags_mut() |= Flags::SEGMENTED | Flags::FIRST_SEGMENT;
     }
-    for r in rec2s.iter_mut() {
+    for r in &mut rec2s {
         *r.flags_mut() |= Flags::SEGMENTED | Flags::LAST_SEGMENT;
     }
 
@@ -790,20 +804,21 @@ fn extract_junction_keys(
     index: &crate::index::GenomeIndex,
 ) -> Vec<crate::junction::SjKey> {
     use crate::align::score::AlignmentScorer;
-    use crate::align::transcript::CigarOp;
+    use cigar::op::Kind;
 
     let scorer = AlignmentScorer::from_params_minimal();
     let mut keys = Vec::new();
     let mut genome_pos = transcript.genome_start;
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::RefSkip(len) => {
-                let intron_len = *len;
+        match op.kind() {
+            Kind::Skip => {
+                let intron_len = op.len();
                 let intron_start = genome_pos + 1;
                 let intron_end = genome_pos + intron_len as u64;
 
-                let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);
+                let motif =
+                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
                 let strand = match motif.implied_strand() {
                     Some('+') => 1u8,
                     Some('-') => 2u8,
@@ -821,13 +836,10 @@ fn extract_junction_keys(
 
                 genome_pos += intron_len as u64;
             }
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                genome_pos += *len as u64;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::Del(len) => {
-                genome_pos += *len as u64;
-            }
-            CigarOp::Ins(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
 
@@ -865,12 +877,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     // Create chimeric output writer if enabled
     let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
-        let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(prefix)?)
+        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
     } else {
         None
     };
@@ -898,7 +909,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let bysj_temp = if by_sjout {
         info!("outFilterType=BySJout: disk-buffering reads for post-alignment junction filtering");
         let tf = tempfile::NamedTempFile::new()
-            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {e}"))?;
         Some(tf)
     } else {
         None
@@ -906,7 +917,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
         let write_file = tf
             .reopen()
-            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
         let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
         (Some(hdr), Some(w))
     } else {
@@ -1163,8 +1174,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         read_count += reads_to_process as u64;
 
         // Progress logging
-        if read_count % 100000 < batch_size as u64 {
-            info!("Processed {} reads...", read_count);
+        if read_count % 100_000 < batch_size as u64 {
+            info!("Processed {read_count} reads...");
         }
 
         if read_count >= max_reads {
@@ -1188,7 +1199,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
             let read_file = tf
                 .reopen()
-                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {e}"))?;
             let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
             reader.read_header()?;
 
@@ -1240,10 +1251,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             }
         }
 
-        info!(
-            "BySJout: filtered {} reads with non-surviving junctions",
-            filtered_count
-        );
+        info!("BySJout: filtered {filtered_count} reads with non-surviving junctions");
     }
 
     // Flush chimeric output if enabled
@@ -1299,12 +1307,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     // Create chimeric output writer if enabled
     let mut chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
         use crate::chimeric::ChimericJunctionWriter;
-        let prefix = params.out_file_name_prefix.to_str().unwrap_or(".");
         info!(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(prefix)?)
+        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
     } else {
         None
     };
@@ -1330,7 +1337,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let bysj_temp = if by_sjout {
         info!("outFilterType=BySJout: disk-buffering pairs for post-alignment junction filtering");
         let tf = tempfile::NamedTempFile::new()
-            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: failed to create temp file: {e}"))?;
         Some(tf)
     } else {
         None
@@ -1338,7 +1345,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let (bysj_sam_header, mut bysj_temp_writer) = if let Some(ref tf) = bysj_temp {
         let write_file = tf
             .reopen()
-            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
         let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
         (Some(hdr), Some(w))
     } else {
@@ -1491,7 +1498,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 if let Some(ref q) = quant {
                     // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
                     let bm_deref: Vec<&crate::align::read_align::PairedAlignment> =
-                        both_mapped.iter().map(|b| b.as_ref()).collect();
+                        both_mapped.iter().map(AsRef::as_ref).collect();
                     q.counts.count_pe_read(
                         &bm_deref,
                         results.is_empty(),
@@ -1623,7 +1630,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 let transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
                     if let Some(ref tidx) = tr_local {
                         build_transcriptome_records_pe(
-                            both_mapped.iter().map(|b| b.as_ref()),
+                            both_mapped.iter().map(AsRef::as_ref),
                             &paired_read.name,
                             &m1_seq,
                             &m1_qual,
@@ -1730,8 +1737,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         read_count += pairs_to_process as u64;
 
         // Progress logging
-        if read_count % 100000 < batch_size as u64 {
-            info!("Processed {} pairs...", read_count);
+        if read_count % 100_000 < batch_size as u64 {
+            info!("Processed {read_count} pairs...");
         }
 
         if read_count >= max_reads {
@@ -1755,7 +1762,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         if let (Some(tf), Some(hdr)) = (&bysj_temp, &bysj_sam_header) {
             let read_file = tf
                 .reopen()
-                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen for reading: {e}"))?;
             let mut reader = noodles::sam::io::Reader::new(std::io::BufReader::new(read_file));
             reader.read_header()?;
 
@@ -1797,10 +1804,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             }
         }
 
-        info!(
-            "BySJout: filtered {} pairs with non-surviving junctions",
-            filtered_count
-        );
+        info!("BySJout: filtered {filtered_count} pairs with non-surviving junctions");
     }
 
     // Flush chimeric output if enabled
@@ -1827,7 +1831,7 @@ fn record_transcript_junctions(
     is_unique: bool,
 ) {
     use crate::align::score::AlignmentScorer;
-    use crate::align::transcript::CigarOp;
+    use cigar::op::Kind;
 
     // First pass: compute exon segment lengths (query-consuming bases between N operations)
     // An "exon segment" is the query bases on each side of a splice junction.
@@ -1835,20 +1839,17 @@ fn record_transcript_junctions(
     let mut current_exon_len = 0u32;
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                current_exon_len += *len;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion => {
+                current_exon_len += op.len() as u32;
             }
-            CigarOp::Ins(len) => {
-                current_exon_len += *len;
-            }
-            CigarOp::RefSkip(_) => {
+            Kind::Skip => {
                 exon_lengths.push(current_exon_len);
                 current_exon_len = 0;
             }
             // Soft clips, deletions, hard clips do not contribute to overhang
             // STAR counts only matched/inserted bases (not soft-clipped bases)
-            CigarOp::SoftClip(_) | CigarOp::Del(_) | CigarOp::HardClip(_) => {}
+            Kind::Deletion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
     exon_lengths.push(current_exon_len); // Final exon segment
@@ -1860,15 +1861,16 @@ fn record_transcript_junctions(
     let scorer = AlignmentScorer::from_params_minimal();
 
     for op in &transcript.cigar {
-        match op {
-            CigarOp::RefSkip(len) => {
+        match op.kind() {
+            Kind::Skip => {
                 // This is a splice junction
-                let intron_len = *len;
+                let intron_len = op.len();
                 let intron_start = genome_pos + 1; // 1-based, first intronic base
                 let intron_end = genome_pos + intron_len as u64; // 1-based, last intronic base
 
                 // Detect splice motif
-                let motif = scorer.detect_splice_motif(genome_pos, intron_len, &index.genome);
+                let motif =
+                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
 
                 // Compute overhang: min(left_exon_length, right_exon_length)
                 let left_exon = exon_lengths[junction_idx];
@@ -1904,14 +1906,10 @@ fn record_transcript_junctions(
                 genome_pos += intron_len as u64;
                 junction_idx += 1;
             }
-            CigarOp::Match(len) | CigarOp::Equal(len) | CigarOp::Diff(len) => {
-                genome_pos += *len as u64;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::Ins(_) => {}
-            CigarOp::Del(len) => {
-                genome_pos += *len as u64;
-            }
-            CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
 }
