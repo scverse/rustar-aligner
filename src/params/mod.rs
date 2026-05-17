@@ -910,8 +910,8 @@ impl Parameters {
             .rg_ids()
             .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
 
-        let user_xs_in_attrs = self.sam_attribute_set().contains("XS");
-        let user_strand_intron_motif = self.out_sam_strand_field == "intronMotif";
+        let user_xs_in_attrs = params.sam_attribute_set().contains("XS");
+        let user_strand_intron_motif = params.out_sam_strand_field == "intronMotif";
         if user_xs_in_attrs && !user_strand_intron_motif {
             log::info!(
                 "--outSAMattributes contains XS, therefore rustar-aligner will use --outSAMstrandField intronMotif"
@@ -1548,12 +1548,13 @@ mod tests {
 
     #[test]
     fn xs_strand_field_intron_motif_adds_xs_to_attrs() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--outSAMstrandField",
             "intronMotif",
-        ]);
+        ])
+        .unwrap();
         let attrs = p.effective_sam_attribute_set();
         assert!(attrs.contains("XS"));
         assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
@@ -1561,14 +1562,15 @@ mod tests {
 
     #[test]
     fn xs_attr_forces_intron_motif_strand_field() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--outSAMattributes",
             "NH",
             "HI",
             "XS",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
         let attrs = p.effective_sam_attribute_set();
         assert!(attrs.contains("XS"));
@@ -1576,7 +1578,7 @@ mod tests {
 
     #[test]
     fn xs_coupling_dormant_without_user_request() {
-        let p = parse(&["--readFilesIn", "r.fq"]);
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
         let attrs = p.effective_sam_attribute_set();
         assert!(!attrs.contains("XS"));
         assert_eq!(p.effective_out_sam_strand_field(), "None");
@@ -1584,7 +1586,7 @@ mod tests {
 
     #[test]
     fn xs_attr_via_all_preset_couples_strand_field() {
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]);
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
         assert_eq!(p.effective_out_sam_strand_field(), "intronMotif");
         assert!(p.effective_sam_attribute_set().contains("XS"));
     }
