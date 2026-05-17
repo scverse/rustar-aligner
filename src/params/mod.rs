@@ -1,7 +1,12 @@
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+
+mod sam;
+
+pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -102,54 +107,6 @@ impl std::str::FromStr for IntronStrandFilter {
 }
 
 // ---------------------------------------------------------------------------
-// SAM output type enums
-// ---------------------------------------------------------------------------
-
-/// STAR's `--outSAMtype` format component.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutSamFormat {
-    Sam,
-    Bam,
-    None,
-}
-
-/// STAR's `--outSAMtype` sort order component (only applies to BAM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutSamSortOrder {
-    Unsorted,
-    SortedByCoordinate,
-}
-
-/// Combined `--outSAMtype` value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutSamType {
-    pub format: OutSamFormat,
-    pub sort_order: Option<OutSamSortOrder>,
-}
-
-impl Default for OutSamType {
-    fn default() -> Self {
-        Self {
-            format: OutSamFormat::Sam,
-            sort_order: None,
-        }
-    }
-}
-
-impl std::fmt::Display for OutSamType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.format, &self.sort_order) {
-            (OutSamFormat::Sam, _) => write!(f, "SAM"),
-            (OutSamFormat::None, _) => write!(f, "None"),
-            (OutSamFormat::Bam, Some(OutSamSortOrder::SortedByCoordinate)) => {
-                write!(f, "BAM SortedByCoordinate")
-            }
-            (OutSamFormat::Bam, _) => write!(f, "BAM Unsorted"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Standard output streaming
 // ---------------------------------------------------------------------------
 
@@ -198,30 +155,6 @@ impl std::str::FromStr for OutReadsUnmapped {
             _ => Err(format!(
                 "unknown outReadsUnmapped value: '{s}'; expected 'None' or 'Fastx'"
             )),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SAM unmapped output
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum OutSamUnmapped {
-    #[default]
-    None,
-    Within,
-    WithinKeepPairs,
-}
-
-impl std::str::FromStr for OutSamUnmapped {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "None" => Ok(Self::None),
-            "Within" => Ok(Self::Within),
-            "Within KeepPairs" => Ok(Self::WithinKeepPairs),
-            _ => Err(format!("unknown outSAMunmapped value: '{s}'")),
         }
     }
 }
@@ -292,8 +225,8 @@ pub struct Parameters {
     pub run_mode: RunMode,
 
     /// Number of threads
-    #[arg(long = "runThreadN", default_value_t = 1)]
-    pub run_thread_n: usize,
+    #[arg(long = "runThreadN", default_value_t = NonZeroUsize::new(1).unwrap())]
+    pub run_thread_n: NonZeroUsize,
 
     /// Random number generator seed for tie-breaking among equal-scoring alignments
     #[arg(long = "runRNGseed", default_value_t = 777)]
@@ -344,12 +277,10 @@ pub struct Parameters {
     // ── Output ──────────────────────────────────────────────────────────
     /// Output file name prefix (including path)
     #[arg(long = "outFileNamePrefix", default_value = "./")]
-    pub out_file_name_prefix: PathBuf,
+    pub out_file_name_prefix: String,
 
-    /// Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None.
-    /// Provide as space-separated tokens, e.g. "BAM SortedByCoordinate".
-    #[arg(long = "outSAMtype", num_args = 1..=2, default_values_t = vec!["SAM".to_string()])]
-    pub out_sam_type_raw: Vec<String>,
+    #[command(flatten)]
+    pub out_sam_type: OutSamType,
 
     /// BAM compression level: -1 = uncompressed, 1 (default) to 9 (maximum)
     #[arg(
@@ -382,8 +313,7 @@ pub struct Parameters {
     #[arg(long = "outSAMattrRGline", num_args = 1.., default_values_t = vec!["-".to_string()])]
     pub out_sam_attr_rg_line: Vec<String>,
 
-    /// Unmapped reads in SAM output: None or Within
-    #[arg(long = "outSAMunmapped", default_value = "None")]
+    #[command(flatten)]
     pub out_sam_unmapped: OutSamUnmapped,
 
     /// Output unmapped reads to FASTQ file(s): None or Fastx
@@ -708,33 +638,9 @@ pub struct Parameters {
 }
 
 impl Parameters {
-    /// Parse the raw `--outSAMtype` tokens into a structured `OutSamType`.
-    pub fn out_sam_type(&self) -> Result<OutSamType, String> {
-        match self
-            .out_sam_type_raw
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            ["SAM"] => Ok(OutSamType {
-                format: OutSamFormat::Sam,
-                sort_order: None,
-            }),
-            ["None"] => Ok(OutSamType {
-                format: OutSamFormat::None,
-                sort_order: None,
-            }),
-            ["BAM", "Unsorted"] => Ok(OutSamType {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::Unsorted),
-            }),
-            ["BAM", "SortedByCoordinate"] => Ok(OutSamType {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::SortedByCoordinate),
-            }),
-            other => Err(format!("unknown outSAMtype: {:?}", other)),
-        }
+    /// Build an output path by concatenating `suffix` onto `out_file_name_prefix`.
+    pub fn output_path(&self, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}{suffix}", self.out_file_name_prefix))
     }
 
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
@@ -752,7 +658,7 @@ impl Parameters {
     /// - `"Standard"` → {NH, HI, AS, NM, nM}
     /// - `"All"`      → {NH, HI, AS, NM, nM, MD, jM, jI, XS}
     /// - `"None"`     → {} (empty)
-    /// - Explicit list (e.g. ["NH", "AS"]) → collected as-is
+    /// - Explicit list (e.g. `["NH", "AS"]`) → collected as-is
     ///
     /// `RG` is auto-appended when `--outSAMattrRGline` is set (STAR behavior,
     /// `Parameters_samAttributes.cpp:201`).
@@ -766,14 +672,14 @@ impl Parameters {
         {
             ["Standard"] => ["NH", "HI", "AS", "NM", "nM"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect(),
             ["All"] => ["NH", "HI", "AS", "NM", "nM", "MD", "jM", "jI", "XS"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect(),
             ["None"] => HashSet::new(),
-            tags => tags.iter().map(|s| s.to_string()).collect(),
+            tags => tags.iter().map(ToString::to_string).collect(),
         };
         if self.rg_line_set() {
             attrs.insert("RG".to_string());
@@ -805,8 +711,7 @@ impl Parameters {
                 })?;
                 if !first.starts_with("ID:") {
                     return Err(crate::error::Error::Parameter(format!(
-                        "--outSAMattrRGline: first field of each RG line must start with 'ID:', got '{}'",
-                        first
+                        "--outSAMattrRGline: first field of each RG line must start with 'ID:', got '{first}'"
                     )));
                 }
                 Ok(block.join("\t"))
@@ -874,8 +779,7 @@ impl Parameters {
             // STAR: no redefinition when both are 0. Log effective max intron.
             let max_intron = (1u64 << self.win_bin_nbits) * self.win_anchor_dist_nbins as u64;
             log::info!(
-                "alignIntronMax=alignMatesGapMax=0, max intron ~= (2^winBinNbits)*winAnchorDistNbins={}",
-                max_intron
+                "alignIntronMax=alignMatesGapMax=0, max intron ~= (2^winBinNbits)*winAnchorDistNbins={max_intron}"
             );
             return;
         }
@@ -911,37 +815,60 @@ impl Parameters {
         );
     }
 
-    /// Validate parameter combinations that clap alone cannot enforce.
-    pub fn validate(&self) -> Result<(), crate::error::Error> {
+    /// Parse and validate parameter combinations.
+    pub fn parse() -> Self {
+        Self::parse_from(std::env::args_os())
+    }
+
+    /// Parse and validate parameter combinations from args.
+    pub fn parse_from<T: Into<std::ffi::OsString> + Clone>(
+        args: impl IntoIterator<Item = T>,
+    ) -> Self {
+        Self::try_parse_from(args).unwrap_or_else(|e| {
+            if cfg!(test) {
+                panic!("{e}")
+            } else {
+                e.format(&mut <Self as CommandFactory>::command()).exit()
+            }
+        })
+    }
+
+    /// Parse and validate parameter combinations.
+    pub fn try_parse() -> Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    /// Parse and validate parameter combinations from args.
+    pub fn try_parse_from<T: Into<std::ffi::OsString> + Clone>(
+        args: impl IntoIterator<Item = T>,
+    ) -> Result<Self, clap::Error> {
+        use clap::error::ErrorKind;
+
+        let mut command = <Self as clap::CommandFactory>::command();
+        let matches = command.clone().get_matches_from(args);
+        let params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+
         // genomeGenerate requires FASTA files
-        if self.run_mode == RunMode::GenomeGenerate && self.genome_fasta_files.is_empty() {
-            return Err(crate::error::Error::Parameter(
-                "--genomeFastaFiles is required when --runMode genomeGenerate".into(),
+        if params.run_mode == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--genomeFastaFiles is required when --runMode genomeGenerate",
             ));
         }
 
         // alignReads requires read files
-        if self.run_mode == RunMode::AlignReads && self.read_files_in.is_empty() {
-            return Err(crate::error::Error::Parameter(
-                "--readFilesIn is required when --runMode alignReads".into(),
-            ));
-        }
-
-        // Validate outSAMtype
-        self.out_sam_type()
-            .map_err(crate::error::Error::Parameter)?;
-
-        // Thread count must be at least 1
-        if self.run_thread_n == 0 {
-            return Err(crate::error::Error::Parameter(
-                "--runThreadN must be >= 1".into(),
+        if params.run_mode == RunMode::AlignReads && params.read_files_in.is_empty() {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--readFilesIn is required when --runMode alignReads",
             ));
         }
 
         // quantMode GeneCounts requires a GTF file
-        if self.quant_gene_counts() && self.sjdb_gtf_file.is_none() {
-            return Err(crate::error::Error::Parameter(
-                "--quantMode GeneCounts requires --sjdbGTFfile".into(),
+        if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantMode GeneCounts requires --sjdbGTFfile",
             ));
         }
 
@@ -949,13 +876,16 @@ impl Parameters {
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
         // does NOT include RG, so only match a literal "RG" token here. Also
         // parse the RG line to validate its ID: prefix and per-file RG count.
-        let user_wants_rg_attr = self.out_sam_attributes.iter().any(|a| a == "RG");
-        if !self.rg_line_set() && user_wants_rg_attr {
-            return Err(crate::error::Error::Parameter(
-                "--outSAMattributes contains RG tag, but --outSAMattrRGline is not set".into(),
+        let user_wants_rg_attr = params.out_sam_attributes.iter().any(|a| a == "RG");
+        if !params.rg_line_set() && user_wants_rg_attr {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--outSAMattributes contains RG tag, but --outSAMattrRGline is not set",
             ));
         }
-        self.rg_ids()?;
+        params
+            .rg_ids()
+            .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
 
         // quantMode TranscriptomeSAM requires transcript annotations —
         // either via --sjdbGTFfile or pre-generated transcriptInfo.tab
@@ -963,16 +893,17 @@ impl Parameters {
         // validation time we can only enforce the genomeGenerate rule;
         // for alignReads, GenomeIndex::load checks for the on-disk files
         // and surfaces a clear error if neither source is available.
-        if self.run_mode == RunMode::GenomeGenerate
-            && self.quant_transcriptome_sam()
-            && self.sjdb_gtf_file.is_none()
+        if params.run_mode == RunMode::GenomeGenerate
+            && params.quant_transcriptome_sam()
+            && params.sjdb_gtf_file.is_none()
         {
-            return Err(crate::error::Error::Parameter(
-                "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate".into(),
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
             ));
         }
 
-        Ok(())
+        Ok(params)
     }
 
     /// Returns true if `--quantMode GeneCounts` was requested.
@@ -995,17 +926,17 @@ mod tests {
     use super::*;
 
     /// Helper: parse a STAR-style command line (without program name).
-    fn parse(args: &[&str]) -> Parameters {
+    fn try_parse(args: &[&str]) -> Result<Parameters, clap::Error> {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
-        Parameters::parse_from(full)
+        Parameters::try_parse_from(&full)
     }
 
     #[test]
     fn defaults() {
-        let p = parse(&["--readFilesIn", "reads.fq"]);
+        let p = try_parse(&["--readFilesIn", "reads.fq"]).unwrap();
         assert_eq!(p.run_mode, RunMode::AlignReads);
-        assert_eq!(p.run_thread_n, 1);
+        assert_eq!(p.run_thread_n, NonZeroUsize::new(1).unwrap());
         assert_eq!(p.run_rng_seed, 777);
         assert_eq!(p.genome_dir, PathBuf::from("./GenomeDir"));
         assert_eq!(p.genome_sa_index_nbases, 14);
@@ -1014,8 +945,8 @@ mod tests {
         assert_eq!(p.read_map_number, -1);
         assert_eq!(p.clip5p_nbases, 0);
         assert_eq!(p.clip3p_nbases, 0);
-        assert_eq!(p.out_file_name_prefix, PathBuf::from("./"));
-        assert_eq!(p.out_sam_type_raw, vec!["SAM".to_string()]);
+        assert_eq!(p.out_file_name_prefix, "./");
+        assert_eq!(p.out_sam_type, OutSamType::default());
         assert_eq!(p.out_sam_strand_field, "None");
         assert_eq!(p.out_sam_attributes, vec!["Standard".to_string()]);
         assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
@@ -1076,13 +1007,13 @@ mod tests {
         assert_eq!(p.out_sj_filter_dist_to_other_sjmin, vec![10, 0, 5, 10]);
         assert_eq!(
             p.out_sj_filter_intron_max_vs_read_n,
-            vec![50000, 100000, 200000]
+            vec![50_000, 100_000, 200_000]
         );
     }
 
     #[test]
     fn genome_generate_mode() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--runMode",
             "genomeGenerate",
             "--genomeDir",
@@ -1094,20 +1025,21 @@ mod tests {
             "8",
             "--genomeSAindexNbases",
             "11",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.run_mode, RunMode::GenomeGenerate);
         assert_eq!(p.genome_dir, PathBuf::from("/data/genome"));
         assert_eq!(
             p.genome_fasta_files,
             vec![PathBuf::from("chr1.fa"), PathBuf::from("chr2.fa")]
         );
-        assert_eq!(p.run_thread_n, 8);
+        assert_eq!(p.run_thread_n, NonZeroUsize::new(8).unwrap());
         assert_eq!(p.genome_sa_index_nbases, 11);
     }
 
     #[test]
     fn typical_align_command() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--runMode",
             "alignReads",
             "--genomeDir",
@@ -1132,7 +1064,8 @@ mod tests {
             "gencode.gtf",
             "--twopassMode",
             "Basic",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.run_mode, RunMode::AlignReads);
         assert_eq!(p.genome_dir, PathBuf::from("/idx/hg38"));
         assert_eq!(
@@ -1140,18 +1073,13 @@ mod tests {
             vec![PathBuf::from("R1.fq.gz"), PathBuf::from("R2.fq.gz")]
         );
         assert_eq!(p.read_files_command, Some("zcat".to_string()));
-        assert_eq!(p.run_thread_n, 16);
+        assert_eq!(p.run_thread_n, NonZeroUsize::new(16).unwrap());
+        assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
         assert_eq!(
-            p.out_sam_type_raw,
-            vec!["BAM".to_string(), "SortedByCoordinate".to_string()]
-        );
-        let sam_type = p.out_sam_type().unwrap();
-        assert_eq!(sam_type.format, OutSamFormat::Bam);
-        assert_eq!(
-            sam_type.sort_order,
+            p.out_sam_type.sort_order,
             Some(OutSamSortOrder::SortedByCoordinate)
         );
-        assert_eq!(p.out_file_name_prefix, PathBuf::from("/out/sample1_"));
+        assert_eq!(p.out_file_name_prefix, "/out/sample1_");
         assert_eq!(p.out_filter_multimap_nmax, 20);
         assert_eq!(p.align_intron_max, 1_000_000);
         assert_eq!(p.sjdb_gtf_file, Some(PathBuf::from("gencode.gtf")));
@@ -1160,7 +1088,7 @@ mod tests {
 
     #[test]
     fn scoring_overrides() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "reads.fq",
             "--scoreGap",
@@ -1179,7 +1107,8 @@ mod tests {
             "-3",
             "--scoreInsBase",
             "-1",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.score_gap, 0);
         assert_eq!(p.score_gap_noncan, -12);
         assert_eq!(p.score_gap_gcag, -6);
@@ -1192,38 +1121,70 @@ mod tests {
 
     #[test]
     fn validate_genome_generate_needs_fasta() {
-        let p = parse(&["--runMode", "genomeGenerate"]);
-        let err = p.validate().unwrap_err();
+        let err = try_parse(&["--runMode", "genomeGenerate"]).unwrap_err();
         assert!(err.to_string().contains("genomeFastaFiles"));
     }
 
     #[test]
     fn validate_align_needs_reads() {
-        let p = parse(&["--runMode", "alignReads"]);
-        let err = p.validate().unwrap_err();
+        let err = try_parse(&["--runMode", "alignReads"]).unwrap_err();
         assert!(err.to_string().contains("readFilesIn"));
     }
 
     #[test]
     fn out_sam_type_parsing() {
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM"]);
-        let t = p.out_sam_type().unwrap();
-        assert_eq!(t.format, OutSamFormat::Sam);
-        assert_eq!(t.sort_order, None);
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM"]).unwrap();
+        assert_eq!(p.out_sam_type.format, OutSamFormat::Sam);
+        assert_eq!(p.out_sam_type.sort_order, None);
 
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Unsorted"]);
-        let t = p.out_sam_type().unwrap();
-        assert_eq!(t.format, OutSamFormat::Bam);
-        assert_eq!(t.sort_order, Some(OutSamSortOrder::Unsorted));
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Unsorted"]).unwrap();
+        assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
+        assert_eq!(p.out_sam_type.sort_order, Some(OutSamSortOrder::Unsorted));
 
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMtype", "None"]);
-        let t = p.out_sam_type().unwrap();
-        assert_eq!(t.format, OutSamFormat::None);
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "None"]).unwrap();
+        assert_eq!(p.out_sam_type.format, OutSamFormat::None);
+
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BOGUS"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM"]).is_err());
+    }
+
+    #[test]
+    fn out_sam_unmapped_parsing() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
+
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "None"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
+
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "Within"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::Within);
+
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMunmapped",
+            "Within",
+            "KeepPairs",
+        ])
+        .unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::WithinKeepPairs);
+
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "Bogus"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMunmapped",
+                "Within",
+                "Bogus"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn chimeric_params() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--chimSegmentMin",
@@ -1233,7 +1194,8 @@ mod tests {
             "--chimOutType",
             "WithinBAM",
             "SoftClip",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.chim_segment_min, 20);
         assert_eq!(p.chim_score_min, 10);
         assert_eq!(
@@ -1244,7 +1206,7 @@ mod tests {
 
     #[test]
     fn chimeric_params_extended() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--chimSegmentMin",
@@ -1261,7 +1223,8 @@ mod tests {
             "12",
             "--chimScoreJunctionNonGTAG",
             "-2",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.chim_score_drop_max, 30);
         assert_eq!(p.chim_score_separation, 15);
         assert_eq!(p.chim_main_segment_mult_nmax, 5);
@@ -1272,7 +1235,7 @@ mod tests {
 
     #[test]
     fn chimeric_params_defaults() {
-        let p = parse(&["--readFilesIn", "r.fq"]);
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
         assert_eq!(p.chim_score_drop_max, 20);
         assert_eq!(p.chim_score_separation, 10);
         assert_eq!(p.chim_main_segment_mult_nmax, 10);
@@ -1283,26 +1246,27 @@ mod tests {
 
     #[test]
     fn win_bin_window_dist_default() {
-        let p = parse(&["--readFilesIn", "r.fq"]);
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
         assert_eq!(p.win_bin_window_dist(), 589_824); // 2^16 * 9
     }
 
     #[test]
     fn win_bin_window_dist_custom() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--winBinNbits",
             "14",
             "--winAnchorDistNbins",
             "5",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.win_bin_window_dist(), 81_920); // 2^14 * 5
     }
 
     #[test]
     fn rg_line_default_unset() {
-        let p = parse(&["--readFilesIn", "r.fq"]);
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
         assert!(!p.rg_line_set());
         assert_eq!(p.parsed_rg_lines().unwrap(), Vec::<String>::new());
         assert_eq!(p.rg_ids().unwrap(), Vec::<String>::new());
@@ -1311,14 +1275,15 @@ mod tests {
 
     #[test]
     fn rg_line_single() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--outSAMattrRGline",
             "ID:foo",
             "SM:bar",
             "LB:lib1",
-        ]);
+        ])
+        .unwrap();
         assert!(p.rg_line_set());
         assert_eq!(
             p.parsed_rg_lines().unwrap(),
@@ -1330,7 +1295,7 @@ mod tests {
 
     #[test]
     fn rg_line_multi() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r1.fq",
             "r2.fq",
@@ -1340,7 +1305,8 @@ mod tests {
             ",",
             "ID:b",
             "LB:x",
-        ]);
+        ])
+        .unwrap();
         let lines = p.parsed_rg_lines().unwrap();
         assert_eq!(
             lines,
@@ -1351,13 +1317,14 @@ mod tests {
 
     #[test]
     fn rg_line_single_replicates_for_multi_file() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r1.fq",
             "r2.fq",
             "--outSAMattrRGline",
             "ID:foo",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             p.rg_ids().unwrap(),
             vec!["foo".to_string(), "foo".to_string()]
@@ -1366,42 +1333,43 @@ mod tests {
 
     #[test]
     fn rg_line_missing_id_prefix_errors() {
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMattrRGline", "SM:oops"]);
-        let err = p.parsed_rg_lines().unwrap_err();
+        let err =
+            try_parse(&["--readFilesIn", "r.fq", "--outSAMattrRGline", "SM:oops"]).unwrap_err();
         assert!(err.to_string().contains("ID:"));
     }
 
     #[test]
     fn rg_line_count_mismatch_errors() {
         // 1 input file, 2 RG entries — mismatch (ids.len()>1 && != n_files).
-        let p = parse(&[
+        let err = try_parse(&[
             "--readFilesIn",
             "r1.fq",
             "--outSAMattrRGline",
             "ID:a",
             ",",
             "ID:b",
-        ]);
-        let err = p.rg_ids().unwrap_err();
+        ])
+        .unwrap_err();
         assert!(err.to_string().contains("does not match"));
     }
 
     #[test]
     fn validate_rg_attr_without_line_errors() {
-        let p = parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "RG"]);
-        let err = p.validate().unwrap_err();
+        let err =
+            try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "RG"]).unwrap_err();
         assert!(err.to_string().contains("RG"));
     }
 
+    #[test]
     fn run_rng_seed_override() {
-        let p = parse(&["--readFilesIn", "r.fq", "--runRNGseed", "42"]);
+        let p = try_parse(&["--readFilesIn", "r.fq", "--runRNGseed", "42"]).unwrap();
         assert_eq!(p.run_rng_seed, 42);
     }
 
     #[test]
     fn quant_transcriptome_sam_default() {
         use crate::quant::transcriptome::QuantTranscriptomeSAMoutput;
-        let p = parse(&["--readFilesIn", "r.fq"]);
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
         assert!(!p.quant_transcriptome_sam());
         assert_eq!(
             p.quant_transcriptome_sam_output,
@@ -1411,7 +1379,7 @@ mod tests {
 
     #[test]
     fn quant_transcriptome_sam_enabled() {
-        let p = parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]);
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
         assert!(p.quant_transcriptome_sam());
         assert!(!p.quant_gene_counts());
     }
@@ -1419,23 +1387,25 @@ mod tests {
     #[test]
     fn quant_transcriptome_sam_output_override() {
         use crate::quant::transcriptome::QuantTranscriptomeSAMoutput;
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--quantTranscriptomeSAMoutput",
             "BanSingleEnd",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEnd
         );
 
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--quantTranscriptomeSAMoutput",
             "BanSingleEnd_ExtendSoftclip",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEndExtendSoftclip
@@ -1444,15 +1414,15 @@ mod tests {
 
     #[test]
     fn validate_transcriptome_sam_at_genome_generate_needs_gtf() {
-        let p = parse(&[
+        let err = try_parse(&[
             "--runMode",
             "genomeGenerate",
             "--genomeFastaFiles",
             "g.fa",
             "--quantMode",
             "TranscriptomeSAM",
-        ]);
-        let err = p.validate().unwrap_err();
+        ])
+        .unwrap_err();
         assert!(err.to_string().contains("TranscriptomeSAM"));
         assert!(err.to_string().contains("sjdbGTFfile"));
     }
@@ -1462,26 +1432,25 @@ mod tests {
         // alignReads: if --sjdbGTFfile is absent, the check is deferred to
         // GenomeIndex::load which will either find transcriptInfo.tab in
         // --genomeDir or surface a clear error at load time.
-        let p = parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]);
-        assert!(p.validate().is_ok());
+        try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
     }
 
     #[test]
     fn validate_transcriptome_sam_with_gtf_ok() {
-        let p = parse(&[
+        try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--quantMode",
             "TranscriptomeSAM",
             "--sjdbGTFfile",
             "genes.gtf",
-        ]);
-        assert!(p.validate().is_ok());
+        ])
+        .unwrap();
     }
 
     #[test]
     fn sj_stitch_mismatch() {
-        let p = parse(&[
+        let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--alignSJstitchMismatchNmax",
@@ -1489,7 +1458,55 @@ mod tests {
             "-1",
             "2",
             "3",
-        ]);
+        ])
+        .unwrap();
         assert_eq!(p.align_sj_stitch_mismatch_nmax, vec![1, -1, 2, 3]);
+    }
+
+    #[test]
+    fn output_path_bare_dot_prefix() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outFileNamePrefix", "SAMPLE."]).unwrap();
+        assert_eq!(p.out_file_name_prefix, "SAMPLE.");
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("SAMPLE.Aligned.out.bam")
+        );
+        assert_eq!(
+            p.output_path("Log.final.out"),
+            PathBuf::from("SAMPLE.Log.final.out")
+        );
+    }
+
+    #[test]
+    fn output_path_trailing_slash_prefix() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outFileNamePrefix", "out/"]).unwrap();
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("out/Aligned.out.bam")
+        );
+    }
+
+    #[test]
+    fn output_path_default_prefix() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("./Aligned.out.bam")
+        );
+    }
+
+    #[test]
+    fn output_path_path_with_underscore() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "/out/sample1_",
+        ])
+        .unwrap();
+        assert_eq!(
+            p.output_path("Aligned.out.bam"),
+            PathBuf::from("/out/sample1_Aligned.out.bam")
+        );
     }
 }

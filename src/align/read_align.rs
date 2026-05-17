@@ -5,12 +5,14 @@ use crate::align::stitch::{
     PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
     stitch_seeds_with_jdb_debug,
 };
-use crate::align::transcript::{Exon, Transcript};
+use crate::align::transcript::{Exon, KindExt as _, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::{IntronMotifFilter, IntronStrandFilter, Parameters};
 use crate::stats::UnmappedReason;
+use noodles::sam::alignment::record::cigar;
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use std::cmp::Ordering;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Derive a deterministic per-read RNG seed from `run_rng_seed` + the read name.
@@ -203,7 +205,7 @@ pub fn align_read(
 
     if seeds.is_empty() {
         if debug_read {
-            eprintln!("[DEBUG {}] No seeds found — unmapped", read_name);
+            eprintln!("[DEBUG {read_name}] No seeds found — unmapped");
         }
         return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
     }
@@ -264,7 +266,7 @@ pub fn align_read(
 
     if clusters.is_empty() {
         if debug_read {
-            eprintln!("[DEBUG {}] No clusters — unmapped", read_name);
+            eprintln!("[DEBUG {read_name}] No clusters — unmapped");
         }
         return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
     }
@@ -309,7 +311,7 @@ pub fn align_read(
             junction_db,
             params.align_transcripts_per_window_nmax,
             debug_name,
-        )?;
+        );
         if debug_read {
             eprintln!(
                 "[DEBUG {}] Cluster[{}]: {} transcripts from DP",
@@ -323,7 +325,6 @@ pub fn align_read(
                 } else {
                     "unknown"
                 };
-                let cigar_str: String = t.cigar.iter().map(|op| format!("{}", op)).collect();
                 eprintln!(
                     "  transcript[{}]: chr={}:{}-{} ({}) score={} mm={} junctions={} cigar={}",
                     ti,
@@ -334,7 +335,7 @@ pub fn align_read(
                     t.score,
                     t.n_mismatch,
                     t.n_junction,
-                    cigar_str
+                    t.cigar_string()
                 );
             }
         }
@@ -351,20 +352,9 @@ pub fn align_read(
 
     // Deduplicate transcripts with identical genomic coordinates AND CIGAR.
     transcripts.sort_by(|a, b| {
-        (
-            a.chr_idx,
-            a.genome_start,
-            a.genome_end,
-            a.is_reverse,
-            &a.cigar,
-        )
-            .cmp(&(
-                b.chr_idx,
-                b.genome_start,
-                b.genome_end,
-                b.is_reverse,
-                &b.cigar,
-            ))
+        (a.chr_idx, a.genome_start, a.genome_end, a.is_reverse)
+            .cmp(&(b.chr_idx, b.genome_start, b.genome_end, b.is_reverse))
+            .then_with(|| cmp_cigar(&a.cigar, &b.cigar))
             .then_with(|| b.score.cmp(&a.score))
     });
     transcripts.dedup_by(|a, b| {
@@ -467,13 +457,13 @@ pub fn align_read(
 
         // Absolute matched bases
         let n_matched = t.n_matched();
-        if n_matched < params.out_filter_match_nmin {
+        if n_matched < params.out_filter_match_nmin as usize {
             *filter_reasons.entry("match_min").or_insert(0) += 1;
             return false;
         }
 
         // Relative matched bases: STAR casts to uint (u32)
-        if n_matched < (params.out_filter_match_nmin_over_lread * lread_m1) as u32 {
+        if (n_matched as f64) < params.out_filter_match_nmin_over_lread * lread_m1 {
             *filter_reasons.entry("match_min_relative").or_insert(0) += 1;
             return false;
         }
@@ -519,7 +509,6 @@ pub fn align_read(
                 match motif.implied_strand() {
                     Some('+') => has_plus = true,
                     Some('-') => has_minus = true,
-                    None => {}
                     _ => {}
                 }
             }
@@ -536,11 +525,7 @@ pub fn align_read(
     if pre_filter_count > transcripts.len() {
         let filtered = pre_filter_count - transcripts.len();
         log::debug!(
-            "Read {}: Filtered {}/{} transcripts: {:?}",
-            read_name,
-            filtered,
-            pre_filter_count,
-            filter_reasons
+            "Read {read_name}: Filtered {filtered}/{pre_filter_count} transcripts: {filter_reasons:?}"
         );
     }
 
@@ -633,7 +618,6 @@ pub fn align_read(
             } else {
                 "unknown"
             };
-            let cigar_str: String = t.cigar.iter().map(|op| format!("{}", op)).collect();
             eprintln!(
                 "  FINAL[{}]: chr={}:{}-{} ({}) score={} mm={} junctions={} cigar={}",
                 i,
@@ -644,7 +628,7 @@ pub fn align_read(
                 t.score,
                 t.n_mismatch,
                 t.n_junction,
-                cigar_str
+                t.cigar_string()
             );
         }
     }
@@ -749,7 +733,7 @@ pub fn align_paired_read(
     combined_seeds.extend(m2_seeds);
     // mate_id: positions 0..len1 → mate1(0); positions len1+1.. → RC(mate2)(1).
     for s in &mut combined_seeds {
-        s.mate_id = if s.read_pos < len1 { 0 } else { 1 };
+        s.mate_id = u8::from(s.read_pos >= len1);
     }
 
     // Cluster combined seeds using the combined read length
@@ -826,140 +810,137 @@ pub fn align_paired_read(
             params.align_transcripts_per_window_nmax,
             params.align_mates_gap_max.into(),
             debug_name,
-        )?;
+        );
 
         for wt in &wts {
             let split_result =
                 split_combined_wt(wt, len1, len2, stitch_is_reverse, scorer.align_intron_min);
-            match split_result {
-                Some((m1_wt, m2_wt)) => {
-                    let (m1_read_slice, m1_orig_rev, m2_read_slice, m2_orig_rev) =
-                        if stitch_is_reverse {
-                            // stitch_read = [mate2(0..len2) | SPACER | RC(mate1)(len2+1..)]
-                            (
-                                &stitch_read[len2 + 1..], // RC(mate1_seq)
-                                true,                     // mate1 5' at right in RC
-                                &stitch_read[..len2],     // mate2_seq
-                                false,                    // mate2 5' at left
-                            )
-                        } else {
-                            // stitch_read = [mate1(0..len1) | SPACER | RC(mate2)(len1+1..)]
-                            (
-                                &stitch_read[..len1],     // mate1_seq
-                                false,                    // mate1 5' at left
-                                &stitch_read[len1 + 1..], // RC(mate2_seq)
-                                true,                     // mate2 5' at right in RC
-                            )
-                        };
+            if let Some((m1_wt, m2_wt)) = split_result {
+                let (m1_read_slice, m1_orig_rev, m2_read_slice, m2_orig_rev) = if stitch_is_reverse
+                {
+                    // stitch_read = [mate2(0..len2) | SPACER | RC(mate1)(len2+1..)]
+                    (
+                        &stitch_read[len2 + 1..], // RC(mate1_seq)
+                        true,                     // mate1 5' at right in RC
+                        &stitch_read[..len2],     // mate2_seq
+                        false,                    // mate2 5' at left
+                    )
+                } else {
+                    // stitch_read = [mate1(0..len1) | SPACER | RC(mate2)(len1+1..)]
+                    (
+                        &stitch_read[..len1],     // mate1_seq
+                        false,                    // mate1 5' at left
+                        &stitch_read[len1 + 1..], // RC(mate2_seq)
+                        true,                     // mate2 5' at right in RC
+                    )
+                };
 
-                    // Suppress inner-side extensions for each mate.
-                    // Inner = 3' end: right for forward (orig_is_rev=false), left for reverse.
-                    let Some(mut t1) = finalize_transcript(
-                        &m1_wt,
-                        m1_read_slice,
-                        index,
-                        &scorer,
-                        &stitch_cluster,
-                        m1_orig_rev,
-                        m1_orig_rev, // no_left_ext = inner for reverse (orig_is_rev=true)
-                        !m1_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    ) else {
-                        continue;
-                    };
-                    let Some(mut t2) = finalize_transcript(
-                        &m2_wt,
-                        m2_read_slice,
-                        index,
-                        &scorer,
-                        &stitch_cluster,
-                        m2_orig_rev,
-                        m2_orig_rev, // no_left_ext = inner for reverse (orig_is_rev=true)
-                        !m2_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    ) else {
-                        continue;
-                    };
+                // Suppress inner-side extensions for each mate.
+                // Inner = 3' end: right for forward (orig_is_rev=false), left for reverse.
+                let Some(mut t1) = finalize_transcript(
+                    &m1_wt,
+                    m1_read_slice,
+                    index,
+                    &scorer,
+                    &stitch_cluster,
+                    m1_orig_rev,
+                    m1_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
+                    !m1_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
+                ) else {
+                    continue;
+                };
+                let Some(mut t2) = finalize_transcript(
+                    &m2_wt,
+                    m2_read_slice,
+                    index,
+                    &scorer,
+                    &stitch_cluster,
+                    m2_orig_rev,
+                    m2_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
+                    !m2_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
+                ) else {
+                    continue;
+                };
 
-                    if stitch_is_reverse {
-                        t1.is_reverse = true;
-                        t2.is_reverse = false;
-                    } else {
-                        t1.is_reverse = false;
-                        t2.is_reverse = true;
-                    }
-                    t1.read_seq = mate1_seq.to_vec();
-                    t2.read_seq = mate2_seq.to_vec();
-
-                    if params.chim_segment_min > 0 {
-                        all_m1_transcripts.push(t1.clone());
-                        all_m2_transcripts.push(t2.clone());
-                    }
-
-                    let combined_span =
-                        t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
-                    let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
-
-                    if let Some(pair) = try_pair_transcripts(
-                        &t1,
-                        &t2,
-                        len1,
-                        len2,
-                        params,
-                        combined_score_threshold,
-                        combined_wt_score,
-                    ) {
-                        joint_pairs.push(pair);
-                    }
+                if stitch_is_reverse {
+                    t1.is_reverse = true;
+                    t2.is_reverse = false;
+                } else {
+                    t1.is_reverse = false;
+                    t2.is_reverse = true;
                 }
-                None => {
-                    // Single-mate WT: save for half-mapped fallback
-                    let all_m1 = wt.exons.iter().all(|e| e.mate_id == 0);
-                    let all_m2 = wt.exons.iter().all(|e| e.mate_id == 1);
-                    if all_m1 {
-                        let (read_slice, orig_rev) = if stitch_is_reverse {
-                            (&stitch_read[len2 + 1..], true)
-                        } else {
-                            (&stitch_read[..len1], false)
-                        };
-                        if let Some(mut t) = finalize_transcript(
-                            wt,
-                            read_slice,
-                            index,
-                            &scorer,
-                            &stitch_cluster,
-                            orig_rev,
-                            false,
-                            false,
-                        ) {
-                            t.is_reverse = stitch_is_reverse;
-                            t.read_seq = mate1_seq.to_vec();
-                            if params.chim_segment_min > 0 {
-                                all_m1_transcripts.push(t.clone());
-                            }
-                            single_mate1_transcripts.push(t);
+                t1.read_seq = mate1_seq.to_vec();
+                t2.read_seq = mate2_seq.to_vec();
+
+                if params.chim_segment_min > 0 {
+                    all_m1_transcripts.push(t1.clone());
+                    all_m2_transcripts.push(t2.clone());
+                }
+
+                let combined_span =
+                    t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
+                let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
+
+                if let Some(pair) = try_pair_transcripts(
+                    &t1,
+                    &t2,
+                    len1,
+                    len2,
+                    params,
+                    combined_score_threshold,
+                    combined_wt_score,
+                ) {
+                    joint_pairs.push(pair);
+                }
+            } else {
+                // Single-mate WT: save for half-mapped fallback
+                let all_m1 = wt.exons.iter().all(|e| e.mate_id == 0);
+                let all_m2 = wt.exons.iter().all(|e| e.mate_id == 1);
+                if all_m1 {
+                    let (read_slice, orig_rev) = if stitch_is_reverse {
+                        (&stitch_read[len2 + 1..], true)
+                    } else {
+                        (&stitch_read[..len1], false)
+                    };
+                    if let Some(mut t) = finalize_transcript(
+                        wt,
+                        read_slice,
+                        index,
+                        &scorer,
+                        &stitch_cluster,
+                        orig_rev,
+                        false,
+                        false,
+                    ) {
+                        t.is_reverse = stitch_is_reverse;
+                        t.read_seq = mate1_seq.to_vec();
+                        if params.chim_segment_min > 0 {
+                            all_m1_transcripts.push(t.clone());
                         }
-                    } else if all_m2 {
-                        let (read_slice, orig_rev) = if stitch_is_reverse {
-                            (&stitch_read[..len2], false)
-                        } else {
-                            (&stitch_read[len1 + 1..], true)
-                        };
-                        if let Some(mut t) = finalize_transcript(
-                            wt,
-                            read_slice,
-                            index,
-                            &scorer,
-                            &stitch_cluster,
-                            orig_rev,
-                            false,
-                            false,
-                        ) {
-                            t.is_reverse = !stitch_is_reverse;
-                            t.read_seq = mate2_seq.to_vec();
-                            if params.chim_segment_min > 0 {
-                                all_m2_transcripts.push(t.clone());
-                            }
-                            single_mate2_transcripts.push(t);
+                        single_mate1_transcripts.push(t);
+                    }
+                } else if all_m2 {
+                    let (read_slice, orig_rev) = if stitch_is_reverse {
+                        (&stitch_read[..len2], false)
+                    } else {
+                        (&stitch_read[len1 + 1..], true)
+                    };
+                    if let Some(mut t) = finalize_transcript(
+                        wt,
+                        read_slice,
+                        index,
+                        &scorer,
+                        &stitch_cluster,
+                        orig_rev,
+                        false,
+                        false,
+                    ) {
+                        t.is_reverse = !stitch_is_reverse;
+                        t.read_seq = mate2_seq.to_vec();
+                        if params.chim_segment_min > 0 {
+                            all_m2_transcripts.push(t.clone());
                         }
+                        single_mate2_transcripts.push(t);
                     }
                 }
             }
@@ -992,8 +973,8 @@ pub fn align_paired_read(
         }
         b.combined_wt_score
             .cmp(&a.combined_wt_score)
-            .then_with(|| a.mate1_transcript.cigar.cmp(&b.mate1_transcript.cigar))
-            .then_with(|| a.mate2_transcript.cigar.cmp(&b.mate2_transcript.cigar))
+            .then_with(|| cmp_cigar(&a.mate1_transcript.cigar, &b.mate1_transcript.cigar))
+            .then_with(|| cmp_cigar(&a.mate2_transcript.cigar, &b.mate2_transcript.cigar))
     });
     joint_pairs.dedup_by(|a, b| {
         a.mate1_transcript.chr_idx == b.mate1_transcript.chr_idx
@@ -1237,6 +1218,18 @@ pub fn align_paired_read(
     }
 }
 
+/// Comparator for deduplicating structs containing CIGAR ops via sort→dedup
+fn cmp_cigar(a: &[cigar::Op], b: &[cigar::Op]) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| {
+        (a.iter().zip(b.iter()))
+            .find_map(|(a, b)| {
+                let ord = (a.char(), a.len()).cmp(&(b.char(), b.len()));
+                (ord != Ordering::Equal).then_some(ord)
+            })
+            .unwrap_or(Ordering::Equal)
+    })
+}
+
 /// Attempt to pair two per-mate transcripts into a PairedAlignment.
 ///
 /// Returns `None` if the mates are incompatible (same strand, different chr, too far, etc.).
@@ -1419,18 +1412,18 @@ fn extract_junctions_from_cigar(t: &Transcript) -> Vec<(u64, u64)> {
     let mut junctions = Vec::new();
     let mut genome_pos = t.genome_start;
     for op in &t.cigar {
-        use crate::align::transcript::CigarOp;
-        match op {
-            CigarOp::Match(n) | CigarOp::Equal(n) | CigarOp::Diff(n) | CigarOp::Del(n) => {
-                genome_pos += *n as u64;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                genome_pos += op.len() as u64;
             }
-            CigarOp::RefSkip(n) => {
+            Kind::Skip => {
                 let donor = genome_pos;
-                let acceptor = genome_pos + *n as u64;
+                let acceptor = genome_pos + op.len() as u64;
                 junctions.push((donor, acceptor));
                 genome_pos = acceptor;
             }
-            CigarOp::Ins(_) | CigarOp::SoftClip(_) | CigarOp::HardClip(_) => {}
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
     junctions
@@ -1481,11 +1474,11 @@ mod tests {
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
-    use clap::Parser;
+    use noodles::sam::alignment::record::cigar;
 
-    fn make_test_params() -> Parameters {
+    fn default_params() -> Parameters {
         // Parse empty args to get default parameters
-        Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap()
+        Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"])
     }
 
     fn make_test_index() -> GenomeIndex {
@@ -1540,8 +1533,7 @@ mod tests {
 
     #[test]
     fn combined_transcript_for_projection_rewrites_mate2_ifrag() {
-        use crate::align::transcript::CigarOp;
-
+        use cigar::op::{Kind, Op};
         let make_tr = |gs: u64, ge: u64, rs: usize, re: usize| Transcript {
             chr_idx: 0,
             genome_start: gs,
@@ -1554,7 +1546,7 @@ mod tests {
                 read_end: re,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match((ge - gs) as u32)],
+            cigar: vec![Op::new(Kind::Match, (ge - gs) as usize)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1585,7 +1577,7 @@ mod tests {
     #[test]
     fn test_align_read_no_seeds() {
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         // Read with all N's (no seeds possible)
         let read_seq = vec![4, 4, 4, 4, 4, 4, 4, 4, 4, 4];
@@ -1603,7 +1595,7 @@ mod tests {
     #[test]
     fn test_transcript_filtering_score() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_score_min = 50;
 
         // Would need actual seeds and alignment to test this properly
@@ -1616,7 +1608,7 @@ mod tests {
     #[test]
     fn test_transcript_filtering_mismatch() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_mismatch_nmax = 2;
 
         let read_seq = vec![0, 1, 2, 3]; // ACGT
@@ -1627,7 +1619,7 @@ mod tests {
     #[test]
     fn test_transcript_multimap_limit() {
         let index = make_test_index();
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.out_filter_multimap_nmax = 5;
 
         let read_seq = vec![0, 1, 2, 3]; // ACGT
@@ -1641,7 +1633,7 @@ mod tests {
     #[test]
     fn test_align_paired_read_no_seeds() {
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         // Both mates with all N's
         let mate1 = vec![4, 4, 4, 4, 4, 4, 4, 4];
@@ -1657,9 +1649,10 @@ mod tests {
 
     #[test]
     fn test_check_proper_pair_distance() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
-        let params = make_test_params();
+        let params = default_params();
 
         // Create two transcripts on same chromosome
         let t1 = Transcript {
@@ -1674,7 +1667,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1696,7 +1689,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1712,9 +1705,10 @@ mod tests {
 
     #[test]
     fn test_check_proper_pair_too_far() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
-        let mut params = make_test_params();
+        let mut params = default_params();
         params.align_mates_gap_max = 100;
 
         let t1 = Transcript {
@@ -1729,7 +1723,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1751,7 +1745,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1767,7 +1761,8 @@ mod tests {
 
     #[test]
     fn test_calculate_insert_size_positive() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         // Mate1 is leftmost
         let t1 = Transcript {
@@ -1782,7 +1777,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1804,7 +1799,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1820,8 +1815,9 @@ mod tests {
 
     #[test]
     fn test_strand_consistency_filter() {
-        use crate::align::transcript::{CigarOp, Exon, Transcript};
+        use crate::align::transcript::{Exon, Transcript};
         use crate::params::IntronStrandFilter;
+        use cigar::op::{Kind, Op};
 
         // Create a transcript with conflicting strand motifs (mixed + and - within one transcript)
         let t_inconsistent = Transcript {
@@ -1836,7 +1832,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1859,7 +1855,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1920,7 +1916,8 @@ mod tests {
 
     #[test]
     fn test_calculate_insert_size_negative() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         // RF pair: mate1 reverse (right side), mate2 forward (left side).
         // STAR reverse cluster: tlen = mate1.genome_end - mate2.genome_start = 1300 - 1000 = 300.
@@ -1937,7 +1934,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1959,7 +1956,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -1976,7 +1973,8 @@ mod tests {
     #[test]
     fn test_noncanonical_unannotated_filter() {
         use crate::align::score::SpliceMotif;
-        use crate::align::transcript::{CigarOp, Exon, Transcript};
+        use crate::align::transcript::{Exon, Transcript};
+        use cigar::op::{Kind, Op};
 
         // Helper: check if a transcript would be filtered by RemoveNoncanonicalUnannotated
         // (mirrors the logic in the retain closure)
@@ -1999,7 +1997,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2056,7 +2054,7 @@ mod tests {
     fn test_align_paired_both_unmapped() {
         // Both mates are all N's → both unmapped → empty Vec
         let index = make_test_index();
-        let params = make_test_params();
+        let params = default_params();
 
         let mate1 = vec![4, 4, 4, 4, 4, 4, 4, 4];
         let mate2 = vec![4, 4, 4, 4, 4, 4, 4, 4];
@@ -2070,7 +2068,8 @@ mod tests {
 
     #[test]
     fn test_paired_alignment_result_enum_variants() {
-        use crate::align::transcript::{CigarOp, Exon};
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
 
         let transcript = Transcript {
             chr_idx: 0,
@@ -2084,7 +2083,7 @@ mod tests {
                 read_end: 100,
                 i_frag: 0,
             }],
-            cigar: vec![CigarOp::Match(100)],
+            cigar: vec![Op::new(Kind::Match, 100)],
             score: 100,
             n_mismatch: 0,
             n_gap: 0,
@@ -2144,7 +2143,7 @@ mod tests {
         assert_eq!(items[4], (40, 4));
         // Tied prefix contains the original three items in some order.
         let mut top: Vec<u32> = items[..3].iter().map(|t| t.1).collect();
-        top.sort();
+        top.sort_unstable();
         assert_eq!(top, vec![0, 1, 2]);
     }
 
@@ -2161,8 +2160,7 @@ mod tests {
         }
         assert!(
             firsts.len() >= 2,
-            "expected different seeds to pick different primaries, got {:?}",
-            firsts
+            "expected different seeds to pick different primaries, got {firsts:?}"
         );
     }
 

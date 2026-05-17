@@ -49,7 +49,7 @@ pub struct SpliceJunctionStats {
 impl Clone for SpliceJunctionStats {
     fn clone(&self) -> Self {
         let new_map = DashMap::new();
-        for entry in self.junctions.iter() {
+        for entry in &self.junctions {
             let key = entry.key().clone();
             let counts = entry.value();
             new_map.insert(
@@ -198,11 +198,11 @@ impl SpliceJunctionStats {
                 let intron_len = key.intron_end.saturating_sub(key.intron_start);
                 let intron_max_thresholds = &params.out_sj_filter_intron_max_vs_read_n;
                 let max_intron_for_reads = if total >= 3 {
-                    intron_max_thresholds.get(2).copied().unwrap_or(200000)
+                    intron_max_thresholds.get(2).copied().unwrap_or(200_000)
                 } else if total >= 2 {
-                    intron_max_thresholds.get(1).copied().unwrap_or(100000)
+                    intron_max_thresholds.get(1).copied().unwrap_or(100_000)
                 } else {
-                    intron_max_thresholds.first().copied().unwrap_or(50000)
+                    intron_max_thresholds.first().copied().unwrap_or(50_000)
                 };
                 if intron_len as i64 > max_intron_for_reads {
                     continue;
@@ -271,7 +271,7 @@ impl SpliceJunctionStats {
                 chr_pos_end,
                 key.strand,
                 key.motif,
-                if *annotated { 1 } else { 0 },
+                i32::from(*annotated),
                 unique,
                 multi,
                 max_overhang
@@ -370,7 +370,13 @@ pub(crate) fn encode_motif(motif: SpliceMotif) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use crate::params::Parameters;
+
     use super::*;
+
+    fn default_params() -> Parameters {
+        Parameters::parse_from(["rustar-aligner", "--readFilesIn", "reads.fq"])
+    }
 
     #[test]
     fn test_sj_stats_new() {
@@ -504,7 +510,6 @@ mod tests {
 
     #[test]
     fn test_write_output() {
-        use clap::Parser;
         use tempfile::NamedTempFile;
 
         let stats = SpliceJunctionStats::new();
@@ -522,7 +527,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
+        let params = default_params();
 
         let output_file = NamedTempFile::new().unwrap();
         stats
@@ -562,7 +567,6 @@ mod tests {
 
     #[test]
     fn test_sj_filter_noncanonical_needs_high_overhang() {
-        use clap::Parser;
         use tempfile::NamedTempFile;
 
         let stats = SpliceJunctionStats::new();
@@ -583,8 +587,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-
+        let params = default_params();
         let output_file = NamedTempFile::new().unwrap();
         stats
             .write_output(output_file.path(), &genome, &params)
@@ -602,7 +605,6 @@ mod tests {
 
     #[test]
     fn test_sj_filter_annotated_bypasses_filters() {
-        use clap::Parser;
         use tempfile::NamedTempFile;
 
         let stats = SpliceJunctionStats::new();
@@ -619,8 +621,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-
+        let params = default_params();
         let output_file = NamedTempFile::new().unwrap();
         stats
             .write_output(output_file.path(), &genome, &params)
@@ -635,8 +636,6 @@ mod tests {
 
     #[test]
     fn test_compute_surviving_junctions_basic() {
-        use clap::Parser;
-
         let stats = SpliceJunctionStats::new();
 
         // High-quality canonical junction (should survive)
@@ -650,7 +649,7 @@ mod tests {
         // Low-count canonical junction (unique=0 < 1)
         stats.record_junction(0, 500, 600, 1, SpliceMotif::GtAg, false, 20, false);
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
+        let params = default_params();
         let surviving = stats.compute_surviving_junctions(&params);
 
         // Only the first junction should survive
@@ -666,14 +665,12 @@ mod tests {
 
     #[test]
     fn test_compute_surviving_junctions_annotated_bypass() {
-        use clap::Parser;
-
         let stats = SpliceJunctionStats::new();
 
         // Annotated junction with terrible stats (should still survive)
         stats.record_junction(0, 100, 200, 1, SpliceMotif::NonCanonical, false, 1, true);
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
+        let params = default_params();
         let surviving = stats.compute_surviving_junctions(&params);
 
         assert_eq!(surviving.len(), 1);
@@ -681,7 +678,6 @@ mod tests {
 
     #[test]
     fn test_compute_surviving_matches_write_output() {
-        use clap::Parser;
         use tempfile::NamedTempFile;
 
         let stats = SpliceJunctionStats::new();
@@ -702,8 +698,7 @@ mod tests {
             chr_name: vec!["chr1".to_string()],
         };
 
-        let params = crate::params::Parameters::try_parse_from(vec!["rustar-aligner"]).unwrap();
-
+        let params = default_params();
         // compute_surviving_junctions should return same set as what write_output writes
         let surviving = stats.compute_surviving_junctions(&params);
 

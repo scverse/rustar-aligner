@@ -70,7 +70,7 @@ pub struct PairedRead {
 
 /// FASTQ reader that handles decompression and base encoding
 pub struct FastqReader {
-    inner: fastq::Reader<Box<dyn BufRead + Send>>,
+    inner: fastq::io::Reader<Box<dyn BufRead + Send>>,
 }
 
 impl FastqReader {
@@ -102,7 +102,7 @@ impl FastqReader {
             }
         };
 
-        let fastq_reader = fastq::Reader::new(reader);
+        let fastq_reader = fastq::io::Reader::new(reader);
 
         Ok(Self {
             inner: fastq_reader,
@@ -134,7 +134,7 @@ impl FastqReader {
                     .map_err(|e| {
                         Error::from(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("invalid UTF-8 in read name: {}", e),
+                            format!("invalid UTF-8 in read name: {e}"),
                         ))
                     })?
                     .to_string();
@@ -272,6 +272,7 @@ impl PairedFastqReader {
 ///
 /// # Returns
 /// Base name with mate suffix removed
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // false positive
 pub fn strip_mate_suffix(name: &str) -> String {
     // First, strip space and everything after (Illumina format)
     let name = if let Some(pos) = name.find(' ') {
@@ -671,7 +672,7 @@ mod tests {
     fn test_paired_batch_reading() {
         let mut tmpfile1 = NamedTempFile::new().unwrap();
         for i in 1..=5 {
-            writeln!(tmpfile1, "@read{}/1", i).unwrap();
+            writeln!(tmpfile1, "@read{i}/1").unwrap();
             writeln!(tmpfile1, "ACGT").unwrap();
             writeln!(tmpfile1, "+").unwrap();
             writeln!(tmpfile1, "IIII").unwrap();
@@ -680,7 +681,7 @@ mod tests {
 
         let mut tmpfile2 = NamedTempFile::new().unwrap();
         for i in 1..=5 {
-            writeln!(tmpfile2, "@read{}/2", i).unwrap();
+            writeln!(tmpfile2, "@read{i}/2").unwrap();
             writeln!(tmpfile2, "GGCC").unwrap();
             writeln!(tmpfile2, "+").unwrap();
             writeln!(tmpfile2, "JJJJ").unwrap();

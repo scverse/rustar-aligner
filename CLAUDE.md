@@ -20,15 +20,15 @@ The primary goal is a faithful port — matching the original STAR behavior as c
 Rust 2024 edition. Standard Cargo commands:
 
 ```bash
-cargo build            # Debug build
-cargo build --release  # Release build
-cargo test             # Run all tests
-cargo test <name>      # Run a single test by name
-cargo clippy           # Lint
-cargo fmt              # Format code
+cargo build                 # Debug build
+cargo build --release       # Release build
+cargo test                  # Run all tests
+cargo test <name>           # Run a single test by name
+cargo clippy --all-targets  # Lint
+cargo fmt                   # Format code
 ```
 
-Always run `cargo clippy`, `cargo fmt --check`, and `cargo test` before considering a phase complete.
+Always run `cargo clippy --all-targets`, `cargo fmt --check`, and `cargo test` before considering a phase complete.
 
 ## Current Status
 

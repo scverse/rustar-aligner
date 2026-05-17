@@ -1,5 +1,3 @@
-use clap::Parser;
-
 use rustar_aligner::cpu;
 use rustar_aligner::params::Parameters;
 
