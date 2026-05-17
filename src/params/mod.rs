@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -6,7 +5,7 @@ use clap::{CommandFactory, Parser};
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped};
+pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -303,9 +302,10 @@ pub struct Parameters {
     #[arg(long = "outSAMstrandField", default_value = "None")]
     pub out_sam_strand_field: String,
 
-    /// SAM attributes to include (Standard, All, None, or explicit list)
-    #[arg(long = "outSAMattributes", num_args = 1.., default_values_t = vec!["Standard".to_string()])]
-    pub out_sam_attributes: Vec<String>,
+    /// SAM optional-tag set (`Standard`, `All`, `None`, or any combination
+    /// of NH HI AS NM nM MD jM jI XS RG). Parsed into a bitflags struct.
+    #[command(flatten)]
+    pub out_sam_attributes: SamAttributes,
 
     /// Read group line(s) for the `@RG` SAM header. Space-separated fields;
     /// a bare `,` separates multiple RG blocks. Each block must start with `ID:`.
@@ -649,40 +649,6 @@ impl Parameters {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
     }
 
-    /// Expand `--outSAMattributes` into a set of individual tag names.
-    ///
-    /// - `"Standard"` → {NH, HI, AS, NM, nM}
-    /// - `"All"`      → {NH, HI, AS, NM, nM, MD, jM, jI, XS}
-    /// - `"None"`     → {} (empty)
-    /// - Explicit list (e.g. `["NH", "AS"]`) → collected as-is
-    ///
-    /// `RG` is auto-appended when `--outSAMattrRGline` is set (STAR behavior,
-    /// `Parameters_samAttributes.cpp:201`).
-    pub fn sam_attribute_set(&self) -> HashSet<String> {
-        let mut attrs: HashSet<String> = match self
-            .out_sam_attributes
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            ["Standard"] => ["NH", "HI", "AS", "NM", "nM"]
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            ["All"] => ["NH", "HI", "AS", "NM", "nM", "MD", "jM", "jI", "XS"]
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            ["None"] => HashSet::new(),
-            tags => tags.iter().map(ToString::to_string).collect(),
-        };
-        if self.rg_line_set() {
-            attrs.insert("RG".to_string());
-        }
-        attrs
-    }
-
     /// True if the user provided a non-default `--outSAMattrRGline`.
     pub fn rg_line_set(&self) -> bool {
         !self.out_sam_attr_rg_line.is_empty() && self.out_sam_attr_rg_line[0] != "-"
@@ -842,7 +808,7 @@ impl Parameters {
 
         let mut command = <Self as clap::CommandFactory>::command();
         let matches = command.clone().get_matches_from(args);
-        let params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
         // genomeGenerate requires FASTA files
         if params.run_mode == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {
@@ -870,10 +836,8 @@ impl Parameters {
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
-        // does NOT include RG, so only match a literal "RG" token here. Also
-        // parse the RG line to validate its ID: prefix and per-file RG count.
-        let user_wants_rg_attr = params.out_sam_attributes.iter().any(|a| a == "RG");
-        if !params.rg_line_set() && user_wants_rg_attr {
+        // does NOT include RG, so only match a literal user-supplied RG flag.
+        if params.out_sam_attributes.contains(SamAttributes::RG) && !params.rg_line_set() {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--outSAMattributes contains RG tag, but --outSAMattrRGline is not set",
@@ -882,6 +846,19 @@ impl Parameters {
         params
             .rg_ids()
             .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
+
+        // Fold runtime-derived bits into the effective attribute set so writers
+        // can read `out_sam_attributes` directly.
+        //   - Auto-emit RG whenever an RG line is configured (STAR,
+        //     `Parameters_samAttributes.cpp:201`).
+        //   - Strip XS unless `--outSAMstrandField intronMotif` is set, since
+        //     STAR only emits XS in that mode.
+        if params.rg_line_set() {
+            params.out_sam_attributes |= SamAttributes::RG;
+        }
+        if params.out_sam_strand_field != "intronMotif" {
+            params.out_sam_attributes.remove(SamAttributes::XS);
+        }
 
         // quantMode TranscriptomeSAM requires transcript annotations —
         // either via --sjdbGTFfile or pre-generated transcriptInfo.tab
@@ -944,7 +921,7 @@ mod tests {
         assert_eq!(p.out_file_name_prefix, "./");
         assert_eq!(p.out_sam_type, OutSamType::default());
         assert_eq!(p.out_sam_strand_field, "None");
-        assert_eq!(p.out_sam_attributes, vec!["Standard".to_string()]);
+        assert_eq!(p.out_sam_attributes, SamAttributes::STANDARD);
         assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
         assert_eq!(p.out_sam_mapq_unique, 255);
         assert_eq!(p.out_sam_mult_nmax, -1);
@@ -1266,7 +1243,7 @@ mod tests {
         assert!(!p.rg_line_set());
         assert_eq!(p.parsed_rg_lines().unwrap(), Vec::<String>::new());
         assert_eq!(p.rg_ids().unwrap(), Vec::<String>::new());
-        assert!(!p.sam_attribute_set().contains("RG"));
+        assert!(!p.out_sam_attributes.contains(SamAttributes::RG));
     }
 
     #[test]
@@ -1286,7 +1263,7 @@ mod tests {
             vec!["ID:foo\tSM:bar\tLB:lib1".to_string()]
         );
         assert_eq!(p.rg_ids().unwrap(), vec!["foo".to_string()]);
-        assert!(p.sam_attribute_set().contains("RG"));
+        assert!(p.out_sam_attributes.contains(SamAttributes::RG));
     }
 
     #[test]
