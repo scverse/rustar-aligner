@@ -2,7 +2,11 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+
+mod sam;
+
+pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -103,108 +107,6 @@ impl std::str::FromStr for IntronStrandFilter {
 }
 
 // ---------------------------------------------------------------------------
-// SAM output type enums
-// ---------------------------------------------------------------------------
-
-/// STAR's `--outSAMtype` format component.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum OutSamFormat {
-    #[default]
-    Sam,
-    Bam,
-    None,
-}
-
-/// STAR's `--outSAMtype` sort order component (only applies to BAM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutSamSortOrder {
-    Unsorted,
-    SortedByCoordinate,
-}
-
-/// Combined `--outSAMtype` value.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct OutSamType {
-    pub format: OutSamFormat,
-    pub sort_order: Option<OutSamSortOrder>,
-}
-
-impl std::fmt::Display for OutSamType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.format, &self.sort_order) {
-            (OutSamFormat::Sam, _) => write!(f, "SAM"),
-            (OutSamFormat::None, _) => write!(f, "None"),
-            (OutSamFormat::Bam, Some(OutSamSortOrder::SortedByCoordinate)) => {
-                write!(f, "BAM SortedByCoordinate")
-            }
-            (OutSamFormat::Bam, _) => write!(f, "BAM Unsorted"),
-        }
-    }
-}
-
-impl clap::FromArgMatches for OutSamType {
-    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
-        let mut s = Self::default();
-        s.update_from_arg_matches(matches)?;
-        Ok(s)
-    }
-
-    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
-        let Some(values) = matches.get_many::<String>("outSAMtype") else {
-            return Ok(());
-        };
-        let tokens: Vec<&str> = values.map(String::as_str).collect();
-        *self = match tokens.as_slice() {
-            ["SAM"] => Self {
-                format: OutSamFormat::Sam,
-                sort_order: None,
-            },
-            ["None"] => Self {
-                format: OutSamFormat::None,
-                sort_order: None,
-            },
-            ["BAM", "Unsorted"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::Unsorted),
-            },
-            ["BAM", "SortedByCoordinate"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::SortedByCoordinate),
-            },
-            other => {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::InvalidValue,
-                    format!(
-                        "invalid value '{}' for '--outSAMtype': expected 'SAM', 'None', 'BAM Unsorted', or 'BAM SortedByCoordinate'\n",
-                        other.join(" ")
-                    ),
-                ));
-            }
-        };
-        Ok(())
-    }
-}
-
-impl clap::Args for OutSamType {
-    fn augment_args(cmd: clap::Command) -> clap::Command {
-        cmd.arg(
-            clap::Arg::new("outSAMtype")
-                .long("outSAMtype")
-                .num_args(1..=2)
-                .default_values(["SAM"])
-                .help(
-                    "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None. \
-                     Provide as space-separated tokens, e.g. \"BAM SortedByCoordinate\".",
-                ),
-        )
-    }
-
-    fn augment_args_for_update(cmd: clap::Command) -> clap::Command {
-        Self::augment_args(cmd)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Standard output streaming
 // ---------------------------------------------------------------------------
 
@@ -253,30 +155,6 @@ impl std::str::FromStr for OutReadsUnmapped {
             _ => Err(format!(
                 "unknown outReadsUnmapped value: '{s}'; expected 'None' or 'Fastx'"
             )),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SAM unmapped output
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum OutSamUnmapped {
-    #[default]
-    None,
-    Within,
-    WithinKeepPairs,
-}
-
-impl std::str::FromStr for OutSamUnmapped {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "None" => Ok(Self::None),
-            "Within" => Ok(Self::Within),
-            "Within KeepPairs" => Ok(Self::WithinKeepPairs),
-            _ => Err(format!("unknown outSAMunmapped value: '{s}'")),
         }
     }
 }
@@ -435,8 +313,7 @@ pub struct Parameters {
     #[arg(long = "outSAMattrRGline", num_args = 1.., default_values_t = vec!["-".to_string()])]
     pub out_sam_attr_rg_line: Vec<String>,
 
-    /// Unmapped reads in SAM output: None or Within
-    #[arg(long = "outSAMunmapped", default_value = "None")]
+    #[command(flatten)]
     pub out_sam_unmapped: OutSamUnmapped,
 
     /// Output unmapped reads to FASTQ file(s): None or Fastx
@@ -943,8 +820,13 @@ impl Parameters {
     pub fn parse_from<T: Into<std::ffi::OsString> + Clone>(
         args: impl IntoIterator<Item = T>,
     ) -> Self {
-        Self::try_parse_from(args)
-            .unwrap_or_else(|e| if cfg!(test) { panic!("{e}") } else { e.exit() })
+        Self::try_parse_from(args).unwrap_or_else(|e| {
+            if cfg!(test) {
+                panic!("{e}")
+            } else {
+                e.format(&mut <Self as CommandFactory>::command()).exit()
+            }
+        })
     }
 
     /// Parse and validate parameter combinations.
@@ -1260,6 +1142,40 @@ mod tests {
 
         assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BOGUS"]).is_err());
         assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM"]).is_err());
+    }
+
+    #[test]
+    fn out_sam_unmapped_parsing() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
+
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "None"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
+
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "Within"]).unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::Within);
+
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMunmapped",
+            "Within",
+            "KeepPairs",
+        ])
+        .unwrap();
+        assert_eq!(p.out_sam_unmapped, OutSamUnmapped::WithinKeepPairs);
+
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMunmapped", "Bogus"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMunmapped",
+                "Within",
+                "Bogus"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
