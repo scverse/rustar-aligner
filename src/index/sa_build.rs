@@ -8,12 +8,17 @@
 //!    sentinel and a position tie-break. Distinct per-run sentinels (plus a
 //!    final terminal sentinel) turn STAR's order into a plain lexicographic
 //!    SA — see the project plan for the correctness argument.
-//! 2. **Standard SA construction** via `caps-sa`. For small genomes (≤
-//!    ~200 MB of transformed text) [`caps_sa::build_in_memory`] is faster;
-//!    for larger genomes [`caps_sa::build_ext_mem`] streams the SA from
-//!    disk-spilling buckets, keeping peak RAM bounded. The threshold can
-//!    be overridden by setting `RUSTAR_USE_EXT_MEM=1` (force) or
-//!    `RUSTAR_USE_EXT_MEM=0` (suppress).
+//! 2. **Standard SA construction** via `caps-sa`. The
+//!    [`caps_sa::build_ext_mem`] path is the default for production-
+//!    scale genomes (transformed text ≥ 16 MB): it streams the SA from
+//!    disk-spilling buckets and keeps peak RAM bounded at ~`O(text +
+//!    n/p)`. For smaller inputs — including the synthetic test fixtures
+//!    where bin-padding dominates the transformed text and would make
+//!    ext-mem pathologically slow — the in-memory
+//!    [`caps_sa::build_in_memory`] is used instead. Override with
+//!    `RUSTAR_USE_IN_MEM=1` (force in-mem) or `RUSTAR_USE_EXT_MEM={1,0}`
+//!    (force ext-mem on/off); see [`use_ext_mem`] for the full
+//!    decision table.
 //! 3. **Filter + pack.** Each output position from caps-sa is fed into a
 //!    streaming callback that keeps only ACGT (`≤ 3`) starts, applies
 //!    STAR's `genomeSAsparseD` stride, and packs into the `PackedArray`
@@ -155,24 +160,47 @@ pub fn build(genome: &Genome) -> Result<SuffixArray, Error> {
 
 /// Select the in-memory vs. external-memory caps-sa path.
 ///
-/// In-memory is significantly faster on small/medium inputs but holds
-/// `~4 × n × sizeof(I)` bytes of merge-sort scratch — `~200 GB` for the
-/// human genome's `n ≈ 6e9`. Phase 2b's ext-mem path handles arbitrarily
-/// repetitive inputs in proportional time via sample-sort partitioning +
-/// LCP-enhanced cascade merge, so it's safe to flip on automatically once
-/// the working set would dwarf realistic machine RAM.
+/// The external-memory path is the **default for genomes at or above
+/// `EXT_MEM_THRESHOLD_BYTES`**: it streams the SA from disk-spilling
+/// buckets and keeps peak RAM bounded at ~`O(text + n/p)` regardless of
+/// genome size. Below the threshold, the in-memory path is preferred:
+/// it's faster on tiny inputs, and ext-mem becomes pathological when
+/// the transformed text is dominated by `genomeChrBinNbits` padding
+/// (e.g. a 20 kb test fixture rounds to 256 kb of padded text, of which
+/// >90% is constant spacer bytes — `caps-sa` sorts those positions and
+/// then we filter them out, but the sort itself does `O(spacer_run_len²)`
+/// work because every spacer-starting suffix shares a near-maximal LCP
+/// with every other).
 ///
-/// Threshold below corresponds to roughly the in-memory working set hitting
-/// ~16 GB — well below any modern indexing machine's RAM. Yeast (~30 MB
-/// transformed text) and the human primary chromosomes stay in-memory;
-/// only the full human genome (and larger mammalian genomes) trip the
-/// switch. Override either way with `RUSTAR_USE_EXT_MEM={1,0}`.
+/// Explicit overrides (decision order):
+///
+/// 1. `RUSTAR_USE_IN_MEM=1` (also accepts `true`/`yes`/`on`) forces
+///    in-memory.
+/// 2. `RUSTAR_USE_EXT_MEM=1` / `=0` (also accepts the usual aliases)
+///    forces ext-mem on / off respectively. Retained for backward
+///    compatibility with the earlier opt-in flag.
+///
+/// Without overrides the threshold below decides. 16 MB transformed
+/// text places yeast (~30 MB), human primary chromosomes (~6 MB-200 MB
+/// transformed text per chromosome), and any input where the padded
+/// genome would dwarf in-memory's `~4 × n × sizeof(I)` working set on
+/// the ext-mem path; tiny synthetic test fixtures stay in-memory.
 fn use_ext_mem(text_len: usize) -> bool {
-    if let Ok(v) = std::env::var("RUSTAR_USE_EXT_MEM") {
-        return matches!(v.as_str(), "1" | "true" | "yes" | "on");
+    if let Ok(v) = std::env::var("RUSTAR_USE_IN_MEM") {
+        if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+            return false;
+        }
     }
-    const EXT_MEM_THRESHOLD_BYTES: usize = 500 * 1024 * 1024;
-    text_len > EXT_MEM_THRESHOLD_BYTES
+    if let Ok(v) = std::env::var("RUSTAR_USE_EXT_MEM") {
+        if matches!(v.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+        if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+    }
+    const EXT_MEM_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+    text_len >= EXT_MEM_THRESHOLD_BYTES
 }
 
 /// Count positions kept by STAR's `G[ii] < 4` + `--genomeSAsparseD` filter.
