@@ -41,6 +41,7 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
+caps-sa = { path = "../caps-sa" }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -49,12 +50,5 @@ predicates = "3"
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# Whole-program LTO + a single codegen unit are worth the extra build time
-# for the seed-search and DP-extension inner loops. CI overrides these via
-# `CARGO_PROFILE_RELEASE_LTO=thin` / `CODEGEN_UNITS=16` env vars to keep
-# test-matrix runtime reasonable.
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
+# Release profile moved to the workspace root (../Cargo.toml) so cargo doesn't
+# warn about per-member profile overrides being ignored.

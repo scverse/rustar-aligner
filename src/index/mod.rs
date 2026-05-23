@@ -1,5 +1,6 @@
 pub mod io;
 pub mod packed_array;
+pub mod sa_build;
 pub mod sa_index;
 pub mod suffix_array;
 
