@@ -41,7 +41,7 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
-caps-sa = { path = "../caps-sa" }
+caps-sa = "0.1"
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -50,5 +50,16 @@ predicates = "3"
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# Release profile moved to the workspace root (../Cargo.toml) so cargo doesn't
-# warn about per-member profile overrides being ignored.
+# Whole-program LTO + a single codegen unit are worth the extra build time
+# for the seed-search and DP-extension inner loops. Cargo warns about this
+# profile being shadowed when rustar-aligner is built as a workspace member
+# (the workspace root carries its own [profile.release] with the same
+# values); keeping it here means standalone clones get the same release
+# tuning even when there is no parent workspace.
+# CI overrides these via `CARGO_PROFILE_RELEASE_LTO=thin` /
+# `CODEGEN_UNITS=16` env vars to keep test-matrix runtime reasonable.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
