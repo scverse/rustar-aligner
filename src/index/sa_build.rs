@@ -75,39 +75,35 @@ pub fn build(genome: &Genome) -> Result<SuffixArray, Error> {
         SENTINEL_BASE as u32 + n_seg
     );
 
-    // (2) Filter+pack budget: STAR's iteration in `Genome_genomeGenerate.cpp`
-    //     is over the REVERSED buffer with step `gSAsparseD`, which
-    //     corresponds to original-T positions `p` with
-    //     `(2*n_genome - 1 - p) % gSAsparseD == 0`. With the default
-    //     `gSAsparseD = 1` (rustar-aligner currently uses the default) the
-    //     stride collapses to "every ACGT position." A non-1 stride is a
-    //     future addition once `params.genome_sa_sparse_d` is threaded
-    //     through.
+    // (2) Build the kept-positions list once. STAR's iteration in
+    //     `Genome_genomeGenerate.cpp` is over the REVERSED buffer with
+    //     step `gSAsparseD`, which corresponds to original-T positions
+    //     `p` with `(2*n_genome - 1 - p) % gSAsparseD == 0`. With the
+    //     default `gSAsparseD = 1` (rustar-aligner currently uses the
+    //     default) the stride collapses to "every ACGT position." A
+    //     non-1 stride is a future addition once
+    //     `params.genome_sa_sparse_d` is threaded through.
+    //
+    //     We hand this exact subset to caps-sa's `_for_positions` APIs so
+    //     the sort never touches the N / spacer / terminal-sentinel
+    //     suffixes — the old "filter at emit time" shape made caps-sa do
+    //     `O(spacer_run_len²)` work on padded test fixtures before
+    //     discarding the results.
     let _ = n_seg;
     let sparse_d: u64 = 1;
-    let n_sa_kept = count_kept_positions(&genome.sequence[..n2], sparse_d);
+    let positions: Vec<u64> = build_kept_positions(&genome.sequence[..n2], sparse_d);
+    let n_sa_kept = positions.len();
     log::info!("sa_build: {n_sa_kept} entries after ACGT + sparse-d={sparse_d} filter");
 
     let mut data = PackedArray::new(word_length, n_sa_kept);
     let n_genome_u64 = n_genome as u64;
-    let n2_minus_one = n2 as u64 - 1;
     let mut out_idx: usize = 0;
 
-    // The packer is shared between the in-memory and ext-mem paths. It
-    // consumes SA entries one at a time in lex order and writes the
-    // strand-bit-encoded packed values into `data`.
+    // The packer is shared between the in-memory and ext-mem paths. With
+    // the `_for_positions` API every emitted position is already kept,
+    // so the only work here is the strand-bit encoding.
     let mut pack_one = |sa_pos: u64| {
-        let p = sa_pos as usize;
-        if p == n2 {
-            return; // terminal sentinel
-        }
-        if genome.sequence[p] >= 4 {
-            return; // N or spacer — STAR's `G[ii] < 4` filter
-        }
-        if sparse_d != 1 && !(n2_minus_one - sa_pos).is_multiple_of(sparse_d) {
-            return;
-        }
-        let packed_value = if p < n_genome {
+        let packed_value = if (sa_pos as usize) < n_genome {
             sa_pos
         } else {
             (sa_pos - n_genome_u64) | n2_bit
@@ -116,28 +112,29 @@ pub fn build(genome: &Genome) -> Result<SuffixArray, Error> {
         out_idx += 1;
     };
 
-    // (3) Standard SA over the transformed text via caps-sa.
+    // (3) Standard SA over the kept positions of the transformed text
+    //     via caps-sa.
     if use_ext_mem(t_prime.len()) {
         log::info!(
-            "sa_build: invoking caps-sa::build_ext_mem (text len {})",
+            "sa_build: invoking caps-sa::build_ext_mem_for_positions (text len {}, {n_sa_kept} positions)",
             t_prime.len()
         );
         let opts = caps_sa::ExtMemOpts {
             work_dir: std::env::temp_dir(),
             ..Default::default()
         };
-        caps_sa::build_ext_mem(&t_prime, &opts, |sa_pos| {
+        caps_sa::build_ext_mem_for_positions(&t_prime, positions, &opts, |sa_pos| {
             pack_one(sa_pos);
             Ok(())
         })
-        .map_err(|e| Error::Index(format!("caps-sa::build_ext_mem failed: {e}")))?;
+        .map_err(|e| Error::Index(format!("caps-sa::build_ext_mem_for_positions failed: {e}")))?;
         drop(t_prime);
     } else {
         log::info!(
-            "sa_build: invoking caps-sa::build_in_memory (text len {})",
+            "sa_build: invoking caps-sa::build_in_memory_for_positions (text len {}, {n_sa_kept} positions)",
             t_prime.len()
         );
-        let sa: Vec<u64> = caps_sa::build_in_memory(&t_prime);
+        let sa: Vec<u64> = caps_sa::build_in_memory_for_positions(&t_prime, positions);
         // Free the transformed text early — only `data` and `genome` are
         // read from this point on.
         drop(t_prime);
@@ -203,16 +200,25 @@ fn use_ext_mem(text_len: usize) -> bool {
     text_len >= EXT_MEM_THRESHOLD_BYTES
 }
 
-/// Count positions kept by STAR's `G[ii] < 4` + `--genomeSAsparseD` filter.
-fn count_kept_positions(text: &[u8], sparse_d: u64) -> usize {
+/// Build the kept-position list for STAR's `G[ii] < 4` +
+/// `--genomeSAsparseD` filter, in ascending order.
+///
+/// The returned positions are exactly the set of `p ∈ [0, n2)` that
+/// STAR would emit a packed SA entry for: bases ACGT only (≤ 3 in the
+/// pre-transform alphabet) and, when `sparse_d > 1`, only positions
+/// whose distance from the reversed-buffer tail is a multiple of
+/// `sparse_d`. caps-sa's `*_for_positions` API takes this list and
+/// skips sorting the N / spacer / terminal-sentinel suffixes
+/// entirely.
+fn build_kept_positions(text: &[u8], sparse_d: u64) -> Vec<u64> {
     let n2 = text.len();
     if sparse_d == 1 {
-        text.iter().filter(|&&b| b < 4).count()
+        (0..n2 as u64).filter(|&p| text[p as usize] < 4).collect()
     } else {
         let n2_minus_one = n2 as u64 - 1;
         (0..n2 as u64)
             .filter(|&p| text[p as usize] < 4 && (n2_minus_one - p).is_multiple_of(sparse_d))
-            .count()
+            .collect()
     }
 }
 
