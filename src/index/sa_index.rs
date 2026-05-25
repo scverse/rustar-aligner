@@ -1,7 +1,14 @@
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rayon::prelude::*;
+
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::index::packed_array::PackedArray;
 use crate::index::suffix_array::SuffixArray;
+
 
 /// SA index for fast k-mer lookup during binary search.
 ///
@@ -44,6 +51,230 @@ impl SaIndex {
         (power - 4) / 3
     }
 
+    /// Parallel SAindex build from a memory-mapped SA byte buffer.
+    ///
+    /// The streaming `genomeGenerate` path writes the SA to disk via
+    /// [`PackedStreamWriter`][crate::index::packed_stream::PackedStreamWriter]
+    /// and then calls this entry. caps-sa's emit no longer touches
+    /// the SAindex, so the ~16 min of per-emit serial k-mer work
+    /// that previously sat on top of caps-sa's parallel SA build is
+    /// replaced by a single parallel pass here.
+    ///
+    /// ## Algorithm
+    ///
+    /// For each k-mer slot `(k, kmer_idx)` we want the **smallest**
+    /// `sa_idx` whose suffix starts with that k-mer (which is the
+    /// "first occurrence" in lex order). The sequential algorithm
+    /// processes SA entries in order and only writes if the slot is
+    /// still "absent"; we generalise to parallel by using
+    /// `AtomicU64::fetch_min` over a temporary `Vec<AtomicU64>` of
+    /// length `num_indices` (~358 M entries × 8 B = ~2.86 GB on
+    /// the human genome). Each rayon worker takes a contiguous
+    /// chunk of SA indices; per-entry it decodes the packed value
+    /// from `sa_bytes` (read via [`read_packed_entry`] — same bit
+    /// layout as [`PackedArray::read`]), computes the genome offset,
+    /// extracts k-mers incrementally (one base read per k, break on
+    /// N) and atomic-min's `sa_idx` into the slot.
+    ///
+    /// After all workers finish, a final sequential pass walks the
+    /// `firsts[]` array and packs each entry into the
+    /// [`PackedArray`] SAindex output (`u64::MAX` sentinel →
+    /// `absent_marker`, else → `sa_idx`).
+    ///
+    /// ## Memory
+    ///
+    /// - `firsts: Vec<AtomicU64>`: ~2.86 GB transient.
+    /// - `PackedArray` output: ~1.5 GB (kept).
+    /// - SA bytes: not in process RSS (kernel page cache, mmap'd).
+    /// - `genome.sequence`: shared with the caller, ~6.3 GB.
+    pub fn build_parallel(
+        genome: &Genome,
+        sa_file: &File,
+        sa_word_length: u32,
+        gstrand_bit: u32,
+        gstrand_mask: u64,
+        n_entries: usize,
+        nbases: u32,
+    ) -> Result<Self, Error> {
+        let sai_word_length = gstrand_bit + 3;
+        let mut genome_sa_index_start = vec![0u64; (nbases + 1) as usize];
+        for k in 1..=nbases {
+            genome_sa_index_start[k as usize] =
+                genome_sa_index_start[(k - 1) as usize] + 4u64.pow(k);
+        }
+        let num_indices = Self::calculate_num_indices(nbases) as usize;
+        log::info!(
+            "Building SA index in parallel: nbases={nbases}, num_indices={num_indices}, \
+             n_entries={n_entries}, threads={}",
+            rayon::current_num_threads()
+        );
+
+        // Sentinel `u64::MAX` means "no SA index has reached this
+        // k-mer yet". `fetch_min` makes any real `sa_idx` smaller
+        // than the sentinel, so the first thread to touch a slot
+        // wins; subsequent threads only narrow the value to the
+        // smallest sa_idx seen across all workers. Total order is
+        // monotonic, so the final value is exactly the
+        // first-in-lex-order `sa_idx`.
+        let firsts: Vec<AtomicU64> = (0..num_indices)
+            .into_par_iter()
+            .map(|_| AtomicU64::new(u64::MAX))
+            .collect();
+
+        let sa_mask: u64 = if sa_word_length == 64 {
+            u64::MAX
+        } else {
+            (1u64 << sa_word_length) - 1
+        };
+        let n_genome = genome.n_genome as usize;
+        let genome_seq: &[u8] = &genome.sequence;
+
+        // Chunk by entries — each worker reads a contiguous byte
+        // range from `sa_file` via `read_at` (= pread; thread-safe
+        // on a shared `&File`). This avoids `memmap2::Mmap`, whose
+        // touched pages get counted in process RSS (`RssFile`); a
+        // 24 GB SA would push the peak up by 24 GB. `read_at` just
+        // hits the kernel page cache, which is kernel-side memory
+        // and **not** counted in the process's resident set.
+        //
+        // Chunk size is 1 M entries (~4 MB at 33-bit `word_length`),
+        // giving 32 × 4 MB ≈ 128 MB of in-flight per-worker buffer
+        // peak. Picking too small a chunk amplifies the per-task
+        // overhead (the SAindex inner loop only does ~14 work units
+        // per entry); too large blows up the buffer per worker.
+        const ENTRIES_PER_CHUNK: usize = 1 << 20;
+        let n_chunks = n_entries.div_ceil(ENTRIES_PER_CHUNK);
+
+        (0..n_chunks)
+            .into_par_iter()
+            .try_for_each(|chunk_idx| -> std::io::Result<()> {
+                let chunk_start = chunk_idx * ENTRIES_PER_CHUNK;
+                let chunk_end = (chunk_start + ENTRIES_PER_CHUNK).min(n_entries);
+                let chunk_n = chunk_end - chunk_start;
+
+                // Bit and byte ranges in the SA file covered by this
+                // chunk's entries. The first entry may start
+                // mid-byte (`start_bit_shift > 0`); we include the
+                // partial start byte and pad the read by 8 bytes
+                // so the 8-byte LE load at the last entry never
+                // goes out of bounds.
+                let start_bit = chunk_start as u64 * sa_word_length as u64;
+                let end_bit = chunk_end as u64 * sa_word_length as u64;
+                let start_byte = start_bit / 8;
+                let start_bit_shift = (start_bit % 8) as u32;
+                let end_byte_excl = end_bit.div_ceil(8);
+                let bytes_to_read = (end_byte_excl - start_byte) as usize + 8;
+                let mut buf = vec![0u8; bytes_to_read];
+                // read_at may return short reads near EOF — that's
+                // fine because we pre-zeroed `buf`. The +8 padding
+                // bytes don't exist on disk and stay zero, matching
+                // what `PackedArray::data_byte_len_for`'s `+ 8`
+                // would have given an in-RAM PackedArray.
+                let _ = sa_file.read_at(&mut buf, start_byte)?;
+
+                for i in 0..chunk_n {
+                    let local_bit =
+                        i as u64 * sa_word_length as u64 + start_bit_shift as u64;
+                    let local_byte = (local_bit / 8) as usize;
+                    let local_shift = (local_bit % 8) as u32;
+                    let bytes: &[u8; 8] = (&buf[local_byte..local_byte + 8])
+                        .try_into()
+                        .expect("padded buf must have 8 bytes at every entry's start");
+                    let word = u64::from_le_bytes(*bytes);
+                    let packed = (word >> local_shift) & sa_mask;
+
+                    let pos = packed & gstrand_mask;
+                    let is_reverse = (packed >> gstrand_bit) != 0;
+                    let genome_pos = if is_reverse {
+                        pos as usize + n_genome
+                    } else {
+                        pos as usize
+                    };
+                    let sa_idx = chunk_start + i;
+
+                    let mut kmer_idx: u64 = 0;
+                    for k in 1..=nbases {
+                        if genome_pos + (k as usize) > genome_seq.len() {
+                            break;
+                        }
+                        let next_base = genome_seq[genome_pos + (k - 1) as usize];
+                        if next_base >= 4 {
+                            break;
+                        }
+                        kmer_idx = (kmer_idx << 2) | (next_base as u64);
+                        let sai_pos = genome_sa_index_start[(k - 1) as usize] + kmer_idx;
+                        firsts[sai_pos as usize].fetch_min(sa_idx as u64, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|e| Error::Index(format!("pread during SAindex build: {e}")))?;
+
+        // Final sequential pack into the output `PackedArray`. The
+        // `+8`-byte pad at the end of the buffer is reserved by
+        // `PackedArray::new`. Per-slot work is ~10 ns × 358 M ≈
+        // 3.6 s on the human genome — negligible vs. the parallel
+        // scan.
+        let mut data = PackedArray::new(sai_word_length, num_indices);
+        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
+        for (i, slot) in firsts.iter().enumerate() {
+            let v = slot.load(Ordering::Relaxed);
+            if v == u64::MAX {
+                data.write(i, absent_marker);
+            } else {
+                data.write(i, v);
+            }
+        }
+        drop(firsts);
+
+        Ok(SaIndex {
+            nbases,
+            genome_sa_index_start,
+            data,
+            word_length: sai_word_length,
+            gstrand_bit,
+        })
+    }
+
+    /// Streaming builder: accepts (sa_idx, packed_value) pairs in SA
+    /// order and updates the per-k-mer first-occurrence entries
+    /// online. Used by the streaming `genomeGenerate` path so the
+    /// 25 GB SA `PackedArray` never has to be materialised in RAM —
+    /// caps-sa emits each entry, the SA file writer takes one copy,
+    /// and this builder takes another (a few bytes per emit).
+    ///
+    /// Holds a shared reference to `genome` for the k-mer extraction
+    /// `genome.sequence[genome_pos..]` reads.
+    pub fn streaming_builder<'a>(
+        genome: &'a Genome,
+        gstrand_bit: u32,
+        gstrand_mask: u64,
+        nbases: u32,
+    ) -> SaIndexBuilder<'a> {
+        let word_length = gstrand_bit + 3;
+        let mut genome_sa_index_start = vec![0u64; (nbases + 1) as usize];
+        for k in 1..=nbases {
+            genome_sa_index_start[k as usize] =
+                genome_sa_index_start[(k - 1) as usize] + 4u64.pow(k);
+        }
+        let num_indices = Self::calculate_num_indices(nbases);
+        let mut data = PackedArray::new(word_length, num_indices as usize);
+        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
+        for i in 0..num_indices as usize {
+            data.write(i, absent_marker);
+        }
+        SaIndexBuilder {
+            nbases,
+            word_length,
+            gstrand_bit,
+            gstrand_mask,
+            genome_sa_index_start,
+            data,
+            genome,
+            sa_idx: 0,
+        }
+    }
+
     /// Build SA index from genome and sorted suffix array.
     ///
     /// # Arguments
@@ -76,57 +307,38 @@ impl SaIndex {
             data.write(i, absent_marker);
         }
 
-        // Iterate through SA and record first occurrence of each k-mer
+        // Iterate through SA and record first occurrence of each k-mer.
+        // Inner k-loop maintains `kmer_idx` **incrementally** — one
+        // base read per k iteration (vs. the original `O(k²)` read
+        // pattern that re-scanned the prefix for every k). When an N
+        // is encountered at position `genome_pos + (k - 1)` we
+        // `break` rather than `continue`: every longer k-mer at this
+        // same `genome_pos` necessarily includes that N too.
         for sa_idx in 0..sa.len() {
             let sa_entry = sa.get(sa_idx);
             let (pos, is_reverse) = sa.decode(sa_entry);
-
-            // Adjust for strand
             let genome_pos = if is_reverse {
                 pos as usize + genome.n_genome as usize
             } else {
                 pos as usize
             };
 
-            // Extract k-mers of all lengths up to nbases
+            let mut kmer_idx: u64 = 0;
             for k in 1..=nbases {
                 if genome_pos + (k as usize) > genome.sequence.len() {
                     break;
                 }
-
-                // Build k-mer index
-                let mut kmer_idx = 0u64;
-                let mut has_n = false;
-
-                for offset in 0..k {
-                    let base = genome.sequence[genome_pos + offset as usize];
-                    if base >= 4 {
-                        // N or padding
-                        has_n = true;
-                        break;
-                    }
-                    kmer_idx = (kmer_idx << 2) | (base as u64);
+                let next_base = genome.sequence[genome_pos + (k - 1) as usize];
+                if next_base >= 4 {
+                    break;
                 }
+                kmer_idx = (kmer_idx << 2) | (next_base as u64);
 
-                if has_n {
-                    continue; // Skip k-mers containing N
-                }
-
-                // Calculate index in SAindex array
                 let sai_pos = genome_sa_index_start[(k - 1) as usize] + kmer_idx;
-
-                // Check if this k-mer hasn't been seen yet
                 let current_entry = data.read(sai_pos as usize);
                 let is_absent = (current_entry >> (gstrand_bit + 2)) & 1 != 0;
-
                 if is_absent {
-                    // Record first occurrence
-                    let entry = sa_idx as u64;
-
-                    // Set "contains N" flag if needed (already checked, so clear)
-                    // Set "prefix absent" flag to 0 (present)
-
-                    data.write(sai_pos as usize, entry);
+                    data.write(sai_pos as usize, sa_idx as u64);
                 }
             }
         }
@@ -139,7 +351,87 @@ impl SaIndex {
             gstrand_bit,
         })
     }
+}
 
+/// Online accumulator for [`SaIndex`]'s per-k-mer first-occurrence
+/// entries. See [`SaIndex::streaming_builder`] for the constructor;
+/// feed each emitted SA entry through [`SaIndexBuilder::add`] in SA
+/// order, then call [`SaIndexBuilder::finish`] to obtain the
+/// [`SaIndex`].
+///
+/// The streaming `genomeGenerate` path interleaves this with the
+/// on-disk SA writer: each caps-sa emit goes to both, and the
+/// 25 GB-class SA `PackedArray` is never materialised in RAM.
+pub struct SaIndexBuilder<'a> {
+    nbases: u32,
+    word_length: u32,
+    gstrand_bit: u32,
+    gstrand_mask: u64,
+    genome_sa_index_start: Vec<u64>,
+    data: PackedArray,
+    genome: &'a Genome,
+    /// 0-based index of the next entry to be added. Updated by
+    /// [`add`][Self::add] after each call.
+    sa_idx: usize,
+}
+
+impl<'a> SaIndexBuilder<'a> {
+    /// Feed the next SA entry (the strand-bit-encoded packed value,
+    /// exactly what would be at `SuffixArray::get(self.sa_idx())`).
+    /// Updates the first-occurrence entry of every k-mer of length
+    /// 1..=nbases that starts at the SA entry's genome position,
+    /// matching the body of [`SaIndex::build`]'s main loop.
+    pub fn add(&mut self, packed_value: u64) {
+        let pos = packed_value & self.gstrand_mask;
+        let is_reverse = (packed_value >> self.gstrand_bit) != 0;
+        let genome_pos = if is_reverse {
+            pos as usize + self.genome.n_genome as usize
+        } else {
+            pos as usize
+        };
+
+        // Incremental k-mer index: one base read per k, break on N.
+        // See the matching loop in `SaIndex::build` for the
+        // correctness argument.
+        let mut kmer_idx: u64 = 0;
+        for k in 1..=self.nbases {
+            if genome_pos + (k as usize) > self.genome.sequence.len() {
+                break;
+            }
+            let next_base = self.genome.sequence[genome_pos + (k - 1) as usize];
+            if next_base >= 4 {
+                break;
+            }
+            kmer_idx = (kmer_idx << 2) | (next_base as u64);
+
+            let sai_pos = self.genome_sa_index_start[(k - 1) as usize] + kmer_idx;
+            let current_entry = self.data.read(sai_pos as usize);
+            let is_absent = (current_entry >> (self.gstrand_bit + 2)) & 1 != 0;
+            if is_absent {
+                self.data.write(sai_pos as usize, self.sa_idx as u64);
+            }
+        }
+        self.sa_idx += 1;
+    }
+
+    /// Number of entries fed so far.
+    pub fn len(&self) -> usize {
+        self.sa_idx
+    }
+
+    /// Finalise the builder into a [`SaIndex`].
+    pub fn finish(self) -> SaIndex {
+        SaIndex {
+            nbases: self.nbases,
+            genome_sa_index_start: self.genome_sa_index_start,
+            data: self.data,
+            word_length: self.word_length,
+            gstrand_bit: self.gstrand_bit,
+        }
+    }
+}
+
+impl SaIndex {
     /// Hierarchical SAindex lookup (STAR's maxMappableLength2strands approach).
     ///
     /// Starts with full k-mer at level min(k, nbases), progressively shortens

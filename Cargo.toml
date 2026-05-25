@@ -41,7 +41,22 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
-caps-sa = "0.2"
+caps-sa = "0.5"
+# mimalloc as the global allocator. Two reasons:
+#   1. **Memory return**: glibc malloc creates one arena per worker
+#      thread (rayon spawns ~num_cpus workers + sub-threads) and
+#      caches freed allocations in those arenas indefinitely. On
+#      genome-scale runs that adds 10-20 GB of allocator slack to
+#      peak RSS for no good reason. mimalloc's per-thread heaps
+#      release whole segments back to the OS when threads abandon
+#      them, so the cache size stays bounded.
+#   2. **Speed**: mimalloc has lower per-allocation cost than
+#      glibc's, which adds up on the millions of small allocations
+#      caps-sa makes during phase 1 / phase 4.
+# `default-features = false` skips the secure / debug builds (no
+# extra cost in release, but the default features add a few hundred
+# kB of fast-path stubs we don't need).
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2"
