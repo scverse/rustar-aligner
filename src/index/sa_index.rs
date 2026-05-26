@@ -51,42 +51,61 @@ impl SaIndex {
         (power - 4) / 3
     }
 
-    /// Parallel SAindex build from a memory-mapped SA byte buffer.
+    /// Parallel SAindex build from the on-disk SA file, using STAR's
+    /// `isaStep + binary search` skip algorithm inside each worker.
     ///
-    /// The streaming `genomeGenerate` path writes the SA to disk via
-    /// [`PackedStreamWriter`][crate::index::packed_stream::PackedStreamWriter]
-    /// and then calls this entry. caps-sa's emit no longer touches
-    /// the SAindex, so the ~16 min of per-emit serial k-mer work
-    /// that previously sat on top of caps-sa's parallel SA build is
-    /// replaced by a single parallel pass here.
+    /// ## Algorithm — STAR's `genomeSAindex.cpp::genomeSAindexChunk`
     ///
-    /// ## Algorithm
+    /// The SA is sorted lex, so consecutive `SA[isa]` entries share
+    /// monotonically non-decreasing k-mer prefixes. STAR walks the
+    /// SA with two ideas:
     ///
-    /// For each k-mer slot `(k, kmer_idx)` we want the **smallest**
-    /// `sa_idx` whose suffix starts with that k-mer (which is the
-    /// "first occurrence" in lex order). The sequential algorithm
-    /// processes SA entries in order and only writes if the slot is
-    /// still "absent"; we generalise to parallel by using
-    /// `AtomicU64::fetch_min` over a temporary `Vec<AtomicU64>` of
-    /// length `num_indices` (~358 M entries × 8 B = ~2.86 GB on
-    /// the human genome). Each rayon worker takes a contiguous
-    /// chunk of SA indices; per-entry it decodes the packed value
-    /// from `sa_bytes` (read via [`read_packed_entry`] — same bit
-    /// layout as [`PackedArray::read`]), computes the genome offset,
-    /// extracts k-mers incrementally (one base read per k, break on
-    /// N) and atomic-min's `sa_idx` into the slot.
+    /// 1. **Boundaries only**: keep `ind0[iL]` = the last-written
+    ///    k-mer index at each level. When the k-mer at `SA[isa]`
+    ///    has `indPref[iL] > ind0[iL]`, record `isa` at slot
+    ///    `start[iL] + indPref[iL]` and update `ind0[iL]`.
+    /// 2. **Skip identical runs**: `isaStep = nSA / 4^nbases` (≈ 22
+    ///    on the human genome). Jump forward by `isaStep`; if the
+    ///    full k-mer didn't change, keep jumping; if it did,
+    ///    binary-search the boundary inside the last `isaStep`
+    ///    window. Total visited entries ≈ number of distinct
+    ///    k-mers × `O(log isaStep)`, not `nSA × nbases` — typically
+    ///    **20-30× less work** than scanning every entry.
     ///
-    /// After all workers finish, a final sequential pass walks the
-    /// `firsts[]` array and packs each entry into the
-    /// [`PackedArray`] SAindex output (`u64::MAX` sentinel →
-    /// `absent_marker`, else → `sa_idx`).
+    /// ## Parallelisation
+    ///
+    /// Each worker owns a chunk `[chunk_start, chunk_end)` of SA
+    /// indices and runs STAR's algorithm *locally* over its range
+    /// with its own `ind0_local[iL]`. Cross-chunk merge uses
+    /// `AtomicU64::fetch_min` on a shared `Vec<AtomicU64>` of length
+    /// `num_indices`: the smallest `sa_idx` seen across all chunks
+    /// wins.
+    ///
+    /// Chunk boundary handling: a chunk's `ind0_local[iL]` starts at
+    /// `None` (no kmer written *in this chunk*). The first iteration
+    /// always writes — the resulting slot may also be written by the
+    /// previous chunk's last iteration, but `fetch_min` picks the
+    /// earlier `sa_idx` so the answer is the same as the serial
+    /// algorithm.
+    ///
+    /// ## Phase 2: gap-fill with `next_isa | absent_mask`
+    ///
+    /// After the parallel pass, `firsts[]` has present slots set to
+    /// the first-occurrence `sa_idx` and absent slots still at
+    /// `u64::MAX`. A sequential **backward** pass per SAindex level
+    /// (level = `[start[iL], start[iL] + 4^(iL+1))`) replaces each
+    /// absent slot with `next_present_sa_idx | absent_mask`,
+    /// matching STAR's encoding. Tail-gaps (after the last present
+    /// slot of a level) get `n_entries | absent_mask`.
     ///
     /// ## Memory
     ///
-    /// - `firsts: Vec<AtomicU64>`: ~2.86 GB transient.
-    /// - `PackedArray` output: ~1.5 GB (kept).
-    /// - SA bytes: not in process RSS (kernel page cache, mmap'd).
-    /// - `genome.sequence`: shared with the caller, ~6.3 GB.
+    /// - `firsts: Vec<AtomicU64>`: ~2.86 GB transient (358 M × 8 B
+    ///   on the human genome). Reused in-place during gap-fill, then
+    ///   dropped after encoding into the output `PackedArray`.
+    /// - Per-worker pread buffer: ~4 MB.
+    /// - Output `PackedArray`: ~1.5 GB (kept).
+    /// - SA bytes: kernel page cache (chunked `pread`), not process RSS.
     pub fn build_parallel(
         genome: &Genome,
         sa_file: &File,
@@ -103,19 +122,24 @@ impl SaIndex {
                 genome_sa_index_start[(k - 1) as usize] + 4u64.pow(k);
         }
         let num_indices = Self::calculate_num_indices(nbases) as usize;
+        let absent_mask: u64 = 1u64 << (gstrand_bit + 2);
+
+        // `isaStep` from STAR: `nSA / 4^nbases`. With 5.9 B SA entries
+        // and `nbases = 14`, this is ~22 — i.e. on average we expect
+        // ~22 consecutive SA entries to share their full 14-mer (and
+        // can be skipped over). Clamp to ≥ 1 to keep the loop
+        // well-formed when `nSA < 4^nbases`.
+        let isa_step = (n_entries / (1usize << (2 * nbases as usize))).max(1);
         log::info!(
             "Building SA index in parallel: nbases={nbases}, num_indices={num_indices}, \
-             n_entries={n_entries}, threads={}",
+             n_entries={n_entries}, isa_step={isa_step}, threads={}",
             rayon::current_num_threads()
         );
 
-        // Sentinel `u64::MAX` means "no SA index has reached this
-        // k-mer yet". `fetch_min` makes any real `sa_idx` smaller
-        // than the sentinel, so the first thread to touch a slot
-        // wins; subsequent threads only narrow the value to the
-        // smallest sa_idx seen across all workers. Total order is
-        // monotonic, so the final value is exactly the
-        // first-in-lex-order `sa_idx`.
+        // Sentinel `u64::MAX` for "no `sa_idx` has reached this slot
+        // yet". `fetch_min` makes any real `sa_idx` smaller than the
+        // sentinel, so the first chunk to write wins — and across
+        // chunks, the smallest `sa_idx` wins.
         let firsts: Vec<AtomicU64> = (0..num_indices)
             .into_par_iter()
             .map(|_| AtomicU64::new(u64::MAX))
@@ -129,19 +153,13 @@ impl SaIndex {
         let n_genome = genome.n_genome as usize;
         let genome_seq: &[u8] = &genome.sequence;
 
-        // Chunk by entries — each worker reads a contiguous byte
-        // range from `sa_file` via `read_at` (= pread; thread-safe
-        // on a shared `&File`). This avoids `memmap2::Mmap`, whose
-        // touched pages get counted in process RSS (`RssFile`); a
-        // 24 GB SA would push the peak up by 24 GB. `read_at` just
-        // hits the kernel page cache, which is kernel-side memory
-        // and **not** counted in the process's resident set.
-        //
-        // Chunk size is 1 M entries (~4 MB at 33-bit `word_length`),
-        // giving 32 × 4 MB ≈ 128 MB of in-flight per-worker buffer
-        // peak. Picking too small a chunk amplifies the per-task
-        // overhead (the SAindex inner loop only does ~14 work units
-        // per entry); too large blows up the buffer per worker.
+        // Chunk size: 1 M entries per worker. STAR's algorithm
+        // visits at most ~chunk_size / isa_step boundaries per chunk
+        // (plus `log isa_step` binary-search probes each), and each
+        // boundary touches `genome.sequence` once. Larger chunks
+        // grow the per-worker pread buffer (~4 MB at 33-bit packed
+        // words for 1 M entries); smaller chunks amortise the pread
+        // setup over fewer boundaries.
         const ENTRIES_PER_CHUNK: usize = 1 << 20;
         let n_chunks = n_entries.div_ceil(ENTRIES_PER_CHUNK);
 
@@ -151,13 +169,13 @@ impl SaIndex {
                 let chunk_start = chunk_idx * ENTRIES_PER_CHUNK;
                 let chunk_end = (chunk_start + ENTRIES_PER_CHUNK).min(n_entries);
                 let chunk_n = chunk_end - chunk_start;
+                if chunk_n == 0 {
+                    return Ok(());
+                }
 
-                // Bit and byte ranges in the SA file covered by this
-                // chunk's entries. The first entry may start
-                // mid-byte (`start_bit_shift > 0`); we include the
-                // partial start byte and pad the read by 8 bytes
-                // so the 8-byte LE load at the last entry never
-                // goes out of bounds.
+                // Pre-read the chunk's SA byte range. `read_at` is
+                // thread-safe pread; the +8-byte tail padding makes
+                // every entry's 8-byte LE load safe.
                 let start_bit = chunk_start as u64 * sa_word_length as u64;
                 let end_bit = chunk_end as u64 * sa_word_length as u64;
                 let start_byte = start_bit / 8;
@@ -165,24 +183,30 @@ impl SaIndex {
                 let end_byte_excl = end_bit.div_ceil(8);
                 let bytes_to_read = (end_byte_excl - start_byte) as usize + 8;
                 let mut buf = vec![0u8; bytes_to_read];
-                // read_at may return short reads near EOF — that's
-                // fine because we pre-zeroed `buf`. The +8 padding
-                // bytes don't exist on disk and stay zero, matching
-                // what `PackedArray::data_byte_len_for`'s `+ 8`
-                // would have given an in-RAM PackedArray.
                 let _ = sa_file.read_at(&mut buf, start_byte)?;
 
-                for i in 0..chunk_n {
-                    let local_bit =
-                        i as u64 * sa_word_length as u64 + start_bit_shift as u64;
+                // Read packed value at chunk-local index `i`
+                // (`0..chunk_n`).
+                let read_packed = |i: usize| -> u64 {
+                    let local_bit = i as u64 * sa_word_length as u64 + start_bit_shift as u64;
                     let local_byte = (local_bit / 8) as usize;
                     let local_shift = (local_bit % 8) as u32;
                     let bytes: &[u8; 8] = (&buf[local_byte..local_byte + 8])
                         .try_into()
                         .expect("padded buf must have 8 bytes at every entry's start");
                     let word = u64::from_le_bytes(*bytes);
-                    let packed = (word >> local_shift) & sa_mask;
+                    (word >> local_shift) & sa_mask
+                };
 
+                // STAR's `funCalcSAiFromSA`: compute the full
+                // `nbases`-long k-mer at chunk-local index `i`, plus
+                // the level `iL4` where the first N (if any) appears.
+                // If no N: `iL4 = -1`, the k-mer is fully defined.
+                // If N at level `iL4`: the returned k-mer has zeros
+                // in positions `iL4..nbases` (i.e. only the
+                // `iL4`-long prefix is valid).
+                let calc_kmer = |i: usize| -> (u64, i32) {
+                    let packed = read_packed(i);
                     let pos = packed & gstrand_mask;
                     let is_reverse = (packed >> gstrand_bit) != 0;
                     let genome_pos = if is_reverse {
@@ -190,40 +214,165 @@ impl SaIndex {
                     } else {
                         pos as usize
                     };
-                    let sa_idx = chunk_start + i;
-
-                    let mut kmer_idx: u64 = 0;
-                    for k in 1..=nbases {
-                        if genome_pos + (k as usize) > genome_seq.len() {
-                            break;
+                    let mut kmer: u64 = 0;
+                    for ii in 0..nbases as usize {
+                        if genome_pos + ii >= genome_seq.len() {
+                            // Treat past-end as an N for early-break
+                            // purposes. Suffix has fewer than nbases
+                            // comparable bases.
+                            return (kmer << (2 * (nbases as usize - ii)), ii as i32);
                         }
-                        let next_base = genome_seq[genome_pos + (k - 1) as usize];
-                        if next_base >= 4 {
-                            break;
+                        let g = genome_seq[genome_pos + ii];
+                        if g >= 4 {
+                            return (kmer << (2 * (nbases as usize - ii)), ii as i32);
                         }
-                        kmer_idx = (kmer_idx << 2) | (next_base as u64);
-                        let sai_pos = genome_sa_index_start[(k - 1) as usize] + kmer_idx;
-                        firsts[sai_pos as usize].fetch_min(sa_idx as u64, Ordering::Relaxed);
+                        kmer = (kmer << 2) | (g as u64);
                     }
+                    (kmer, -1)
+                };
+
+                // STAR's `funSAiFindNextIndex`: jump forward by
+                // `isa_step` while `(indFull, iL4)` is unchanged;
+                // when it changes, binary-search the boundary inside
+                // the last `isa_step` window. Returns the chunk-local
+                // index of the first entry where `(indFull, iL4)`
+                // differs from the input, plus its `(indFull, iL4)`.
+                // Returns `chunk_n` if no change is found in this
+                // chunk.
+                let find_next = |i: usize,
+                                 ind_full_prev: u64,
+                                 il4_prev: i32|
+                 -> (usize, u64, i32) {
+                    let mut next_i = i + isa_step;
+                    let mut next_kmer = 0u64;
+                    let mut next_il4 = -1i32;
+                    while next_i < chunk_n {
+                        let (k, l) = calc_kmer(next_i);
+                        if k == ind_full_prev && l == il4_prev {
+                            next_i += isa_step;
+                            continue;
+                        }
+                        next_kmer = k;
+                        next_il4 = l;
+                        break;
+                    }
+                    if next_i >= chunk_n {
+                        // Past chunk end. Check the chunk's last
+                        // entry; if it still matches, no boundary
+                        // exists in this chunk.
+                        if chunk_n > 0 {
+                            let last_i = chunk_n - 1;
+                            let (k, l) = calc_kmer(last_i);
+                            if k == ind_full_prev && l == il4_prev {
+                                return (chunk_n, 0, -1);
+                            }
+                            next_kmer = k;
+                            next_il4 = l;
+                            next_i = last_i;
+                        } else {
+                            return (chunk_n, 0, -1);
+                        }
+                    }
+                    // Binary search in `(i .. next_i]` for the first
+                    // index where `(indFull, iL4)` differs from
+                    // `(ind_full_prev, il4_prev)`.
+                    let mut lo = next_i.saturating_sub(isa_step).max(i);
+                    let mut hi = next_i.min(chunk_n - 1);
+                    while lo + 1 < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        let (k, l) = calc_kmer(mid);
+                        if k == ind_full_prev && l == il4_prev {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                            next_kmer = k;
+                            next_il4 = l;
+                        }
+                    }
+                    (hi, next_kmer, next_il4)
+                };
+
+                // Per-chunk last-written kmer index at each level.
+                // `None` means "nothing written in this chunk yet";
+                // the first iteration always writes (matches STAR's
+                // `isa == 0` special-case).
+                let mut ind0_local: [Option<u64>; 32] = [None; 32];
+                let mut i: usize = 0;
+                let (mut ind_full, mut il4) = calc_kmer(i);
+
+                while i < chunk_n {
+                    let sa_idx = (chunk_start + i) as u64;
+                    for il in 0..nbases as usize {
+                        if il as i32 == il4 {
+                            // N at level `il`. STAR sets the N flag
+                            // on `ind0[il1]` for `il1 >= il4`; we
+                            // don't track the N flag in this version
+                            // (our `hierarchical_lookup` doesn't
+                            // consult it), so just break out of the
+                            // level loop. This means our SAindex
+                            // file is not byte-identical to STAR's
+                            // in the N-bit positions — documented
+                            // limitation.
+                            break;
+                        }
+                        let ind_pref = ind_full >> (2 * (nbases as usize - 1 - il));
+                        let is_new = match ind0_local[il] {
+                            None => true,
+                            Some(prev) => ind_pref > prev,
+                        };
+                        if is_new {
+                            let slot = (genome_sa_index_start[il] + ind_pref) as usize;
+                            firsts[slot].fetch_min(sa_idx, Ordering::Relaxed);
+                            ind0_local[il] = Some(ind_pref);
+                        }
+                        // `ind_pref < ind0_local[il]` would mean the
+                        // SA isn't sorted — we don't error here
+                        // (per-chunk locality + sorted SA → can't
+                        // happen unless caps-sa produced a broken
+                        // SA, which our differential tests guard
+                        // against).
+                    }
+                    let (next_i, next_full, next_il4) = find_next(i, ind_full, il4);
+                    i = next_i;
+                    ind_full = next_full;
+                    il4 = next_il4;
                 }
                 Ok(())
             })
             .map_err(|e| Error::Index(format!("pread during SAindex build: {e}")))?;
 
-        // Final sequential pack into the output `PackedArray`. The
-        // `+8`-byte pad at the end of the buffer is reserved by
-        // `PackedArray::new`. Per-slot work is ~10 ns × 358 M ≈
-        // 3.6 s on the human genome — negligible vs. the parallel
-        // scan.
-        let mut data = PackedArray::new(sai_word_length, num_indices);
-        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
-        for (i, slot) in firsts.iter().enumerate() {
-            let v = slot.load(Ordering::Relaxed);
-            if v == u64::MAX {
-                data.write(i, absent_marker);
-            } else {
-                data.write(i, v);
+        // Phase 2: backward gap-fill **in place** in `firsts[]`.
+        // For each SAindex level, walk slots from high to low. Track
+        // the most recently seen present `sa_idx`; replace each
+        // `u64::MAX` slot with `next_present_sa_idx | absent_mask`.
+        // Levels are processed independently (no dependency between
+        // them); parallel across levels is overkill for ~358 M
+        // total slots × ~10 ns per slot = ~3.6 s.
+        for il in 0..nbases as usize {
+            let level_start = genome_sa_index_start[il] as usize;
+            let level_size = 4u64.pow(il as u32 + 1) as usize;
+            // Tail-gap sentinel: STAR uses `nSA | absent_mask` for
+            // slots after the last-written present k-mer at this
+            // level (i.e. the trailing run that has no further
+            // present slot to point at).
+            let mut next_present: u64 = n_entries as u64;
+            for off in (0..level_size).rev() {
+                let slot = level_start + off;
+                let v = firsts[slot].load(Ordering::Relaxed);
+                if v == u64::MAX {
+                    firsts[slot].store(next_present | absent_mask, Ordering::Relaxed);
+                } else {
+                    next_present = v;
+                }
             }
+        }
+
+        // Final sequential pack into the output `PackedArray`.
+        // Every slot in `firsts` is now valid (either the
+        // first-occurrence `sa_idx` or `next | absent_mask`).
+        let mut data = PackedArray::new(sai_word_length, num_indices);
+        for (i, slot) in firsts.iter().enumerate() {
+            data.write(i, slot.load(Ordering::Relaxed));
         }
         drop(firsts);
 
