@@ -149,7 +149,7 @@ impl GenomeIndex {
 
         log::info!("Building suffix array...");
         let (got_gbit, got_gmask, n_entries) =
-            sa_build::build_streaming(&genome, |packed_value| {
+            sa_build::build_streaming(&genome, params.temp_dir.as_deref(), |packed_value| {
                 // Emit is now lightweight: just bit-pack into the SA
                 // file. caps-sa's phase-4 emit loop is single-threaded,
                 // so anything we do here serialises the whole build.

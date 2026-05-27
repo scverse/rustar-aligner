@@ -9,7 +9,6 @@ use crate::genome::Genome;
 use crate::index::packed_array::PackedArray;
 use crate::index::suffix_array::SuffixArray;
 
-
 /// SA index for fast k-mer lookup during binary search.
 ///
 /// For each k-mer prefix (up to genomeSAindexNbases length), stores the
@@ -239,58 +238,56 @@ impl SaIndex {
                 // differs from the input, plus its `(indFull, iL4)`.
                 // Returns `chunk_n` if no change is found in this
                 // chunk.
-                let find_next = |i: usize,
-                                 ind_full_prev: u64,
-                                 il4_prev: i32|
-                 -> (usize, u64, i32) {
-                    let mut next_i = i + isa_step;
-                    let mut next_kmer = 0u64;
-                    let mut next_il4 = -1i32;
-                    while next_i < chunk_n {
-                        let (k, l) = calc_kmer(next_i);
-                        if k == ind_full_prev && l == il4_prev {
-                            next_i += isa_step;
-                            continue;
-                        }
-                        next_kmer = k;
-                        next_il4 = l;
-                        break;
-                    }
-                    if next_i >= chunk_n {
-                        // Past chunk end. Check the chunk's last
-                        // entry; if it still matches, no boundary
-                        // exists in this chunk.
-                        if chunk_n > 0 {
-                            let last_i = chunk_n - 1;
-                            let (k, l) = calc_kmer(last_i);
+                let find_next =
+                    |i: usize, ind_full_prev: u64, il4_prev: i32| -> (usize, u64, i32) {
+                        let mut next_i = i + isa_step;
+                        let mut next_kmer = 0u64;
+                        let mut next_il4 = -1i32;
+                        while next_i < chunk_n {
+                            let (k, l) = calc_kmer(next_i);
                             if k == ind_full_prev && l == il4_prev {
-                                return (chunk_n, 0, -1);
+                                next_i += isa_step;
+                                continue;
                             }
                             next_kmer = k;
                             next_il4 = l;
-                            next_i = last_i;
-                        } else {
-                            return (chunk_n, 0, -1);
+                            break;
                         }
-                    }
-                    // Binary search in `(i .. next_i]` for the first
-                    // index where `(indFull, iL4)` differs from
-                    // `(ind_full_prev, il4_prev)`.
-                    let mut lo = next_i.saturating_sub(isa_step).max(i);
-                    let mut hi = next_i.min(chunk_n - 1);
-                    while lo + 1 < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        let (k, l) = calc_kmer(mid);
-                        if k == ind_full_prev && l == il4_prev {
-                            lo = mid;
-                        } else {
-                            hi = mid;
-                            next_kmer = k;
-                            next_il4 = l;
+                        if next_i >= chunk_n {
+                            // Past chunk end. Check the chunk's last
+                            // entry; if it still matches, no boundary
+                            // exists in this chunk.
+                            if chunk_n > 0 {
+                                let last_i = chunk_n - 1;
+                                let (k, l) = calc_kmer(last_i);
+                                if k == ind_full_prev && l == il4_prev {
+                                    return (chunk_n, 0, -1);
+                                }
+                                next_kmer = k;
+                                next_il4 = l;
+                                next_i = last_i;
+                            } else {
+                                return (chunk_n, 0, -1);
+                            }
                         }
-                    }
-                    (hi, next_kmer, next_il4)
-                };
+                        // Binary search in `(i .. next_i]` for the first
+                        // index where `(indFull, iL4)` differs from
+                        // `(ind_full_prev, il4_prev)`.
+                        let mut lo = next_i.saturating_sub(isa_step).max(i);
+                        let mut hi = next_i.min(chunk_n - 1);
+                        while lo + 1 < hi {
+                            let mid = lo + (hi - lo) / 2;
+                            let (k, l) = calc_kmer(mid);
+                            if k == ind_full_prev && l == il4_prev {
+                                lo = mid;
+                            } else {
+                                hi = mid;
+                                next_kmer = k;
+                                next_il4 = l;
+                            }
+                        }
+                        (hi, next_kmer, next_il4)
+                    };
 
                 // Per-chunk last-written kmer index at each level.
                 // `None` means "nothing written in this chunk yet";

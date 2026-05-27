@@ -2,7 +2,7 @@
 name = "rustar-aligner"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["James Ferguson"]
 description = "A Rust reimplementation of STAR (Spliced Transcripts Alignment to a Reference), the RNA-seq aligner"
 license = "MIT"
@@ -41,7 +41,7 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
-caps-sa = "0.5"
+caps-sa = "0.6"
 # mimalloc as the global allocator. Two reasons:
 #   1. **Memory return**: glibc malloc creates one arena per worker
 #      thread (rayon spawns ~num_cpus workers + sub-threads) and

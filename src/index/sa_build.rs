@@ -117,6 +117,7 @@ use crate::genome::Genome;
 use crate::index::packed_array::PackedArray;
 use crate::index::suffix_array::SuffixArray;
 use rayon::prelude::*;
+use std::path::Path;
 
 /// STAR's spacer byte. Matches `GENOME_spacingChar` in
 /// `STAR/source/IncludeDefine.h` and the value `5` used throughout the
@@ -223,7 +224,7 @@ pub(crate) fn build_impl(genome: &Genome, force_sentinel: bool) -> Result<Suffix
     // exactly the path used by tests and by any non-streaming
     // caller; production [`genomeGenerate`] uses
     // [`build_streaming`] directly and bypasses this allocation.
-    build_streaming_impl(genome, force_sentinel, |packed_value| {
+    build_streaming_impl(genome, force_sentinel, None, |packed_value| {
         data.write(out_idx, packed_value);
         out_idx += 1;
         Ok(())
@@ -249,7 +250,11 @@ pub(crate) fn build_impl(genome: &Genome, force_sentinel: bool) -> Result<Suffix
 /// Reads `RUSTAR_USE_SENTINEL_TRANSFORM` once at entry; tests
 /// should go through [`build_streaming_impl`] directly to avoid
 /// racing on the env var.
-pub fn build_streaming<F>(genome: &Genome, emit: F) -> Result<(u32, u64, usize), Error>
+pub fn build_streaming<F>(
+    genome: &Genome,
+    temp_dir: Option<&Path>,
+    emit: F,
+) -> Result<(u32, u64, usize), Error>
 where
     F: FnMut(u64) -> Result<(), Error>,
 {
@@ -261,7 +266,7 @@ where
     );
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
     let gstrand_mask = (1u64 << gstrand_bit) - 1;
-    let n_kept = build_streaming_impl(genome, force_sentinel, emit)?;
+    let n_kept = build_streaming_impl(genome, force_sentinel, temp_dir, emit)?;
     Ok((gstrand_bit, gstrand_mask, n_kept))
 }
 
@@ -273,6 +278,7 @@ where
 pub(crate) fn build_streaming_impl<F>(
     genome: &Genome,
     force_sentinel: bool,
+    temp_dir: Option<&Path>,
     mut emit: F,
 ) -> Result<usize, Error>
 where
@@ -316,31 +322,25 @@ where
 
     let n_genome_u64 = n_genome as u64;
     let mut emit_count: usize = 0;
-    let mut emit_err: Option<Error> = None;
 
     // The packer is shared between the in-memory and ext-mem paths.
     // With caps-sa's filter API every emitted position is already
     // a kept ACGT position (in original coordinates after the
     // spacer-free → original translation done inside
     // `dispatch_caps_sa_segmented`), so the only work here is the
-    // strand-bit encoding + forwarding to `emit`. Errors from
-    // `emit` are deferred into `emit_err` because caps-sa's
-    // dispatchers expect an infallible `FnMut(u64)`; we propagate
-    // after the dispatch returns.
-    let mut pack_one = |orig_pos: u64| {
-        if emit_err.is_some() {
-            return;
-        }
+    // strand-bit encoding + forwarding to `emit`. caps-sa 0.6's
+    // `try_*` APIs propagate this callback error immediately, so
+    // SA-file write failures abort the build instead of running to
+    // completion and reporting afterwards.
+    let mut pack_one = |orig_pos: u64| -> Result<(), Error> {
         let packed_value = if (orig_pos as usize) < n_genome {
             orig_pos
         } else {
             (orig_pos - n_genome_u64) | n2_bit
         };
-        if let Err(e) = emit(packed_value) {
-            emit_err = Some(e);
-            return;
-        }
+        emit(packed_value)?;
         emit_count += 1;
+        Ok(())
     };
 
     // The default path is the segmented arm: caps-sa's
@@ -365,14 +365,14 @@ where
              using sentinel-transform arm"
         );
         let t_prime: Vec<u8> = build_sentinel_transformed_text(&genome.sequence[..n2], n_seg);
-        dispatch_caps_sa(t_prime, &genome.sequence[..n2], &mut pack_one)?;
+        dispatch_caps_sa(t_prime, &genome.sequence[..n2], temp_dir, &mut pack_one)?;
     } else if force_sentinel && alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
         log::info!(
             "sa_build: RUSTAR_USE_SENTINEL_TRANSFORM=1, alphabet fits u16 — \
              using sentinel-transform arm"
         );
         let t_prime: Vec<u16> = build_sentinel_transformed_text(&genome.sequence[..n2], n_seg);
-        dispatch_caps_sa(t_prime, &genome.sequence[..n2], &mut pack_one)?;
+        dispatch_caps_sa(t_prime, &genome.sequence[..n2], temp_dir, &mut pack_one)?;
     } else {
         if force_sentinel {
             log::warn!(
@@ -387,16 +387,9 @@ where
                  alphabet_max={alphabet_max}, {n_seg} segments)"
             );
         }
-        dispatch_caps_sa_segmented(&genome.sequence[..n2], &mut pack_one)?;
+        dispatch_caps_sa_segmented(&genome.sequence[..n2], temp_dir, &mut pack_one)?;
     }
 
-    // Propagate any error the caller's `emit` returned during the
-    // dispatch. caps-sa's `pack_one` is `FnMut(u64)`, so we stash the
-    // error in `emit_err` and short-circuit further emits — see the
-    // body of `pack_one` above.
-    if let Some(e) = emit_err {
-        return Err(e);
-    }
     debug_assert_eq!(
         emit_count, n_sa_kept,
         "sa_build: emitted {emit_count} entries but counted {n_sa_kept}",
@@ -545,7 +538,11 @@ impl caps_sa::LimitProvider for StarSegmentedText {
 /// Each emitted SA position is already in original coordinates;
 /// `pack_one` is the only thing needed before bit-packing into the
 /// output sink.
-fn dispatch_caps_sa_segmented(original: &[u8], mut pack_one: impl FnMut(u64)) -> Result<(), Error> {
+fn dispatch_caps_sa_segmented(
+    original: &[u8],
+    temp_dir: Option<&Path>,
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error> {
     let n = original.len();
     if n == 0 {
         return Ok(());
@@ -575,33 +572,25 @@ fn dispatch_caps_sa_segmented(original: &[u8], mut pack_one: impl FnMut(u64)) ->
     );
 
     if use_ext_mem(n) {
-        let opts = caps_sa::ExtMemOpts {
-            work_dir: std::env::temp_dir(),
-            ..Default::default()
-        };
+        let opts = caps_sa_ext_mem_opts(temp_dir);
         // Predicate accepts ACGT only (rejects N at 4, spacer at 5).
         // Borrows `original` via `&[u8]` — `Send + Sync` is satisfied.
         let original_ref: &[u8] = original;
-        caps_sa::build_ext_mem_for_filter_with(
+        caps_sa::try_build_ext_mem_for_filter_with(
             original,
             |p| original_ref[p as usize] < 4,
             &lp,
             &opts,
-            |orig_pos| {
-                pack_one(orig_pos);
-                Ok(())
-            },
+            |orig_pos| pack_one(orig_pos),
         )
-        .map_err(|e| {
-            Error::Index(format!(
-                "caps-sa::build_ext_mem_for_filter_with failed: {e}"
-            ))
-        })?;
+        .map_err(map_caps_sa_error)?;
     } else {
         // Small-input in-memory path. Materialising the position
         // list at this scale is harmless (≤ 16 MB text → ≤ ~100 K
         // kept positions); keeps the in-mem fast-path simple.
-        let positions: Vec<u64> = (0..n as u64).filter(|&p| original[p as usize] < 4).collect();
+        let positions: Vec<u64> = (0..n as u64)
+            .filter(|&p| original[p as usize] < 4)
+            .collect();
         let sa: Vec<u64> = caps_sa::build_in_memory_for_positions_with(
             original,
             positions,
@@ -609,7 +598,7 @@ fn dispatch_caps_sa_segmented(original: &[u8], mut pack_one: impl FnMut(u64)) ->
             &caps_sa::Opts::default(),
         );
         for &orig_pos in &sa {
-            pack_one(orig_pos);
+            pack_one(orig_pos)?;
         }
     }
     Ok(())
@@ -651,7 +640,8 @@ fn compute_spacer_ends(text: &[u8]) -> Vec<u64> {
 fn dispatch_caps_sa<S>(
     t_prime: Vec<S>,
     original: &[u8],
-    mut pack_one: impl FnMut(u64),
+    temp_dir: Option<&Path>,
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
 ) -> Result<(), Error>
 where
     S: caps_sa::Symbol,
@@ -664,26 +654,20 @@ where
              (text len {}, {symbol_width}-byte alphabet)",
             t_prime.len()
         );
-        let opts = caps_sa::ExtMemOpts {
-            work_dir: std::env::temp_dir(),
-            ..Default::default()
-        };
+        let opts = caps_sa_ext_mem_opts(temp_dir);
         // Predicate must skip both the per-segment sentinels (bytes
         // ≥ 5 in `t_prime`, encoded at the spacer-run positions in
         // `original`) and the terminal sentinel at index `n2`. The
         // shorthand `p < n2 && original[p] < 4` covers both: the
         // terminal-sentinel index n2 fails the first guard and the
         // spacer indices (where `original[p] == 5`) fail the second.
-        caps_sa::build_ext_mem_for_filter(
+        caps_sa::try_build_ext_mem_for_filter(
             &t_prime,
             |p| (p as usize) < n2 && original[p as usize] < 4,
             &opts,
-            |sa_pos| {
-                pack_one(sa_pos);
-                Ok(())
-            },
+            |sa_pos| pack_one(sa_pos),
         )
-        .map_err(|e| Error::Index(format!("caps-sa::build_ext_mem_for_filter failed: {e}")))?;
+        .map_err(map_caps_sa_error)?;
         drop(t_prime);
     } else {
         log::info!(
@@ -699,10 +683,31 @@ where
         let sa: Vec<u64> = caps_sa::build_in_memory_for_positions(&t_prime, positions);
         drop(t_prime);
         for &sa_pos in &sa {
-            pack_one(sa_pos);
+            pack_one(sa_pos)?;
         }
     }
     Ok(())
+}
+
+fn caps_sa_ext_mem_opts(temp_dir: Option<&Path>) -> caps_sa::ExtMemOpts {
+    let mut opts = caps_sa::ExtMemOpts::from_env();
+    if let Some(dir) = temp_dir {
+        opts = opts.work_dir(dir);
+    } else if let Some(dir) =
+        std::env::var_os("RUSTAR_TMPDIR").or_else(|| std::env::var_os("RUSTAR_TEMP_DIR"))
+    {
+        opts = opts.work_dir(dir);
+    }
+    opts
+}
+
+fn map_caps_sa_error(err: caps_sa::BuildError<Error>) -> Error {
+    match err {
+        caps_sa::BuildError::Io(e) => {
+            Error::Index(format!("caps-sa external-memory I/O failed: {e}"))
+        }
+        caps_sa::BuildError::Emit(e) => e,
+    }
 }
 
 /// Select the in-memory vs. external-memory caps-sa path.
@@ -940,7 +945,6 @@ mod tests {
     /// `build()` would see.
     fn build_genome_from_fasta(fasta: &str, bin_nbits: u32) -> crate::genome::Genome {
         use crate::params::Parameters;
-        use clap::Parser;
         use std::io::Write;
         use tempfile::NamedTempFile;
 
@@ -999,7 +1003,7 @@ mod tests {
         let word_length = in_mem.data.word_length();
         let mut got: Vec<u8> = Vec::new();
         let mut writer = PackedStreamWriter::new(&mut got, word_length);
-        let (gbit, gmask, n) = super::build_streaming(&genome, |pv| {
+        let (gbit, gmask, n) = super::build_streaming(&genome, None, |pv| {
             writer.write_one(pv).unwrap();
             Ok(())
         })

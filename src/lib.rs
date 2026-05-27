@@ -77,6 +77,9 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
     use index::GenomeIndex;
 
     info!("genomeDir: {}", params.genome_dir.display());
+    if let Some(temp_dir) = &params.temp_dir {
+        info!("tempDir: {}", temp_dir.display());
+    }
     info!(
         "genomeFastaFiles: {:?}",
         params
