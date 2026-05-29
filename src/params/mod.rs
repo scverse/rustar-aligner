@@ -294,6 +294,10 @@ pub struct Parameters {
     #[arg(long = "limitBAMsortRAM", default_value_t = 0)]
     pub limit_bam_sort_ram: u64,
 
+    /// Maximum RAM (bytes) for genome generation.
+    #[arg(long = "limitGenomeGenerateRAM", default_value_t = 31_000_000_000_u64)]
+    pub limit_genome_generate_ram: u64,
+
     /// Route primary alignment output to stdout instead of a file.
     /// Values: None (default), SAM, BAM_Unsorted, BAM_SortedByCoordinate.
     #[arg(long = "outStd", default_value = "None")]
