@@ -460,8 +460,16 @@ impl SamWriter {
         if attrs.contains("AS") {
             data.insert(Tag::ALIGNMENT_SCORE, Value::from(mapped_transcript.score));
         }
-        if attrs.contains("NM") || attrs.contains("nM") {
-            // STAR maps NM attribute to 'nM' tag (mismatches only, not edit distance)
+        if attrs.contains("NM") {
+            data.insert(
+                Tag::EDIT_DISTANCE,
+                Value::from(sam_spec_nm(
+                    mapped_transcript.n_mismatch,
+                    &mapped_transcript.cigar,
+                )),
+            );
+        }
+        if attrs.contains("nM") {
             data.insert(
                 Tag::new(b'n', b'M'),
                 Value::from(mapped_transcript.n_mismatch as i32),
@@ -651,7 +659,13 @@ impl SamWriter {
             if attrs.contains("AS") {
                 data.insert(Tag::ALIGNMENT_SCORE, Value::from(t.score));
             }
-            if attrs.contains("NM") || attrs.contains("nM") {
+            if attrs.contains("NM") {
+                data.insert(
+                    Tag::EDIT_DISTANCE,
+                    Value::from(sam_spec_nm(t.n_mismatch, &t.cigar)),
+                );
+            }
+            if attrs.contains("nM") {
                 data.insert(Tag::new(b'n', b'M'), Value::from(t.n_mismatch as i32));
             }
 
@@ -955,8 +969,13 @@ fn transcript_to_record(
     if attrs.contains("AS") {
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(transcript.score));
     }
-    if attrs.contains("NM") || attrs.contains("nM") {
-        // STAR maps NM attribute to 'nM' tag (mismatches only, not edit distance)
+    if attrs.contains("NM") {
+        data.insert(
+            Tag::EDIT_DISTANCE,
+            Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
+        );
+    }
+    if attrs.contains("nM") {
         data.insert(
             Tag::new(b'n', b'M'),
             Value::from(transcript.n_mismatch as i32),
@@ -985,20 +1004,18 @@ fn transcript_to_record(
     Ok(record)
 }
 
-/// Compute edit distance (mismatches + inserted + deleted bases).
-/// Not emitted in SAM output (STAR maps NM attribute to 'nM' tag), but kept for tests.
-#[cfg(test)]
-fn compute_edit_distance(transcript: &Transcript) -> i32 {
+/// SAM-spec `NM:i:` edit distance: substitutions + inserted bases + deleted bases.
+/// Intron `N` skips and clips are excluded per SAM v1 §1.4.
+fn sam_spec_nm(n_mismatch: u32, cigar: &[cigar::Op]) -> i32 {
     use cigar::op::Kind;
-    let indel_bases: usize = transcript
-        .cigar
+    let indel_bases: usize = cigar
         .iter()
         .filter_map(|op| match op.kind() {
             Kind::Insertion | Kind::Deletion => Some(op.len()),
             _ => None,
         })
         .sum();
-    (transcript.n_mismatch + indel_bases as u32) as i32
+    (n_mismatch + indel_bases as u32) as i32
 }
 
 /// Derive XS strand tag from transcript junction motifs.
@@ -1262,8 +1279,13 @@ fn build_paired_mate_record(
         // STAR reports combined score (sum of both mates) for PE AS tag
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(combined_score));
     }
-    if attrs.contains("NM") || attrs.contains("nM") {
-        // STAR maps NM attribute to 'nM' tag (mismatches only, not edit distance)
+    if attrs.contains("NM") {
+        data.insert(
+            Tag::EDIT_DISTANCE,
+            Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
+        );
+    }
+    if attrs.contains("nM") {
         data.insert(
             Tag::new(b'n', b'M'),
             Value::from(transcript.n_mismatch as i32),
@@ -1833,16 +1855,15 @@ mod tests {
             Some(&Value::from(100_i32)),
             "AS tag should be 100"
         );
-        // STAR maps NM attribute to 'nM' tag (mismatches only); no standard NM tag
         assert_eq!(
             data.get(&Tag::EDIT_DISTANCE),
-            None,
-            "Standard NM tag should not be present (STAR outputs nM not NM)"
+            Some(&Value::from(5_i32)),
+            "NM should be edit distance (2 mismatches + 3 deleted bases)"
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
             Some(&Value::from(2_i32)),
-            "nM tag should be 2 (mismatches only, both NM and nM attrs map here)"
+            "nM should be mismatches only (2)"
         );
     }
 
@@ -1850,90 +1871,48 @@ mod tests {
     fn test_edit_distance_computation() {
         use cigar::op::{Kind, Op};
         // Pure match: NM = n_mismatch only
-        let t1 = Transcript {
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 50,
-            is_reverse: false,
-            exons: vec![],
-            cigar: vec![Op::new(Kind::Match, 50)],
-            score: 100,
-            n_mismatch: 3,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            read_seq: vec![],
-        };
-        assert_eq!(compute_edit_distance(&t1), 3);
+        assert_eq!(sam_spec_nm(3, &[Op::new(Kind::Match, 50)]), 3);
 
         // Match + Ins + Del: NM = n_mismatch + ins_len + del_len
-        let t2 = Transcript {
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 60,
-            is_reverse: false,
-            exons: vec![],
-            cigar: vec![
-                Op::new(Kind::Match, 20),
-                Op::new(Kind::Insertion, 5),
-                Op::new(Kind::Match, 10),
-                Op::new(Kind::Deletion, 7),
-                Op::new(Kind::Match, 20),
-            ],
-            score: 80,
-            n_mismatch: 1,
-            n_gap: 2,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            read_seq: vec![],
-        };
-        assert_eq!(compute_edit_distance(&t2), 13); // 1 + 5 + 7
+        assert_eq!(
+            sam_spec_nm(
+                1,
+                &[
+                    Op::new(Kind::Match, 20),
+                    Op::new(Kind::Insertion, 5),
+                    Op::new(Kind::Match, 10),
+                    Op::new(Kind::Deletion, 7),
+                    Op::new(Kind::Match, 20),
+                ],
+            ),
+            13
+        );
 
         // RefSkip (splice junction) should NOT count toward NM
-        let t3 = Transcript {
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 200,
-            is_reverse: false,
-            exons: vec![],
-            cigar: vec![
-                Op::new(Kind::Match, 25),
-                Op::new(Kind::Skip, 1000),
-                Op::new(Kind::Match, 25),
-            ],
-            score: 50,
-            n_mismatch: 0,
-            n_gap: 0,
-            n_junction: 1,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            read_seq: vec![],
-        };
-        assert_eq!(compute_edit_distance(&t3), 0);
+        assert_eq!(
+            sam_spec_nm(
+                0,
+                &[
+                    Op::new(Kind::Match, 25),
+                    Op::new(Kind::Skip, 1000),
+                    Op::new(Kind::Match, 25),
+                ],
+            ),
+            0
+        );
 
         // Soft clips should NOT count toward NM
-        let t4 = Transcript {
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 40,
-            is_reverse: false,
-            exons: vec![],
-            cigar: vec![
-                Op::new(Kind::SoftClip, 10),
-                Op::new(Kind::Match, 40),
-                Op::new(Kind::SoftClip, 10),
-            ],
-            score: 40,
-            n_mismatch: 2,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            read_seq: vec![],
-        };
-        assert_eq!(compute_edit_distance(&t4), 2);
+        assert_eq!(
+            sam_spec_nm(
+                2,
+                &[
+                    Op::new(Kind::SoftClip, 10),
+                    Op::new(Kind::Match, 40),
+                    Op::new(Kind::SoftClip, 10),
+                ],
+            ),
+            2
+        );
     }
 
     #[test]
@@ -1982,11 +1961,8 @@ mod tests {
         );
         assert_eq!(data.get(&Tag::HIT_INDEX), Some(&Value::from(1_i32)));
         assert_eq!(data.get(&Tag::ALIGNMENT_SCORE), Some(&Value::from(100_i32)));
-        // Standard NM tag absent (STAR maps NM→nM)
-        assert_eq!(data.get(&Tag::EDIT_DISTANCE), None);
-        // nM = 2 mismatches (NM and nM attrs both map to nM tag)
+        assert_eq!(data.get(&Tag::EDIT_DISTANCE), Some(&Value::from(2_i32)));
         assert_eq!(data.get(&Tag::new(b'n', b'M')), Some(&Value::from(2_i32)));
-        // XS not in standard attrs
         assert_eq!(data.get(&Tag::new(b'X', b'S')), None);
     }
 
@@ -3122,12 +3098,12 @@ mod tests {
             "AS should be present"
         );
         assert!(
-            data.get(&Tag::EDIT_DISTANCE).is_none(),
-            "Standard NM tag should be absent (STAR maps NM→nM)"
+            data.get(&Tag::EDIT_DISTANCE).is_some(),
+            "NM should be present"
         );
         assert!(
             data.get(&Tag::new(b'n', b'M')).is_some(),
-            "nM should be present (NM and nM attrs both map here)"
+            "nM should be present"
         );
         // Non-standard tags absent
         assert!(
@@ -3404,17 +3380,117 @@ mod tests {
         .unwrap();
 
         let data = record.data();
-        // Standard NM tag absent (STAR maps NM attribute to 'nM' tag)
         assert_eq!(
             data.get(&Tag::EDIT_DISTANCE),
-            None,
-            "Standard NM tag should be absent"
+            Some(&Value::from(10_i32)),
+            "NM should be edit distance: 2 mismatches + 5 ins + 3 del = 10"
         );
-        // nM = mismatches only: 2 (both NM and nM attrs map here)
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
             Some(&Value::from(2_i32)),
-            "nM should be 2 (mismatches only, NM+nM attrs both map to nM tag)"
+            "nM should be 2 (mismatches only)"
+        );
+    }
+
+    #[test]
+    fn test_nm_tag_distinct_from_nm_lower() {
+        use cigar::op::{Kind, Op};
+        let genome = make_test_genome();
+
+        let transcript = Transcript {
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 103,
+            is_reverse: false,
+            exons: vec![],
+            cigar: vec![
+                Op::new(Kind::Match, 80),
+                Op::new(Kind::Deletion, 2),
+                Op::new(Kind::Match, 21),
+            ],
+            score: 100,
+            n_mismatch: 1,
+            n_gap: 1,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![0, 1, 2, 3],
+        };
+
+        let read_seq = vec![0, 1, 2, 3];
+        let read_qual = vec![30, 30, 30, 30];
+
+        let both: HashSet<String> = ["NM", "nM"].iter().map(ToString::to_string).collect();
+        let record = transcript_to_record(
+            &transcript,
+            "read1",
+            &read_seq,
+            &read_qual,
+            &genome,
+            255,
+            1,
+            1,
+            &both,
+        )
+        .unwrap();
+        let data = record.data();
+        assert_eq!(
+            data.get(&Tag::EDIT_DISTANCE),
+            Some(&Value::from(3_i32)),
+            "NM should be 1 mismatch + 2 deleted bases = 3"
+        );
+        assert_eq!(
+            data.get(&Tag::new(b'n', b'M')),
+            Some(&Value::from(1_i32)),
+            "nM should be 1 (mismatches only)"
+        );
+
+        let only_lower: HashSet<String> = ["nM"].iter().map(ToString::to_string).collect();
+        let record = transcript_to_record(
+            &transcript,
+            "read1",
+            &read_seq,
+            &read_qual,
+            &genome,
+            255,
+            1,
+            1,
+            &only_lower,
+        )
+        .unwrap();
+        let data = record.data();
+        assert!(
+            data.get(&Tag::EDIT_DISTANCE).is_none(),
+            "NM should be absent when only nM is requested"
+        );
+        assert_eq!(
+            data.get(&Tag::new(b'n', b'M')),
+            Some(&Value::from(1_i32)),
+            "nM should still be 1"
+        );
+
+        let only_upper: HashSet<String> = ["NM"].iter().map(ToString::to_string).collect();
+        let record = transcript_to_record(
+            &transcript,
+            "read1",
+            &read_seq,
+            &read_qual,
+            &genome,
+            255,
+            1,
+            1,
+            &only_upper,
+        )
+        .unwrap();
+        let data = record.data();
+        assert_eq!(
+            data.get(&Tag::EDIT_DISTANCE),
+            Some(&Value::from(3_i32)),
+            "NM should be present when only NM is requested"
+        );
+        assert!(
+            data.get(&Tag::new(b'n', b'M')).is_none(),
+            "nM should be absent when only NM is requested"
         );
     }
 
