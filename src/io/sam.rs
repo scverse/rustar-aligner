@@ -104,10 +104,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let mut attrs = params.sam_attribute_set();
-        if params.out_sam_strand_field != "intronMotif" {
-            attrs.remove("XS");
-        }
+        let attrs = params.effective_sam_attribute_set();
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -227,10 +224,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let mut attrs = params.sam_attribute_set();
-        if params.out_sam_strand_field != "intronMotif" {
-            attrs.remove("XS");
-        }
+        let attrs = params.effective_sam_attribute_set();
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -294,10 +288,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let mut attrs = params.sam_attribute_set();
-        if params.out_sam_strand_field != "intronMotif" {
-            attrs.remove("XS");
-        }
+        let attrs = params.effective_sam_attribute_set();
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -380,10 +371,7 @@ impl SamWriter {
         let n_alignments = 1usize;
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let mut attrs = params.sam_attribute_set();
-        if params.out_sam_strand_field != "intronMotif" {
-            attrs.remove("XS");
-        }
+        let attrs = params.effective_sam_attribute_set();
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -3781,5 +3769,129 @@ mod tests {
         assert!(records_m2[1].flags().is_last_segment()); // Second record = mate2 (mapped)
         assert!(records_m2[0].flags().is_unmapped()); // mate1 is unmapped
         assert!(!records_m2[1].flags().is_unmapped()); // mate2 is mapped
+    }
+
+    fn spliced_gtag_transcript() -> Transcript {
+        use cigar::op::{Kind, Op};
+        Transcript {
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 200,
+            is_reverse: false,
+            exons: vec![],
+            cigar: vec![
+                Op::new(Kind::Match, 25),
+                Op::new(Kind::Skip, 100),
+                Op::new(Kind::Match, 25),
+            ],
+            score: 50,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 1,
+            junction_motifs: vec![SpliceMotif::GtAg],
+            junction_annotated: vec![false],
+            read_seq: vec![0; 4],
+        }
+    }
+
+    #[test]
+    fn xs_tag_emitted_when_strand_field_intron_motif_only() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMstrandField",
+            "intronMotif",
+        ]);
+
+        let transcripts = vec![spliced_gtag_transcript()];
+        let read_seq = vec![0, 1, 2, 3];
+        let read_qual = vec![30, 30, 30, 30];
+
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &read_seq,
+            &read_qual,
+            &transcripts,
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        let data = records[0].data();
+        assert_eq!(
+            data.get(&Tag::new(b'X', b'S')),
+            Some(&Value::Character(b'+')),
+            "XS:A:+ should be emitted when --outSAMstrandField intronMotif is set"
+        );
+    }
+
+    #[test]
+    fn xs_tag_emitted_when_xs_in_attributes_only() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "NH",
+            "HI",
+            "XS",
+        ]);
+
+        let transcripts = vec![spliced_gtag_transcript()];
+        let read_seq = vec![0, 1, 2, 3];
+        let read_qual = vec![30, 30, 30, 30];
+
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &read_seq,
+            &read_qual,
+            &transcripts,
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        let data = records[0].data();
+        assert_eq!(
+            data.get(&Tag::new(b'X', b'S')),
+            Some(&Value::Character(b'+')),
+            "XS:A:+ should be emitted when XS is listed in --outSAMattributes"
+        );
+    }
+
+    #[test]
+    fn xs_tag_absent_when_neither_xs_nor_intron_motif_requested() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r.fq"]);
+
+        let transcripts = vec![spliced_gtag_transcript()];
+        let read_seq = vec![0, 1, 2, 3];
+        let read_qual = vec![30, 30, 30, 30];
+
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &read_seq,
+            &read_qual,
+            &transcripts,
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        let data = records[0].data();
+        assert_eq!(
+            data.get(&Tag::new(b'X', b'S')),
+            None,
+            "XS should not be emitted under default attributes and strand field"
+        );
     }
 }
