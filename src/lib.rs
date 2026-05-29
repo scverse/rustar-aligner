@@ -1464,8 +1464,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     .collect();
 
                 if results.is_empty() {
-                    // Both mates unmapped
-                    stats.record_alignment(0, max_multimaps);
+                    stats.record_alignment(n_for_mapq, max_multimaps);
                     stats.record_unmapped_reason(
                         unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                     );
