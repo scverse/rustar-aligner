@@ -436,6 +436,7 @@ mod tests {
         Genome {
             sequence: vec![0u8; 2048],
             n_genome: 1024,
+            n_genome_real: 1024,
             n_chr_real: 2,
             chr_name: vec!["chr9".to_string(), "chr22".to_string()],
             chr_length: vec![512, 512],

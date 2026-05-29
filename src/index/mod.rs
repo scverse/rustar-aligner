@@ -27,11 +27,16 @@ pub struct GenomeIndex {
     /// `transcriptInfo.tab` + friends at `genomeGenerate`, reloaded at
     /// `alignReads` from the same files.
     pub transcriptome: Option<TranscriptomeIndex>,
-    /// Prepared splice junctions (sorted/deduped) used only on the build
-    /// path to write `sjdbInfo.txt` + `sjdbList.out.tab`. Empty on the
-    /// load path — those files have already been written and are not
-    /// needed at align time.
+    /// Prepared splice junctions in their post-dedup order (the same
+    /// order they occupy in the Gsj buffer appended to the genome).
+    /// Populated on both build and load paths when sjdb is present;
+    /// empty for indices built without a GTF. Used at align time to
+    /// decode Gsj-region SA hits back to real-genome `(donor, acceptor)`
+    /// pairs.
     pub prepared_junctions: Vec<PreparedJunction>,
+    /// `sjdbOverhang` recorded in `sjdbInfo.txt`. Zero when no sjdb
+    /// junctions are present.
+    pub sjdb_overhang: u32,
 }
 
 impl GenomeIndex {
@@ -136,6 +141,12 @@ impl GenomeIndex {
             sa_index.data.len()
         );
 
+        let sjdb_overhang = if prepared_junctions.is_empty() {
+            0
+        } else {
+            params.sjdb_overhang
+        };
+
         Ok(GenomeIndex {
             genome,
             suffix_array,
@@ -143,6 +154,7 @@ impl GenomeIndex {
             junction_db,
             transcriptome,
             prepared_junctions,
+            sjdb_overhang,
         })
     }
 

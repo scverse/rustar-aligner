@@ -467,6 +467,7 @@ mod tests {
         Genome {
             sequence: vec![0, 1, 2, 3, 0, 1, 2, 3], // ACGTACGT
             n_genome: 8,
+            n_genome_real: 8,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![8],

@@ -21,6 +21,191 @@ use crate::error::Error;
 use crate::genome::Genome;
 use crate::junction::encode_motif;
 
+/// Parsed `sjdbInfo.txt` header + body. Reconstructs the junction order
+/// STAR used when building the Gsj buffer so align-time code can decode
+/// SA hits in the Gsj region back to `(donor, acceptor)` genome positions.
+#[derive(Debug, Clone)]
+pub struct SjdbInfoTab {
+    pub sjdb_overhang: u32,
+    pub junctions: Vec<PreparedJunction>,
+}
+
+/// Parse `sjdbInfo.txt` and rebuild `PreparedJunction` entries in their
+/// post-dedup order (the same order they occupy in the Gsj buffer).
+///
+/// `chr_idx` is recovered by locating `original_start` in
+/// `genome.chr_start[..n_chr_real]`. Positions falling in chromosome
+/// padding return an `Error::Index`.
+pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, Error> {
+    let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let mut lines = contents.lines();
+
+    let header = lines
+        .next()
+        .ok_or_else(|| Error::Index(format!("{}: empty sjdbInfo.txt", path.display())))?;
+    let mut hdr_iter = header.split('\t');
+    let n_expected: usize = hdr_iter
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Index(format!("{}: bad header count", path.display())))?;
+    let sjdb_overhang: u32 = hdr_iter
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Index(format!("{}: bad header overhang", path.display())))?;
+
+    let mut junctions = Vec::with_capacity(n_expected);
+    for (i, line) in lines.enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut f = line.split('\t');
+        let stored_start: u64 = f.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            Error::Index(format!("{}: bad stored_start at row {}", path.display(), i))
+        })?;
+        let stored_end: u64 = f.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            Error::Index(format!("{}: bad stored_end at row {}", path.display(), i))
+        })?;
+        let motif: u8 = f
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Error::Index(format!("{}: bad motif at row {}", path.display(), i)))?;
+        let shift_left: u8 = f.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            Error::Index(format!("{}: bad shift_left at row {}", path.display(), i))
+        })?;
+        let shift_right: u8 = f.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            Error::Index(format!("{}: bad shift_right at row {}", path.display(), i))
+        })?;
+        let strand: u8 = f
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| Error::Index(format!("{}: bad strand at row {}", path.display(), i)))?;
+
+        // stored_start = canonical: original_start; non-canonical: shifted = original_start - shift_left.
+        // Reverse the same mapping for start_pos (the shifted form).
+        let (start_pos, end_pos) = if motif == 0 {
+            (stored_start, stored_end)
+        } else {
+            (
+                stored_start.saturating_sub(shift_left as u64),
+                stored_end.saturating_sub(shift_left as u64),
+            )
+        };
+
+        let original_start = start_pos + shift_left as u64;
+        let chr_idx = genome
+            .chr_start
+            .iter()
+            .take(genome.n_chr_real)
+            .rposition(|&s| s <= original_start)
+            .ok_or_else(|| {
+                Error::Index(format!(
+                    "{}: junction at {} precedes first chromosome",
+                    path.display(),
+                    original_start
+                ))
+            })?;
+
+        junctions.push(PreparedJunction {
+            chr_idx,
+            start_pos,
+            end_pos,
+            motif,
+            shift_left,
+            shift_right,
+            strand,
+        });
+    }
+
+    if junctions.len() != n_expected {
+        return Err(Error::Index(format!(
+            "{}: header expected {} junctions, found {}",
+            path.display(),
+            n_expected,
+            junctions.len()
+        )));
+    }
+
+    Ok(SjdbInfoTab {
+        sjdb_overhang,
+        junctions,
+    })
+}
+
+/// Decode a single SA-hit position that falls in the Gsj flanking-sequence
+/// buffer back to one or two real-genome positions, mirroring the layout
+/// STAR builds in `build_gsj`.
+///
+/// `fwd_pos` is a forward-strand genome position (`[0, n_genome)`). If
+/// `fwd_pos < n_genome_real` the hit is on the real genome — the caller
+/// should use the original `(fwd_pos, length)` directly and not invoke
+/// this function.
+///
+/// Returns a vector of `(real_fwd_pos, read_offset, length)` tuples:
+/// - **One** entry when the hit lies entirely within a single junction's
+///   donor flank or acceptor flank — the read↔genome correspondence is a
+///   single contiguous run with `read_offset = 0` and `length` unchanged.
+/// - **Two** entries when the hit crosses the donor/acceptor boundary at
+///   `slot_offset == sjdb_overhang`: the first run covers the donor side,
+///   the second covers the acceptor side (with `read_offset` advanced by
+///   the donor-side length). The two runs together describe the same
+///   read window but at non-adjacent genome positions — the downstream
+///   stitch DP can then chain them via its splice branch.
+///
+/// Returns an empty vector when the hit's Gsj junction index is out of
+/// bounds, when the hit's slot offset lands on the trailing spacer byte,
+/// or when the hit would extend past the spacer.
+pub fn decode_gsj_hit(
+    fwd_pos: u64,
+    length: usize,
+    n_genome_real: u64,
+    sjdb_overhang: u32,
+    junctions: &[PreparedJunction],
+) -> Vec<(u64, usize, usize)> {
+    if fwd_pos < n_genome_real {
+        return Vec::new();
+    }
+    let overhang = sjdb_overhang as u64;
+    let sjdb_length = 2 * overhang + 1;
+    let rel = fwd_pos - n_genome_real;
+    let junction_idx = (rel / sjdb_length) as usize;
+    let slot_offset = rel % sjdb_length;
+
+    if junction_idx >= junctions.len() {
+        return Vec::new();
+    }
+    let pj = &junctions[junction_idx];
+
+    if slot_offset >= 2 * overhang {
+        return Vec::new();
+    }
+    if length == 0 {
+        return Vec::new();
+    }
+    if slot_offset + length as u64 > 2 * overhang {
+        return Vec::new();
+    }
+
+    let donor_genome_start = pj.original_start().saturating_sub(overhang);
+    let acceptor_genome_start = pj.original_end() + 1;
+
+    if slot_offset + length as u64 <= overhang || slot_offset >= overhang {
+        // Single-flank hit: the matching bases live in the corresponding
+        // real-genome flank too, so the same SA range already supplies an
+        // entry at the equivalent real-genome position. Re-emitting it
+        // here would just create duplicate work for the cluster dedup.
+        Vec::new()
+    } else {
+        let donor_len = (overhang - slot_offset) as usize;
+        let acceptor_len = length - donor_len;
+        let donor_real = donor_genome_start + slot_offset;
+        let acceptor_real = acceptor_genome_start;
+        vec![
+            (donor_real, 0, donor_len),
+            (acceptor_real, donor_len, acceptor_len),
+        ]
+    }
+}
+
 /// STAR's inter-SJ spacer byte in the Gsj buffer (same value STAR uses
 /// for inter-chromosome padding — `IncludeDefine.h::GENOME_spacingChar`).
 const GSJ_SPACING: u8 = 5;
@@ -386,6 +571,7 @@ mod tests {
         Genome {
             sequence: seq,
             n_genome: n as u64,
+            n_genome_real: n as u64,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![n as u64],
@@ -790,6 +976,7 @@ mod tests {
         let genome = Genome {
             sequence: seq,
             n_genome: 2000,
+            n_genome_real: 2000,
             n_chr_real: 2,
             chr_name: vec!["chrA".to_string(), "chrB".to_string()],
             chr_length: vec![1000, 1000],
@@ -823,5 +1010,141 @@ mod tests {
         assert_eq!(out.len(), 1);
         // `old_wrong` is on wrong strand for its motif — STAR replaces.
         assert_eq!(out[0], new_right);
+    }
+
+    #[test]
+    fn decode_gsj_hit_outside_buffer_returns_empty() {
+        let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
+        // Hit in the real genome: caller should bypass this function.
+        assert!(decode_gsj_hit(500, 50, 5000, 100, &junctions).is_empty());
+    }
+
+    #[test]
+    fn decode_gsj_hit_single_flank_is_dropped() {
+        // sjdb_length = 2*100 + 1 = 201. Junction 0 occupies bytes
+        // [n_genome_real .. n_genome_real + 201). A hit at slot_offset 5
+        // with length 20 sits entirely in the donor flank — the same SA
+        // range already includes a real-genome entry there, so the decoder
+        // returns no work to avoid duplicates.
+        let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
+        let n_genome_real = 5000;
+        let overhang = 100u32;
+        let hit_pos = n_genome_real + 5;
+        assert!(decode_gsj_hit(hit_pos, 20, n_genome_real, overhang, &junctions).is_empty());
+        // Acceptor-only hit (slot_offset >= overhang) is also dropped.
+        let hit_pos2 = n_genome_real + 120;
+        assert!(decode_gsj_hit(hit_pos2, 20, n_genome_real, overhang, &junctions).is_empty());
+    }
+
+    #[test]
+    fn decode_gsj_hit_boundary_crossing_splits_into_two() {
+        // sjdb_length=21 (overhang 10), one canonical junction at
+        // original [1000..2000]. Donor flank covers forward genome
+        // [990..1000), acceptor flank covers [2001..2011). A hit at
+        // slot_offset 6 with length 12 straddles the boundary: 4 donor
+        // bytes, 8 acceptor bytes.
+        let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
+        let n_genome_real = 5000;
+        let overhang = 10u32;
+        let hit_pos = n_genome_real + 6;
+        let out = decode_gsj_hit(hit_pos, 12, n_genome_real, overhang, &junctions);
+        assert_eq!(out.len(), 2);
+        // Donor: real_fwd = 990 + 6 = 996, read_offset = 0, sub_len = 4.
+        assert_eq!(out[0], (996, 0, 4));
+        // Acceptor: real_fwd = 2001, read_offset = 4, sub_len = 8.
+        assert_eq!(out[1], (2001, 4, 8));
+    }
+
+    #[test]
+    fn decode_gsj_hit_second_junction_offset() {
+        // Two junctions, overhang=10 → sjdb_length=21. Junction 1 begins
+        // at n_genome_real + 21. A boundary-crossing hit there must use
+        // junction 1's original coords, not junction 0's.
+        let junctions = vec![pj(0, 1000, 2000, 1, 0, 1), pj(0, 3000, 4000, 1, 0, 1)];
+        let n_genome_real = 5000;
+        let overhang = 10u32;
+        let hit_pos = n_genome_real + 21 + 6;
+        let out = decode_gsj_hit(hit_pos, 12, n_genome_real, overhang, &junctions);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 2996); // donor flank of J1 starts at 2990
+        assert_eq!(out[1].0, 4001); // acceptor flank of J1 starts at 4001
+    }
+
+    #[test]
+    fn decode_gsj_hit_uses_original_for_noncanonical() {
+        // Non-canonical motif with shift_left=3: stored coords sit 3bp
+        // left of original. The Gsj buffer was built from ORIGINAL coords,
+        // so the decoder must un-shift back to original_start when
+        // computing donor/acceptor positions.
+        let junctions = vec![pj(0, 1000, 2000, 0, 3, 0)];
+        let n_genome_real = 5000;
+        let overhang = 10u32;
+        // Boundary-crossing hit at slot_offset 5, length 10 (5 donor + 5 acceptor).
+        let hit_pos = n_genome_real + 5;
+        let out = decode_gsj_hit(hit_pos, 10, n_genome_real, overhang, &junctions);
+        assert_eq!(out.len(), 2);
+        // original_start = 1003 → donor flank [993..1003). Hit at slot 5 = 993+5 = 998.
+        assert_eq!(out[0], (998, 0, 5));
+        // original_end = 2003 → acceptor flank starts at 2004.
+        assert_eq!(out[1], (2004, 5, 5));
+    }
+
+    #[test]
+    fn decode_gsj_hit_oob_junction_or_spacer_returns_empty() {
+        let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
+        let n_genome_real = 5000;
+        let overhang = 10u32;
+        // Past last junction.
+        assert!(
+            decode_gsj_hit(n_genome_real + 21, 5, n_genome_real, overhang, &junctions).is_empty()
+        );
+        // On the trailing spacer byte (slot_offset == 2*overhang).
+        assert!(
+            decode_gsj_hit(n_genome_real + 20, 1, n_genome_real, overhang, &junctions).is_empty()
+        );
+        // Hit extends past the spacer.
+        assert!(
+            decode_gsj_hit(n_genome_real + 19, 3, n_genome_real, overhang, &junctions).is_empty()
+        );
+    }
+
+    #[test]
+    fn read_sjdb_info_tab_roundtrip() {
+        let mut seq = vec![5u8; 4000];
+        seq[..2000].copy_from_slice(&vec![0u8; 2000]);
+        let genome = Genome {
+            sequence: seq,
+            n_genome: 2000,
+            n_genome_real: 2000,
+            n_chr_real: 1,
+            chr_name: vec!["I".to_string()],
+            chr_length: vec![1000],
+            chr_start: vec![0, 1000],
+        };
+        let junctions = vec![
+            PreparedJunction {
+                chr_idx: 0,
+                start_pos: 200,
+                end_pos: 500,
+                motif: 1,
+                shift_left: 0,
+                shift_right: 1,
+                strand: 1,
+            },
+            PreparedJunction {
+                chr_idx: 0,
+                start_pos: 700,
+                end_pos: 800,
+                motif: 0,
+                shift_left: 3,
+                shift_right: 0,
+                strand: 0,
+            },
+        ];
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_sjdb_info_tab(tmp.path(), &junctions, 100).unwrap();
+        let parsed = read_sjdb_info_tab(tmp.path(), &genome).unwrap();
+        assert_eq!(parsed.sjdb_overhang, 100);
+        assert_eq!(parsed.junctions, junctions);
     }
 }
