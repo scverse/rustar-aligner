@@ -1309,9 +1309,10 @@ fn stitch_align_to_transcript(
                     || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
             });
 
-            d_score += motif_score;
             if is_annotated {
                 d_score += scorer.sjdb_score;
+            } else {
+                d_score += motif_score;
             }
 
             new_wt.n_junction += 1;
@@ -3413,5 +3414,40 @@ mod tests {
         let mut bin_start_edge: u64 = 2;
         bin_start_edge = bin_start_edge.saturating_sub(win_flank_nbins);
         assert_eq!(bin_start_edge, 0, "Flanking should saturate at 0");
+    }
+
+    #[test]
+    fn test_junction_score_annotated_uses_sjdb_not_motif() {
+        use crate::align::score::AlignmentScorer;
+
+        let scorer = AlignmentScorer::from_params_minimal();
+
+        for motif_score in [0_i32, scorer.score_gap_gcag, scorer.score_gap_atac] {
+            let baseline: i32 = 100;
+
+            let mut d_score_annot = baseline;
+            let is_annotated = true;
+            if is_annotated {
+                d_score_annot += scorer.sjdb_score;
+            } else {
+                d_score_annot += motif_score;
+            }
+            assert_eq!(d_score_annot, baseline + scorer.sjdb_score);
+
+            let mut d_score_novel = baseline;
+            let is_annotated = false;
+            if is_annotated {
+                d_score_novel += scorer.sjdb_score;
+            } else {
+                d_score_novel += motif_score;
+            }
+            assert_eq!(d_score_novel, baseline + motif_score);
+        }
+
+        let baseline: i32 = 100;
+        let motif_score = scorer.score_gap_gcag;
+        let additive_buggy = baseline + motif_score + scorer.sjdb_score;
+        let replacement_correct = baseline + scorer.sjdb_score;
+        assert_ne!(additive_buggy, replacement_correct);
     }
 }
