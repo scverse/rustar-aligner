@@ -190,8 +190,7 @@ impl SamWriter {
         let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
         *record.sequence_mut() = Sequence::from(seq_bytes);
 
-        // Quality scores
-        *record.quality_scores_mut() = QualityScores::from(read_qual.to_vec());
+        *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
 
         maybe_insert_rg_tag(&mut record, rg_id);
 
@@ -440,13 +439,14 @@ impl SamWriter {
                 .map(|&b| decode_base(complement_base(b)))
                 .collect();
             *mapped_rec.sequence_mut() = Sequence::from(seq_bytes);
-            let mut qual = mapped_qual.to_vec();
+            let mut qual = fastq_qual_to_phred(mapped_qual);
             qual.reverse();
             *mapped_rec.quality_scores_mut() = QualityScores::from(qual);
         } else {
             let seq_bytes: Vec<u8> = mapped_seq.iter().map(|&b| decode_base(b)).collect();
             *mapped_rec.sequence_mut() = Sequence::from(seq_bytes);
-            *mapped_rec.quality_scores_mut() = QualityScores::from(mapped_qual.to_vec());
+            *mapped_rec.quality_scores_mut() =
+                QualityScores::from(fastq_qual_to_phred(mapped_qual));
         }
 
         // Optional tags on mapped mate
@@ -532,7 +532,8 @@ impl SamWriter {
         // SEQ/QUAL: forward orientation (no RC for unmapped)
         let unmapped_seq_bytes: Vec<u8> = unmapped_seq.iter().map(|&b| decode_base(b)).collect();
         *unmapped_rec.sequence_mut() = Sequence::from(unmapped_seq_bytes);
-        *unmapped_rec.quality_scores_mut() = QualityScores::from(unmapped_qual.to_vec());
+        *unmapped_rec.quality_scores_mut() =
+            QualityScores::from(fastq_qual_to_phred(unmapped_qual));
         maybe_insert_rg_tag(&mut unmapped_rec, rg_id);
 
         // Order: mate1 first, mate2 second
@@ -629,13 +630,13 @@ impl SamWriter {
                     .map(|&b| decode_base(complement_base(b)))
                     .collect();
                 *record.sequence_mut() = Sequence::from(seq_bytes);
-                let mut qual = read_qual.to_vec();
+                let mut qual = fastq_qual_to_phred(read_qual);
                 qual.reverse();
                 *record.quality_scores_mut() = QualityScores::from(qual);
             } else {
                 let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
                 *record.sequence_mut() = Sequence::from(seq_bytes);
-                *record.quality_scores_mut() = QualityScores::from(read_qual.to_vec());
+                *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
             }
 
             // Optional tags
@@ -686,7 +687,7 @@ impl SamWriter {
 
         let seq1_bytes: Vec<u8> = mate1_seq.iter().map(|&b| decode_base(b)).collect();
         *rec1.sequence_mut() = Sequence::from(seq1_bytes);
-        *rec1.quality_scores_mut() = QualityScores::from(mate1_qual.to_vec());
+        *rec1.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate1_qual));
         maybe_insert_rg_tag(&mut rec1, rg_id);
         records.push(rec1);
 
@@ -703,7 +704,7 @@ impl SamWriter {
 
         let seq2_bytes: Vec<u8> = mate2_seq.iter().map(|&b| decode_base(b)).collect();
         *rec2.sequence_mut() = Sequence::from(seq2_bytes);
-        *rec2.quality_scores_mut() = QualityScores::from(mate2_qual.to_vec());
+        *rec2.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate2_qual));
         maybe_insert_rg_tag(&mut rec2, rg_id);
         records.push(rec2);
 
@@ -860,6 +861,14 @@ fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
     }
 }
 
+/// Convert FASTQ ASCII quality bytes (Phred+33) to raw Phred values (0-93) for
+/// the BAM binary QUAL field, per SAM spec §4.2.3.
+///
+/// `saturating_sub` clamps malformed bytes < 33 to 0 rather than underflowing.
+fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
+    qual.iter().map(|&b| b.saturating_sub(33)).collect()
+}
+
 /// Convert Transcript to SAM record
 #[allow(clippy::too_many_arguments)]
 fn transcript_to_record(
@@ -926,13 +935,13 @@ fn transcript_to_record(
         *record.sequence_mut() = Sequence::from(seq_bytes);
 
         // Reverse the quality scores
-        let mut qual = read_qual.to_vec();
+        let mut qual = fastq_qual_to_phred(read_qual);
         qual.reverse();
         *record.quality_scores_mut() = QualityScores::from(qual);
     } else {
         let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
         *record.sequence_mut() = Sequence::from(seq_bytes);
-        *record.quality_scores_mut() = QualityScores::from(read_qual.to_vec());
+        *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
     }
 
     // Optional tags: gated by --outSAMattributes
@@ -1232,13 +1241,13 @@ fn build_paired_mate_record(
             .collect();
         *record.sequence_mut() = Sequence::from(seq_bytes);
 
-        let mut qual = mate_qual.to_vec();
+        let mut qual = fastq_qual_to_phred(mate_qual);
         qual.reverse();
         *record.quality_scores_mut() = QualityScores::from(qual);
     } else {
         let seq_bytes: Vec<u8> = mate_seq.iter().map(|&b| decode_base(b)).collect();
         *record.sequence_mut() = Sequence::from(seq_bytes);
-        *record.quality_scores_mut() = QualityScores::from(mate_qual.to_vec());
+        *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate_qual));
     }
 
     // Optional tags: gated by --outSAMattributes
@@ -1435,6 +1444,33 @@ mod tests {
         let tmpfile = NamedTempFile::new().unwrap();
         let writer = SamWriter::create(tmpfile.path(), &genome, &params);
         assert!(writer.is_ok());
+    }
+
+    /// Regression test for issue #34: BAM binary QUAL must store raw Phred values
+    /// (0-93), not FASTQ ASCII bytes (Phred+33). Each FASTQ ASCII byte should be
+    /// reduced by 33 before being placed in the BAM QUAL field.
+    #[test]
+    fn test_qual_phred33_offset_stripped_for_bam() {
+        // FASTQ ASCII 'I' = 73 → Phred 40
+        let read_qual = b"III";
+        let read_seq = vec![0u8, 1, 2]; // ACG
+        let record = SamWriter::build_unmapped_record("read1", &read_seq, read_qual, None).unwrap();
+
+        let stored: &[u8] = record.quality_scores().as_ref();
+        assert_eq!(stored, &[40u8, 40, 40]);
+    }
+
+    /// `saturating_sub` must clamp malformed FASTQ bytes (< 33) to 0 rather
+    /// than underflowing.
+    #[test]
+    fn test_qual_phred33_offset_saturating_sub() {
+        // Byte 32 is below the Phred+33 floor; should clamp to 0.
+        let read_qual = &[32u8, 33, 34][..];
+        let read_seq = vec![0u8, 1, 2];
+        let record = SamWriter::build_unmapped_record("read1", &read_seq, read_qual, None).unwrap();
+
+        let stored: &[u8] = record.quality_scores().as_ref();
+        assert_eq!(stored, &[0u8, 0, 1]);
     }
 
     #[test]
