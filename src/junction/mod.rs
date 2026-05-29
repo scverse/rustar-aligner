@@ -409,6 +409,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 4000],
             n_genome: 2000,
+            n_genome_real: 2000,
             n_chr_real: 2,
             chr_start: vec![0, 1000, 2000],
             chr_length: vec![1000, 1000],
