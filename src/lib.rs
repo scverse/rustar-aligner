@@ -478,13 +478,9 @@ fn run_two_pass(
     info!("Two-pass mode: Pass 1 - Junction discovery");
     let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
 
-    // Write SJ.pass1.out.tab
-    let pass1_path = params.output_path("SJ.pass1.out.tab");
-
-    // Create output directory if it doesn't exist
-    if let Some(parent) = pass1_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let pass1_dir = params.output_path("_STARpass1");
+    std::fs::create_dir_all(&pass1_dir)?;
+    let pass1_path = pass1_dir.join("SJ.out.tab");
 
     info!("Writing pass 1 junctions to {}", pass1_path.display());
     sj_stats_pass1.write_output(&pass1_path, &index.genome, params)?;
