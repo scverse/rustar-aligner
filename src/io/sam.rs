@@ -1163,6 +1163,50 @@ fn build_md_tag(
     md
 }
 
+/// Stamp paired-end mate-bookkeeping (PROPERLY_SEGMENTED, MATE_REVERSE_COMPLEMENTED,
+/// RNEXT, PNEXT, TLEN) on two transcriptome-space mate records that share a
+/// transcript by construction. The records and transcripts are paired as
+/// (mate1_record, mate2_record, mate1_transcript, mate2_transcript).
+pub(crate) fn apply_pe_transcriptome_mate_fields(
+    rec1: &mut RecordBuf,
+    rec2: &mut RecordBuf,
+    t1: &Transcript,
+    t2: &Transcript,
+) -> Result<(), Error> {
+    use crate::align::read_align::calculate_insert_size;
+    use sam::alignment::record::Flags;
+
+    *rec1.flags_mut() |= Flags::PROPERLY_SEGMENTED;
+    *rec2.flags_mut() |= Flags::PROPERLY_SEGMENTED;
+
+    if rec2.flags().is_reverse_complemented() {
+        *rec1.flags_mut() |= Flags::MATE_REVERSE_COMPLEMENTED;
+    }
+    if rec1.flags().is_reverse_complemented() {
+        *rec2.flags_mut() |= Flags::MATE_REVERSE_COMPLEMENTED;
+    }
+
+    *rec1.mate_reference_sequence_id_mut() = Some(t2.chr_idx);
+    *rec2.mate_reference_sequence_id_mut() = Some(t1.chr_idx);
+
+    let pos1 = (t1.genome_start + 1) as usize;
+    let pos2 = (t2.genome_start + 1) as usize;
+    *rec1.mate_alignment_start_mut() = Some(
+        pos2.try_into()
+            .map_err(|e| Error::Alignment(format!("invalid mate position {pos2}: {e}")))?,
+    );
+    *rec2.mate_alignment_start_mut() = Some(
+        pos1.try_into()
+            .map_err(|e| Error::Alignment(format!("invalid mate position {pos1}: {e}")))?,
+    );
+
+    let tlen = calculate_insert_size(t1, t2);
+    *rec1.template_length_mut() = tlen;
+    *rec2.template_length_mut() = -tlen;
+
+    Ok(())
+}
+
 /// Build a SAM record for one mate of a paired-end read
 #[allow(clippy::too_many_arguments)]
 fn build_paired_mate_record(
@@ -1961,6 +2005,150 @@ mod tests {
             Some(&Value::from(0_i32)),
             "nM should be 0 (no mismatches in this mate)"
         );
+    }
+
+    #[test]
+    fn test_apply_pe_transcriptome_mate_fields() {
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
+        use sam::alignment::record::Flags;
+
+        let chr_idx = 7;
+
+        let t1 = Transcript {
+            chr_idx,
+            genome_start: 100,
+            genome_end: 130,
+            is_reverse: false,
+            exons: vec![Exon {
+                genome_start: 100,
+                genome_end: 130,
+                read_start: 0,
+                read_end: 30,
+                i_frag: 0,
+            }],
+            cigar: vec![Op::new(Kind::Match, 30)],
+            score: 60,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![],
+        };
+
+        let t2 = Transcript {
+            chr_idx,
+            genome_start: 200,
+            genome_end: 230,
+            is_reverse: true,
+            exons: vec![Exon {
+                genome_start: 200,
+                genome_end: 230,
+                read_start: 0,
+                read_end: 30,
+                i_frag: 0,
+            }],
+            cigar: vec![Op::new(Kind::Match, 30)],
+            score: 60,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![],
+        };
+
+        let mut rec1 = RecordBuf::default();
+        *rec1.flags_mut() = Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+        let mut rec2 = RecordBuf::default();
+        *rec2.flags_mut() = Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
+
+        apply_pe_transcriptome_mate_fields(&mut rec1, &mut rec2, &t1, &t2).unwrap();
+
+        assert!(rec1.flags().is_properly_segmented());
+        assert!(rec2.flags().is_properly_segmented());
+
+        assert!(rec1.flags().is_mate_reverse_complemented());
+        assert!(!rec2.flags().is_mate_reverse_complemented());
+
+        assert_eq!(rec1.mate_reference_sequence_id(), Some(chr_idx));
+        assert_eq!(rec2.mate_reference_sequence_id(), Some(chr_idx));
+
+        let pnext1 = rec1.mate_alignment_start().unwrap();
+        let pnext2 = rec2.mate_alignment_start().unwrap();
+        assert_eq!(usize::from(pnext1), 201);
+        assert_eq!(usize::from(pnext2), 101);
+
+        assert_ne!(rec1.template_length(), 0);
+        assert_ne!(rec2.template_length(), 0);
+        assert!(rec1.template_length() > 0);
+        assert!(rec2.template_length() < 0);
+        assert_eq!(rec1.template_length(), -rec2.template_length());
+    }
+
+    #[test]
+    fn test_apply_pe_transcriptome_mate_fields_reverse_cluster() {
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
+        use sam::alignment::record::Flags;
+
+        let chr_idx = 3;
+
+        let t1 = Transcript {
+            chr_idx,
+            genome_start: 200,
+            genome_end: 230,
+            is_reverse: true,
+            exons: vec![Exon {
+                genome_start: 200,
+                genome_end: 230,
+                read_start: 0,
+                read_end: 30,
+                i_frag: 0,
+            }],
+            cigar: vec![Op::new(Kind::Match, 30)],
+            score: 60,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![],
+        };
+
+        let t2 = Transcript {
+            chr_idx,
+            genome_start: 100,
+            genome_end: 130,
+            is_reverse: false,
+            exons: vec![Exon {
+                genome_start: 100,
+                genome_end: 130,
+                read_start: 0,
+                read_end: 30,
+                i_frag: 0,
+            }],
+            cigar: vec![Op::new(Kind::Match, 30)],
+            score: 60,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            read_seq: vec![],
+        };
+
+        let mut rec1 = RecordBuf::default();
+        *rec1.flags_mut() = Flags::SEGMENTED | Flags::FIRST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
+        let mut rec2 = RecordBuf::default();
+        *rec2.flags_mut() = Flags::SEGMENTED | Flags::LAST_SEGMENT;
+
+        apply_pe_transcriptome_mate_fields(&mut rec1, &mut rec2, &t1, &t2).unwrap();
+
+        assert!(rec1.template_length() < 0);
+        assert!(rec2.template_length() > 0);
+        assert_eq!(rec1.template_length(), -rec2.template_length());
     }
 
     #[test]
