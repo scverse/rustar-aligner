@@ -4,6 +4,26 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 
+/// Parse a memory string into bytes. Accepts plain integers or a suffix:
+/// K/k = ×1024, M/m = ×1024², G/g = ×1024³, T/t = ×1024⁴.
+/// Examples: `31000000000`, `64G`, `512M`, `1T`.
+fn parse_mem_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, shift) = match s.chars().last() {
+        Some('K' | 'k') => (&s[..s.len() - 1], 10),
+        Some('M' | 'm') => (&s[..s.len() - 1], 20),
+        Some('G' | 'g') => (&s[..s.len() - 1], 30),
+        Some('T' | 't') => (&s[..s.len() - 1], 40),
+        _ => (s, 0),
+    };
+    let base: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid memory value '{s}' — expected a number with optional K/M/G/T suffix"))?;
+    base.checked_shl(shift)
+        .ok_or_else(|| format!("memory value '{s}' overflows u64"))
+}
+
 mod sam;
 
 pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped};
@@ -290,12 +310,12 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
-    /// Maximum RAM (bytes) for coordinate-sorted BAM. 0 = unlimited.
-    #[arg(long = "limitBAMsortRAM", default_value_t = 0)]
+    /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
+    #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
 
-    /// Maximum RAM (bytes) for genome generation.
-    #[arg(long = "limitGenomeGenerateRAM", default_value_t = 31_000_000_000_u64)]
+    /// Maximum RAM for genome generation. Accepts bytes or a suffix: 64G, 512M, 1T.
+    #[arg(long = "limitGenomeGenerateRAM", default_value = "31G", value_parser = parse_mem_bytes)]
     pub limit_genome_generate_ram: u64,
 
     /// Route primary alignment output to stdout instead of a file.
@@ -1508,5 +1528,34 @@ mod tests {
             p.output_path("Aligned.out.bam"),
             PathBuf::from("/out/sample1_Aligned.out.bam")
         );
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_raw() {
+        assert_eq!(parse_mem_bytes("0").unwrap(), 0);
+        assert_eq!(parse_mem_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("31000000000").unwrap(), 31_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_suffixes() {
+        assert_eq!(parse_mem_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("1k").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1T").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_mem_bytes("1t").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_mem_bytes("64G").unwrap(), 64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("31G").unwrap(), 31 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_errors() {
+        assert!(parse_mem_bytes("abc").is_err());
+        assert!(parse_mem_bytes("1X").is_err());
+        assert!(parse_mem_bytes("").is_err());
+        assert!(parse_mem_bytes("-1G").is_err());
     }
 }
