@@ -833,9 +833,16 @@ impl Parameters {
     ) -> Result<Self, clap::Error> {
         use clap::error::ErrorKind;
 
+        let args: Vec<_> = args.into_iter().map(Into::into).collect();
+
         let mut command = <Self as clap::CommandFactory>::command();
-        let matches = command.clone().get_matches_from(args);
+        let matches = command.clone().get_matches_from(args.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+
+        params.command_line = {
+            let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
+            shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
+        };
 
         // genomeGenerate requires FASTA files
         if params.run_mode == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {

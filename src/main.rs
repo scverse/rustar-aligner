@@ -6,8 +6,5 @@ fn main() -> anyhow::Result<()> {
 
     cpu::check_cpu_compat()?;
 
-    let command_line = std::env::args().collect::<Vec<_>>().join(" ");
-    let mut params = Parameters::parse();
-    params.command_line = Some(command_line);
-    rustar_aligner::run(&params)
+    rustar_aligner::run(&Parameters::parse())
 }

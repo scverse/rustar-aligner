@@ -1422,9 +1422,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_sam_header_pg_line_cl_quoted() {
+        let genome = make_test_genome();
+        let params =
+            Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "some words.fq"]);
+
+        let header = build_sam_header(&genome, &params).unwrap();
+        let programs = header.programs().as_ref();
+        let pg = programs.get(&b"rustar-aligner"[..]).unwrap();
+        let cl = pg
+            .other_fields()
+            .get(&program_tag::COMMAND_LINE)
+            .expect("CL field must be present");
+        assert_eq!(cl, "rustar-aligner --readFilesIn 'some words.fq'");
+    }
+
+    #[test]
     fn test_build_sam_header_pg_line_default_cl_when_unset() {
         let genome = make_test_genome();
-        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq\0"]);
+        // when there are null bytes in the args, `command_line` is set to None
         assert!(params.command_line.is_none());
 
         let header = build_sam_header(&genome, &params).unwrap();
