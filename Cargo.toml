@@ -41,6 +41,7 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
+bitflags = { version = "2.11.1", features = ["std"] }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -6,7 +6,7 @@ use crate::genome::Genome;
 use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
-use crate::params::Parameters;
+use crate::params::{Parameters, SamAttributes};
 use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
@@ -104,7 +104,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let attrs = params.effective_sam_attribute_set();
+        let attrs = params.out_sam_attributes;
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -118,7 +118,7 @@ impl SamWriter {
                 mapq,
                 max_output,    // NH = number of reported alignments
                 hit_index + 1, // 1-based
-                &attrs,
+                attrs,
             )?;
             maybe_insert_rg_tag(&mut record, rg_id);
 
@@ -224,7 +224,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let attrs = params.effective_sam_attribute_set();
+        let attrs = params.out_sam_attributes;
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -239,7 +239,7 @@ impl SamWriter {
                 mapq,
                 max_output,    // NH = number of reported alignments
                 hit_index + 1, // 1-based
-                &attrs,
+                attrs,
             )?;
             maybe_insert_rg_tag(&mut record, rg_id);
             records.push(record);
@@ -288,7 +288,7 @@ impl SamWriter {
         };
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let attrs = params.effective_sam_attribute_set();
+        let attrs = params.out_sam_attributes;
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -315,7 +315,7 @@ impl SamWriter {
                 max_output, // NH = number of reported alignments
                 hit_index,
                 combined_score,
-                &attrs,
+                attrs,
             )?;
             maybe_insert_rg_tag(&mut rec1, rg_id);
             records.push(rec1);
@@ -335,7 +335,7 @@ impl SamWriter {
                 max_output,              // NH = number of reported alignments
                 hit_index,
                 combined_score,
-                &attrs,
+                attrs,
             )?;
             maybe_insert_rg_tag(&mut rec2, rg_id);
             records.push(rec2);
@@ -371,7 +371,7 @@ impl SamWriter {
         let n_alignments = 1usize;
         let effective_n = n_alignments.max(n_for_mapq);
         let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let attrs = params.effective_sam_attribute_set();
+        let attrs = params.out_sam_attributes;
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
 
@@ -439,16 +439,16 @@ impl SamWriter {
 
         // Optional tags on mapped mate
         let data = mapped_rec.data_mut();
-        if attrs.contains("NH") {
+        if attrs.contains(SamAttributes::NH) {
             data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
         }
-        if attrs.contains("HI") {
+        if attrs.contains(SamAttributes::HI) {
             data.insert(Tag::HIT_INDEX, Value::from(1i32));
         }
-        if attrs.contains("AS") {
+        if attrs.contains(SamAttributes::AS) {
             data.insert(Tag::ALIGNMENT_SCORE, Value::from(mapped_transcript.score));
         }
-        if attrs.contains("NM") {
+        if attrs.contains(SamAttributes::NM) {
             data.insert(
                 Tag::EDIT_DISTANCE,
                 Value::from(sam_spec_nm(
@@ -456,29 +456,27 @@ impl SamWriter {
                     &mapped_transcript.cigar,
                 )),
             );
-        }
-        if attrs.contains("nM") {
             data.insert(
                 Tag::new(b'n', b'M'),
                 Value::from(mapped_transcript.n_mismatch as i32),
             );
         }
-        if attrs.contains("XS")
+        if attrs.contains(SamAttributes::XS)
             && let Some(xs_strand) = derive_xs_strand(mapped_transcript)
         {
             data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
         }
-        if attrs.contains("jM")
+        if attrs.contains(SamAttributes::JM)
             && let Some(jm) = build_jm_tag(mapped_transcript)
         {
             data.insert(Tag::new(b'j', b'M'), jm);
         }
-        if attrs.contains("jI")
+        if attrs.contains(SamAttributes::JI)
             && let Some(ji) = build_ji_tag(mapped_transcript, chr_start)
         {
             data.insert(Tag::new(b'j', b'I'), ji);
         }
-        if attrs.contains("MD") {
+        if attrs.contains(SamAttributes::MD) {
             let md = build_md_tag(
                 mapped_transcript,
                 mapped_seq,
@@ -572,15 +570,11 @@ impl SamWriter {
         if projected.is_empty() {
             return Ok(Vec::new());
         }
-        let mut attrs = params.sam_attribute_set();
-        // Splice tags are meaningless in t-space.
-        attrs.remove("jM");
-        attrs.remove("jI");
-        attrs.remove("XS");
-        // MD-tag would require the transcript's t-space reference which we do
-        // not precompute; drop it to keep this writer simple.  STAR also does
-        // not emit MD for transcriptome SAM.
-        attrs.remove("MD");
+        // Splice tags are meaningless in t-space; MD would require the
+        // transcript's t-space reference which we do not precompute, and
+        // STAR also does not emit MD for transcriptome SAM.
+        let attrs = params.out_sam_attributes
+            - (SamAttributes::JM | SamAttributes::JI | SamAttributes::XS | SamAttributes::MD);
 
         let n_alignments = projected.len();
         let mut records = Vec::with_capacity(n_alignments);
@@ -640,23 +634,21 @@ impl SamWriter {
 
             // Optional tags
             let data = record.data_mut();
-            if attrs.contains("NH") {
+            if attrs.contains(SamAttributes::NH) {
                 data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
             }
-            if attrs.contains("HI") {
+            if attrs.contains(SamAttributes::HI) {
                 // HI is 1-based; primary = 1, secondaries > 1 in emission order.
                 data.insert(Tag::HIT_INDEX, Value::from((hit_idx + 1) as i32));
             }
-            if attrs.contains("AS") {
+            if attrs.contains(SamAttributes::AS) {
                 data.insert(Tag::ALIGNMENT_SCORE, Value::from(t.score));
             }
-            if attrs.contains("NM") {
+            if attrs.contains(SamAttributes::NM) {
                 data.insert(
                     Tag::EDIT_DISTANCE,
                     Value::from(sam_spec_nm(t.n_mismatch, &t.cigar)),
                 );
-            }
-            if attrs.contains("nM") {
                 data.insert(Tag::new(b'n', b'M'), Value::from(t.n_mismatch as i32));
             }
 
@@ -869,9 +861,9 @@ where
     Ok(builder.build())
 }
 
-/// Insert `RG:Z:<id>` on the record when an ID is set. `sam_attribute_set()`
-/// auto-adds `RG` to the attribute set whenever an RG line is configured, so
-/// `rg_id.is_some()` implies the attribute is wanted — no extra gate needed.
+/// Insert `RG:Z:<id>` on the record when an ID is set. `Parameters::try_parse_from`
+/// auto-ORs `SamAttributes::RG` into `out_sam_attributes` whenever an RG line is
+/// configured, so `rg_id.is_some()` implies the attribute is wanted.
 fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
     if let Some(id) = rg_id {
         record
@@ -899,7 +891,7 @@ fn transcript_to_record(
     mapq: u8,
     n_alignments: usize,
     hit_index: usize,
-    attrs: &HashSet<String>,
+    attrs: SamAttributes,
 ) -> Result<RecordBuf, Error> {
     let mut record = RecordBuf::default();
 
@@ -965,43 +957,41 @@ fn transcript_to_record(
 
     // Optional tags: gated by --outSAMattributes
     let data = record.data_mut();
-    if attrs.contains("NH") {
+    if attrs.contains(SamAttributes::NH) {
         data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
     }
-    if attrs.contains("HI") {
+    if attrs.contains(SamAttributes::HI) {
         data.insert(Tag::HIT_INDEX, Value::from(hit_index as i32));
     }
-    if attrs.contains("AS") {
+    if attrs.contains(SamAttributes::AS) {
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(transcript.score));
     }
-    if attrs.contains("NM") {
+    if attrs.contains(SamAttributes::NM) {
         data.insert(
             Tag::EDIT_DISTANCE,
             Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
         );
-    }
-    if attrs.contains("nM") {
         data.insert(
             Tag::new(b'n', b'M'),
             Value::from(transcript.n_mismatch as i32),
         );
     }
-    if attrs.contains("XS")
+    if attrs.contains(SamAttributes::XS)
         && let Some(xs_strand) = derive_xs_strand(transcript)
     {
         data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
     }
-    if attrs.contains("jM")
+    if attrs.contains(SamAttributes::JM)
         && let Some(jm) = build_jm_tag(transcript)
     {
         data.insert(Tag::new(b'j', b'M'), jm);
     }
-    if attrs.contains("jI")
+    if attrs.contains(SamAttributes::JI)
         && let Some(ji) = build_ji_tag(transcript, chr_start)
     {
         data.insert(Tag::new(b'j', b'I'), ji);
     }
-    if attrs.contains("MD") {
+    if attrs.contains(SamAttributes::MD) {
         let md = build_md_tag(transcript, read_seq, genome, transcript.is_reverse);
         data.insert(Tag::new(b'M', b'D'), Value::String(BString::from(md)));
     }
@@ -1223,7 +1213,7 @@ fn build_paired_mate_record(
     n_alignments: usize,
     hit_index: usize,
     combined_score: i32,
-    attrs: &HashSet<String>,
+    attrs: SamAttributes,
 ) -> Result<RecordBuf, Error> {
     let mut record = RecordBuf::default();
 
@@ -1318,44 +1308,42 @@ fn build_paired_mate_record(
 
     // Optional tags: gated by --outSAMattributes
     let data = record.data_mut();
-    if attrs.contains("NH") {
+    if attrs.contains(SamAttributes::NH) {
         data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
     }
-    if attrs.contains("HI") {
+    if attrs.contains(SamAttributes::HI) {
         data.insert(Tag::HIT_INDEX, Value::from(hit_index as i32));
     }
-    if attrs.contains("AS") {
+    if attrs.contains(SamAttributes::AS) {
         // STAR reports combined score (sum of both mates) for PE AS tag
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(combined_score));
     }
-    if attrs.contains("NM") {
+    if attrs.contains(SamAttributes::NM) {
         data.insert(
             Tag::EDIT_DISTANCE,
             Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
         );
-    }
-    if attrs.contains("nM") {
         data.insert(
             Tag::new(b'n', b'M'),
             Value::from(transcript.n_mismatch as i32),
         );
     }
-    if attrs.contains("XS")
+    if attrs.contains(SamAttributes::XS)
         && let Some(xs_strand) = derive_xs_strand(transcript)
     {
         data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
     }
-    if attrs.contains("jM")
+    if attrs.contains(SamAttributes::JM)
         && let Some(jm) = build_jm_tag(transcript)
     {
         data.insert(Tag::new(b'j', b'M'), jm);
     }
-    if attrs.contains("jI")
+    if attrs.contains(SamAttributes::JI)
         && let Some(ji) = build_ji_tag(transcript, chr_start)
     {
         data.insert(Tag::new(b'j', b'I'), ji);
     }
-    if attrs.contains("MD") {
+    if attrs.contains(SamAttributes::MD) {
         let md = build_md_tag(transcript, mate_seq, genome, transcript.is_reverse);
         data.insert(Tag::new(b'M', b'D'), Value::String(BString::from(md)));
     }
@@ -1370,22 +1358,6 @@ mod tests {
     use crate::genome::Genome;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
-
-    /// Build an attribute set with all tags enabled (for tests that don't care about filtering)
-    fn all_attrs() -> HashSet<String> {
-        ["NH", "HI", "AS", "NM", "nM", "XS", "jM", "jI", "MD"]
-            .iter()
-            .map(ToString::to_string)
-            .collect()
-    }
-
-    /// Build the standard attribute set (NH, HI, AS, NM, nM)
-    fn standard_attrs() -> HashSet<String> {
-        ["NH", "HI", "AS", "NM", "nM"]
-            .iter()
-            .map(ToString::to_string)
-            .collect()
-    }
 
     fn make_test_genome() -> Genome {
         Genome {
@@ -1631,7 +1603,7 @@ mod tests {
             255,
             1,
             1,
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         );
         assert!(record.is_ok());
 
@@ -1868,7 +1840,7 @@ mod tests {
             1,   // n_alignments
             1,   // hit_index
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -1896,7 +1868,7 @@ mod tests {
             1,   // n_alignments
             1,   // hit_index
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -1980,7 +1952,7 @@ mod tests {
             1,   // n_alignments
             1,   // hit_index
             350, // combined_score (200+150)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -2189,7 +2161,7 @@ mod tests {
             255,
             3, // n_alignments
             2, // hit_index
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -2306,7 +2278,7 @@ mod tests {
             255,
             1, // unique mapper
             1,
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -2439,7 +2411,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -2484,7 +2456,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -2533,7 +2505,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -2584,7 +2556,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -2633,7 +2605,7 @@ mod tests {
             255,
             1,
             1,
-            &standard_attrs(), // XS not in standard attrs
+            SamAttributes::STANDARD, // XS not in standard attrs
         )
         .unwrap();
 
@@ -3067,7 +3039,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -3153,7 +3125,7 @@ mod tests {
             1,
             1,
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -3176,7 +3148,7 @@ mod tests {
             1,
             1,
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -3262,7 +3234,7 @@ mod tests {
             1,
             1,
             180, // combined_score (100+80)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
         assert_eq!(
@@ -3292,7 +3264,7 @@ mod tests {
             1,
             1,
             180, // combined_score (100+80)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
         assert_eq!(
@@ -3378,7 +3350,7 @@ mod tests {
             1,
             1,
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
         assert!(!rec1.flags().is_mate_reverse_complemented());
@@ -3398,7 +3370,7 @@ mod tests {
             1,
             1,
             190, // combined_score (100+90)
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
         assert!(!rec2.flags().is_mate_reverse_complemented());
@@ -3439,7 +3411,7 @@ mod tests {
             255,
             1,
             1,
-            &standard_attrs(),
+            SamAttributes::STANDARD,
         )
         .unwrap();
 
@@ -3506,7 +3478,7 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3];
         let read_qual = vec![30, 30, 30, 30];
 
-        let empty_attrs: HashSet<String> = HashSet::new();
+        let empty_attrs = SamAttributes::empty();
         let record = transcript_to_record(
             &transcript,
             "read1",
@@ -3516,7 +3488,7 @@ mod tests {
             255,
             1,
             1,
-            &empty_attrs,
+            empty_attrs,
         )
         .unwrap();
 
@@ -3581,7 +3553,7 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3];
         let read_qual = vec![30, 30, 30, 30];
 
-        let attrs: HashSet<String> = ["NH", "MD"].iter().map(ToString::to_string).collect();
+        let attrs = SamAttributes::NH | SamAttributes::MD;
         let record = transcript_to_record(
             &transcript,
             "read1",
@@ -3591,7 +3563,7 @@ mod tests {
             255,
             1,
             1,
-            &attrs,
+            attrs,
         )
         .unwrap();
 
@@ -3639,15 +3611,10 @@ mod tests {
 
         // Standard
         let p = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
-        let attrs = p.sam_attribute_set();
-        assert_eq!(attrs.len(), 5);
-        assert!(attrs.contains("NH"));
-        assert!(attrs.contains("HI"));
-        assert!(attrs.contains("AS"));
-        assert!(attrs.contains("NM"));
-        assert!(attrs.contains("nM"));
+        assert_eq!(p.out_sam_attributes, SamAttributes::STANDARD);
 
-        // All
+        // All — note: XS is stripped at parse-time because the default
+        // --outSAMstrandField is "None" (STAR only emits XS in intronMotif mode).
         let p = Parameters::parse_from([
             "rustar-aligner",
             "--readFilesIn",
@@ -3655,13 +3622,19 @@ mod tests {
             "--outSAMattributes",
             "All",
         ]);
-        let attrs = p.sam_attribute_set();
-        assert_eq!(attrs.len(), 9);
-        assert!(attrs.contains("nM"));
-        assert!(attrs.contains("XS"));
-        assert!(attrs.contains("MD"));
-        assert!(attrs.contains("jM"));
-        assert!(attrs.contains("jI"));
+        assert_eq!(p.out_sam_attributes, SamAttributes::ALL - SamAttributes::XS);
+
+        // All + intronMotif keeps XS.
+        let p = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "All",
+            "--outSAMstrandField",
+            "intronMotif",
+        ]);
+        assert_eq!(p.out_sam_attributes, SamAttributes::ALL);
 
         // None
         let p = Parameters::parse_from([
@@ -3671,8 +3644,7 @@ mod tests {
             "--outSAMattributes",
             "None",
         ]);
-        let attrs = p.sam_attribute_set();
-        assert!(attrs.is_empty());
+        assert!(p.out_sam_attributes.is_empty());
 
         // Explicit subset
         let p = Parameters::parse_from([
@@ -3684,12 +3656,10 @@ mod tests {
             "AS",
             "MD",
         ]);
-        let attrs = p.sam_attribute_set();
-        assert_eq!(attrs.len(), 3);
-        assert!(attrs.contains("NH"));
-        assert!(attrs.contains("AS"));
-        assert!(attrs.contains("MD"));
-        assert!(!attrs.contains("HI"));
+        assert_eq!(
+            p.out_sam_attributes,
+            SamAttributes::NH | SamAttributes::AS | SamAttributes::MD,
+        );
     }
 
     #[test]
@@ -3732,7 +3702,7 @@ mod tests {
             255,
             1,
             1,
-            &all_attrs(),
+            SamAttributes::ALL,
         )
         .unwrap();
 
@@ -3750,7 +3720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nm_tag_distinct_from_nm_lower() {
+    fn test_nm_tag_emits_both_edit_distance_and_mismatch_count() {
         use cigar::op::{Kind, Op};
         let genome = make_test_genome();
 
@@ -3777,7 +3747,8 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3];
         let read_qual = vec![30, 30, 30, 30];
 
-        let both: HashSet<String> = ["NM", "nM"].iter().map(ToString::to_string).collect();
+        // SamAttributes::NM covers both "NM" and "nM" CLI tokens and emits both tags.
+        let attrs = SamAttributes::NM;
         let record = transcript_to_record(
             &transcript,
             "read1",
@@ -3787,22 +3758,23 @@ mod tests {
             255,
             1,
             1,
-            &both,
+            attrs,
         )
         .unwrap();
         let data = record.data();
         assert_eq!(
             data.get(&Tag::EDIT_DISTANCE),
             Some(&Value::from(3_i32)),
-            "NM should be 1 mismatch + 2 deleted bases = 3"
+            "NM:i: should be 1 mismatch + 2 deleted bases = 3"
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
             Some(&Value::from(1_i32)),
-            "nM should be 1 (mismatches only)"
+            "nM:i: should be 1 (mismatches only)"
         );
 
-        let only_lower: HashSet<String> = ["nM"].iter().map(ToString::to_string).collect();
+        // When NM bit is absent, neither tag is emitted.
+        let no_nm = SamAttributes::NH | SamAttributes::HI;
         let record = transcript_to_record(
             &transcript,
             "read1",
@@ -3812,43 +3784,12 @@ mod tests {
             255,
             1,
             1,
-            &only_lower,
+            no_nm,
         )
         .unwrap();
         let data = record.data();
-        assert!(
-            data.get(&Tag::EDIT_DISTANCE).is_none(),
-            "NM should be absent when only nM is requested"
-        );
-        assert_eq!(
-            data.get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(1_i32)),
-            "nM should still be 1"
-        );
-
-        let only_upper: HashSet<String> = ["NM"].iter().map(ToString::to_string).collect();
-        let record = transcript_to_record(
-            &transcript,
-            "read1",
-            &read_seq,
-            &read_qual,
-            &genome,
-            255,
-            1,
-            1,
-            &only_upper,
-        )
-        .unwrap();
-        let data = record.data();
-        assert_eq!(
-            data.get(&Tag::EDIT_DISTANCE),
-            Some(&Value::from(3_i32)),
-            "NM should be present when only NM is requested"
-        );
-        assert!(
-            data.get(&Tag::new(b'n', b'M')).is_none(),
-            "nM should be absent when only NM is requested"
-        );
+        assert!(data.get(&Tag::EDIT_DISTANCE).is_none(), "NM:i: absent when not requested");
+        assert!(data.get(&Tag::new(b'n', b'M')).is_none(), "nM:i: absent when not requested");
     }
 
     #[test]
@@ -4133,7 +4074,9 @@ mod tests {
     }
 
     #[test]
-    fn xs_tag_emitted_when_xs_in_attributes_only() {
+    fn xs_tag_absent_when_xs_in_attrs_but_no_intron_motif() {
+        // XS listed in --outSAMattributes without --outSAMstrandField intronMotif:
+        // the bit is stripped at parse time, so no XS tag is emitted.
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
             "rustar-aligner",
@@ -4162,10 +4105,9 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         let data = records[0].data();
-        assert_eq!(
-            data.get(&Tag::new(b'X', b'S')),
-            Some(&Value::Character(b'+')),
-            "XS:A:+ should be emitted when XS is listed in --outSAMattributes"
+        assert!(
+            data.get(&Tag::new(b'X', b'S')).is_none(),
+            "XS:A: should be absent when --outSAMstrandField is not intronMotif"
         );
     }
 
