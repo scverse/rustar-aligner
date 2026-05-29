@@ -3788,8 +3788,14 @@ mod tests {
         )
         .unwrap();
         let data = record.data();
-        assert!(data.get(&Tag::EDIT_DISTANCE).is_none(), "NM:i: absent when not requested");
-        assert!(data.get(&Tag::new(b'n', b'M')).is_none(), "nM:i: absent when not requested");
+        assert!(
+            data.get(&Tag::EDIT_DISTANCE).is_none(),
+            "NM:i: absent when not requested"
+        );
+        assert!(
+            data.get(&Tag::new(b'n', b'M')).is_none(),
+            "nM:i: absent when not requested"
+        );
     }
 
     #[test]

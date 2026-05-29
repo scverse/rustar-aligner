@@ -15,10 +15,9 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
         Some('T' | 't') => (&s[..s.len() - 1], 40),
         _ => (s, 0),
     };
-    let base: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid memory value '{s}' — expected a number with optional K/M/G/T suffix"))?;
+    let base: u64 = digits.trim().parse().map_err(|_| {
+        format!("invalid memory value '{s}' — expected a number with optional K/M/G/T suffix")
+    })?;
     base.checked_shl(shift)
         .ok_or_else(|| format!("memory value '{s}' overflows u64"))
 }
