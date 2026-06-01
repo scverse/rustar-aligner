@@ -907,7 +907,6 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
-    let rg_id_owned = params.primary_rg_id()?;
 
     // BySJout disk buffer: SAM records written to a temp file; only compact metadata kept in RAM.
     // For 100M reads this avoids ~60 GB of Vec<RecordBuf> in memory.
@@ -982,7 +981,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
-                            rg_id_owned.as_deref(),
+                            params,
+                            crate::stats::UnmappedReason::Other,
                         )?;
                         buffer.push(record);
                     }
@@ -1059,7 +1059,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
-                            rg_id_owned.as_deref(),
+                            params,
+                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                         )?;
                         buffer.push(record);
                     }
@@ -1422,6 +1423,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             &m2_seq,
                             &m2_qual,
                             params,
+                            crate::stats::UnmappedReason::Other,
                         )?;
                         for record in records {
                             buffer.push(record);
@@ -1578,6 +1580,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             &m2_seq,
                             &m2_qual,
                             params,
+                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                         )?;
                         for record in records {
                             buffer.push(record);
