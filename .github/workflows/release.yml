@@ -227,7 +227,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # ratchet:docker/build-push-action@v7.0.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # ratchet:docker/build-push-action@v7.2.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -307,7 +307,7 @@ jobs:
             type=raw,value=dev-${{ matrix.tag_suffix }}
 
       - name: Build and push
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # ratchet:docker/build-push-action@v7.0.0
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # ratchet:docker/build-push-action@v7.2.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
