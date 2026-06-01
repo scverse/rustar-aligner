@@ -833,6 +833,59 @@ mod tests {
     }
 
     #[test]
+    fn test_too_many_loci_routed_and_totals_conserved() {
+        let stats = AlignmentStats::new();
+        let max_multimaps = 3;
+
+        stats.record_alignment(5, max_multimaps);
+        stats.record_unmapped_reason(UnmappedReason::TooManyLoci);
+
+        assert_eq!(stats.total_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.too_many_loci.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.uniquely_mapped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.multi_mapped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unmapped_other.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unmapped_short.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unmapped_mismatches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_bucket_sum_conserved_with_too_many_loci() {
+        let stats = AlignmentStats::new();
+        let max_multimaps = 10;
+
+        for _ in 0..3 {
+            stats.record_alignment(1, max_multimaps);
+        }
+        for _ in 0..2 {
+            stats.record_alignment(5, max_multimaps);
+        }
+        for _ in 0..4 {
+            stats.record_alignment(0, max_multimaps);
+            stats.record_unmapped_reason(UnmappedReason::TooShort);
+        }
+        for _ in 0..2 {
+            stats.record_alignment(15, max_multimaps);
+            stats.record_unmapped_reason(UnmappedReason::TooManyLoci);
+        }
+
+        let total = stats.total_reads.load(Ordering::Relaxed);
+        let unique = stats.uniquely_mapped.load(Ordering::Relaxed);
+        let multi = stats.multi_mapped.load(Ordering::Relaxed);
+        let unmapped_short = stats.unmapped_short.load(Ordering::Relaxed);
+        let unmapped_other = stats.unmapped_other.load(Ordering::Relaxed);
+        let unmapped_mismatches = stats.unmapped_mismatches.load(Ordering::Relaxed);
+        let too_many_loci = stats.too_many_loci.load(Ordering::Relaxed);
+
+        assert_eq!(total, 11);
+        assert_eq!(too_many_loci, 2);
+        let bucket_sum =
+            unique + multi + unmapped_short + unmapped_other + unmapped_mismatches + too_many_loci;
+        assert_eq!(bucket_sum, total);
+    }
+
+    #[test]
     fn test_splice_motif_aggregation() {
         use crate::align::score::SpliceMotif;
         use crate::align::transcript::Exon;

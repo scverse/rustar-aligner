@@ -70,6 +70,13 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     );
 
+    if params.limit_genome_generate_ram != 31_000_000_000 {
+        log::warn!(
+            "--limitGenomeGenerateRAM {} accepted but not enforced; rustar manages genome-generation memory independently",
+            params.limit_genome_generate_ram
+        );
+    }
+
     info!("Building genome index...");
     let index = GenomeIndex::build(params)?;
 
@@ -471,13 +478,9 @@ fn run_two_pass(
     info!("Two-pass mode: Pass 1 - Junction discovery");
     let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
 
-    // Write SJ.pass1.out.tab
-    let pass1_path = params.output_path("SJ.pass1.out.tab");
-
-    // Create output directory if it doesn't exist
-    if let Some(parent) = pass1_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let pass1_dir = params.output_path("_STARpass1");
+    std::fs::create_dir_all(&pass1_dir)?;
+    let pass1_path = pass1_dir.join("SJ.out.tab");
 
     info!("Writing pass 1 junctions to {}", pass1_path.display());
     sj_stats_pass1.write_output(&pass1_path, &index.genome, params)?;
@@ -781,6 +784,15 @@ where
         *r.flags_mut() |= Flags::SEGMENTED | Flags::LAST_SEGMENT;
     }
 
+    for (((r1, r2), p1), p2) in rec1s
+        .iter_mut()
+        .zip(rec2s.iter_mut())
+        .zip(p1s.iter())
+        .zip(p2s.iter())
+    {
+        crate::io::sam::apply_pe_transcriptome_mate_fields(r1, r2, p1, p2)?;
+    }
+
     let mut out: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
         Vec::with_capacity(n_alignments * 2);
     for (r1, r2) in rec1s.into_iter().zip(rec2s) {
@@ -807,8 +819,8 @@ fn extract_junction_keys(
         match op.kind() {
             Kind::Skip => {
                 let intron_len = op.len();
-                let intron_start = genome_pos + 1;
-                let intron_end = genome_pos + intron_len as u64;
+                let intron_start = genome_pos;
+                let intron_end = genome_pos + intron_len as u64 - 1;
 
                 let motif =
                     scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
@@ -1461,8 +1473,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     .collect();
 
                 if results.is_empty() {
-                    // Both mates unmapped
-                    stats.record_alignment(0, max_multimaps);
+                    stats.record_alignment(n_for_mapq, max_multimaps);
                     stats.record_unmapped_reason(
                         unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                     );
@@ -1858,8 +1869,8 @@ fn record_transcript_junctions(
             Kind::Skip => {
                 // This is a splice junction
                 let intron_len = op.len();
-                let intron_start = genome_pos + 1; // 1-based, first intronic base
-                let intron_end = genome_pos + intron_len as u64; // 1-based, last intronic base
+                let intron_start = genome_pos;
+                let intron_end = genome_pos + intron_len as u64 - 1;
 
                 // Detect splice motif
                 let motif =
