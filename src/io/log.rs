@@ -46,64 +46,64 @@ pub fn write_log_out(
     time_genome_loaded: chrono::DateTime<chrono::Local>,
     time_finish: chrono::DateTime<chrono::Local>,
 ) -> std::io::Result<()> {
-    let f = std::fs::File::create(path)?;
-    let mut w = BufWriter::new(f);
+    let file = std::fs::File::create(path)?;
+    let mut out = BufWriter::new(file);
 
     // STAR uses two timestamp formats in Log.out
     let long_fmt = "%a %b %e %H:%M:%S %Y"; // "Tue Feb 10 17:11:24 2026"
     let short_fmt = "%b %e %H:%M:%S"; //      "Feb 10 17:11:26"
 
     // ── Header ─────────────────────────────────────────────────────────────
-    writeln!(w, "STAR version={}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(out, "STAR version={}", env!("CARGO_PKG_VERSION"))?;
     writeln!(
-        w,
+        out,
         "STAR compilation time,server,dir={} :",
         time_start.format("%Y-%m-%dT%H:%M:%S%:z")
     )?;
-    writeln!(w, "STAR git: ")?;
+    writeln!(out, "STAR git: ")?;
 
     // ── Command line and parameter sections ────────────────────────────────
     let cmd = params.command_line.as_deref().unwrap_or("");
     let pairs = cli_params(cmd);
 
-    writeln!(w, "##### Command Line:")?;
-    writeln!(w, "{cmd}")?;
+    writeln!(out, "##### Command Line:")?;
+    writeln!(out, "{cmd}")?;
 
-    writeln!(w, "##### Initial USER parameters from Command Line:")?;
+    writeln!(out, "##### Initial USER parameters from Command Line:")?;
     if let Some((_, v)) = pairs.iter().find(|(k, _)| k == "outFileNamePrefix") {
-        writeln!(w, "{:<33}{v}", "outFileNamePrefix")?;
+        writeln!(out, "{:<33}{v}", "outFileNamePrefix")?;
     }
 
-    writeln!(w, "###### All USER parameters from Command Line:")?;
+    writeln!(out, "###### All USER parameters from Command Line:")?;
     for (k, v) in &pairs {
-        writeln!(w, "{k:<30}{v}     ~RE-DEFINED")?;
+        writeln!(out, "{k:<30}{v}     ~RE-DEFINED")?;
     }
-    writeln!(w, "##### Finished reading parameters from all sources")?;
-    writeln!(w)?;
+    writeln!(out, "##### Finished reading parameters from all sources")?;
+    writeln!(out)?;
 
     writeln!(
-        w,
+        out,
         "##### Final user re-defined parameters-----------------:"
     )?;
     for (k, v) in &pairs {
-        writeln!(w, "{k:<34}{v}")?;
+        writeln!(out, "{k:<34}{v}")?;
     }
-    writeln!(w)?;
-    writeln!(w, "-------------------------------")?;
-    writeln!(w, "##### Final effective command line:")?;
-    writeln!(w, "{cmd}")?;
-    writeln!(w, "----------------------------------------")?;
-    writeln!(w)?;
+    writeln!(out)?;
+    writeln!(out, "-------------------------------")?;
+    writeln!(out, "##### Final effective command line:")?;
+    writeln!(out, "{cmd}")?;
+    writeln!(out, "----------------------------------------")?;
+    writeln!(out)?;
 
     // ── Chromosome table ───────────────────────────────────────────────────
     writeln!(
-        w,
+        out,
         "Number of real (reference) chromosomes= {}",
         genome.n_chr_real
     )?;
     for i in 0..genome.n_chr_real {
         writeln!(
-            w,
+            out,
             "{}\t{}\t{}\t{}",
             i + 1,
             genome.chr_name[i],
@@ -114,23 +114,23 @@ pub fn write_log_out(
 
     // ── Phase timestamps ───────────────────────────────────────────────────
     writeln!(
-        w,
+        out,
         "Started loading the genome: {}",
         time_genome_loaded.format(long_fmt)
     )?;
-    writeln!(w)?;
+    writeln!(out)?;
     writeln!(
-        w,
+        out,
         "Finished loading the genome: {}",
         time_genome_loaded.format(long_fmt)
     )?;
-    writeln!(w)?;
+    writeln!(out)?;
     writeln!(
-        w,
+        out,
         "{} ..... finished mapping",
         time_finish.format(short_fmt)
     )?;
-    writeln!(w, "ALL DONE!")?;
+    writeln!(out, "ALL DONE!")?;
 
     Ok(())
 }
@@ -148,16 +148,16 @@ pub fn write_log_progress_out(
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
 
-    let f = std::fs::File::create(path)?;
-    let mut w = BufWriter::new(f);
+    let file = std::fs::File::create(path)?;
+    let mut out = BufWriter::new(file);
 
     // STAR's exact two-line header
     writeln!(
-        w,
+        out,
         "           Time    Speed        Read     Read   Mapped   Mapped   Mapped   Mapped Unmapped Unmapped Unmapped Unmapped"
     )?;
     writeln!(
-        w,
+        out,
         "                    M/hr      number   length   unique   length   MMrate    multi   multi+       MM    short    other"
     )?;
 
@@ -169,14 +169,15 @@ pub fn write_log_progress_out(
 
         let read_len = stats.read_bases.load(Ordering::Relaxed) / total;
         let unique = stats.uniquely_mapped.load(Ordering::Relaxed);
-        let mapped_len = if unique > 0 {
-            stats.mapped_bases.load(Ordering::Relaxed) / unique
-        } else {
-            0
-        };
+        let mapped_len = stats
+            .mapped_bases
+            .load(Ordering::Relaxed)
+            .checked_div(unique)
+            .unwrap_or(0);
         let multi = stats.multi_mapped.load(Ordering::Relaxed);
-        let mm_rate = if unique + multi > 0 {
-            (multi as f64 / (unique + multi) as f64) * 100.0
+        let mapped_total = unique + multi;
+        let mm_rate = if mapped_total > 0 {
+            (multi as f64 / mapped_total as f64) * 100.0
         } else {
             0.0
         };
@@ -186,17 +187,17 @@ pub fn write_log_progress_out(
             + stats.too_many_loci.load(Ordering::Relaxed);
 
         let elapsed = time_finish - time_start;
-        let h = elapsed.num_hours();
-        let m = elapsed.num_minutes() % 60;
-        let s = elapsed.num_seconds() % 60;
+        let hours = elapsed.num_hours();
+        let mins = elapsed.num_minutes() % 60;
+        let secs = elapsed.num_seconds() % 60;
 
         writeln!(
-            w,
-            "{h:>15}:{m:02}:{s:02}  {speed_m_hr:>11.2}  {total:>11}  {read_len:>7}  {unique:>7}  {mapped_len:>7}  {mm_rate:>7.2}%  {multi:>7}        0  {too_many_mm:>7}  {too_short:>7}  {other:>7}"
+            out,
+            "{hours:>15}:{mins:02}:{secs:02}  {speed_m_hr:>11.2}  {total:>11}  {read_len:>7}  {unique:>7}  {mapped_len:>7}  {mm_rate:>7.2}%  {multi:>7}        0  {too_many_mm:>7}  {too_short:>7}  {other:>7}"
         )?;
     }
 
-    writeln!(w, "ALL DONE!")?;
+    writeln!(out, "ALL DONE!")?;
 
     Ok(())
 }
