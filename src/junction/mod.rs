@@ -19,7 +19,12 @@ use crate::genome::Genome;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Key for junction lookup: (chr_idx, intron_start, intron_end, strand)
+/// Key for junction lookup: (chr_idx, intron_start, intron_end, strand).
+///
+/// `intron_start` / `intron_end` are genome-absolute 0-based positions of
+/// the first and last intronic bases, matching the convention used by
+/// `PreparedJunction`, `SpliceJunctionStats`, and the alignment-time
+/// `genome_pos` variables.
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct JunctionKey {
     chr_idx: usize,
@@ -102,12 +107,12 @@ impl SpliceJunctionDb {
         Self { junctions }
     }
 
-    /// Check if a junction is annotated in the GTF
+    /// Check if a junction is annotated in the GTF.
     ///
     /// # Arguments
     /// * `chr_idx` - Chromosome index
-    /// * `start` - Intron start position (last exon base + 1)
-    /// * `end` - Intron end position (first exon base of next exon - 1)
+    /// * `start` - Genome-absolute 0-based position of the first intronic base
+    /// * `end` - Genome-absolute 0-based position of the last intronic base
     /// * `strand` - Strand (0=unknown, 1=+, 2=-)
     ///
     /// # Returns
@@ -393,5 +398,62 @@ mod tests {
         // Only the 35-overhang junction should pass (30bp minimum for non-canonical)
         assert_eq!(novel_junctions.len(), 1);
         assert_eq!(novel_junctions[0].0.intron_start, 300);
+    }
+
+    #[test]
+    fn test_db_keyed_in_genome_absolute_zero_based_multi_chr() {
+        use crate::junction::gtf::{GtfRecord, extract_junctions_configured};
+        use std::collections::HashMap;
+
+        // Two-chromosome toy genome so chr_start[1] != 0.
+        let genome = Genome {
+            sequence: vec![0; 4000],
+            n_genome: 2000,
+            n_genome_real: 2000,
+            n_chr_real: 2,
+            chr_start: vec![0, 1000, 2000],
+            chr_length: vec![1000, 1000],
+            chr_name: vec!["chr1".to_string(), "chr2".to_string()],
+        };
+
+        let make_exon = |seqname: &str, start: u64, end: u64, transcript: &str| -> GtfRecord {
+            let mut attrs: HashMap<String, String> = HashMap::new();
+            attrs.insert("gene_id".to_string(), "G".to_string());
+            attrs.insert("transcript_id".to_string(), transcript.to_string());
+            GtfRecord {
+                seqname: seqname.to_string(),
+                feature: "exon".to_string(),
+                start,
+                end,
+                strand: '+',
+                attributes: attrs,
+            }
+        };
+
+        let exons = vec![
+            make_exon("chr1", 100, 200, "T1"),
+            make_exon("chr1", 300, 400, "T1"),
+            make_exon("chr2", 100, 200, "T2"),
+            make_exon("chr2", 300, 400, "T2"),
+        ];
+
+        let raw = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
+        let db = SpliceJunctionDb::from_raw_junctions(&raw);
+        assert_eq!(db.len(), 2);
+
+        // Junction on chr1: intron local 1-based 201..299
+        // → genome-absolute 0-based: chr_start[0] + 200 .. chr_start[0] + 298
+        assert!(db.is_annotated(0, 200, 298, 1));
+        // Off-by-one in either direction must miss.
+        assert!(!db.is_annotated(0, 201, 299, 1));
+        assert!(!db.is_annotated(0, 199, 297, 1));
+
+        // Junction on chr2: same chr-local coords, but chr_start[1] = 1000
+        // → genome-absolute 0-based: 1200 .. 1298
+        assert!(db.is_annotated(1, 1200, 1298, 1));
+        // The pre-fix chr-local 1-based key (201, 299) must not match on chr2.
+        assert!(!db.is_annotated(1, 201, 299, 1));
+        // The pre-fix stitch-time off-by-one (1199, 1297) must not match either.
+        assert!(!db.is_annotated(1, 1199, 1297, 1));
     }
 }

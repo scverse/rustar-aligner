@@ -776,10 +776,15 @@ fn test_two_pass_mode() {
         .assert()
         .success();
 
-    let pass1_path = output_dir.join("SJ.pass1.out.tab");
+    let pass1_path = output_dir.join("_STARpass1").join("SJ.out.tab");
     assert!(
         pass1_path.exists(),
-        "SJ.pass1.out.tab not found — two-pass mode did not write pass-1 junctions"
+        "_STARpass1/SJ.out.tab not found — two-pass mode did not write pass-1 junctions"
+    );
+    let top_level_pass1 = output_dir.join("SJ.pass1.out.tab");
+    assert!(
+        !top_level_pass1.exists(),
+        "SJ.pass1.out.tab should no longer be emitted at the top level"
     );
 
     let sam_path = output_dir.join("Aligned.out.sam");

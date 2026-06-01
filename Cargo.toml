@@ -41,6 +41,8 @@ dashmap = "6"
 chrono = "0.4"
 rand = "0.10"
 tempfile = "3"
+bitflags = { version = "2.11.1", features = ["std"] }
+shlex = "2.0.1"
 caps-sa = "0.6"
 # mimalloc as the global allocator. Two reasons:
 #   1. **Memory return**: glibc malloc creates one arena per worker

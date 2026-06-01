@@ -13,6 +13,5 @@ fn main() -> anyhow::Result<()> {
 
     cpu::check_cpu_compat()?;
 
-    let params = Parameters::parse();
-    rustar_aligner::run(&params)
+    rustar_aligner::run(&Parameters::parse())
 }

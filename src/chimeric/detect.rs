@@ -999,6 +999,7 @@ mod tests {
         Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real: 2,
             chr_name: vec!["chr0".to_string(), "chr1".to_string()],
             chr_length: vec![chr_len, chr_len],
@@ -1026,6 +1027,7 @@ mod tests {
             junction_db: SpliceJunctionDb::empty(),
             transcriptome: None,
             prepared_junctions: Vec::new(),
+            sjdb_overhang: 0,
         }
     }
 
