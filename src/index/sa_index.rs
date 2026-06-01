@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
@@ -8,6 +7,24 @@ use crate::error::Error;
 use crate::genome::Genome;
 use crate::index::packed_array::PackedArray;
 use crate::index::suffix_array::SuffixArray;
+
+/// Thread-safe positioned read (no shared cursor), portable across
+/// platforms: `pread` on Unix via [`std::os::unix::fs::FileExt::read_at`],
+/// the equivalent overlapped read on Windows via
+/// [`std::os::windows::fs::FileExt::seek_read`]. Like both primitives it
+/// may return a short count at EOF; callers size their buffer with tail
+/// padding so a short final read just leaves the padding bytes zero.
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
 
 /// SA index for fast k-mer lookup during binary search.
 ///
@@ -182,7 +199,7 @@ impl SaIndex {
                 let end_byte_excl = end_bit.div_ceil(8);
                 let bytes_to_read = (end_byte_excl - start_byte) as usize + 8;
                 let mut buf = vec![0u8; bytes_to_read];
-                let _ = sa_file.read_at(&mut buf, start_byte)?;
+                let _ = read_at(sa_file, &mut buf, start_byte)?;
 
                 // Read packed value at chunk-local index `i`
                 // (`0..chunk_n`).
@@ -345,8 +362,12 @@ impl SaIndex {
         // Levels are processed independently (no dependency between
         // them); parallel across levels is overkill for ~358 M
         // total slots × ~10 ns per slot = ~3.6 s.
-        for il in 0..nbases as usize {
-            let level_start = genome_sa_index_start[il] as usize;
+        for (il, &level_start_raw) in genome_sa_index_start
+            .iter()
+            .enumerate()
+            .take(nbases as usize)
+        {
+            let level_start = level_start_raw as usize;
             let level_size = 4u64.pow(il as u32 + 1) as usize;
             // Tail-gap sentinel: STAR uses `nSA | absent_mask` for
             // slots after the last-written present k-mer at this
@@ -391,12 +412,12 @@ impl SaIndex {
     ///
     /// Holds a shared reference to `genome` for the k-mer extraction
     /// `genome.sequence[genome_pos..]` reads.
-    pub fn streaming_builder<'a>(
-        genome: &'a Genome,
+    pub fn streaming_builder(
+        genome: &Genome,
         gstrand_bit: u32,
         gstrand_mask: u64,
         nbases: u32,
-    ) -> SaIndexBuilder<'a> {
+    ) -> SaIndexBuilder<'_> {
         let word_length = gstrand_bit + 3;
         let mut genome_sa_index_start = vec![0u64; (nbases + 1) as usize];
         for k in 1..=nbases {
@@ -521,7 +542,7 @@ pub struct SaIndexBuilder<'a> {
     sa_idx: usize,
 }
 
-impl<'a> SaIndexBuilder<'a> {
+impl SaIndexBuilder<'_> {
     /// Feed the next SA entry (the strand-bit-encoded packed value,
     /// exactly what would be at `SuffixArray::get(self.sa_idx())`).
     /// Updates the first-occurrence entry of every k-mer of length
@@ -563,6 +584,11 @@ impl<'a> SaIndexBuilder<'a> {
     /// Number of entries fed so far.
     pub fn len(&self) -> usize {
         self.sa_idx
+    }
+
+    /// Whether no entries have been fed yet.
+    pub fn is_empty(&self) -> bool {
+        self.sa_idx == 0
     }
 
     /// Finalise the builder into a [`SaIndex`].

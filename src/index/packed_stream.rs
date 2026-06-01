@@ -212,7 +212,7 @@ mod tests {
         // never hit in practice. The streaming writer uses `u128`
         // and is correct for all widths 1..=64.
         use rand::{RngExt, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5AC0DE);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5A_C0DE);
         for &wl in &[1u32, 5, 12, 32, 33, 35, 48, 57] {
             for &n in &[0usize, 1, 7, 8, 9, 127, 128, 129, 1000] {
                 let mask = if wl == 64 { u64::MAX } else { (1u64 << wl) - 1 };

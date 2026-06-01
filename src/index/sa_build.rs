@@ -581,7 +581,7 @@ fn dispatch_caps_sa_segmented(
             |p| original_ref[p as usize] < 4,
             &lp,
             &opts,
-            |orig_pos| pack_one(orig_pos),
+            &mut pack_one,
         )
         .map_err(map_caps_sa_error)?;
     } else {
@@ -665,7 +665,7 @@ where
             &t_prime,
             |p| (p as usize) < n2 && original[p as usize] < 4,
             &opts,
-            |sa_pos| pack_one(sa_pos),
+            &mut pack_one,
         )
         .map_err(map_caps_sa_error)?;
         drop(t_prime);
@@ -720,9 +720,9 @@ fn map_caps_sa_error(err: caps_sa::BuildError<Error>) -> Error {
 /// the transformed text is dominated by `genomeChrBinNbits` padding
 /// (e.g. a 20 kb test fixture rounds to 256 kb of padded text, of which
 /// >90% is constant spacer bytes — `caps-sa` sorts those positions and
-/// then we filter them out, but the sort itself does `O(spacer_run_len²)`
-/// work because every spacer-starting suffix shares a near-maximal LCP
-/// with every other).
+/// > then we filter them out, but the sort itself does `O(spacer_run_len²)`
+/// > work because every spacer-starting suffix shares a near-maximal LCP
+/// > with every other).
 ///
 /// Explicit overrides (decision order):
 ///
@@ -738,10 +738,10 @@ fn map_caps_sa_error(err: caps_sa::BuildError<Error>) -> Error {
 /// genome would dwarf in-memory's `~4 × n × sizeof(I)` working set on
 /// the ext-mem path; tiny synthetic test fixtures stay in-memory.
 fn use_ext_mem(text_len: usize) -> bool {
-    if let Ok(v) = std::env::var("RUSTAR_USE_IN_MEM") {
-        if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
-            return false;
-        }
+    if let Ok(v) = std::env::var("RUSTAR_USE_IN_MEM")
+        && matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    {
+        return false;
     }
     if let Ok(v) = std::env::var("RUSTAR_USE_EXT_MEM") {
         if matches!(v.as_str(), "0" | "false" | "no" | "off") {
@@ -780,10 +780,11 @@ fn count_spacer_runs(genome: &[u8]) -> u32 {
 /// Each maximal run of spacer bytes (value `5`) is numbered in position
 /// order; the run at index `i` has every position stamped with the
 /// sentinel value `SENTINEL_BASE + i`, encoded via `S::from_sentinel(i)`.
-/// After the last byte we append one extra terminal sentinel = `SENTINEL_BASE
-/// + n_seg` (a value larger than every per-run sentinel), so the final RC
-/// suffix has a sentinel-terminator and the `caps-sa` "implicit smallest
-/// sentinel at the end" never affects any kept suffix's order.
+/// After the last byte we append one extra terminal sentinel
+/// `SENTINEL_BASE + n_seg` (a value larger than every per-run sentinel),
+/// so the final RC suffix has a sentinel-terminator and the `caps-sa`
+/// "implicit smallest sentinel at the end" never affects any kept
+/// suffix's order.
 ///
 /// `n_seg` must be the value returned by [`count_spacer_runs`] for the
 /// same input and must satisfy `SENTINEL_BASE + n_seg <= S::MAX_REPRESENTABLE`
@@ -1044,9 +1045,10 @@ mod tests {
         // ~30 short chromosomes — exercises many cross-segment
         // boundary tie-breaks. Still well within the u8 alphabet
         // (~30 sentinels) so the sentinel arm picks the u8 path.
+        use std::fmt::Write as _;
         let mut fasta = String::new();
         for i in 0..30 {
-            fasta.push_str(&format!(">chr{i}\nACGT{}\n", "AC".repeat(i % 5 + 1)));
+            write!(fasta, ">chr{i}\nACGT{}\n", "AC".repeat(i % 5 + 1)).unwrap();
         }
         assert_arms_byte_identical("many-short-chrs", &fasta, 4);
     }
