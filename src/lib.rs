@@ -209,6 +209,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // 1. Load genome index
     info!("Loading genome index from {}", params.genome_dir.display());
     let index = Arc::new(GenomeIndex::load(&params.genome_dir, params)?);
+    let time_genome_loaded = chrono::Local::now();
     info!(
         "Loaded {} chromosomes, {} bases",
         index.genome.n_chr_real, index.genome.n_genome
@@ -284,6 +285,22 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     }
     stats.write_log_final(&log_path, time_start, time_map_start, time_finish)?;
     info!("Wrote {}", log_path.display());
+
+    // Write Log.out and Log.progress.out
+    let log_out_path = params.output_path("Log.out");
+    crate::io::log::write_log_out(
+        &log_out_path,
+        &params,
+        &index.genome,
+        time_start,
+        time_genome_loaded,
+        time_finish,
+    )?;
+    info!("Wrote {}", log_out_path.display());
+
+    let log_progress_path = params.output_path("Log.progress.out");
+    crate::io::log::write_log_progress_out(&log_progress_path, &stats, time_start, time_finish)?;
+    info!("Wrote {}", log_progress_path.display());
 
     // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
     if let Some(ref ctx) = quant_ctx {
