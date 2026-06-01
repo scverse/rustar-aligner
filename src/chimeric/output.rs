@@ -24,6 +24,12 @@ impl ChimericJunctionWriter {
     pub fn new(prefix: &str) -> Result<Self, Error> {
         let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
 
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
+        }
+
         let file = File::create(&path).map_err(|e| Error::io(e, &path))?;
 
         let writer = BufWriter::new(file);
@@ -255,6 +261,26 @@ mod tests {
     }
 
     #[test]
+    fn test_chimeric_junction_writer_creates_missing_parent() {
+        let dir = tempdir().unwrap();
+        let prefix = format!("{}/sample/", dir.path().display());
+        let prefix_path = PathBuf::from(&prefix);
+
+        assert!(!prefix_path.exists(), "parent dir should not exist yet");
+
+        let writer = ChimericJunctionWriter::new(&prefix);
+        assert!(
+            writer.is_ok(),
+            "writer should create missing parent dir, got: {:?}",
+            writer.err()
+        );
+
+        let mut path = prefix_path.clone();
+        path.push("Chimeric.out.junction");
+        assert!(path.exists(), "chim output file should exist at {path:?}");
+    }
+
+    #[test]
     fn test_write_inter_chromosomal() {
         use cigar::op::{Kind, Op};
         let dir = tempdir().unwrap();
@@ -410,6 +436,7 @@ mod tests {
         Genome {
             sequence: vec![0u8; 2048],
             n_genome: 1024,
+            n_genome_real: 1024,
             n_chr_real: 2,
             chr_name: vec!["chr9".to_string(), "chr22".to_string()],
             chr_length: vec![512, 512],

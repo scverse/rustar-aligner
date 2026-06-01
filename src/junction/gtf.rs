@@ -148,7 +148,10 @@ fn parse_attributes(attr_str: &str) -> HashMap<String, String> {
 /// `transcript_tag` is the GTF attribute key for the parent transcript
 /// (STAR: `sjdbGTFtagExonParentTranscript`, default `"transcript_id"`).
 ///
-/// Returns: Vec<(chr_idx, intron_start, intron_end, strand)>
+/// Returns: Vec<(chr_idx, intron_start, intron_end, strand)> where
+/// `intron_start` / `intron_end` are genome-absolute 0-based positions
+/// of the first and last intronic bases (matching the convention used
+/// by `PreparedJunction` and the rest of the alignment pipeline).
 pub fn extract_junctions_configured(
     exons: Vec<GtfRecord>,
     genome: &Genome,
@@ -192,22 +195,24 @@ pub fn extract_junctions_configured(
         // Sort exons by position
         exons.sort_by_key(|e| e.start);
 
-        // Calculate junction coordinates from consecutive exons
+        let chr_off = genome.chr_start[chr_idx];
+
         for i in 0..exons.len() - 1 {
             let exon1 = &exons[i];
             let exon2 = &exons[i + 1];
 
-            // Intron coordinates (1-based, STAR convention)
-            let intron_start = exon1.end + 1;
-            let intron_end = exon2.start - 1;
+            let intron_start_local_1b = exon1.end + 1;
+            let intron_end_local_1b = exon2.start.saturating_sub(1);
 
-            // Validate junction
-            if intron_end <= intron_start {
+            if intron_end_local_1b <= intron_start_local_1b {
                 log::warn!(
-                    "Invalid junction coordinates: {intron_start}-{intron_end} (possibly overlapping exons)"
+                    "Invalid junction coordinates: {intron_start_local_1b}-{intron_end_local_1b} (possibly overlapping exons)"
                 );
                 continue;
             }
+
+            let intron_start = chr_off + intron_start_local_1b - 1;
+            let intron_end = chr_off + intron_end_local_1b - 1;
 
             junctions.push((chr_idx, intron_start, intron_end, strand));
         }
@@ -307,6 +312,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -348,9 +354,9 @@ mod tests {
         assert_eq!(junctions.len(), 1);
         let (chr_idx, start, end, strand) = junctions[0];
         assert_eq!(chr_idx, 0);
-        assert_eq!(start, 201); // exon1.end + 1
-        assert_eq!(end, 299); // exon2.start - 1
-        assert_eq!(strand, 1); // + strand
+        assert_eq!(start, 200);
+        assert_eq!(end, 298);
+        assert_eq!(strand, 1);
     }
 
     #[test]
@@ -358,6 +364,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -424,11 +431,8 @@ mod tests {
 
         let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
 
-        // Should have 1 unique junction (both transcripts share junction 201-299)
-        // Note: T1 has 100-200, 300-400 and T2 has 100-200, 300-500
-        // They share the junction from exon ending at 200 to exon starting at 300
         assert_eq!(junctions.len(), 1);
-        assert_eq!(junctions[0], (0, 201, 299, 1)); // chr0, junction 201-299, strand +
+        assert_eq!(junctions[0], (0, 200, 298, 1));
     }
 
     #[test]
@@ -436,6 +440,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -467,6 +472,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -513,6 +519,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -554,8 +561,8 @@ mod tests {
 
         assert_eq!(junctions.len(), 1);
         let (_chr_idx, start, end, _strand) = junctions[0];
-        assert_eq!(start, 201);
-        assert_eq!(end, 299);
+        assert_eq!(start, 200);
+        assert_eq!(end, 298);
     }
 
     #[test]
@@ -596,6 +603,7 @@ mod tests {
         let genome = Genome {
             sequence: vec![0; 1000],
             n_genome: 1000,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_start: vec![0, 1000],
             chr_length: vec![1000],
@@ -633,6 +641,6 @@ mod tests {
 
         let junctions = extract_junctions_configured(exons, &genome, "Parent").unwrap();
         assert_eq!(junctions.len(), 1);
-        assert_eq!(junctions[0], (0, 201, 299, 1));
+        assert_eq!(junctions[0], (0, 200, 298, 1));
     }
 }

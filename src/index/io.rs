@@ -11,6 +11,7 @@ use crate::index::packed_array::PackedArray;
 use crate::index::sa_index::SaIndex;
 use crate::index::suffix_array::SuffixArray;
 use crate::junction::SpliceJunctionDb;
+use crate::junction::sjdb_insert;
 use crate::params::Parameters;
 use crate::quant::transcriptome::TranscriptomeIndex;
 
@@ -99,13 +100,32 @@ impl GenomeIndex {
             );
         }
 
+        // Reload prepared junctions + sjdbOverhang from sjdbInfo.txt when
+        // present. STAR appends a Gsj flanking-sequence buffer to the
+        // genome at build time; align-time code needs the parsed junctions
+        // to decode SA hits that land inside that buffer back to real
+        // `(donor, acceptor)` genome positions.
+        let sjdb_info_path = genome_dir.join("sjdbInfo.txt");
+        let (prepared_junctions, sjdb_overhang) = if sjdb_info_path.exists() {
+            let tab = sjdb_insert::read_sjdb_info_tab(&sjdb_info_path, &genome)?;
+            log::info!(
+                "Loaded sjdbInfo.txt: {} junctions, sjdbOverhang={}",
+                tab.junctions.len(),
+                tab.sjdb_overhang,
+            );
+            (tab.junctions, tab.sjdb_overhang)
+        } else {
+            (Vec::new(), 0)
+        };
+
         Ok(GenomeIndex {
             genome,
             suffix_array,
             sa_index,
             junction_db,
             transcriptome,
-            prepared_junctions: Vec::new(),
+            prepared_junctions,
+            sjdb_overhang,
         })
     }
 }
@@ -164,7 +184,8 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     // (real + Gsj) lives in `genomeParameters.txt` under `genomeFileSizes`.
     // Prefer that value; fall back to the chr_start boundary for indices
     // built without a GTF.
-    let n_genome = read_genome_file_size(genome_dir)?.unwrap_or(chr_start[n_chr_real]);
+    let n_genome_real = chr_start[n_chr_real];
+    let n_genome = read_genome_file_size(genome_dir)?.unwrap_or(n_genome_real);
 
     // Load Genome sequence file
     let genome_path = genome_dir.join("Genome");
@@ -192,6 +213,7 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     Ok(Genome {
         sequence,
         n_genome,
+        n_genome_real,
         n_chr_real,
         chr_name,
         chr_length,
