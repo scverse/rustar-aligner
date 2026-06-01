@@ -149,9 +149,9 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "caps-sa"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f906d6f36489f6964846b1521e07201515fb22967063cf8a7df172b26e50216"
+checksum = "be62f8675f16876a7f29cfd8b26cc18dcc52eca05a8428d530cc7036b2269f30"
 dependencies = [
  "rayon",
  "tempfile",
