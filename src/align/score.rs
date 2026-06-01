@@ -126,19 +126,12 @@ impl AlignmentScorer {
         ((genomic_span as f64).log2() * self.score_genomic_length_log2_scale - 0.5).ceil() as i32
     }
 
-    /// Apply annotation bonus to junction score
-    ///
-    /// # Arguments
-    /// * `base_score` - Base score from motif
-    /// * `annotated` - Whether the junction is annotated in GTF
-    ///
-    /// # Returns
-    /// Adjusted score with annotation bonus applied
-    pub fn score_annotated_junction(&self, base_score: i32, annotated: bool) -> i32 {
+    /// Annotated junctions score `sjdb_score`; unannotated junctions score `motif_score`.
+    pub fn score_annotated_junction(&self, motif_score: i32, annotated: bool) -> i32 {
         if annotated {
-            base_score + self.sjdb_score
+            self.sjdb_score
         } else {
-            base_score
+            motif_score
         }
     }
 
@@ -643,6 +636,7 @@ mod tests {
         Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![seq.len() as u64],
@@ -965,17 +959,14 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
         };
 
-        // Annotated junction should get bonus
         let annotated_score = scorer.score_annotated_junction(0, true);
         assert_eq!(annotated_score, 2);
 
-        // Novel junction should not get bonus
         let novel_score = scorer.score_annotated_junction(0, false);
         assert_eq!(novel_score, 0);
 
-        // Bonus applies to any base score
         let annotated_noncanon = scorer.score_annotated_junction(-8, true);
-        assert_eq!(annotated_noncanon, -6); // -8 + 2
+        assert_eq!(annotated_noncanon, 2);
     }
 
     #[test]

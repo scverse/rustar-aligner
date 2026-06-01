@@ -173,6 +173,7 @@ mod tests {
         Genome {
             sequence: seq,
             n_genome: 100,
+            n_genome_real: 100,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_start: vec![0],

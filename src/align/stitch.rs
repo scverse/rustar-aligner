@@ -383,6 +383,58 @@ pub fn cluster_seeds(
     let seed_per_window_nmax = params.seed_per_window_nmax;
     let min_seed_length = params.seed_map_min;
 
+    let n_genome_real = index.genome.n_genome_real;
+    let n_genome = index.genome.n_genome;
+    let sjdb_overhang = index.sjdb_overhang;
+    let prepared = index.prepared_junctions.as_slice();
+
+    // Expand one raw SA hit into the candidate `(real_fwd_pos, read_offset,
+    // sub_length, sub_sa_pos)` tuples cluster_seeds should consume. Hits
+    // in the real genome pass through unchanged. Hits in the Gsj
+    // flanking buffer are decoded via the sjdb table - yielding one
+    // entry for hits confined to a single flank, two entries for hits
+    // that straddle the donor/acceptor boundary (so the stitch DP can
+    // chain them through its splice branch).
+    let expand_hit = |sa_pos: u64, strand: bool, length: usize| -> Vec<(u64, usize, usize, u64)> {
+        let raw_fwd = index.sa_pos_to_forward(sa_pos, strand, length);
+        if raw_fwd < n_genome_real {
+            return vec![(raw_fwd, 0, length, sa_pos)];
+        }
+        if sjdb_overhang == 0 || prepared.is_empty() {
+            return Vec::new();
+        }
+        let mut decoded = crate::junction::sjdb_insert::decode_gsj_hit(
+            raw_fwd,
+            length,
+            n_genome_real,
+            sjdb_overhang,
+            prepared,
+        );
+        // Reverse-strand hits traverse the donor/acceptor halves in reverse
+        // read order: the leftmost forward bytes (donor flank) align to the
+        // last read bases. Swap the read offsets so each sub-seed's
+        // `read_pos = seed.read_pos + read_offset` lands at the right place
+        // in original-read coords.
+        if strand && decoded.len() == 2 {
+            let acceptor_len = decoded[1].2;
+            decoded[0].1 = acceptor_len;
+            decoded[1].1 = 0;
+        }
+        decoded
+            .into_iter()
+            .map(|(real_fwd, read_off, sub_len)| {
+                let sub_sa_pos = if strand {
+                    n_genome
+                        .saturating_sub(real_fwd)
+                        .saturating_sub(sub_len as u64)
+                } else {
+                    real_fwd
+                };
+                (real_fwd, read_off, sub_len, sub_sa_pos)
+            })
+            .collect()
+    };
+
     let anchor_set: Vec<bool> = seeds
         .iter()
         .map(|seed| {
@@ -443,112 +495,119 @@ pub fn cluster_seeds(
         for (sa_pos, strand) in anchor.genome_positions(index) {
             // STAR uses MMP length directly without per-position verification.
             // All SA positions in the range match for the full MMP length by definition.
-            let length = anchor.length;
-            if length < min_seed_length {
+            let full_length = anchor.length;
+            if full_length < min_seed_length {
                 continue;
             }
 
-            let forward_pos = index.sa_pos_to_forward(sa_pos, strand, length);
-
-            let chr_idx = match index.genome.position_to_chr(forward_pos) {
-                Some(info) => info.0,
-                None => continue,
-            };
-
-            let anchor_bin = forward_pos >> win_bin_nbits;
-
-            // STAR's stitchPieces: Phase 1 creates windows from anchor positions
-            // but does NOT populate WA entries. After flank extension, nWA is reset
-            // to 0 (line 115), then Phase 3 re-assigns ALL seeds through
-            // assignAlignToWindow. We match this by not adding entries here.
-
-            // Check if this bin already has a window (STAR: skip creation, just assign)
-            if let Some(&win_idx) = win_bin.get(&(strand, anchor_bin)) {
-                let window = &mut windows[win_idx];
-                if window.alive && window.chr_idx == chr_idx {
-                    window.actual_start = window.actual_start.min(forward_pos);
-                    window.actual_end = window.actual_end.max(forward_pos + length as u64);
-                    continue;
-                }
-            }
-
-            // Scan LEFT for existing window to merge with
-            let mut merge_left: Option<usize> = None;
-            for scan_bin in
-                (anchor_bin.saturating_sub(win_anchor_dist_nbins as u64)..anchor_bin).rev()
+            for (forward_pos, _read_off, sub_length, _sub_sa_pos) in
+                expand_hit(sa_pos, strand, full_length)
             {
-                if let Some(&win_idx) = win_bin.get(&(strand, scan_bin)) {
-                    let w = &windows[win_idx];
-                    if w.alive && w.chr_idx == chr_idx {
-                        merge_left = Some(win_idx);
-                        break;
+                // Anchor sub-pieces shorter than the minimum still drive a
+                // window centre — STAR seeds new windows from Gsj hits even
+                // when the donor or acceptor half of the read is short.
+                let chr_idx = match index.genome.position_to_chr(forward_pos) {
+                    Some(info) => info.0,
+                    None => continue,
+                };
+
+                let length = sub_length;
+                let anchor_bin = forward_pos >> win_bin_nbits;
+
+                // STAR's stitchPieces: Phase 1 creates windows from anchor positions
+                // but does NOT populate WA entries. After flank extension, nWA is reset
+                // to 0 (line 115), then Phase 3 re-assigns ALL seeds through
+                // assignAlignToWindow. We match this by not adding entries here.
+
+                // Check if this bin already has a window (STAR: skip creation, just assign)
+                if let Some(&win_idx) = win_bin.get(&(strand, anchor_bin)) {
+                    let window = &mut windows[win_idx];
+                    if window.alive && window.chr_idx == chr_idx {
+                        window.actual_start = window.actual_start.min(forward_pos);
+                        window.actual_end = window.actual_end.max(forward_pos + length as u64);
+                        continue;
                     }
                 }
-            }
 
-            // Scan RIGHT for existing window to merge with
-            let mut merge_right: Option<usize> = None;
-            for scan_bin in (anchor_bin + 1)..=(anchor_bin + win_anchor_dist_nbins as u64) {
-                if let Some(&win_idx) = win_bin.get(&(strand, scan_bin)) {
-                    let w = &windows[win_idx];
-                    if w.alive && w.chr_idx == chr_idx {
-                        merge_right = Some(win_idx);
-                        break;
+                // Scan LEFT for existing window to merge with
+                let mut merge_left: Option<usize> = None;
+                for scan_bin in
+                    (anchor_bin.saturating_sub(win_anchor_dist_nbins as u64)..anchor_bin).rev()
+                {
+                    if let Some(&win_idx) = win_bin.get(&(strand, scan_bin)) {
+                        let w = &windows[win_idx];
+                        if w.alive && w.chr_idx == chr_idx {
+                            merge_left = Some(win_idx);
+                            break;
+                        }
                     }
                 }
-            }
 
-            match (merge_left, merge_right) {
-                (Some(left_idx), Some(right_idx)) if left_idx != right_idx => {
-                    // Merge both windows: extend left window to cover right + anchor
-                    let right_window = &windows[right_idx];
-                    let new_bin_end = right_window.bin_end.max(anchor_bin);
-                    let new_actual_start = right_window.actual_start.min(forward_pos);
-                    let new_actual_end = right_window.actual_end.max(forward_pos + length as u64);
-                    // Kill right window
-                    windows[right_idx].alive = false;
-
-                    // Extend left window
-                    let left_window = &mut windows[left_idx];
-                    left_window.bin_start = left_window.bin_start.min(anchor_bin);
-                    left_window.bin_end = left_window.bin_end.max(new_bin_end);
-                    left_window.actual_start = left_window.actual_start.min(new_actual_start);
-                    left_window.actual_end = left_window.actual_end.max(new_actual_end);
-
-                    // Update winBin for all bins from left to right
-                    for bin in left_window.bin_start..=left_window.bin_end {
-                        win_bin.insert((strand, bin), left_idx);
+                // Scan RIGHT for existing window to merge with
+                let mut merge_right: Option<usize> = None;
+                for scan_bin in (anchor_bin + 1)..=(anchor_bin + win_anchor_dist_nbins as u64) {
+                    if let Some(&win_idx) = win_bin.get(&(strand, scan_bin)) {
+                        let w = &windows[win_idx];
+                        if w.alive && w.chr_idx == chr_idx {
+                            merge_right = Some(win_idx);
+                            break;
+                        }
                     }
                 }
-                (Some(idx), _) | (_, Some(idx)) => {
-                    // Merge with one existing window
-                    let window = &mut windows[idx];
-                    window.bin_start = window.bin_start.min(anchor_bin);
-                    window.bin_end = window.bin_end.max(anchor_bin);
-                    window.actual_start = window.actual_start.min(forward_pos);
-                    window.actual_end = window.actual_end.max(forward_pos + length as u64);
 
-                    // Update winBin for newly covered bins
-                    for bin in window.bin_start..=window.bin_end {
-                        win_bin.insert((strand, bin), idx);
+                match (merge_left, merge_right) {
+                    (Some(left_idx), Some(right_idx)) if left_idx != right_idx => {
+                        // Merge both windows: extend left window to cover right + anchor
+                        let right_window = &windows[right_idx];
+                        let new_bin_end = right_window.bin_end.max(anchor_bin);
+                        let new_actual_start = right_window.actual_start.min(forward_pos);
+                        let new_actual_end =
+                            right_window.actual_end.max(forward_pos + length as u64);
+                        // Kill right window
+                        windows[right_idx].alive = false;
+
+                        // Extend left window
+                        let left_window = &mut windows[left_idx];
+                        left_window.bin_start = left_window.bin_start.min(anchor_bin);
+                        left_window.bin_end = left_window.bin_end.max(new_bin_end);
+                        left_window.actual_start = left_window.actual_start.min(new_actual_start);
+                        left_window.actual_end = left_window.actual_end.max(new_actual_end);
+
+                        // Update winBin for all bins from left to right
+                        for bin in left_window.bin_start..=left_window.bin_end {
+                            win_bin.insert((strand, bin), left_idx);
+                        }
                     }
-                }
-                _ => {
-                    // No merge: create new window
-                    let new_idx = windows.len();
-                    win_bin.insert((strand, anchor_bin), new_idx);
-                    windows.push(Window {
-                        bin_start: anchor_bin,
-                        bin_end: anchor_bin,
-                        chr_idx,
-                        is_reverse: strand,
-                        anchor_idx,
-                        alignments: Vec::new(),
-                        actual_start: forward_pos,
-                        actual_end: forward_pos + length as u64,
-                        alive: true,
-                        wa_lrec: 0,
-                    });
+                    (Some(idx), _) | (_, Some(idx)) => {
+                        // Merge with one existing window
+                        let window = &mut windows[idx];
+                        window.bin_start = window.bin_start.min(anchor_bin);
+                        window.bin_end = window.bin_end.max(anchor_bin);
+                        window.actual_start = window.actual_start.min(forward_pos);
+                        window.actual_end = window.actual_end.max(forward_pos + length as u64);
+
+                        // Update winBin for newly covered bins
+                        for bin in window.bin_start..=window.bin_end {
+                            win_bin.insert((strand, bin), idx);
+                        }
+                    }
+                    _ => {
+                        // No merge: create new window
+                        let new_idx = windows.len();
+                        win_bin.insert((strand, anchor_bin), new_idx);
+                        windows.push(Window {
+                            bin_start: anchor_bin,
+                            bin_end: anchor_bin,
+                            chr_idx,
+                            is_reverse: strand,
+                            anchor_idx,
+                            alignments: Vec::new(),
+                            actual_start: forward_pos,
+                            actual_end: forward_pos + length as u64,
+                            alive: true,
+                            wa_lrec: 0,
+                        });
+                    }
                 }
             }
         }
@@ -605,6 +664,11 @@ pub fn cluster_seeds(
         is_anchor: bool,
         ps_rstart: usize, // positive-strand read start (sort key)
         mate_id: u8,      // STAR: iFrag (overlap dedup must respect fragment boundaries)
+        /// Derived read start in original read coordinates. Identical to
+        /// `seeds[seed_idx].read_pos` for real-genome SA hits, advanced
+        /// by the donor-side length for the acceptor half of a Gsj
+        /// boundary-crossing hit.
+        read_pos: usize,
     }
 
     let mut win_candidates: Vec<Vec<WinCandidate>> =
@@ -618,45 +682,46 @@ pub fn cluster_seeds(
         let is_anchor_seed = anchor_set[seed_idx];
 
         for (sa_pos, strand) in seed.genome_positions(index) {
-            let length = seed.length;
-            if length < min_seed_length {
+            let full_length = seed.length;
+            if full_length < min_seed_length {
                 continue;
             }
 
-            let forward_pos = index.sa_pos_to_forward(sa_pos, strand, length);
+            for (forward_pos, read_off, sub_length, sub_sa_pos) in
+                expand_hit(sa_pos, strand, full_length)
+            {
+                let length = sub_length;
+                let chr_idx = match index.genome.position_to_chr(forward_pos) {
+                    Some(info) => info.0,
+                    None => continue,
+                };
 
-            let chr_idx = match index.genome.position_to_chr(forward_pos) {
-                Some(info) => info.0,
-                None => {
-                    continue;
-                }
-            };
+                let seed_bin = forward_pos >> win_bin_nbits;
 
-            let seed_bin = forward_pos >> win_bin_nbits;
+                let win_idx = match win_bin.get(&(strand, seed_bin)) {
+                    Some(&idx) if windows[idx].alive && windows[idx].chr_idx == chr_idx => idx,
+                    _ => continue,
+                };
 
-            let win_idx = match win_bin.get(&(strand, seed_bin)) {
-                Some(&idx) if windows[idx].alive && windows[idx].chr_idx == chr_idx => idx,
-                _ => {
-                    continue;
-                }
-            };
+                let derived_read_pos = seed.read_pos + read_off;
+                let ps_rstart = if windows[win_idx].is_reverse {
+                    read_len - (length + derived_read_pos)
+                } else {
+                    derived_read_pos
+                };
 
-            let ps_rstart = if windows[win_idx].is_reverse {
-                read_len - (length + seed.read_pos)
-            } else {
-                seed.read_pos
-            };
-
-            win_candidates[win_idx].push(WinCandidate {
-                seed_idx,
-                sa_pos,
-                forward_pos,
-                length,
-                n_loci,
-                is_anchor: is_anchor_seed,
-                ps_rstart,
-                mate_id: seed.mate_id,
-            });
+                win_candidates[win_idx].push(WinCandidate {
+                    seed_idx,
+                    sa_pos: sub_sa_pos,
+                    forward_pos,
+                    length,
+                    n_loci,
+                    is_anchor: is_anchor_seed,
+                    ps_rstart,
+                    mate_id: seed.mate_id,
+                    read_pos: derived_read_pos,
+                });
+            }
         }
     }
 
@@ -787,7 +852,7 @@ pub fn cluster_seeds(
                         insert_pos,
                         WindowAlignment {
                             seed_idx,
-                            read_pos: seed.read_pos,
+                            read_pos: cand.read_pos,
                             length,
                             genome_pos: forward_pos,
                             sa_pos,
@@ -855,7 +920,7 @@ pub fn cluster_seeds(
                 insert_pos,
                 WindowAlignment {
                     seed_idx,
-                    read_pos: seed.read_pos,
+                    read_pos: cand.read_pos,
                     length,
                     genome_pos: forward_pos,
                     sa_pos,
@@ -1299,20 +1364,20 @@ fn stitch_align_to_transcript(
                 return None;
             }
 
-            // Check annotation (needed for sjdbScore bonus and finalization check)
             let is_annotated = junction_db.is_some_and(|db| {
                 let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
                 let donor_fwd =
                     index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-                let acceptor_fwd = donor_fwd + del as u64;
+                let acceptor_fwd = donor_fwd + del as u64 - 1;
                 db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
                     || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
                     || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
             });
 
-            d_score += motif_score;
             if is_annotated {
                 d_score += scorer.sjdb_score;
+            } else {
+                d_score += motif_score;
             }
 
             new_wt.n_junction += 1;
@@ -2956,6 +3021,7 @@ mod tests {
         let genome = Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![10],
@@ -2986,6 +3052,7 @@ mod tests {
             junction_db: crate::junction::SpliceJunctionDb::empty(),
             transcriptome: None,
             prepared_junctions: Vec::new(),
+            sjdb_overhang: 0,
         }
     }
 
@@ -3076,6 +3143,7 @@ mod tests {
         let genome = Genome {
             sequence,
             n_genome,
+            n_genome_real: n_genome,
             n_chr_real: 1,
             chr_name: vec!["chr1".to_string()],
             chr_length: vec![seq.len() as u64],
@@ -3104,6 +3172,7 @@ mod tests {
             junction_db: crate::junction::SpliceJunctionDb::empty(),
             transcriptome: None,
             prepared_junctions: Vec::new(),
+            sjdb_overhang: 0,
         }
     }
 
@@ -3414,5 +3483,40 @@ mod tests {
         let mut bin_start_edge: u64 = 2;
         bin_start_edge = bin_start_edge.saturating_sub(win_flank_nbins);
         assert_eq!(bin_start_edge, 0, "Flanking should saturate at 0");
+    }
+
+    #[test]
+    fn test_junction_score_annotated_uses_sjdb_not_motif() {
+        use crate::align::score::AlignmentScorer;
+
+        let scorer = AlignmentScorer::from_params_minimal();
+
+        for motif_score in [0_i32, scorer.score_gap_gcag, scorer.score_gap_atac] {
+            let baseline: i32 = 100;
+
+            let mut d_score_annot = baseline;
+            let is_annotated = true;
+            if is_annotated {
+                d_score_annot += scorer.sjdb_score;
+            } else {
+                d_score_annot += motif_score;
+            }
+            assert_eq!(d_score_annot, baseline + scorer.sjdb_score);
+
+            let mut d_score_novel = baseline;
+            let is_annotated = false;
+            if is_annotated {
+                d_score_novel += scorer.sjdb_score;
+            } else {
+                d_score_novel += motif_score;
+            }
+            assert_eq!(d_score_novel, baseline + motif_score);
+        }
+
+        let baseline: i32 = 100;
+        let motif_score = scorer.score_gap_gcag;
+        let additive_buggy = baseline + motif_score + scorer.sjdb_score;
+        let replacement_correct = baseline + scorer.sjdb_score;
+        assert_ne!(additive_buggy, replacement_correct);
     }
 }

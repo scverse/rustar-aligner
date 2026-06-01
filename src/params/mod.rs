@@ -1,12 +1,30 @@
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 
+/// Parse a memory string into bytes. Accepts plain integers or a suffix:
+/// K/k = ×1024, M/m = ×1024², G/g = ×1024³, T/t = ×1024⁴.
+/// Examples: `31000000000`, `64G`, `512M`, `1T`.
+fn parse_mem_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (digits, shift) = match s.chars().last() {
+        Some('K' | 'k') => (&s[..s.len() - 1], 10),
+        Some('M' | 'm') => (&s[..s.len() - 1], 20),
+        Some('G' | 'g') => (&s[..s.len() - 1], 30),
+        Some('T' | 't') => (&s[..s.len() - 1], 40),
+        _ => (s, 0),
+    };
+    let base: u64 = digits.trim().parse().map_err(|_| {
+        format!("invalid memory value '{s}' — expected a number with optional K/M/G/T suffix")
+    })?;
+    base.checked_shl(shift)
+        .ok_or_else(|| format!("memory value '{s}' overflows u64"))
+}
+
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped};
+pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -290,9 +308,13 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
-    /// Maximum RAM (bytes) for coordinate-sorted BAM. 0 = unlimited.
-    #[arg(long = "limitBAMsortRAM", default_value_t = 0)]
+    /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
+    #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
+
+    /// Maximum RAM for genome generation. Accepts bytes or a suffix: 64G, 512M, 1T.
+    #[arg(long = "limitGenomeGenerateRAM", default_value = "31G", value_parser = parse_mem_bytes)]
+    pub limit_genome_generate_ram: u64,
 
     /// Route primary alignment output to stdout instead of a file.
     /// Values: None (default), SAM, BAM_Unsorted, BAM_SortedByCoordinate.
@@ -303,9 +325,10 @@ pub struct Parameters {
     #[arg(long = "outSAMstrandField", default_value = "None")]
     pub out_sam_strand_field: String,
 
-    /// SAM attributes to include (Standard, All, None, or explicit list)
-    #[arg(long = "outSAMattributes", num_args = 1.., default_values_t = vec!["Standard".to_string()])]
-    pub out_sam_attributes: Vec<String>,
+    /// SAM optional-tag set (`Standard`, `All`, `None`, or any combination
+    /// of NH HI AS NM nM MD jM jI XS RG). Parsed into a bitflags struct.
+    #[command(flatten)]
+    pub out_sam_attributes: SamAttributes,
 
     /// Read group line(s) for the `@RG` SAM header. Space-separated fields;
     /// a bare `,` separates multiple RG blocks. Each block must start with `ID:`.
@@ -631,6 +654,10 @@ pub struct Parameters {
     /// Chimeric output type
     #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
+
+    /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
+    #[arg(skip)]
+    pub command_line: Option<String>,
 }
 
 impl Parameters {
@@ -647,40 +674,6 @@ impl Parameters {
     /// Whether `--chimOutType` includes `WithinBAM` (write supplementary BAM records).
     pub fn chim_out_within_bam(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
-    }
-
-    /// Expand `--outSAMattributes` into a set of individual tag names.
-    ///
-    /// - `"Standard"` → {NH, HI, AS, NM, nM}
-    /// - `"All"`      → {NH, HI, AS, NM, nM, MD, jM, jI, XS}
-    /// - `"None"`     → {} (empty)
-    /// - Explicit list (e.g. `["NH", "AS"]`) → collected as-is
-    ///
-    /// `RG` is auto-appended when `--outSAMattrRGline` is set (STAR behavior,
-    /// `Parameters_samAttributes.cpp:201`).
-    pub fn sam_attribute_set(&self) -> HashSet<String> {
-        let mut attrs: HashSet<String> = match self
-            .out_sam_attributes
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            ["Standard"] => ["NH", "HI", "AS", "NM", "nM"]
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            ["All"] => ["NH", "HI", "AS", "NM", "nM", "MD", "jM", "jI", "XS"]
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            ["None"] => HashSet::new(),
-            tags => tags.iter().map(ToString::to_string).collect(),
-        };
-        if self.rg_line_set() {
-            attrs.insert("RG".to_string());
-        }
-        attrs
     }
 
     /// True if the user provided a non-default `--outSAMattrRGline`.
@@ -840,9 +833,16 @@ impl Parameters {
     ) -> Result<Self, clap::Error> {
         use clap::error::ErrorKind;
 
+        let args: Vec<_> = args.into_iter().map(Into::into).collect();
+
         let mut command = <Self as clap::CommandFactory>::command();
-        let matches = command.clone().get_matches_from(args);
-        let params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+        let matches = command.clone().get_matches_from(args.iter());
+        let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+
+        params.command_line = {
+            let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
+            shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
+        };
 
         // genomeGenerate requires FASTA files
         if params.run_mode == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {
@@ -870,10 +870,8 @@ impl Parameters {
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
-        // does NOT include RG, so only match a literal "RG" token here. Also
-        // parse the RG line to validate its ID: prefix and per-file RG count.
-        let user_wants_rg_attr = params.out_sam_attributes.iter().any(|a| a == "RG");
-        if !params.rg_line_set() && user_wants_rg_attr {
+        // does NOT include RG, so only match a literal user-supplied RG flag.
+        if params.out_sam_attributes.contains(SamAttributes::RG) && !params.rg_line_set() {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--outSAMattributes contains RG tag, but --outSAMattrRGline is not set",
@@ -882,6 +880,22 @@ impl Parameters {
         params
             .rg_ids()
             .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
+
+        // Fold runtime-derived bits into out_sam_attributes so writers can read
+        // it directly without re-computing. Mirrors STAR Parameters_samAttributes.cpp.
+        if params.rg_line_set() {
+            params.out_sam_attributes |= SamAttributes::RG;
+        }
+        // XS is only emitted in intronMotif mode (Parameters_samAttributes.cpp:172-179).
+        // intronMotif forces XS on; anything else strips XS even if explicitly listed.
+        if params.out_sam_strand_field == "intronMotif" {
+            log::info!(
+                "--outSAMstrandField=intronMotif, therefore rustar-aligner will output XS attribute"
+            );
+            params.out_sam_attributes |= SamAttributes::XS;
+        } else {
+            params.out_sam_attributes.remove(SamAttributes::XS);
+        }
 
         // quantMode TranscriptomeSAM requires transcript annotations —
         // either via --sjdbGTFfile or pre-generated transcriptInfo.tab
@@ -944,7 +958,7 @@ mod tests {
         assert_eq!(p.out_file_name_prefix, "./");
         assert_eq!(p.out_sam_type, OutSamType::default());
         assert_eq!(p.out_sam_strand_field, "None");
-        assert_eq!(p.out_sam_attributes, vec!["Standard".to_string()]);
+        assert_eq!(p.out_sam_attributes, SamAttributes::STANDARD);
         assert_eq!(p.out_sam_unmapped, OutSamUnmapped::None);
         assert_eq!(p.out_sam_mapq_unique, 255);
         assert_eq!(p.out_sam_mult_nmax, -1);
@@ -1266,7 +1280,7 @@ mod tests {
         assert!(!p.rg_line_set());
         assert_eq!(p.parsed_rg_lines().unwrap(), Vec::<String>::new());
         assert_eq!(p.rg_ids().unwrap(), Vec::<String>::new());
-        assert!(!p.sam_attribute_set().contains("RG"));
+        assert!(!p.out_sam_attributes.contains(SamAttributes::RG));
     }
 
     #[test]
@@ -1286,7 +1300,7 @@ mod tests {
             vec!["ID:foo\tSM:bar\tLB:lib1".to_string()]
         );
         assert_eq!(p.rg_ids().unwrap(), vec!["foo".to_string()]);
-        assert!(p.sam_attribute_set().contains("RG"));
+        assert!(p.out_sam_attributes.contains(SamAttributes::RG));
     }
 
     #[test]
@@ -1504,5 +1518,79 @@ mod tests {
             p.output_path("Aligned.out.bam"),
             PathBuf::from("/out/sample1_Aligned.out.bam")
         );
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_raw() {
+        assert_eq!(parse_mem_bytes("0").unwrap(), 0);
+        assert_eq!(parse_mem_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("31000000000").unwrap(), 31_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_suffixes() {
+        assert_eq!(parse_mem_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("1k").unwrap(), 1024);
+        assert_eq!(parse_mem_bytes("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("1T").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_mem_bytes("1t").unwrap(), 1024_u64.pow(4));
+        assert_eq!(parse_mem_bytes("64G").unwrap(), 64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("31G").unwrap(), 31 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_mem_bytes_errors() {
+        assert!(parse_mem_bytes("abc").is_err());
+        assert!(parse_mem_bytes("1X").is_err());
+        assert!(parse_mem_bytes("").is_err());
+        assert!(parse_mem_bytes("-1G").is_err());
+    }
+
+    #[test]
+    fn xs_strand_field_intron_motif_adds_xs_to_attrs() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMstrandField",
+            "intronMotif",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::XS));
+        assert_eq!(p.out_sam_strand_field, "intronMotif");
+    }
+
+    #[test]
+    fn xs_without_intron_motif_is_stripped() {
+        // Explicit XS in attrs without --outSAMstrandField intronMotif: XS gets stripped.
+        // Users must set both to get XS output.
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "NH",
+            "HI",
+            "XS",
+        ])
+        .unwrap();
+        assert_eq!(p.out_sam_strand_field, "None");
+        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+    }
+
+    #[test]
+    fn xs_absent_by_default() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+        assert_eq!(p.out_sam_strand_field, "None");
+    }
+
+    #[test]
+    fn xs_stripped_from_all_preset_without_intron_motif() {
+        // "All" includes XS but it is stripped unless intronMotif is also set.
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        assert_eq!(p.out_sam_strand_field, "None");
+        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
     }
 }
