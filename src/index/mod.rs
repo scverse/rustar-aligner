@@ -27,11 +27,16 @@ pub struct GenomeIndex {
     /// `transcriptInfo.tab` + friends at `genomeGenerate`, reloaded at
     /// `alignReads` from the same files.
     pub transcriptome: Option<TranscriptomeIndex>,
-    /// Prepared splice junctions (sorted/deduped) used only on the build
-    /// path to write `sjdbInfo.txt` + `sjdbList.out.tab`. Empty on the
-    /// load path — those files have already been written and are not
-    /// needed at align time.
+    /// Prepared splice junctions in their post-dedup order (the same
+    /// order they occupy in the Gsj buffer appended to the genome).
+    /// Populated on both build and load paths when sjdb is present;
+    /// empty for indices built without a GTF. Used at align time to
+    /// decode Gsj-region SA hits back to real-genome `(donor, acceptor)`
+    /// pairs.
     pub prepared_junctions: Vec<PreparedJunction>,
+    /// `sjdbOverhang` recorded in `sjdbInfo.txt`. Zero when no sjdb
+    /// junctions are present.
+    pub sjdb_overhang: u32,
 }
 
 impl GenomeIndex {
@@ -83,20 +88,13 @@ impl GenomeIndex {
             log::info!("Extracted {} annotated junctions from GTF", raw.len());
             let jdb = SpliceJunctionDb::from_raw_junctions(&raw);
 
-            // `extract_junctions_from_exons` returns chromosome-local 1-based
-            // intron coordinates (matching STAR's `sjdbList.fromGTF.out.tab`).
-            // `prepare_junction` + `sjdbInfo.txt` expect 0-based absolute
-            // genome offsets (matching STAR's `sjdbPrepare.cpp` and
-            // `detect_splice_motif`'s `genome.sequence[donor_pos]` access),
-            // so convert here.
             let prepared: Vec<PreparedJunction> = raw
                 .iter()
-                .map(|&(chr_idx, start_local_1b, end_local_1b, strand)| {
-                    let chr_off = genome.chr_start[chr_idx];
+                .map(|&(chr_idx, intron_start, intron_end, strand)| {
                     sjdb_insert::prepare_junction(
                         chr_idx,
-                        chr_off + start_local_1b - 1,
-                        chr_off + end_local_1b - 1,
+                        intron_start,
+                        intron_end,
                         strand,
                         &genome,
                         n_genome_real,
@@ -143,6 +141,12 @@ impl GenomeIndex {
             sa_index.data.len()
         );
 
+        let sjdb_overhang = if prepared_junctions.is_empty() {
+            0
+        } else {
+            params.sjdb_overhang
+        };
+
         Ok(GenomeIndex {
             genome,
             suffix_array,
@@ -150,6 +154,7 @@ impl GenomeIndex {
             junction_db,
             transcriptome,
             prepared_junctions,
+            sjdb_overhang,
         })
     }
 

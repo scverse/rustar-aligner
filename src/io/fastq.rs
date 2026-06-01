@@ -53,7 +53,8 @@ pub struct EncodedRead {
     pub name: String,
     /// Base sequence encoded as 0=A, 1=C, 2=G, 3=T, 4=N
     pub sequence: Vec<u8>,
-    /// Quality scores (raw FASTQ quality values)
+    /// FASTQ ASCII quality bytes (Phred+33 encoded) - subtract 33 before
+    /// writing to BAM binary QUAL.
     pub quality: Vec<u8>,
 }
 
