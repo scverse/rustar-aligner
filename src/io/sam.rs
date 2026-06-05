@@ -7,6 +7,7 @@ use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
 use crate::params::{Parameters, SamAttributes};
+use crate::stats::UnmappedReason;
 use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
@@ -45,6 +46,33 @@ impl BufferedSamRecords {
     pub fn push(&mut self, record: RecordBuf) {
         self.records.push(record);
     }
+}
+
+/// Insert STAR-compatible optional tags on unmapped records.
+///
+/// NH, HI, AS, nM are gated on `outSAMattributes`; `uT:A:` is always emitted
+/// (STAR emits it unconditionally so QC tools can parse unmapping categories).
+fn insert_unmapped_tags(record: &mut RecordBuf, attrs: SamAttributes, reason: UnmappedReason) {
+    let data = record.data_mut();
+    if attrs.contains(SamAttributes::NH) {
+        data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(0i32));
+    }
+    if attrs.contains(SamAttributes::HI) {
+        data.insert(Tag::HIT_INDEX, Value::from(0i32));
+    }
+    if attrs.contains(SamAttributes::AS) {
+        data.insert(Tag::ALIGNMENT_SCORE, Value::from(0i32));
+    }
+    if attrs.contains(SamAttributes::NM) {
+        data.insert(Tag::new(b'n', b'M'), Value::from(0i32));
+    }
+    let ut = match reason {
+        UnmappedReason::Other => b'0',
+        UnmappedReason::TooShort => b'1',
+        UnmappedReason::TooManyMismatches => b'2',
+        UnmappedReason::TooManyLoci => b'3',
+    };
+    data.insert(Tag::new(b'u', b'T'), Value::Character(ut));
 }
 
 /// SAM file writer
@@ -167,12 +195,14 @@ impl SamWriter {
     /// * `read_name` - Read identifier
     /// * `read_seq` - Read sequence (encoded)
     /// * `read_qual` - Quality scores
-    /// * `rg_id` - Optional read group ID to emit as `RG:Z:<id>` tag
+    /// * `params` - Parameters (used for attribute gating and RG tag)
+    /// * `unmapped_reason` - Why the read was not mapped (drives `uT:A:` tag)
     pub fn build_unmapped_record(
         read_name: &str,
         read_seq: &[u8],
         read_qual: &[u8],
-        rg_id: Option<&str>,
+        params: &Parameters,
+        unmapped_reason: UnmappedReason,
     ) -> Result<RecordBuf, Error> {
         let mut record = RecordBuf::default();
 
@@ -189,7 +219,9 @@ impl SamWriter {
 
         *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
 
-        maybe_insert_rg_tag(&mut record, rg_id);
+        let rg_id_owned = params.primary_rg_id()?;
+        maybe_insert_rg_tag(&mut record, rg_id_owned.as_deref());
+        insert_unmapped_tags(&mut record, params.out_sam_attributes, unmapped_reason);
 
         Ok(record)
     }
@@ -276,7 +308,13 @@ impl SamWriter {
         if paired_alignments.is_empty() {
             // Both mates unmapped
             return Self::build_paired_unmapped_records(
-                read_name, mate1_seq, mate1_qual, mate2_seq, mate2_qual, params,
+                read_name,
+                mate1_seq,
+                mate1_qual,
+                mate2_seq,
+                mate2_qual,
+                params,
+                UnmappedReason::Other,
             );
         }
 
@@ -529,6 +567,7 @@ impl SamWriter {
         *unmapped_rec.quality_scores_mut() =
             QualityScores::from(fastq_qual_to_phred(unmapped_qual));
         maybe_insert_rg_tag(&mut unmapped_rec, rg_id);
+        insert_unmapped_tags(&mut unmapped_rec, attrs, UnmappedReason::Other);
 
         // Order: mate1 first, mate2 second
         if mate1_is_mapped {
@@ -668,10 +707,12 @@ impl SamWriter {
         mate2_seq: &[u8],
         mate2_qual: &[u8],
         params: &Parameters,
+        unmapped_reason: UnmappedReason,
     ) -> Result<Vec<RecordBuf>, Error> {
         let mut records = Vec::with_capacity(2);
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
+        let attrs = params.out_sam_attributes;
 
         // Mate1 record
         let mut rec1 = RecordBuf::default();
@@ -688,6 +729,7 @@ impl SamWriter {
         *rec1.sequence_mut() = Sequence::from(seq1_bytes);
         *rec1.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate1_qual));
         maybe_insert_rg_tag(&mut rec1, rg_id);
+        insert_unmapped_tags(&mut rec1, attrs, unmapped_reason);
         records.push(rec1);
 
         // Mate2 record
@@ -705,6 +747,7 @@ impl SamWriter {
         *rec2.sequence_mut() = Sequence::from(seq2_bytes);
         *rec2.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate2_qual));
         maybe_insert_rg_tag(&mut rec2, rg_id);
+        insert_unmapped_tags(&mut rec2, attrs, unmapped_reason);
         records.push(rec2);
 
         Ok(records)
@@ -1568,7 +1611,15 @@ mod tests {
         // FASTQ ASCII 'I' = 73 → Phred 40
         let read_qual = b"III";
         let read_seq = vec![0u8, 1, 2]; // ACG
-        let record = SamWriter::build_unmapped_record("read1", &read_seq, read_qual, None).unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "t.fq"]);
+        let record = SamWriter::build_unmapped_record(
+            "read1",
+            &read_seq,
+            read_qual,
+            &params,
+            UnmappedReason::Other,
+        )
+        .unwrap();
 
         let stored: &[u8] = record.quality_scores().as_ref();
         assert_eq!(stored, &[40u8, 40, 40]);
@@ -1581,10 +1632,59 @@ mod tests {
         // Byte 32 is below the Phred+33 floor; should clamp to 0.
         let read_qual = &[32u8, 33, 34][..];
         let read_seq = vec![0u8, 1, 2];
-        let record = SamWriter::build_unmapped_record("read1", &read_seq, read_qual, None).unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "t.fq"]);
+        let record = SamWriter::build_unmapped_record(
+            "read1",
+            &read_seq,
+            read_qual,
+            &params,
+            UnmappedReason::Other,
+        )
+        .unwrap();
 
         let stored: &[u8] = record.quality_scores().as_ref();
         assert_eq!(stored, &[0u8, 0, 1]);
+    }
+
+    #[test]
+    fn test_unmapped_record_tags_emitted() {
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "t.fq"]);
+        let read_seq = vec![0u8, 1, 2, 3];
+        let read_qual = b"IIII";
+
+        for (reason, expected_ut) in [
+            (UnmappedReason::Other, b'0'),
+            (UnmappedReason::TooShort, b'1'),
+            (UnmappedReason::TooManyMismatches, b'2'),
+            (UnmappedReason::TooManyLoci, b'3'),
+        ] {
+            let record =
+                SamWriter::build_unmapped_record("r", &read_seq, read_qual, &params, reason)
+                    .unwrap();
+            let data = record.data();
+            // NH/HI/AS present (Standard attrs enabled by default)
+            assert_eq!(
+                data.get(&Tag::ALIGNMENT_HIT_COUNT),
+                Some(&Value::from(0i32)),
+                "NH:i:0 missing for {reason:?}"
+            );
+            assert_eq!(
+                data.get(&Tag::HIT_INDEX),
+                Some(&Value::from(0i32)),
+                "HI:i:0 missing for {reason:?}"
+            );
+            assert_eq!(
+                data.get(&Tag::ALIGNMENT_SCORE),
+                Some(&Value::from(0i32)),
+                "AS:i:0 missing for {reason:?}"
+            );
+            // uT:A: always emitted with correct value
+            assert_eq!(
+                data.get(&Tag::new(b'u', b'T')),
+                Some(&Value::Character(expected_ut)),
+                "uT:A: wrong for {reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -1760,6 +1860,7 @@ mod tests {
             &mate2_seq,
             &mate2_qual,
             &params,
+            UnmappedReason::Other,
         )
         .unwrap();
 

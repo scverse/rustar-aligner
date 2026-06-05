@@ -1,8 +1,8 @@
 [package]
 name = "rustar-aligner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["James Ferguson"]
 description = "A Rust reimplementation of STAR (Spliced Transcripts Alignment to a Reference), the RNA-seq aligner"
 license = "MIT"
@@ -43,6 +43,22 @@ rand = "0.10"
 tempfile = "3"
 bitflags = { version = "2.11.1", features = ["std"] }
 shlex = "2.0.1"
+caps-sa = "0.6"
+# mimalloc as the global allocator. Two reasons:
+#   1. **Memory return**: glibc malloc creates one arena per worker
+#      thread (rayon spawns ~num_cpus workers + sub-threads) and
+#      caches freed allocations in those arenas indefinitely. On
+#      genome-scale runs that adds 10-20 GB of allocator slack to
+#      peak RSS for no good reason. mimalloc's per-thread heaps
+#      release whole segments back to the OS when threads abandon
+#      them, so the cache size stays bounded.
+#   2. **Speed**: mimalloc has lower per-allocation cost than
+#      glibc's, which adds up on the millions of small allocations
+#      caps-sa makes during phase 1 / phase 4.
+# `default-features = false` skips the secure / debug builds (no
+# extra cost in release, but the default features add a few hundred
+# kB of fast-path stubs we don't need).
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -52,9 +68,13 @@ predicates = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Whole-program LTO + a single codegen unit are worth the extra build time
-# for the seed-search and DP-extension inner loops. CI overrides these via
-# `CARGO_PROFILE_RELEASE_LTO=thin` / `CODEGEN_UNITS=16` env vars to keep
-# test-matrix runtime reasonable.
+# for the seed-search and DP-extension inner loops. Cargo warns about this
+# profile being shadowed when rustar-aligner is built as a workspace member
+# (the workspace root carries its own [profile.release] with the same
+# values); keeping it here means standalone clones get the same release
+# tuning even when there is no parent workspace.
+# CI overrides these via `CARGO_PROFILE_RELEASE_LTO=thin` /
+# `CODEGEN_UNITS=16` env vars to keep test-matrix runtime reasonable.
 [profile.release]
 opt-level = 3
 lto = "fat"

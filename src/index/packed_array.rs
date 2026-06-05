@@ -134,6 +134,22 @@ impl PackedArray {
         self.length
     }
 
+    /// Storage size in bytes for a [`PackedArray`] of `length` entries
+    /// at the given bit width — equivalent to `PackedArray::new(...)
+    /// .data().len()` but without allocating. Used by the streaming
+    /// writer ([`PackedStreamWriter`]) to know when to stop emitting
+    /// padding zeros.
+    pub fn data_byte_len_for(word_length: u32, length: usize) -> usize {
+        if length == 0 {
+            0
+        } else {
+            // STAR's formula: `((length - 1) * word_length) / 8 + 8`.
+            // The +8 reserves the 8-byte read window the `read` path
+            // uses on the last entry.
+            ((length as u64 - 1) * word_length as u64) as usize / 8 + 8
+        }
+    }
+
     /// Check if the array is empty.
     pub fn is_empty(&self) -> bool {
         self.length == 0
