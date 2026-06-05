@@ -503,7 +503,11 @@ mod tests {
 
         // Build record using SAM builder
         let record = crate::io::sam::SamWriter::build_unmapped_record(
-            read_name, &read_seq, &read_qual, None,
+            read_name,
+            &read_seq,
+            &read_qual,
+            &params,
+            crate::stats::UnmappedReason::Other,
         )
         .unwrap();
 
@@ -620,14 +624,16 @@ mod tests {
                 "read1",
                 &[0, 1, 2, 3],
                 &[30, 30, 30, 30],
-                None,
+                &params,
+                crate::stats::UnmappedReason::Other,
             )
             .unwrap(),
             crate::io::sam::SamWriter::build_unmapped_record(
                 "read2",
                 &[0, 1, 2, 3],
                 &[30, 30, 30, 30],
-                None,
+                &params,
+                crate::stats::UnmappedReason::Other,
             )
             .unwrap(),
         ];
@@ -674,9 +680,14 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let mut writer = SortedBamWriter::create(temp_file.path(), &genome, &params).unwrap();
         // Add a record to trigger the limit
-        let rec =
-            crate::io::sam::SamWriter::build_unmapped_record("r1", &[0, 1, 2, 3], &[30; 4], None)
-                .unwrap();
+        let rec = crate::io::sam::SamWriter::build_unmapped_record(
+            "r1",
+            &[0, 1, 2, 3],
+            &[30; 4],
+            &params,
+            crate::stats::UnmappedReason::Other,
+        )
+        .unwrap();
         writer.write_batch(&[rec]).unwrap();
         let result = writer.finish();
         assert!(result.is_err(), "Should fail when RAM limit is exceeded");

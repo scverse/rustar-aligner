@@ -51,6 +51,22 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
     info!("runMode: {}", params.run_mode);
     info!("runThreadN: {}", params.run_thread_n);
 
+    // Configure the rayon global pool from `--runThreadN` **before**
+    // dispatching to either run-mode. Without this, rayon falls back
+    // to `num_cpus::get()` (= logical cores), which on big servers
+    // (e.g. 256-core machines) spawns hundreds of worker threads
+    // independent of `--runThreadN`. With a thread-caching allocator
+    // (we use mimalloc) each thread retains some MB of per-thread
+    // heap, adding ~64 MB × n_threads of allocator overhead to peak
+    // RSS for nothing. `build_global` errors if called twice; we
+    // ignore the error so the in-process tests that already
+    // initialised the pool still work.
+    if usize::from(params.run_thread_n) > 1 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(params.run_thread_n.into())
+            .build_global();
+    }
+
     match params.run_mode {
         RunMode::GenomeGenerate => genome_generate(params),
         RunMode::AlignReads => align_reads(params),
@@ -61,6 +77,9 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
     use index::GenomeIndex;
 
     info!("genomeDir: {}", params.genome_dir.display());
+    if let Some(temp_dir) = &params.temp_dir {
+        info!("tempDir: {}", temp_dir.display());
+    }
     info!(
         "genomeFastaFiles: {:?}",
         params
@@ -77,11 +96,12 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
     }
 
-    info!("Building genome index...");
-    let index = GenomeIndex::build(params)?;
-
-    info!("Writing index files to {}...", params.genome_dir.display());
-    index.write(&params.genome_dir, params)?;
+    info!("Building genome index (streaming SA + on-the-fly SAindex)...");
+    // Streaming path: opens SA file early, packs each caps-sa emit
+    // directly to disk + into the SAindex builder, never holding the
+    // ~25 GB SA `PackedArray` in RAM. The in-memory `GenomeIndex::build`
+    // + `write` remains for tests / random-access callers.
+    GenomeIndex::generate_streaming(params)?;
 
     info!("Genome generation complete!");
     Ok(())
@@ -188,14 +208,10 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 
     info!("Starting read alignment...");
 
-    // Configure Rayon thread pool based on --runThreadN
+    // Rayon thread pool was already configured by `run()` from
+    // `--runThreadN`; just log the choice here for parity with the
+    // previous behaviour.
     if usize::from(params.run_thread_n) > 1 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(params.run_thread_n.into())
-            .build_global()
-            .map_err(|e| {
-                error::Error::Parameter(format!("Failed to configure thread pool: {e}"))
-            })?;
         info!("Using {} threads for alignment", params.run_thread_n);
     } else {
         info!("Using single-threaded mode");
@@ -907,7 +923,6 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
-    let rg_id_owned = params.primary_rg_id()?;
 
     // BySJout disk buffer: SAM records written to a temp file; only compact metadata kept in RAM.
     // For 100M reads this avoids ~60 GB of Vec<RecordBuf> in memory.
@@ -982,7 +997,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
-                            rg_id_owned.as_deref(),
+                            params,
+                            crate::stats::UnmappedReason::Other,
                         )?;
                         buffer.push(record);
                     }
@@ -1059,7 +1075,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
-                            rg_id_owned.as_deref(),
+                            params,
+                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                         )?;
                         buffer.push(record);
                     }
@@ -1422,6 +1439,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             &m2_seq,
                             &m2_qual,
                             params,
+                            crate::stats::UnmappedReason::Other,
                         )?;
                         for record in records {
                             buffer.push(record);
@@ -1583,6 +1601,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             &m2_seq,
                             &m2_qual,
                             params,
+                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                         )?;
                         for record in records {
                             buffer.push(record);
