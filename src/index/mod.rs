@@ -1,13 +1,18 @@
 pub mod io;
 pub mod packed_array;
+pub mod packed_stream;
+pub mod sa_build;
 pub mod sa_index;
 pub mod suffix_array;
 
 use std::fs;
+use std::io::BufWriter;
 use std::path::Path;
 
 use crate::error::Error;
 use crate::genome::Genome;
+use crate::index::packed_array::PackedArray;
+use crate::index::packed_stream::PackedStreamWriter;
 use crate::junction::SpliceJunctionDb;
 use crate::junction::sjdb_insert::{self, PreparedJunction};
 use crate::params::Parameters;
@@ -39,9 +44,221 @@ pub struct GenomeIndex {
     pub sjdb_overhang: u32,
 }
 
+/// Output of [`GenomeIndex::build_prep`] — the shared setup
+/// stage between the in-memory [`GenomeIndex::build`] and the
+/// streaming [`GenomeIndex::generate_streaming`]. Holds everything
+/// needed to drive the SA construction and the per-file writes.
+struct BuildPrep {
+    genome: Genome,
+    junction_db: SpliceJunctionDb,
+    transcriptome: Option<TranscriptomeIndex>,
+    prepared_junctions: Vec<PreparedJunction>,
+}
+
 impl GenomeIndex {
     /// Build a complete genome index from FASTA files.
     pub fn build(params: &Parameters) -> Result<Self, Error> {
+        let BuildPrep {
+            genome,
+            junction_db,
+            transcriptome,
+            prepared_junctions,
+        } = Self::build_prep(params)?;
+
+        log::info!("Building suffix array...");
+        let suffix_array = SuffixArray::build(&genome)?;
+        log::info!("Suffix array built: {} entries", suffix_array.len());
+
+        log::info!("Building SA index...");
+        let sa_index = SaIndex::build(&genome, &suffix_array, params.genome_sa_index_nbases)?;
+        log::info!(
+            "SA index built: nbases={}, {} indices",
+            sa_index.nbases,
+            sa_index.data.len()
+        );
+
+        let sjdb_overhang = if prepared_junctions.is_empty() {
+            0
+        } else {
+            params.sjdb_overhang
+        };
+
+        Ok(GenomeIndex {
+            genome,
+            suffix_array,
+            sa_index,
+            junction_db,
+            transcriptome,
+            prepared_junctions,
+            sjdb_overhang,
+        })
+    }
+
+    /// Streaming genome-index generation: writes every index file
+    /// directly to `params.genome_dir` without materialising the
+    /// 25 GB-class SA `PackedArray` in RAM. The flow:
+    ///
+    /// 1. [`build_prep`][Self::build_prep] — same as the in-memory path:
+    ///    load FASTA, parse GTF, build junction database, append
+    ///    `gsj` to the genome.
+    /// 2. Write genome files (`Genome`, `chrInfo`, `genomeParameters.txt`,
+    ///    etc.) immediately — no dependency on the SA.
+    /// 3. Open `genome_dir/SA` through a [`PackedStreamWriter`]; build
+    ///    a [`SaIndexBuilder`][sa_index::SaIndexBuilder]. The caps-sa
+    ///    emit callback feeds each entry to **both**, so the SA file
+    ///    grows as construction progresses and the SAindex is built
+    ///    on the fly. Total peak RSS during this phase ≈
+    ///    `genome.sequence` + caps-sa scratch + `SaIndex.data` —
+    ///    ~5 GB on the human genome vs the ~47 GB the in-memory
+    ///    path peaked at.
+    /// 4. Finalise the SA writer (flush partial-byte + padding).
+    /// 5. **Build the SAindex in parallel** from the on-disk SA via
+    ///    mmap + [`SaIndex::build_parallel`]. caps-sa's phase-4
+    ///    emit is single-threaded; doing the SAindex k-mer work
+    ///    there sat the entire ~16 min of serial extraction
+    ///    on top of caps-sa's parallel SA build. Deferring lets
+    ///    the SAindex use all available rayon workers.
+    /// 6. Write the SAindex file, patch `genomeParameters.txt` with
+    ///    the SA size, write transcriptome + sjdb outputs.
+    ///
+    /// This is the path used by `--runMode genomeGenerate`. The
+    /// in-memory [`build`][Self::build] + [`write`][Self::write]
+    /// remains for tests and any caller that needs random access to
+    /// the SA in RAM.
+    pub fn generate_streaming(params: &Parameters) -> Result<(), Error> {
+        let BuildPrep {
+            genome,
+            junction_db: _,
+            transcriptome,
+            prepared_junctions,
+        } = Self::build_prep(params)?;
+
+        let dir = &params.genome_dir;
+        if !dir.exists() {
+            fs::create_dir_all(dir).map_err(|e| Error::io(e, dir))?;
+        }
+
+        log::info!("Writing genome files to {}...", dir.display());
+        genome.write_index_files(dir, params)?;
+
+        let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
+        let gstrand_mask = (1u64 << gstrand_bit) - 1;
+        let word_length = gstrand_bit + 1;
+        let nbases = params.genome_sa_index_nbases;
+
+        log::info!(
+            "Streaming SA to {} (gstrand_bit={gstrand_bit}, word_length={word_length}, nbases={nbases})",
+            dir.join("SA").display()
+        );
+
+        let sa_path = dir.join("SA");
+        let sa_file = fs::File::create(&sa_path).map_err(|e| Error::io(e, &sa_path))?;
+        // Large buffer — at 33 bit / entry × 5.9 B entries the SA file
+        // is ~24 GB; an 8 MB BufWriter keeps the write-side syscall
+        // rate to ~3000/s, dominated by sequential bandwidth.
+        let sa_buf = BufWriter::with_capacity(8 * 1024 * 1024, sa_file);
+        let mut sa_writer = PackedStreamWriter::new(sa_buf, word_length);
+
+        log::info!("Building suffix array...");
+        let (got_gbit, got_gmask, n_entries) =
+            sa_build::build_streaming(&genome, params.temp_dir.as_deref(), |packed_value| {
+                // Emit is now lightweight: just bit-pack into the SA
+                // file. caps-sa's phase-4 emit loop is single-threaded,
+                // so anything we do here serialises the whole build.
+                // The SAindex is built afterwards via a parallel pass
+                // over the on-disk SA.
+                sa_writer
+                    .write_one(packed_value)
+                    .map_err(|e| Error::io(e, &sa_path))?;
+                Ok(())
+            })?;
+        debug_assert_eq!(got_gbit, gstrand_bit);
+        debug_assert_eq!(got_gmask, gstrand_mask);
+        log::info!("Suffix array streamed to disk: {n_entries} entries");
+
+        let buf = sa_writer.finish().map_err(|e| Error::io(e, &sa_path))?;
+        buf.into_inner()
+            .map_err(|e| Error::io(e.into_error(), &sa_path))?
+            .sync_all()
+            .map_err(|e| Error::io(e, &sa_path))?;
+
+        let sa_size = PackedArray::data_byte_len_for(word_length, n_entries);
+
+        // Parallel SAindex build via chunked pread on the on-disk
+        // SA. Avoiding `memmap2::Mmap` keeps the touched SA pages
+        // out of process RSS (`read_at` hits the kernel page cache,
+        // which is kernel-side memory — not counted in
+        // `Maximum resident set size`). The only big new allocation
+        // for this phase is the ~2.86 GB `Vec<AtomicU64>` inside
+        // `build_parallel`.
+        log::info!("Building SAindex in parallel from on-disk SA...");
+        let sa_handle = fs::File::open(&sa_path).map_err(|e| Error::io(e, &sa_path))?;
+        let sa_index = SaIndex::build_parallel(
+            &genome,
+            &sa_handle,
+            word_length,
+            gstrand_bit,
+            gstrand_mask,
+            n_entries,
+            nbases,
+        )?;
+        drop(sa_handle);
+        log::info!(
+            "SA index built: nbases={}, {} indices",
+            sa_index.nbases,
+            sa_index.data.len()
+        );
+
+        // Write SAindex, then drop it — the transcriptome / sjdb
+        // writers below don't read it, and the file on disk is the
+        // canonical copy from this point on. On the human genome
+        // this frees ~1.5 GB of resident `PackedArray` before the
+        // last writes.
+        write_sa_index_file(&dir.join("SAindex"), &sa_index)?;
+        drop(sa_index);
+
+        // Update genomeParameters.txt with the SA file size — matches
+        // STAR's `genomeFileSizes\t<n_genome> <sa_size>\n` pattern.
+        // Same edit as `GenomeIndex::write` does for the in-memory
+        // path; factored into a helper.
+        update_genome_params_sa_size(&dir.join("genomeParameters.txt"), genome.n_genome, sa_size)?;
+
+        // Transcriptome + sjdb files. Matches the tail of
+        // `GenomeIndex::write` byte-for-byte.
+        if let Some(tr) = &transcriptome {
+            tr.write_transcript_info(dir)?;
+            tr.write_exon_info(dir)?;
+            tr.write_gene_info(dir)?;
+            tr.write_exon_ge_tr_info(dir)?;
+            tr.write_sjdb_list_from_gtf(dir, &genome)?;
+            log::info!(
+                "Wrote transcriptome index files: {} transcripts, {} genes",
+                tr.n_transcripts(),
+                tr.gene_ids.len()
+            );
+        }
+        if !prepared_junctions.is_empty() {
+            sjdb_insert::write_sjdb_info_tab(
+                &dir.join("sjdbInfo.txt"),
+                &prepared_junctions,
+                params.sjdb_overhang,
+            )?;
+            sjdb_insert::write_sjdb_list_out_tab(
+                &dir.join("sjdbList.out.tab"),
+                &prepared_junctions,
+                &genome,
+            )?;
+            log::info!("Wrote sjdb files: {} junctions", prepared_junctions.len());
+        }
+
+        Ok(())
+    }
+
+    /// Shared setup: load FASTA, parse GTF, build junctions, append
+    /// `gsj` to the genome. Used by both [`build`][Self::build] and
+    /// [`generate_streaming`][Self::generate_streaming] so they
+    /// share the same SA-input shape.
+    fn build_prep(params: &Parameters) -> Result<BuildPrep, Error> {
         log::info!("Loading FASTA files...");
         let mut genome = Genome::from_fasta(params)?;
 
@@ -129,32 +346,11 @@ impl GenomeIndex {
             junction_db.len()
         );
 
-        log::info!("Building suffix array...");
-        let suffix_array = SuffixArray::build(&genome)?;
-        log::info!("Suffix array built: {} entries", suffix_array.len());
-
-        log::info!("Building SA index...");
-        let sa_index = SaIndex::build(&genome, &suffix_array, params.genome_sa_index_nbases)?;
-        log::info!(
-            "SA index built: nbases={}, {} indices",
-            sa_index.nbases,
-            sa_index.data.len()
-        );
-
-        let sjdb_overhang = if prepared_junctions.is_empty() {
-            0
-        } else {
-            params.sjdb_overhang
-        };
-
-        Ok(GenomeIndex {
+        Ok(BuildPrep {
             genome,
-            suffix_array,
-            sa_index,
             junction_db,
             transcriptome,
             prepared_junctions,
-            sjdb_overhang,
         })
     }
 
@@ -181,8 +377,6 @@ impl GenomeIndex {
 
     /// Write index files to directory.
     pub fn write(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
-        use std::io::Write;
-
         // Write genome files
         self.genome.write_index_files(dir, params)?;
 
@@ -190,41 +384,17 @@ impl GenomeIndex {
         let sa_path = dir.join("SA");
         fs::write(&sa_path, self.suffix_array.data.data()).map_err(|e| Error::io(e, &sa_path))?;
 
-        // Write SAindex file
-        let sai_path = dir.join("SAindex");
-        let mut sai_file = fs::File::create(&sai_path).map_err(|e| Error::io(e, &sai_path))?;
+        // Write SAindex file (factored helper, shared with the
+        // streaming path).
+        write_sa_index_file(&dir.join("SAindex"), &self.sa_index)?;
 
-        // Write header: gSAindexNbases as u64
-        sai_file
-            .write_all(&(self.sa_index.nbases as u64).to_le_bytes())
-            .map_err(|e| Error::io(e, &sai_path))?;
-
-        // Write genomeSAindexStart array
-        for &val in &self.sa_index.genome_sa_index_start {
-            sai_file
-                .write_all(&val.to_le_bytes())
-                .map_err(|e| Error::io(e, &sai_path))?;
-        }
-
-        // Write packed SAindex data
-        sai_file
-            .write_all(self.sa_index.data.data())
-            .map_err(|e| Error::io(e, &sai_path))?;
-
-        // Update genomeParameters.txt with SA file size. Matches STAR's
-        // `genomeFileSizes\t<n_genome> <sa_size>\n` pattern (tab before first
-        // value, space between subsequent values) — written out in
-        // Genome::write_genome_parameters_txt with `0` as the SA placeholder.
-        let genome_params_path = dir.join("genomeParameters.txt");
+        // Update genomeParameters.txt with SA file size.
         let sa_size = self.suffix_array.data.data().len();
-        let content = fs::read_to_string(&genome_params_path)
-            .map_err(|e| Error::io(e, &genome_params_path))?;
-        let updated_content = content.replace(
-            &format!("genomeFileSizes\t{} 0", self.genome.n_genome),
-            &format!("genomeFileSizes\t{} {}", self.genome.n_genome, sa_size),
-        );
-        fs::write(&genome_params_path, updated_content)
-            .map_err(|e| Error::io(e, &genome_params_path))?;
+        update_genome_params_sa_size(
+            &dir.join("genomeParameters.txt"),
+            self.genome.n_genome,
+            sa_size,
+        )?;
 
         // Write transcriptome index files (STAR-compatible) when the GTF
         // was supplied. Matches STAR's `GTF_transcriptGeneSJ.cpp` outputs.
@@ -263,4 +433,39 @@ impl GenomeIndex {
 
         Ok(())
     }
+}
+
+/// Write a [`SaIndex`] to `path` in STAR's `SAindex` file format
+/// (8-byte little-endian `nbases` header, then the
+/// `genome_sa_index_start[]` u64s, then the packed entries).
+/// Shared between [`GenomeIndex::write`] (in-memory build) and
+/// [`GenomeIndex::generate_streaming`] (streaming build).
+fn write_sa_index_file(path: &Path, sa_index: &SaIndex) -> Result<(), Error> {
+    use std::io::Write;
+    let mut f = fs::File::create(path).map_err(|e| Error::io(e, path))?;
+    f.write_all(&(sa_index.nbases as u64).to_le_bytes())
+        .map_err(|e| Error::io(e, path))?;
+    for &val in &sa_index.genome_sa_index_start {
+        f.write_all(&val.to_le_bytes())
+            .map_err(|e| Error::io(e, path))?;
+    }
+    f.write_all(sa_index.data.data())
+        .map_err(|e| Error::io(e, path))?;
+    Ok(())
+}
+
+/// Update `genomeParameters.txt` with the actual SA file size.
+/// [`Genome::write_genome_parameters_txt`] emits the file with a `0`
+/// placeholder for the SA size; this helper substitutes the real
+/// number once it's known. Matches STAR's
+/// `genomeFileSizes\t<n_genome> <sa_size>\n` line format (tab before
+/// the first value, space before the second).
+fn update_genome_params_sa_size(path: &Path, n_genome: u64, sa_size: usize) -> Result<(), Error> {
+    let content = fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let updated = content.replace(
+        &format!("genomeFileSizes\t{n_genome} 0"),
+        &format!("genomeFileSizes\t{n_genome} {sa_size}"),
+    );
+    fs::write(path, updated).map_err(|e| Error::io(e, path))?;
+    Ok(())
 }

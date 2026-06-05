@@ -1499,7 +1499,7 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert("transcript_id".to_string(), transcript_id.to_string());
         for (k, v) in gene_attrs {
-            attrs.insert(k.to_string(), v.to_string());
+            attrs.insert((*k).to_string(), (*v).to_string());
         }
         GtfRecord {
             seqname: seqname.to_string(),

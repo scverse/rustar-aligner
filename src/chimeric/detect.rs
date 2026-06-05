@@ -773,12 +773,10 @@ pub fn detect_chimeric_old(
             } else {
                 ro_end1 - ro_start2 + 1
             }
+        } else if ro_end2 < ro_start1 {
+            0
         } else {
-            if ro_end2 < ro_start1 {
-                0
-            } else {
-                ro_end2 - ro_start1 + 1
-            }
+            ro_end2 - ro_start1 + 1
         };
 
         let r_length2 = ro_end2 + 1 - ro_start2;
@@ -809,12 +807,10 @@ pub fn detect_chimeric_old(
                     } else {
                         prev_e - ro_start2 + 1
                     }
+                } else if ro_end2 < prev_s {
+                    0
                 } else {
-                    if ro_end2 < prev_s {
-                        0
-                    } else {
-                        ro_end2 - prev_s + 1
-                    }
+                    ro_end2 - prev_s + 1
                 }
             } else {
                 0

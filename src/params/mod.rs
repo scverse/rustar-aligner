@@ -250,6 +250,10 @@ pub struct Parameters {
     #[arg(long = "runRNGseed", default_value_t = 777)]
     pub run_rng_seed: u64,
 
+    /// Temporary directory for large external-memory index-construction files
+    #[arg(long = "tempDir")]
+    pub temp_dir: Option<PathBuf>,
+
     // ── Genome ──────────────────────────────────────────────────────────
     /// Path to genome index directory
     #[arg(long = "genomeDir", default_value = "./GenomeDir")]
@@ -1033,6 +1037,8 @@ mod tests {
             "chr2.fa",
             "--runThreadN",
             "8",
+            "--tempDir",
+            "/scratch2/tmp",
             "--genomeSAindexNbases",
             "11",
         ])
@@ -1044,6 +1050,7 @@ mod tests {
             vec![PathBuf::from("chr1.fa"), PathBuf::from("chr2.fa")]
         );
         assert_eq!(p.run_thread_n, NonZeroUsize::new(8).unwrap());
+        assert_eq!(p.temp_dir, Some(PathBuf::from("/scratch2/tmp")));
         assert_eq!(p.genome_sa_index_nbases, 11);
     }
 
