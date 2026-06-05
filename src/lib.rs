@@ -1516,6 +1516,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
                 }
 
+                // Chimeric stats
+                if params.chim_segment_min > 0 && !pe_chimeric.is_empty() {
+                    stats.record_chimeric();
+                }
+
                 // Gene-level quantification (lock-free atomic counts)
                 if let Some(ref q) = quant {
                     // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
