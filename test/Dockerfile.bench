@@ -1,0 +1,15 @@
+# amd64 Linux image to benchmark CellRanger vs STARsolo vs rustar-aligner in a
+# consistent environment. CellRanger is x86_64-only, so everything runs under
+# linux/amd64 (Rosetta-accelerated on Apple Silicon) for a fair comparison.
+#
+# CellRanger itself is mounted at runtime (not baked in) from the extracted
+# cellranger-10.0.0/ directory.
+FROM --platform=linux/amd64 rust:1-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      rna-star python3 samtools procps time pigz ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN STAR --version && cargo --version && python3 --version
+WORKDIR /work

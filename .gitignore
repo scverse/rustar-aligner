@@ -37,3 +37,6 @@ target
 *.log
 *.tab
 *.sam
+
+# Linux build dir used by the solo Docker benchmark/diff (CARGO_TARGET_DIR)
+/target-linux/

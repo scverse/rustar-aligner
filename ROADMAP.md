@@ -27,7 +27,7 @@ Phase 1 (CLI) ✅
                                                                                        └→ Phase 17.B (per-mate seeding) [planned]
                                                               └→ Phase 17.1 (Log.final.out) ✅
                                                                    └→ Phase 17.2+ (features + polish)
-                                                              └→ Phase 14 (STARsolo) [DEFERRED]
+                                                              └→ Phase 14 (STARsolo) 🚧 14.1 done
 ```
 
 **Phase ordering rationale**: Threading (Phase 9) done first to establish parallel architecture.
@@ -55,7 +55,7 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 | [15](docs-old/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
 | [16](docs-old/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
 | [17](docs-old/phase17_features.md) | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
-| 14 | STARsolo | DEFERRED | — | Waiting for accuracy parity |
+| [14](docs-old/phase14_starsolo.md) | STARsolo (single-cell) | 🚧 In progress | 475 | **MVP done (14.1–14.4)**: 10x Gene count matrix end-to-end (barcode plumbing, CB correction, gene assignment, UMI dedup, raw matrix.mtx) |
 
 *Partially complete — see linked docs for sub-phase status.
 
@@ -308,6 +308,35 @@ See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase t
 
 ---
 
-## Phase 14: STARsolo (Single-Cell) — DEFERRED
+## Phase 14: STARsolo (Single-Cell) — IN PROGRESS
 
-Waiting for accuracy parity (position agreement >99%).
+**Prerequisite met**: position agreement >99% (SE 99.815% tie-adj, PE 99.883%). Phase unblocked 2026-06-10.
+
+Single-cell quantification layered around the existing aligner: the cDNA read aligns through the normal SE path; a paired **barcode read** (R1 = cell barcode + UMI) is parsed, corrected against a whitelist, assigned to a gene, UMI-deduplicated, and emitted as a sparse per-cell count matrix. Target: faithful port of STARsolo (all features). See [docs-old/phase14_starsolo.md](docs-old/phase14_starsolo.md) for the full design and sub-phase tracking.
+
+| Sub-phase | Description | Status |
+|-----------|-------------|--------|
+| 14.1 | `--solo*` params + barcode-read input plumbing (`src/solo/`, CB/UMI extraction, SE dispatch) | ✅ Complete |
+| 14.2 | Whitelist load + CB correction (`--soloCBmatchWLtype`) + UMI checks | ✅ Complete |
+| 14.3 | Per-read gene assignment + CB/UMI threaded into the alignment loop | ✅ Complete |
+| 14.4 | UMI dedup + raw `matrix.mtx` (**MVP complete**) | ✅ Complete |
+| 14.CR | CellRanger 4/5-matching flags (`1MM_CR`, `MultiGeneUMI_CR`, `1MM_multi_Nbase_pseudocounts`, `CellRanger4` clip) | ✅ Complete |
+| 14.5 | `Summary.csv` / `Barcodes.stats` / `Features.stats` | ⬜ Planned |
+| 14.6 | Cell filtering (`--soloCellFilter`: CellRanger2.2, EmptyDrops_CR) | ⬜ Planned |
+| 14.7 | `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` | ⬜ Planned |
+| 14.8 | More features: GeneFull, SJ, Velocyto | ⬜ Planned |
+| 14.9 | Multi-gene resolution (`--soloMultiMappers`) | ⬜ Planned |
+| 14.10 | Other chemistries: CB_UMI_Complex, SmartSeq | ⬜ Planned |
+| 14.11 | Differential test harness vs STARsolo + synthetic integration tests | ⬜ Planned |
+
+**Phase 14.1** (2026-06-10): `SoloType` enum + 12 `--solo*` params in `src/params/mod.rs`; new `src/solo/mod.rs` (`SoloBarcodeLayout` geometry, `CellBarcode` CB/UMI extraction, `SoloReadReader` lockstep cDNA+barcode FASTQ reader); solo validation (2 read files, GTF for Gene/GeneFull, CB/UMI length); `run_single_pass` + `run_pass1` dispatch routes solo runs to the SE cDNA path (file 0). 447 lib tests (+6 solo), 0 clippy warnings.
+
+**Phase 14.2** (2026-06-11): new `src/solo/whitelist.rs` — faithful port of STAR's `SoloReadBarcode_getCBandUMI.cpp` read stage. 2-bit barcode packing (`seq[0]` high bits, N-detection: 0/1/>1), sorted-array whitelist load (plain/gz), `match_cb` (exact → single-N → 1MM enumeration) honoring `--soloCBmatchWLtype` (Exact/1MM/1MM_multi/…); multi-match reads record all candidate WL indices + mismatch quality (`CbMatch::Multi`) for the Phase 14.4 posterior; exact-match count table accumulated as the posterior prior; UMI checks (N → reject, homopolymer → reject); `CbMatchStats` with STAR's cbMatch categories. Params: `--soloCBmatchWLtype` validation, `solo_cb_match_type()` / `solo_cb_whitelist_path()` helpers, None-whitelist-requires-Exact rule, CBlen≤32 guard. 460 lib tests (+13 solo), 0 clippy warnings.
+
+**Phase 14.3** (2026-06-11): per-read gene assignment + barcode threading into the alignment loop. New `src/solo/gene.rs` — `SoloStrand` (`--soloStrand`), `assign_gene_se` (union of strand-filtered `overlapping_genes` across all loci → `Gene`/`NoFeature`/`Ambiguous`/`Unmapped`; multi-locus-same-gene stays unique). `src/solo/mod.rs` gains `SoloContext` (whitelist + gene model + stats + recorder, `build()` from params), `SoloRecorder` (thread-safe `SoloCountRecord` / deferred `SoloMultiRecord`), and `process_read` (CB match → UMI check → gene assign → record). New `align_reads_solo` loop in `lib.rs` reads cDNA + barcode in lockstep (`SoloReadReader`), aligns the cDNA, writes SAM/BAM, and collects per-cell records; `run_single_pass`/`run_two_pass` thread `solo_ctx`. 467 lib + 10 integration tests, 0 clippy warnings.
+
+**Phase 14.CR — CellRanger 4.x/5.x matching** (2026-06-12): implemented the STARsolo.md CellRanger-matching flag set faithfully from STAR source. `--soloUMIdedup 1MM_CR` (`umiArrayCorrect_CR`: each UMI corrected to its highest-count 1MM neighbor, non-transitive, count = distinct corrected). `--soloUMIfiltering MultiGeneUMI_CR` (keep the top-read-count gene of a multi-gene UMI) + `MultiGeneUMI`; `build_matrix` restructured to per-cell `umi → gene → readcount`. `--soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts` adds a +1 pseudocount to the CB posterior prior. `--clipAdapterType CellRanger4` (TSO 5' clip + polyA 3' trim, conservative no-op on adapter-free reads). All validated in params. Differential harness `test/solo_cellranger_diff.py` runs the full CellRanger flag set on both rustar-aligner and real STAR and compares decoded `{(barcode, gene_id): count}` matrices; committed cargo test `test_starsolo_cellranger_style_matrix` asserts the matrix (incl. 1MM_CR collapse) always.
+
+**Live verification — PASS:** rustar-aligner's `Gene/raw` matrix is **byte-identical to real STARsolo's** for the CellRanger-style run, confirmed deterministically (3/3 runs). The reference STAR (2.7.10b) and a Linux build of rustar-aligner run in a consistent Linux container (`test/Dockerfile.solodiff` + `test/solo_diff_docker.sh`, via colima — no Docker Desktop). This was necessary because STAR 2.7.11b reads 0 input reads on Apple-Silicon macOS (a known STAR/macOS bug, `nextChar=-1`). 479 lib + 11 integration tests, 0 clippy warnings.
+
+**Phase 14.4 — MVP COMPLETE** (2026-06-11): UMI deduplication + raw count-matrix output. New `src/solo/count.rs`: `UmiDedup` (`--soloUMIdedup`: Exact / NoDedup / 1MM_All [default, connected-components within Hamming-1] / 1MM_Directional / 1MM_Directional_UMItools, `dirCountAdd` 0/−1); deferred 1MM_multi CB resolution via STAR's count+quality posterior (weight = `exactCount·10^(−q/10)`, prior from `whitelist.exact_count_snapshot()`); `build_matrix` groups reads by (cell,gene), collapses UMIs, and `write_gene_matrix` writes `Solo.out/Gene/raw/{matrix.mtx, barcodes.tsv, features.tsv}` (MatrixMarket `nFeatures nBarcodes nEntries`, entries `gene+1 cell+1 count`, 1-based; CellRanger-v3 3-column features.tsv; whitelist-sorted barcodes.tsv). Wired into `align_reads` post-alignment. `--soloUMIdedup` validation in params. End-to-end test (`test_starsolo_gene_matrix`): 8 reads, one cell, two Hamming-distant UMI clouds → 2 deduped molecules → matrix `1 1 2`. **A working 10x Chromium Gene count matrix.** 475 lib + 10 integration tests, 0 clippy warnings.

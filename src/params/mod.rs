@@ -222,6 +222,62 @@ impl std::str::FromStr for TwopassMode {
 }
 
 // ---------------------------------------------------------------------------
+// STARsolo (single-cell) type
+// ---------------------------------------------------------------------------
+
+/// STAR's `--soloType` — selects the single-cell barcode geometry.
+///
+/// Mirrors STAR's `ParametersSolo::typeStr` values. Only `None` and
+/// `CB_UMI_Simple` (droplet 10x-style) are functional in Phase 14.1; the
+/// remaining variants are parsed so the CLI accepts them and later sub-phases
+/// can fill in behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SoloType {
+    /// Not a single-cell run (default).
+    #[default]
+    None,
+    /// One cell barcode + one UMI at fixed positions in the barcode read
+    /// (10x Chromium, Drop-seq, inDrops-simple, etc.). STAR alias: `Droplet`.
+    CbUmiSimple,
+    /// Multi-segment cell barcode and/or UMI, optionally adapter-anchored.
+    CbUmiComplex,
+    /// Barcodes passed through as SAM tags only (no collapsing).
+    CbSamTagOut,
+    /// Plate-based Smart-seq: one cell per read-group, no UMI.
+    SmartSeq,
+}
+
+impl std::str::FromStr for SoloType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "None" => Ok(Self::None),
+            // STAR accepts both the descriptive name and the `Droplet` alias.
+            "CB_UMI_Simple" | "Droplet" => Ok(Self::CbUmiSimple),
+            "CB_UMI_Complex" => Ok(Self::CbUmiComplex),
+            "CB_samTagOut" => Ok(Self::CbSamTagOut),
+            "SmartSeq" => Ok(Self::SmartSeq),
+            _ => Err(format!(
+                "unknown soloType '{s}'; expected None, CB_UMI_Simple, CB_UMI_Complex, CB_samTagOut, or SmartSeq"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for SoloType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::None => "None",
+            Self::CbUmiSimple => "CB_UMI_Simple",
+            Self::CbUmiComplex => "CB_UMI_Complex",
+            Self::CbSamTagOut => "CB_samTagOut",
+            Self::SmartSeq => "SmartSeq",
+        };
+        write!(f, "{s}")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parameters struct
 // ---------------------------------------------------------------------------
 
@@ -295,6 +351,13 @@ pub struct Parameters {
     /// Bases to clip from 3' end of each mate
     #[arg(long = "clip3pNbases", default_value_t = 0)]
     pub clip3p_nbases: u32,
+
+    /// Adapter clipping type applied to the cDNA read: `Hamming` (default,
+    /// adapter-sequence based, no-op when no adapter is configured) or
+    /// `CellRanger4` (clip the 10x TSO from the 5' end and trim the 3' polyA
+    /// tail, to match CellRanger ≥ 4.0).
+    #[arg(long = "clipAdapterType", default_value = "Hamming")]
+    pub clip_adapter_type: String,
 
     // ── Output ──────────────────────────────────────────────────────────
     /// Output file name prefix (including path)
@@ -659,6 +722,65 @@ pub struct Parameters {
     #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
+    // ── STARsolo (single-cell) ──────────────────────────────────────────
+    /// Single-cell barcode geometry; `None` disables solo processing.
+    #[arg(long = "soloType", default_value = "None")]
+    pub solo_type: SoloType,
+
+    /// Cell-barcode whitelist file (one barcode per line, plain or gzipped).
+    /// The literal `None` means "no whitelist" (all observed barcodes kept).
+    /// Multiple files are allowed for `CB_UMI_Complex` (one per CB segment).
+    #[arg(long = "soloCBwhitelist", num_args = 1.., default_values_t = vec!["None".to_string()])]
+    pub solo_cb_whitelist: Vec<String>,
+
+    /// 1-based start position of the cell barcode in the barcode read.
+    #[arg(long = "soloCBstart", default_value_t = 1)]
+    pub solo_cb_start: u32,
+
+    /// Length of the cell barcode in bases.
+    #[arg(long = "soloCBlen", default_value_t = 16)]
+    pub solo_cb_len: u32,
+
+    /// 1-based start position of the UMI in the barcode read.
+    #[arg(long = "soloUMIstart", default_value_t = 17)]
+    pub solo_umi_start: u32,
+
+    /// Length of the UMI in bases (10x v2 = 10, v3 = 12).
+    #[arg(long = "soloUMIlen", default_value_t = 10)]
+    pub solo_umi_len: u32,
+
+    /// Genomic features to quantify per cell: Gene, GeneFull, SJ, Velocyto, …
+    #[arg(long = "soloFeatures", num_args = 1.., default_values_t = vec!["Gene".to_string()])]
+    pub solo_features: Vec<String>,
+
+    /// UMI collapsing strategy: 1MM_All, 1MM_Directional, 1MM_Directional_UMItools,
+    /// Exact, or NoDedup.
+    #[arg(long = "soloUMIdedup", num_args = 1.., default_values_t = vec!["1MM_All".to_string()])]
+    pub solo_umi_dedup: Vec<String>,
+
+    /// Cell-barcode-to-whitelist matching: Exact, 1MM, 1MM_multi,
+    /// 1MM_multi_pseudocounts, 1MM_multi_Nbase_pseudocounts.
+    #[arg(long = "soloCBmatchWLtype", default_value = "1MM_multi")]
+    pub solo_cb_match_wl_type: String,
+
+    /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR, TopCells.
+    #[arg(long = "soloCellFilter", num_args = 1.., default_values_t = vec!["CellRanger2.2".to_string(), "3000".to_string(), "0.99".to_string(), "10".to_string()])]
+    pub solo_cell_filter: Vec<String>,
+
+    /// Output directory name for solo matrices (relative to `--outFileNamePrefix`).
+    #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
+    pub solo_out_file_names: Vec<String>,
+
+    /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
+    #[arg(long = "soloStrand", default_value = "Forward")]
+    pub solo_strand: String,
+
+    /// UMI filtering of multi-gene UMIs: `-`/`None` (default, no filtering),
+    /// `MultiGeneUMI`, `MultiGeneUMI_CR`, or `MultiGeneUMI_All`. The `_CR`
+    /// variant matches CellRanger > 3.0.
+    #[arg(long = "soloUMIfiltering", num_args = 1.., default_values_t = vec!["-".to_string()])]
+    pub solo_umi_filtering: Vec<String>,
+
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,
@@ -917,6 +1039,129 @@ impl Parameters {
             ));
         }
 
+        // ── STARsolo validation ─────────────────────────────────────────
+        if params.run_mode == RunMode::AlignReads && params.solo_enabled() {
+            // CB_UMI_Simple needs exactly two read files: cDNA + barcode read.
+            // (SmartSeq is plate-based and is handled differently; it is not
+            // yet implemented, so we only enforce the droplet geometry here.)
+            if matches!(
+                params.solo_type,
+                SoloType::CbUmiSimple | SoloType::CbUmiComplex | SoloType::CbSamTagOut
+            ) && params.read_files_in.len() != 2
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--soloType {} requires exactly two --readFilesIn files (cDNA read then barcode read); got {}",
+                        params.solo_type,
+                        params.read_files_in.len()
+                    ),
+                ));
+            }
+            // Gene-level features need a gene model.
+            if params
+                .solo_features
+                .iter()
+                .any(|f| f == "Gene" || f == "GeneFull")
+                && params.sjdb_gtf_file.is_none()
+            {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
+                ));
+            }
+            // CB length / UMI length sanity.
+            if params.solo_type == SoloType::CbUmiSimple
+                && (params.solo_cb_len == 0 || params.solo_umi_len == 0)
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--soloCBlen and --soloUMIlen must be > 0 for soloType CB_UMI_Simple",
+                ));
+            }
+            // Cell barcode cannot exceed a u64 packing (32 bases).
+            if params.solo_cb_len as usize > crate::solo::whitelist::CB_LEN_MAX {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--soloCBlen {} exceeds the maximum of {}",
+                        params.solo_cb_len,
+                        crate::solo::whitelist::CB_LEN_MAX
+                    ),
+                ));
+            }
+            // Validate --soloCBmatchWLtype.
+            if params
+                .solo_cb_match_wl_type
+                .parse::<crate::solo::whitelist::CbMatchType>()
+                .is_err()
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "unknown --soloCBmatchWLtype '{}'; expected Exact, 1MM, 1MM_multi, 1MM_multi_pseudocounts, or 1MM_multi_Nbase_pseudocounts",
+                        params.solo_cb_match_wl_type
+                    ),
+                ));
+            }
+            // Validate --soloUMIdedup (each method string).
+            for m in &params.solo_umi_dedup {
+                if m.parse::<crate::solo::UmiDedup>().is_err() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "unknown --soloUMIdedup '{m}'; expected Exact, NoDedup, 1MM_All, 1MM_Directional, or 1MM_Directional_UMItools"
+                        ),
+                    ));
+                }
+            }
+            // Validate --soloUMIfiltering (each method string).
+            for f in &params.solo_umi_filtering {
+                if f.parse::<crate::solo::UmiFiltering>().is_err() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "unknown --soloUMIfiltering '{f}'; expected -, None, MultiGeneUMI, MultiGeneUMI_CR, or MultiGeneUMI_All"
+                        ),
+                    ));
+                }
+            }
+            // Validate --clipAdapterType.
+            if !matches!(
+                params.clip_adapter_type.as_str(),
+                "Hamming" | "CellRanger4" | "None"
+            ) {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "unknown --clipAdapterType '{}'; expected Hamming, CellRanger4, or None",
+                        params.clip_adapter_type
+                    ),
+                ));
+            }
+            // Validate --soloStrand.
+            if params
+                .solo_strand
+                .parse::<crate::solo::SoloStrand>()
+                .is_err()
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "unknown --soloStrand '{}'; expected Forward, Reverse, or Unstranded",
+                        params.solo_strand
+                    ),
+                ));
+            }
+            // A whitelist is required for any correction beyond None.
+            if params.solo_cb_whitelist_none() && params.solo_cb_match_wl_type != "Exact" {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--soloCBwhitelist None requires --soloCBmatchWLtype Exact (no correction possible without a whitelist)",
+                ));
+            }
+        }
+
         Ok(params)
     }
 
@@ -928,6 +1173,56 @@ impl Parameters {
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// True when a single-cell run is requested (`--soloType` != None).
+    pub fn solo_enabled(&self) -> bool {
+        self.solo_type != SoloType::None
+    }
+
+    /// Path to the cDNA (transcript) read file. For solo runs this is the
+    /// FIRST `--readFilesIn` file (STAR convention: `cDNA_read barcode_read`).
+    /// Returns `None` if no read files are configured.
+    pub fn cdna_read_file(&self) -> Option<&PathBuf> {
+        self.read_files_in.first()
+    }
+
+    /// Path to the barcode (CB+UMI) read file — the SECOND `--readFilesIn`
+    /// file when solo is enabled. `None` if absent.
+    pub fn barcode_read_file(&self) -> Option<&PathBuf> {
+        if self.solo_enabled() {
+            self.read_files_in.get(1)
+        } else {
+            None
+        }
+    }
+
+    /// True when the literal `None` whitelist was given (keep all barcodes).
+    pub fn solo_cb_whitelist_none(&self) -> bool {
+        self.solo_cb_whitelist.len() == 1 && self.solo_cb_whitelist[0] == "None"
+    }
+
+    /// Path to the (first) cell-barcode whitelist file, or `None` for the
+    /// literal `None` whitelist.
+    pub fn solo_cb_whitelist_path(&self) -> Option<PathBuf> {
+        if self.solo_cb_whitelist_none() {
+            None
+        } else {
+            self.solo_cb_whitelist.first().map(PathBuf::from)
+        }
+    }
+
+    /// Parsed `--soloCBmatchWLtype` flags. Falls back to the `1MM_multi`
+    /// default if somehow unset (validation rejects invalid strings).
+    pub fn solo_cb_match_type(&self) -> crate::solo::whitelist::CbMatchType {
+        self.solo_cb_match_wl_type
+            .parse()
+            .unwrap_or(crate::solo::whitelist::CbMatchType {
+                mm1: true,
+                mm1_multi: true,
+                mm1_multi_nbase: false,
+                pseudocounts: false,
+            })
     }
 }
 

@@ -879,3 +879,263 @@ fn test_bare_dot_prefix_is_literal_string() {
     }
     assert!(count >= 1, "expected at least 1 BAM record, got {count}");
 }
+
+// ---------------------------------------------------------------------------
+// Test 9 — STARsolo (Phase 14.1–14.4): barcode parse, CB match, gene assign,
+// UMI dedup, raw count-matrix output
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_starsolo_gene_matrix() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // cDNA reads (R2): 50 bp from Exon1 of gene G1 (genome[10000..10050]),
+    // so each maps uniquely on the + strand inside G1 → Forward sense.
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+
+    let cb = "AAAACCCCGGGGTTTT"; // 16 bp, sorts first in the whitelist
+    // 8 reads, one cell, two well-separated UMI clouds (Hamming distance 10
+    // apart, 4 reads each) → 1MM_All collapses each cloud to 1 molecule → 2.
+    let umi_a = "ACGTACGTAC";
+    let umi_b = "TGCATGCATG";
+    let n_reads = 8usize;
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        let exon1 = &genome[10000..10050];
+        for i in 0..n_reads {
+            writeln!(cf, "@read{i}").unwrap();
+            cf.write_all(exon1).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+
+            let umi = if i < 4 { umi_a } else { umi_b };
+            writeln!(bf, "@read{i}").unwrap();
+            writeln!(bf, "{cb}{umi}").unwrap();
+            writeln!(bf, "+\n{}", "I".repeat(26)).unwrap();
+        }
+    }
+    {
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}").unwrap();
+        writeln!(wf, "CCCCGGGGTTTTAAAA").unwrap(); // decoys
+        writeln!(wf, "GGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_solo");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+
+    let assert = cargo_bin_cmd!("rustar-aligner")
+        .env("RUST_LOG", "info")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+            "Gene",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    // cDNA alignments are emitted like a normal SE run.
+    let sam_path = output_dir.join("Aligned.out.sam");
+    assert!(sam_path.exists(), "Aligned.out.sam not found");
+    assert!(
+        count_sam_records(&sam_path) >= n_reads,
+        "expected >= {n_reads} cDNA alignment records"
+    );
+
+    // 8 reads collected, all exact CB matches.
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("collected 8 resolved"),
+        "expected 8 resolved solo records in log, stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exact=8"),
+        "expected 8 exact CB matches in log, stderr was:\n{stderr}"
+    );
+
+    // Raw matrix output.
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    let features = fs::read_to_string(raw.join("features.tsv")).unwrap();
+    let barcodes = fs::read_to_string(raw.join("barcodes.tsv")).unwrap();
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+
+    // One gene G1 with a name column + feature type.
+    assert_eq!(features.lines().count(), 1);
+    assert!(
+        features.starts_with("G1\tG1\tGene Expression"),
+        "unexpected features.tsv:\n{features}"
+    );
+    // Three whitelist barcodes; the assayed CB sorts first.
+    assert_eq!(barcodes.lines().count(), 3);
+    assert_eq!(barcodes.lines().next().unwrap(), cb);
+
+    // MatrixMarket: header, dims "1 3 1" (1 gene × 3 barcodes, 1 entry),
+    // single entry "1 1 2" (gene 1, cell 1, 2 deduped molecules).
+    let mtx_lines: Vec<&str> = matrix.lines().collect();
+    assert!(
+        mtx_lines[0].starts_with("%%MatrixMarket matrix coordinate integer general"),
+        "unexpected mtx banner: {}",
+        mtx_lines[0]
+    );
+    let dims = mtx_lines.iter().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(*dims, "1 3 1", "unexpected matrix dimensions");
+    let entry = mtx_lines.last().unwrap();
+    assert_eq!(
+        *entry, "1 1 2",
+        "expected 2 deduped molecules for G1 in cell 1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10 — CellRanger-style STARsolo run (Phase 14.5)
+//
+// Exercises the full CellRanger 4.x/5.x flag set from STARsolo.md:
+//   --clipAdapterType CellRanger4 --outFilterScoreMin 30
+//   --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts
+//   --soloUMIfiltering MultiGeneUMI_CR --soloUMIdedup 1MM_CR
+// and asserts the raw Gene matrix. The 1MM_CR UMI collapse is the key
+// CellRanger-specific behavior verified here. A live differential comparison
+// against the real STAR binary is in test/solo_cellranger_diff.py.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_starsolo_cellranger_style_matrix() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+
+    // One cell (CB sorts first), 8 reads in Exon1 of G1. UMIs: M x5 + a 1MM
+    // neighbor of M x1 (1MM_CR collapses these to ONE molecule) + N x2 (a second
+    // molecule) => 2 deduped molecules for (CB, G1).
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi_m = "ACGTACGTAC"; // 10 bp (default soloUMIlen)
+    let umi_m_1mm = "ACGTACGTAG"; // 1 mismatch from umi_m (last base)
+    let umi_n = "TGCATGCATG";
+    let plan = [(umi_m, 5usize), (umi_m_1mm, 1), (umi_n, 2)];
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        let exon1 = &genome[10000..10050];
+        let mut i = 0;
+        for (umi, n) in plan {
+            for _ in 0..n {
+                writeln!(cf, "@read{i}").unwrap();
+                cf.write_all(exon1).unwrap();
+                writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+                writeln!(
+                    bf,
+                    "@read{i}\n{cb}{umi}\n+\n{}",
+                    "I".repeat(cb.len() + umi.len())
+                )
+                .unwrap();
+                i += 1;
+            }
+        }
+    }
+    {
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}").unwrap();
+        writeln!(wf, "TTTTGGGGCCCCAAAA").unwrap(); // decoy (sorts after cb)
+    }
+
+    let output_dir = tmpdir.path().join("out_cr");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "10",
+            "--soloFeatures",
+            "Gene",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            // CellRanger 4.x/5.x matching flags:
+            "--clipAdapterType",
+            "CellRanger4",
+            "--outFilterScoreMin",
+            "30",
+            "--soloCBmatchWLtype",
+            "1MM_multi_Nbase_pseudocounts",
+            "--soloUMIfiltering",
+            "MultiGeneUMI_CR",
+            "--soloUMIdedup",
+            "1MM_CR",
+            "--outSAMtype",
+            "SAM",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    let features = fs::read_to_string(raw.join("features.tsv")).unwrap();
+    let barcodes = fs::read_to_string(raw.join("barcodes.tsv")).unwrap();
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+
+    assert!(features.starts_with("G1\t"), "features.tsv: {features}");
+    assert_eq!(barcodes.lines().count(), 2);
+    assert_eq!(barcodes.lines().next().unwrap(), cb); // CB sorts first
+
+    let lines: Vec<&str> = matrix.lines().collect();
+    let dims = lines.iter().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(
+        *dims, "1 2 1",
+        "matrix dims (1 gene x 2 barcodes x 1 entry)"
+    );
+    // 1MM_CR: M(5)+M_1mm(1) collapse to 1 molecule, N(2) is another => 2.
+    assert_eq!(
+        *lines.last().unwrap(),
+        "1 1 2",
+        "expected 2 deduped molecules"
+    );
+}

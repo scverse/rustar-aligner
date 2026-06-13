@@ -33,6 +33,7 @@ pub mod io;
 pub mod junction;
 pub mod mapq;
 pub mod quant;
+pub mod solo;
 pub mod stats;
 
 use log::info;
@@ -278,17 +279,43 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             None
         };
 
+    // Build the STARsolo context (whitelist + gene model) if a solo run.
+    let solo_ctx: Option<std::sync::Arc<crate::solo::SoloContext>> = if params.solo_enabled() {
+        info!(
+            "STARsolo: soloType={} — building barcode + gene context",
+            params.solo_type
+        );
+        Some(std::sync::Arc::new(crate::solo::SoloContext::build(
+            &params,
+            &index.genome,
+        )?))
+    } else {
+        None
+    };
+
     let time_map_start = chrono::Local::now();
 
     // 2. Dispatch based on two-pass mode
     let stats = match params.twopass_mode {
         TwopassMode::None => {
             info!("Running single-pass alignment");
-            run_single_pass(&index, &params, quant_ctx.as_ref(), tr_idx.as_ref())?
+            run_single_pass(
+                &index,
+                &params,
+                quant_ctx.as_ref(),
+                tr_idx.as_ref(),
+                solo_ctx.as_ref(),
+            )?
         }
         TwopassMode::Basic => {
             info!("Running two-pass alignment mode");
-            run_two_pass(&index, &params, quant_ctx.as_ref(), tr_idx.as_ref())?
+            run_two_pass(
+                &index,
+                &params,
+                quant_ctx.as_ref(),
+                tr_idx.as_ref(),
+                solo_ctx.as_ref(),
+            )?
         }
     };
 
@@ -325,6 +352,31 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
         info!("Wrote {}", quant_path.display());
     }
 
+    // STARsolo: report collected per-cell records. The count-matrix output
+    // (raw/matrix.mtx + barcodes.tsv + features.tsv) follows in Phase 14.4.
+    if let Some(ref sctx) = solo_ctx {
+        use std::sync::atomic::Ordering;
+        let s = &sctx.stats;
+        info!(
+            "STARsolo barcode stats: exact={} 1MM={} multiMM={} noMatch={} N-in-CB={} multReject={} N-in-UMI={} UMIhomopolymer={}",
+            s.yes_exact.load(Ordering::Relaxed),
+            s.yes_one_mm.load(Ordering::Relaxed),
+            s.yes_mult_mm.load(Ordering::Relaxed),
+            s.no_match.load(Ordering::Relaxed),
+            s.n_in_cb.load(Ordering::Relaxed),
+            s.mult_rejected.load(Ordering::Relaxed),
+            s.n_in_umi.load(Ordering::Relaxed),
+            s.umi_homopolymer.load(Ordering::Relaxed),
+        );
+        info!(
+            "STARsolo: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
+            sctx.recorder.n_records(),
+            sctx.recorder.n_multi_records(),
+        );
+        // Write the raw count matrix (Gene/raw/{matrix.mtx,barcodes.tsv,features.tsv}).
+        crate::solo::write_gene_matrix(sctx, &params)?;
+    }
+
     info!("Alignment complete!");
     Ok(())
 }
@@ -335,6 +387,7 @@ fn run_single_pass(
     params: &Parameters,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
+    solo_ctx: Option<&std::sync::Arc<crate::solo::SoloContext>>,
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
     use crate::io::bam::{BamWriter, SortedBamWriter};
     use crate::io::sam::SamWriter;
@@ -365,7 +418,7 @@ fn run_single_pass(
     use crate::io::fastq::UnmappedFastqWriter;
     use crate::params::OutReadsUnmapped;
 
-    let is_paired = params.read_files_in.len() == 2;
+    let is_paired = params.read_files_in.len() == 2 && !params.solo_enabled();
     let mut unmapped_w1: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx {
             let path = params.output_path("Unmapped.out.mate1");
@@ -448,7 +501,27 @@ fn run_single_pass(
     };
 
     // Align reads through the boxed writer.
-    match params.read_files_in.len() {
+    //
+    // Solo runs supply two `--readFilesIn` files (cDNA read + barcode read) but
+    // are single-end *alignment* runs: only the cDNA read (file 0) is aligned.
+    // The dedicated solo loop reads the barcode read in lockstep, quantifies
+    // per cell, and otherwise emits the cDNA alignments like the SE path.
+    if let Some(sctx) = solo_ctx {
+        align_reads_solo(params, index, writer.as_mut(), &stats, &sj_stats, sctx)?;
+        writer.finish()?;
+        if let Some(ref mut w) = tr_writer {
+            w.finish()?;
+        }
+        let sj_output_path = params.output_path("SJ.out.tab");
+        if !sj_stats.is_empty() {
+            sj_stats.write_output(&sj_output_path, &index.genome, params)?;
+        }
+        stats.print_summary();
+        return Ok(stats);
+    }
+
+    let n_align_files = params.read_files_in.len();
+    match n_align_files {
         1 => align_reads_single_end(
             params,
             index,
@@ -504,6 +577,7 @@ fn run_two_pass(
     params: &Parameters,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
+    solo_ctx: Option<&std::sync::Arc<crate::solo::SoloContext>>,
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
     use std::sync::Arc;
 
@@ -534,7 +608,7 @@ fn run_two_pass(
 
     // PASS 2: Re-alignment with merged DB (quant counts happen here)
     info!("Two-pass mode: Pass 2 - Re-alignment");
-    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx, tr_idx)?;
+    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx, tr_idx, solo_ctx)?;
 
     Ok(stats)
 }
@@ -567,8 +641,14 @@ fn run_pass1(
     // Create NullWriter (discard SAM/BAM output in pass 1)
     let mut null_writer = NullWriter;
 
-    // Align reads (single-end or paired-end); no quant counting in pass 1
-    match params.read_files_in.len() {
+    // Align reads (single-end or paired-end); no quant counting in pass 1.
+    // Solo runs align only the cDNA read (file 0) — route to the SE path.
+    let n_align_files = if params.solo_enabled() {
+        1
+    } else {
+        params.read_files_in.len()
+    };
+    match n_align_files {
         1 => align_reads_single_end(
             &params_pass1,
             index,
@@ -1302,6 +1382,194 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     // Flush unmapped FASTQ writer
     if let Some(ref mut uw) = unmapped_writer {
         uw.flush()?;
+    }
+
+    Ok(())
+}
+
+/// Align a STARsolo single-cell run: the cDNA read (file 0) is aligned exactly
+/// like the SE path, while the barcode read (file 1) is read in lockstep and
+/// quantified per cell. Mapped cDNA alignments are written to the SAM/BAM output
+/// just like a normal SE run; the per-cell (CB, UMI, gene) records are collected
+/// into `solo_ctx.recorder` for the matrix output that follows in Phase 14.4.
+///
+/// Solo runs are single-pass and (for now) do not support BySJout / chimeric /
+/// transcriptome-SAM side outputs — those are not part of the STARsolo MVP.
+fn align_reads_solo<W: AlignmentWriter + ?Sized>(
+    params: &Parameters,
+    index: &std::sync::Arc<crate::index::GenomeIndex>,
+    writer: &mut W,
+    stats: &std::sync::Arc<crate::stats::AlignmentStats>,
+    sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
+    solo_ctx: &std::sync::Arc<crate::solo::SoloContext>,
+) -> anyhow::Result<()> {
+    use crate::align::read_align::align_read;
+    use crate::io::fastq::clip_read;
+    use crate::io::sam::{BufferedSamRecords, SamWriter};
+    use crate::solo::{SoloCountRecord, SoloMultiRecord};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+
+    let cdna_file = &params.read_files_in[0];
+    let barcode_file = &params.read_files_in[1];
+    info!(
+        "STARsolo: cDNA reads from {}, barcode reads from {}",
+        cdna_file.display(),
+        barcode_file.display()
+    );
+    let mut reader = crate::solo::open_reader(params)?;
+
+    let stats = Arc::clone(stats);
+    let sj_stats = Arc::clone(sj_stats);
+    let solo = Arc::clone(solo_ctx);
+
+    let mut read_count = 0u64;
+    let max_reads = if params.read_map_number < 0 {
+        u64::MAX
+    } else {
+        params.read_map_number as u64
+    };
+    let batch_size = 10000;
+    let clip5p = params.clip5p_nbases as usize;
+    let clip3p = params.clip3p_nbases as usize;
+    let cr4_clip = params.clip_adapter_type == "CellRanger4";
+    let max_multimaps = params.out_filter_multimap_nmax as usize;
+    let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+
+    /// Per-read result for the solo loop.
+    struct SoloReadProduct {
+        sam_records: BufferedSamRecords,
+        record: Option<SoloCountRecord>,
+        multi: Option<SoloMultiRecord>,
+    }
+
+    info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
+    loop {
+        let batch = reader.read_batch(batch_size)?;
+        if batch.is_empty() {
+            break;
+        }
+        let reads_to_process = if read_count + batch.len() as u64 > max_reads {
+            (max_reads - read_count) as usize
+        } else {
+            batch.len()
+        };
+        let batch_to_process = &batch[..reads_to_process];
+
+        let batch_results: Vec<Result<SoloReadProduct, error::Error>> = batch_to_process
+            .par_iter()
+            .map(|sread| {
+                let index = Arc::clone(index);
+                let stats = Arc::clone(&stats);
+                let sj_stats = Arc::clone(&sj_stats);
+                let solo = Arc::clone(&solo);
+
+                let read = &sread.cdna;
+                // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
+                // the fixed clip5p/clip3p Nbases trimming.
+                let (cr_seq, cr_qual) = if cr4_clip {
+                    crate::solo::clip_adapter_cr4(&read.sequence, &read.quality)
+                } else {
+                    (read.sequence.clone(), read.quality.clone())
+                };
+                let (clipped_seq, clipped_qual) = clip_read(&cr_seq, &cr_qual, clip5p, clip3p);
+                let mut buffer = BufferedSamRecords::new();
+                stats.record_read_bases(clipped_seq.len() as u64);
+
+                if clipped_seq.is_empty() {
+                    stats.record_alignment(0, max_multimaps);
+                    stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
+                    // No alignment → barcode still counts toward stats (unmapped → no gene).
+                    let outcome = solo.process_read(&[], sread.barcode.as_ref());
+                    return Ok(SoloReadProduct {
+                        sam_records: buffer,
+                        record: outcome.record,
+                        multi: outcome.multi,
+                    });
+                }
+
+                let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
+                    align_read(&clipped_seq, &read.name, &index, params)?;
+
+                let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
+                    n_for_mapq
+                } else {
+                    transcripts.len()
+                };
+                stats.record_alignment(n_for_stats, max_multimaps);
+                if transcripts.is_empty() && unmapped_reason.is_some() {
+                    stats.record_unmapped_reason(
+                        unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                    );
+                } else if transcripts.len() == 1 {
+                    stats.record_transcript_stats(&transcripts[0]);
+                }
+
+                let is_unique = transcripts.len() == 1;
+                for transcript in &transcripts {
+                    record_transcript_junctions(transcript, &index, &sj_stats, is_unique);
+                }
+
+                // Solo quantification (CB match + UMI check + gene assignment).
+                let outcome = solo.process_read(&transcripts, sread.barcode.as_ref());
+
+                // Build SAM records for the cDNA alignment (same as SE path).
+                if transcripts.is_empty() {
+                    if output_unmapped {
+                        let record = SamWriter::build_unmapped_record(
+                            &read.name,
+                            &clipped_seq,
+                            &clipped_qual,
+                            params,
+                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                        )?;
+                        buffer.push(record);
+                    }
+                } else if transcripts.len() <= max_multimaps {
+                    let records = SamWriter::build_alignment_records(
+                        &read.name,
+                        &clipped_seq,
+                        &clipped_qual,
+                        &transcripts,
+                        &index.genome,
+                        params,
+                        n_for_mapq,
+                    )?;
+                    for record in records {
+                        buffer.push(record);
+                    }
+                }
+
+                Ok(SoloReadProduct {
+                    sam_records: buffer,
+                    record: outcome.record,
+                    multi: outcome.multi,
+                })
+            })
+            .collect();
+
+        // Sequential write + record collection.
+        let mut batch_records: Vec<SoloCountRecord> = Vec::new();
+        let mut batch_multi: Vec<SoloMultiRecord> = Vec::new();
+        for result in batch_results {
+            let product = result?;
+            writer.write_batch(&product.sam_records.records)?;
+            if let Some(r) = product.record {
+                batch_records.push(r);
+            }
+            if let Some(m) = product.multi {
+                batch_multi.push(m);
+            }
+        }
+        solo.recorder.extend(batch_records, batch_multi);
+
+        read_count += reads_to_process as u64;
+        if read_count % 100_000 < batch_size as u64 {
+            info!("STARsolo: processed {read_count} reads...");
+        }
+        if read_count >= max_reads {
+            break;
+        }
     }
 
     Ok(())

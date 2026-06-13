@@ -1,0 +1,19 @@
+# Linux environment to run the STARsolo CellRanger differential test in a
+# consistent way (real STAR works on Linux; the macOS build has a read bug).
+#
+# Build:  docker build -f test/Dockerfile.solodiff -t rustar-solodiff .
+# Run:    docker run --rm -v "$PWD":/work -w /work \
+#             -e CARGO_TARGET_DIR=/tmp/ct rustar-solodiff \
+#             bash -c "cargo build --release && \
+#                      python3 test/solo_cellranger_diff.py \
+#                        --star \$(which STAR) --rustar /tmp/ct/release/rustar-aligner"
+FROM rust:1-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends rna-star python3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Report tool versions at build time for the record.
+RUN STAR --version && cargo --version && python3 --version
+
+WORKDIR /work
