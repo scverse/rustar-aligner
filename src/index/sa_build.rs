@@ -299,10 +299,30 @@ where
 /// roadmap). It sorts the same per-segment sentinel-transformed text the caps-sa
 /// sentinel arm uses; because the suffix array is unique, the packed output is
 /// **byte-for-byte identical to [`build`]** (asserted in `build_libsais_matches_*`
-/// tests). Currently covers genomes whose per-segment sentinel alphabet fits `u8`
-/// or `u16`; larger segment counts fall back to [`build`] until the libsais
-/// large-alphabet (`i32`) path is wired.
+/// tests). The narrowest sentinel alphabet is chosen automatically: `u8`/`u16`
+/// small-alphabet for few segments, `i32` large-alphabet for many-segment genomes
+/// (many chromosomes + sjdb), so every genome is covered.
+///
+/// libsais builds the suffix array **in memory**; for very large sequences (e.g.
+/// the human genome) that needs substantially more RAM than caps-sa's external-
+/// memory path. Wiring libsais in as the default builder — and choosing libsais vs.
+/// caps-sa by available memory — is roadmap follow-up.
 pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
+    build_libsais_impl(genome, None)
+}
+
+/// Per-segment sentinel alphabet width fed to libsais.
+#[derive(Clone, Copy, Debug)]
+enum LibsaisWidth {
+    U8,
+    U16,
+    I32,
+}
+
+/// Inner libsais build with an optional forced alphabet width. Production passes
+/// `None` (narrowest width that fits); tests force the `i32` large-alphabet path on
+/// small fixtures to exercise it without a >64 K-segment genome.
+fn build_libsais_impl(genome: &Genome, force: Option<LibsaisWidth>) -> Result<SuffixArray, Error> {
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
     let gstrand_mask = (1u64 << gstrand_bit) - 1;
     let word_length = gstrand_bit + 1;
@@ -335,18 +355,29 @@ pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
         Ok(())
     };
 
-    if alphabet_max <= <u8 as SaSymbol>::MAX_REPRESENTABLE {
-        let t_prime: Vec<u8> = build_sentinel_transformed_text(original, n_seg);
-        libsais_emit_kept(&t_prime, original, &mut pack_one)?;
-    } else if alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
-        let t_prime: Vec<u16> = build_sentinel_transformed_text(original, n_seg);
-        libsais_emit_kept(&t_prime, original, &mut pack_one)?;
-    } else {
-        log::warn!(
-            "build_libsais: sentinel alphabet_max={alphabet_max} exceeds u16 \
-             ({n_seg} segments); falling back to caps-sa build()"
-        );
-        return build(genome);
+    let width = force.unwrap_or({
+        if alphabet_max <= <u8 as SaSymbol>::MAX_REPRESENTABLE {
+            LibsaisWidth::U8
+        } else if alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
+            LibsaisWidth::U16
+        } else {
+            LibsaisWidth::I32
+        }
+    });
+
+    match width {
+        LibsaisWidth::U8 => {
+            let t_prime: Vec<u8> = build_sentinel_transformed_text(original, n_seg);
+            libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+        }
+        LibsaisWidth::U16 => {
+            let t_prime: Vec<u16> = build_sentinel_transformed_text(original, n_seg);
+            libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+        }
+        LibsaisWidth::I32 => {
+            let mut t_prime: Vec<i32> = build_sentinel_transformed_text_i32(original, n_seg);
+            libsais_emit_kept_i32(&mut t_prime, original, &mut pack_one)?;
+        }
     }
 
     debug_assert_eq!(out_idx, n_sa_kept);
@@ -355,6 +386,61 @@ pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
         gstrand_bit,
         gstrand_mask,
     })
+}
+
+/// `i32` variant of [`build_sentinel_transformed_text`] for the libsais
+/// large-alphabet path (symbols exceed `u16`). Identical layout: bases map to
+/// their code, each spacer run to a unique ascending sentinel `SENTINEL_BASE +
+/// run_idx`, and a terminal sentinel `SENTINEL_BASE + n_seg` closes the text.
+fn build_sentinel_transformed_text_i32(genome: &[u8], n_seg: u32) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(genome.len() + 1);
+    let mut run_idx: u32 = 0;
+    let mut in_run = false;
+    for &b in genome {
+        if b == SPACER {
+            in_run = true;
+            out.push((SENTINEL_BASE as u32 + run_idx) as i32);
+        } else {
+            if in_run {
+                in_run = false;
+                run_idx += 1;
+            }
+            out.push(i32::from(b));
+        }
+    }
+    if in_run {
+        run_idx += 1;
+    }
+    debug_assert_eq!(run_idx, n_seg);
+    out.push((SENTINEL_BASE as u32 + n_seg) as i32);
+    out
+}
+
+/// libsais large-alphabet SA over an `i32` sentinel-transformed text. Same kept-
+/// position filter and coordinate semantics as [`libsais_emit_kept`]; the text is
+/// passed mutably because libsais may reuse it as scratch.
+fn libsais_emit_kept_i32(
+    t_prime: &mut [i32],
+    original: &[u8],
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    use libsais::suffix_array::SuffixArrayConstruction;
+    let n2 = original.len();
+    // `i32` text uses an `i32` SA buffer (positions must fit i32); this bounds the
+    // large-alphabet path to texts shorter than 2^31, which is fine for the
+    // many-segment genomes it targets. Huge sequences use the caps-sa ext-mem path.
+    let sa = SuffixArrayConstruction::for_text_mut(t_prime)
+        .in_owned_buffer32()
+        .single_threaded()
+        .run()
+        .map_err(|e| Error::Index(format!("libsais large-alphabet suffix-array failed: {e:?}")))?;
+    for &p in sa.suffix_array() {
+        let p = p as usize;
+        if p < n2 && original[p] < 4 {
+            pack_one(p as u64)?;
+        }
+    }
+    Ok(())
 }
 
 /// Public streaming entry. Calls `emit(packed_value)` for each SA
@@ -1184,6 +1270,34 @@ mod tests {
         assert_libsais_matches_caps_sa(
             "repeat",
             ">chrA\nAAAAAAAAAAAAAAAA\n>chrB\nACACACACACAC\n",
+            4,
+        );
+    }
+
+    /// The libsais **large-alphabet (i32)** path must also be byte-identical to
+    /// caps-sa. Small fixtures have a tiny sentinel alphabet, so force the i32 arm
+    /// to exercise it without needing a >64 K-segment genome.
+    fn assert_libsais_i32_matches_caps_sa(label: &str, fasta: &str, bin_nbits: u32) {
+        let genome = build_genome_from_fasta(fasta, bin_nbits);
+        let caps = build(&genome).unwrap();
+        let ls = build_libsais_impl(&genome, Some(LibsaisWidth::I32)).unwrap();
+        assert_eq!(
+            ls.data.data(),
+            caps.data.data(),
+            "libsais i32 large-alphabet vs caps-sa packed SA differ on `{label}`"
+        );
+    }
+
+    #[test]
+    fn build_libsais_i32_matches_caps_sa_single_chr() {
+        assert_libsais_i32_matches_caps_sa("i32-single", ">chrA\nACGTACGTACGTACGT\n", 4);
+    }
+
+    #[test]
+    fn build_libsais_i32_matches_caps_sa_multi_chr_with_n() {
+        assert_libsais_i32_matches_caps_sa(
+            "i32-multi",
+            ">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n",
             4,
         );
     }
