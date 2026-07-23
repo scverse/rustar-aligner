@@ -259,6 +259,104 @@ pub(crate) fn build_impl(
     })
 }
 
+/// Sort the sentinel-transformed text `t_prime` with **libsais** and emit the kept
+/// ACGT positions (in original coordinates) in suffix-array order via `pack_one`.
+///
+/// A suffix array is unique for a given text, so libsais's SA of `t_prime` is
+/// byte-identical to the caps-sa path's SA of the same `t_prime` — and hence to
+/// STAR's ordering (see [`build_sentinel_transformed_text`]). `t_prime` is
+/// index-aligned with `original` for its first `original.len()` positions, so the
+/// keep predicate is the same `p < n2 && original[p] < 4` used by the caps-sa arm
+/// (this drops per-segment sentinels, N, and the terminal sentinel at index `n2`).
+fn libsais_emit_kept<S>(
+    t_prime: &[S],
+    original: &[u8],
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error>
+where
+    S: libsais::SmallAlphabet,
+    i64: libsais::IsValidOutputFor<S>,
+{
+    use libsais::suffix_array::SuffixArrayConstruction;
+    let n2 = original.len();
+    let sa = SuffixArrayConstruction::for_text(t_prime)
+        .in_owned_buffer64()
+        .single_threaded()
+        .run()
+        .map_err(|e| Error::Index(format!("libsais suffix-array construction failed: {e:?}")))?;
+    for &p in sa.suffix_array() {
+        let p = p as usize;
+        if p < n2 && original[p] < 4 {
+            pack_one(p as u64)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the suffix array via **libsais** instead of caps-sa.
+///
+/// libsais is a fast SA-IS construction (index-construction speedup tracked in the
+/// roadmap). It sorts the same per-segment sentinel-transformed text the caps-sa
+/// sentinel arm uses; because the suffix array is unique, the packed output is
+/// **byte-for-byte identical to [`build`]** (asserted in `build_libsais_matches_*`
+/// tests). Currently covers genomes whose per-segment sentinel alphabet fits `u8`
+/// or `u16`; larger segment counts fall back to [`build`] until the libsais
+/// large-alphabet (`i32`) path is wired.
+pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
+    let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
+    let gstrand_mask = (1u64 << gstrand_bit) - 1;
+    let word_length = gstrand_bit + 1;
+
+    let n_genome = genome.n_genome as usize;
+    let n2 = 2 * n_genome;
+    if genome.sequence.len() < n2 {
+        return Err(Error::Index(format!(
+            "build_libsais: genome.sequence length {} < 2 * n_genome ({n2})",
+            genome.sequence.len()
+        )));
+    }
+    let original = &genome.sequence.as_slice()[..n2];
+    let n_seg = count_spacer_runs(original);
+    let alphabet_max = SENTINEL_BASE as u32 + n_seg;
+    let n2_bit = 1u64 << gstrand_bit;
+    let n_genome_u64 = n_genome as u64;
+
+    let n_sa_kept = original.par_iter().filter(|&&b| b < 4).count();
+    let mut data = PackedArray::new(word_length, n_sa_kept);
+    let mut out_idx: usize = 0;
+    let mut pack_one = |orig_pos: u64| -> Result<(), Error> {
+        let packed = if (orig_pos as usize) < n_genome {
+            orig_pos
+        } else {
+            (orig_pos - n_genome_u64) | n2_bit
+        };
+        data.write(out_idx, packed);
+        out_idx += 1;
+        Ok(())
+    };
+
+    if alphabet_max <= <u8 as SaSymbol>::MAX_REPRESENTABLE {
+        let t_prime: Vec<u8> = build_sentinel_transformed_text(original, n_seg);
+        libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+    } else if alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
+        let t_prime: Vec<u16> = build_sentinel_transformed_text(original, n_seg);
+        libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+    } else {
+        log::warn!(
+            "build_libsais: sentinel alphabet_max={alphabet_max} exceeds u16 \
+             ({n_seg} segments); falling back to caps-sa build()"
+        );
+        return build(genome);
+    }
+
+    debug_assert_eq!(out_idx, n_sa_kept);
+    Ok(SuffixArray {
+        data,
+        gstrand_bit,
+        gstrand_mask,
+    })
+}
+
 /// Public streaming entry. Calls `emit(packed_value)` for each SA
 /// entry in lexicographic order, packed in STAR's strand-bit
 /// encoding (forward `p → p`, reverse `p → (p - n_genome) |
@@ -1046,6 +1144,48 @@ mod tests {
             "segmented vs sentinel-transform packed array differ on `{label}`"
         );
         assert_eq!(sa_segmented.gstrand_bit, sa_sentinel.gstrand_bit);
+    }
+
+    /// libsais must produce a **byte-identical** packed suffix array to the
+    /// caps-sa [`build`] on the same genome. The suffix array of a text is
+    /// unique, so any correct constructor over the same sentinel-transformed
+    /// text agrees — this pins libsais to the STAR-faithful ordering.
+    fn assert_libsais_matches_caps_sa(label: &str, fasta: &str, bin_nbits: u32) {
+        let genome = build_genome_from_fasta(fasta, bin_nbits);
+        let caps = build(&genome).unwrap();
+        let ls = build_libsais(&genome).unwrap();
+        assert_eq!(
+            ls.gstrand_bit, caps.gstrand_bit,
+            "gstrand_bit differs on `{label}`"
+        );
+        assert_eq!(
+            ls.data.data(),
+            caps.data.data(),
+            "libsais vs caps-sa packed SA differ on `{label}`"
+        );
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_single_chr() {
+        assert_libsais_matches_caps_sa("single", ">chrA\nACGTACGTACGTACGT\n", 4);
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_multi_chr_with_n() {
+        assert_libsais_matches_caps_sa(
+            "multi",
+            ">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n",
+            4,
+        );
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_repetitive() {
+        assert_libsais_matches_caps_sa(
+            "repeat",
+            ">chrA\nAAAAAAAAAAAAAAAA\n>chrB\nACACACACACAC\n",
+            4,
+        );
     }
 
     /// The streaming entry [`build_streaming`] must produce the same
