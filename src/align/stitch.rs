@@ -1125,6 +1125,7 @@ impl WorkingTranscript {
 #[allow(clippy::too_many_arguments)]
 fn stitch_align_to_transcript(
     wt: &WorkingTranscript,
+    last_exon: &ExonBlock,
     wa: &WindowAlignment,
     read_seq: &[u8],
     index: &GenomeIndex,
@@ -1134,8 +1135,6 @@ fn stitch_align_to_transcript(
     align_mates_gap_max: u64,
     _debug_name: &str,
 ) -> Option<WorkingTranscript> {
-    let last_exon = wt.exons.last().unwrap();
-
     // Mate-boundary detection: STAR canonSJ[iex] = -3 (stitchAlignToTranscript.cpp:402)
     // When crossing from mate1 to mate2 (or vice versa), skip junction scoring and
     // check alignMatesGapMax instead.
@@ -1701,6 +1700,7 @@ pub fn stitch_seeds_with_jdb(
         scorer,
         junction_db,
         max_transcripts_per_window,
+        false,
         "",
     )
 }
@@ -2437,6 +2437,7 @@ fn stitch_recurse(
         // Try stitching this seed onto the existing transcript
         if let Some(new_wt) = stitch_align_to_transcript(
             &wt,
+            wt.exons.last().unwrap(),
             wa,
             read_seq,
             index,
@@ -2658,6 +2659,7 @@ pub(crate) fn split_combined_wt(
 /// Uses STAR's recursive combinatorial stitcher (stitchWindowAligns) instead of
 /// forward DP. For each seed, explores include/exclude branches, allowing the
 /// algorithm to skip spurious short seeds that would create false splices.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stitch_seeds_with_jdb_debug(
     cluster: &SeedCluster,
     read_seq: &[u8],
@@ -2665,18 +2667,31 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
     scorer: &AlignmentScorer,
     junction_db: Option<&crate::junction::SpliceJunctionDb>,
     max_transcripts_per_window: usize,
+    long_read: bool,
     debug_read_name: &str,
 ) -> Vec<Transcript> {
-    let (working_transcripts, stitch_cluster, stitch_is_reverse, stitch_read) = stitch_seeds_core(
-        cluster,
-        read_seq,
-        index,
-        scorer,
-        junction_db,
-        max_transcripts_per_window,
-        0,
-        debug_read_name,
-    );
+    let (working_transcripts, stitch_cluster, stitch_is_reverse, stitch_read) = if long_read {
+        stitch_seeds_long_read(
+            cluster,
+            read_seq,
+            index,
+            scorer,
+            junction_db,
+            0,
+            debug_read_name,
+        )
+    } else {
+        stitch_seeds_core(
+            cluster,
+            read_seq,
+            index,
+            scorer,
+            junction_db,
+            max_transcripts_per_window,
+            0,
+            debug_read_name,
+        )
+    };
 
     // Finalize working transcripts → Transcript (filtering by overhang+repeat check)
     let mut transcripts: Vec<Transcript> = Vec::with_capacity(working_transcripts.len());
@@ -2786,16 +2801,20 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
 
 /// Shared core: preprocessing + recursive stitcher, returns working transcripts + context.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn stitch_seeds_core(
+/// Shared preamble for both the recursive short-read stitcher ([`stitch_seeds_core`]) and the
+/// STARlong chaining DP ([`stitch_seeds_long_read`]): diagonal-dedup the cluster's seeds, convert
+/// reverse-strand coordinates into the stitcher's positive-strand/forward-genome frame, pre-extend
+/// each seed's base score (STAR's `scoreSeedBest` base case), sort by read position, and cap the
+/// seed count. Returns the prepared WA entries (pre-extended; empty if the cluster had none after
+/// dedup/capping), the stitch-frame cluster, whether the original cluster was reverse-strand, and
+/// the (possibly RC'd) stitch-frame read.
+fn prepare_stitch_input(
     cluster: &SeedCluster,
     read_seq: &[u8],
     index: &GenomeIndex,
     scorer: &AlignmentScorer,
-    junction_db: Option<&crate::junction::SpliceJunctionDb>,
-    max_transcripts_per_window: usize,
-    align_mates_gap_max: u64,
     debug_read_name: &str,
-) -> (Vec<WorkingTranscript>, SeedCluster, bool, Vec<u8>) {
+) -> (Vec<WindowAlignment>, SeedCluster, bool, Vec<u8>) {
     let debug = !debug_read_name.is_empty();
 
     // Include ALL seeds (anchor and non-anchor) in the stitcher.
@@ -3059,6 +3078,41 @@ pub(crate) fn stitch_seeds_core(
         }
     }
 
+    (
+        wa_entries,
+        stitch_cluster,
+        stitch_is_reverse,
+        stitch_read_owned,
+    )
+}
+
+/// Inner implementation of the recursive short-read stitcher, sharing [`prepare_stitch_input`]
+/// with [`stitch_seeds_long_read`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stitch_seeds_core(
+    cluster: &SeedCluster,
+    read_seq: &[u8],
+    index: &GenomeIndex,
+    scorer: &AlignmentScorer,
+    junction_db: Option<&crate::junction::SpliceJunctionDb>,
+    max_transcripts_per_window: usize,
+    align_mates_gap_max: u64,
+    debug_read_name: &str,
+) -> (Vec<WorkingTranscript>, SeedCluster, bool, Vec<u8>) {
+    let debug = !debug_read_name.is_empty();
+    let (wa_entries, stitch_cluster, stitch_is_reverse, stitch_read_owned) =
+        prepare_stitch_input(cluster, read_seq, index, scorer, debug_read_name);
+    let stitch_read: &[u8] = &stitch_read_owned;
+
+    if wa_entries.is_empty() {
+        return (
+            Vec::new(),
+            stitch_cluster,
+            stitch_is_reverse,
+            stitch_read_owned,
+        );
+    }
+
     // Phase 2: DP chain over pre-extended scores (STAR: scoreSeedBest chain accumulation).
     // dp[i] = best chain score ending at wa_entries[i].
     // For intra-read gaps: if read_gap != genome_gap this is a potential splice — 0 penalty.
@@ -3127,6 +3181,250 @@ pub(crate) fn stitch_seeds_core(
 
     (
         working_transcripts,
+        stitch_cluster,
+        stitch_is_reverse,
+        stitch_read_owned,
+    )
+}
+
+/// STARlong's `stitchWindowSeeds` (`-DCOMPILE_FOR_LONG_READS`): an O(n^2) chaining DP over a
+/// window's seeds that assembles the single best-scoring seed chain into ONE working transcript,
+/// replacing [`stitch_seeds_core`]'s recursive include/exclude enumeration (exponential in seed
+/// count, intractable for long-read seed counts). Reuses [`stitch_align_to_transcript`] for
+/// per-edge scoring; end extension and CIGAR assembly are left to the shared
+/// [`finalize_transcript`] pass, exactly as for the short-read path — this port does not
+/// duplicate that logic with STARlong's own `L_PREV`-widened end extension.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stitch_seeds_long_read(
+    cluster: &SeedCluster,
+    read_seq: &[u8],
+    index: &GenomeIndex,
+    scorer: &AlignmentScorer,
+    junction_db: Option<&crate::junction::SpliceJunctionDb>,
+    align_mates_gap_max: u64,
+    debug_read_name: &str,
+) -> (Vec<WorkingTranscript>, SeedCluster, bool, Vec<u8>) {
+    let (wa_entries, stitch_cluster, stitch_is_reverse, stitch_read_owned) =
+        prepare_stitch_input(cluster, read_seq, index, scorer, debug_read_name);
+    let stitch_read: &[u8] = &stitch_read_owned;
+
+    let n = wa_entries.len();
+    if n == 0 {
+        return (
+            Vec::new(),
+            stitch_cluster,
+            stitch_is_reverse,
+            stitch_read_owned,
+        );
+    }
+
+    // `extendAlign`'s ratio-based mismatch budget collapses to a flat `n_mm_max` when
+    // `len_prev` is this large (STAR `stitchWindowSeeds.cpp`'s `L_PREV` constant).
+    const L_PREV: usize = 100_000;
+
+    let mut score_best = vec![0i32; n];
+    let mut mm_best = vec![0u32; n];
+    // Predecessor seed index, -1 = none. A chain start points to itself.
+    let mut pred: Vec<i64> = vec![-1; n];
+
+    let exon_block = |wa: &WindowAlignment| ExonBlock {
+        read_start: wa.read_pos,
+        read_end: wa.read_pos + wa.length,
+        genome_start: wa.sa_pos,
+        genome_end: wa.sa_pos + wa.length as u64,
+        mate_id: wa.mate_id,
+    };
+
+    // ---- Phase A: forward DP (best chain score ending at each seed) ----
+    for i1 in 0..n {
+        for i2 in 0..=i1 {
+            if i2 < i1 {
+                let a = &wa_entries[i2];
+                let b = &wa_entries[i1];
+                let a_exon = exon_block(a);
+                let wt_a = WorkingTranscript {
+                    exons: vec![a_exon.clone()],
+                    score: a.length as i32,
+                    n_mismatch: mm_best[i2],
+                    n_gap: 0,
+                    n_junction: 0,
+                    junction_motifs: Vec::new(),
+                    junction_annotated: Vec::new(),
+                    junction_shifts: Vec::new(),
+                    n_anchor: u32::from(a.is_anchor),
+                    read_start: a_exon.read_start,
+                    read_end: a_exon.read_end,
+                    genome_start: a_exon.genome_start,
+                    genome_end: a_exon.genome_end,
+                };
+                let Some(new_wt) = stitch_align_to_transcript(
+                    &wt_a,
+                    &a_exon,
+                    b,
+                    stitch_read,
+                    index,
+                    scorer,
+                    &stitch_cluster,
+                    junction_db,
+                    align_mates_gap_max,
+                    debug_read_name,
+                ) else {
+                    continue;
+                };
+                // Marginal score of the A->B edge (STAR's `score2`): the DP accumulates
+                // these, it does not re-add A's own base score at every step.
+                let d_score = new_wt.score - wt_a.score;
+                let is_annotated = new_wt.junction_annotated.last().copied().unwrap_or(false);
+                let overhang = if is_annotated {
+                    scorer.align_sjdb_overhang_min
+                } else {
+                    scorer.align_sj_overhang_min
+                } as usize;
+                let exon_a_len = new_wt.exons[0].read_end - new_wt.exons[0].read_start;
+                if exon_a_len >= overhang
+                    && d_score > 0
+                    && score_best[i2] + d_score > score_best[i1]
+                {
+                    score_best[i1] = score_best[i2] + d_score;
+                    mm_best[i1] = new_wt.n_mismatch;
+                    pred[i1] = i2 as i64;
+                }
+            } else {
+                // Chain start: seed length plus a left extension to the read start.
+                let s = &wa_entries[i1];
+                let mut score2 = s.length as i32;
+                let mut ext_len = 0usize;
+                if s.read_pos > 0 {
+                    let e = extend_alignment(
+                        stitch_read,
+                        s.read_pos,
+                        s.sa_pos,
+                        -1,
+                        s.read_pos,
+                        0,
+                        L_PREV,
+                        scorer.n_mm_max,
+                        scorer.p_mm_max,
+                        index,
+                        false,
+                    );
+                    score2 += e.max_score;
+                    ext_len = e.extend_len;
+                }
+                let exon_long_enough =
+                    (s.length + ext_len) >= scorer.align_sj_overhang_min as usize;
+                if exon_long_enough && score2 > score_best[i1] {
+                    score_best[i1] = score2;
+                    pred[i1] = i1 as i64;
+                    // mm_best[i1] intentionally left at 0 here: STARlong's own chain-start
+                    // case never records the left extension's mismatches into
+                    // `scoreSeedBestMM` either (faithful to the upstream quirk).
+                }
+            }
+        }
+    }
+
+    // ---- Phase B: right-extend each chain, track the global best ----
+    let mut global_best = 0i32;
+    let mut best_ind = 0usize;
+    let mut found = false;
+    for i1 in 0..n {
+        let s = &wa_entries[i1];
+        let t_r2 = s.read_pos + s.length;
+        let mut ext_len = 0usize;
+        if t_r2 < stitch_read.len() {
+            let e = extend_alignment(
+                stitch_read,
+                t_r2,
+                s.sa_pos + s.length as u64,
+                1,
+                stitch_read.len() - t_r2,
+                mm_best[i1],
+                L_PREV,
+                scorer.n_mm_max,
+                scorer.p_mm_max,
+                index,
+                false,
+            );
+            score_best[i1] += e.max_score;
+            ext_len = e.extend_len;
+        }
+        let exon_long_enough = (s.length + ext_len) >= scorer.align_sj_overhang_min as usize;
+        if exon_long_enough && (!found || score_best[i1] > global_best) {
+            global_best = score_best[i1];
+            best_ind = i1;
+            found = true;
+        }
+    }
+    if !found {
+        return (
+            Vec::new(),
+            stitch_cluster,
+            stitch_is_reverse,
+            stitch_read_owned,
+        );
+    }
+
+    // ---- Phase C: traceback the best chain (rightmost -> leftmost) ----
+    let mut chain: Vec<usize> = Vec::new();
+    let mut cur = best_ind;
+    loop {
+        chain.push(cur);
+        let p = pred[cur];
+        if p >= 0 && (cur as i64) > p {
+            cur = p as usize;
+        } else {
+            break;
+        }
+    }
+
+    // ---- Phase D: assemble the transcript by replaying the chain, left to right ----
+    let first = &wa_entries[chain[chain.len() - 1]];
+    let first_exon = exon_block(first);
+    let mut wt = WorkingTranscript {
+        exons: vec![first_exon.clone()],
+        score: first.length as i32,
+        n_mismatch: 0,
+        n_gap: 0,
+        n_junction: 0,
+        junction_motifs: Vec::new(),
+        junction_annotated: Vec::new(),
+        junction_shifts: Vec::new(),
+        n_anchor: u32::from(first.is_anchor),
+        read_start: first_exon.read_start,
+        read_end: first_exon.read_end,
+        genome_start: first_exon.genome_start,
+        genome_end: first_exon.genome_end,
+    };
+    for isc in (1..chain.len()).rev() {
+        let last_exon = wt.exons.last().unwrap().clone();
+        let b = &wa_entries[chain[isc - 1]];
+        let Some(new_wt) = stitch_align_to_transcript(
+            &wt,
+            &last_exon,
+            b,
+            stitch_read,
+            index,
+            scorer,
+            &stitch_cluster,
+            junction_db,
+            align_mates_gap_max,
+            debug_read_name,
+        ) else {
+            // The traceback replays exactly the edges Phase A already validated; a
+            // failure here means this window yields no long-read alignment.
+            return (
+                Vec::new(),
+                stitch_cluster,
+                stitch_is_reverse,
+                stitch_read_owned,
+            );
+        };
+        wt = new_wt;
+    }
+
+    (
+        vec![wt],
         stitch_cluster,
         stitch_is_reverse,
         stitch_read_owned,
@@ -3697,5 +3995,110 @@ mod tests {
         let additive_buggy = baseline + motif_score + scorer.sjdb_score;
         let replacement_correct = baseline + scorer.sjdb_score;
         assert_ne!(additive_buggy, replacement_correct);
+    }
+
+    #[test]
+    fn long_read_single_seed_chain() {
+        // STARlong chaining DP with exactly one seed spanning the whole read: Phase A/B/C/D
+        // should hand back that one seed's own exon, untouched (end extension is deferred to
+        // the shared `finalize_transcript` pass, not duplicated here).
+        let genome_seq: Vec<u8> = (0..40u32).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let index = make_index_with_seq(&genome_seq);
+        let read_seq = genome_seq[10..20].to_vec();
+
+        let cluster = SeedCluster {
+            alignments: vec![WindowAlignment {
+                seed_idx: 0,
+                read_pos: 0,
+                length: 10,
+                genome_pos: 10,
+                sa_pos: 10,
+                n_rep: 1,
+                is_anchor: true,
+                mate_id: 2,
+                pre_ext_score: 0,
+            }],
+            chr_idx: 0,
+            genome_start: 10,
+            genome_end: 20,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        let scorer = AlignmentScorer::from_params_minimal();
+
+        let (transcripts, _cluster, is_reverse, _read) =
+            stitch_seeds_long_read(&cluster, &read_seq, &index, &scorer, None, 0, "");
+
+        assert_eq!(transcripts.len(), 1);
+        assert!(!is_reverse);
+        let wt = &transcripts[0];
+        assert_eq!(wt.exons.len(), 1);
+        assert_eq!(wt.exons[0].read_start, 0);
+        assert_eq!(wt.exons[0].read_end, 10);
+        assert_eq!(wt.exons[0].genome_start, 10);
+        assert_eq!(wt.exons[0].genome_end, 20);
+        assert_eq!(wt.score, 10);
+    }
+
+    #[test]
+    fn long_read_chains_two_seeds_across_deletion() {
+        // Two seeds bridged by a short (3bp) deletion — below alignIntronMin, so
+        // stitchAlignToTranscript's deletion path is taken, not the splice path. The
+        // chaining DP should still assemble both seeds into a single 2-exon transcript.
+        let genome_seq: Vec<u8> = (0..40u32).map(|i| ((i * 7 + 3) % 4) as u8).collect();
+        let index = make_index_with_seq(&genome_seq);
+        let mut read_seq = genome_seq[0..10].to_vec();
+        read_seq.extend_from_slice(&genome_seq[13..23]);
+
+        let cluster = SeedCluster {
+            alignments: vec![
+                WindowAlignment {
+                    seed_idx: 0,
+                    read_pos: 0,
+                    length: 10,
+                    genome_pos: 0,
+                    sa_pos: 0,
+                    n_rep: 1,
+                    is_anchor: true,
+                    mate_id: 2,
+                    pre_ext_score: 0,
+                },
+                WindowAlignment {
+                    seed_idx: 1,
+                    read_pos: 10,
+                    length: 10,
+                    genome_pos: 13,
+                    sa_pos: 13,
+                    n_rep: 1,
+                    is_anchor: true,
+                    mate_id: 2,
+                    pre_ext_score: 0,
+                },
+            ],
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 23,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        let scorer = AlignmentScorer::from_params_minimal();
+
+        let (transcripts, _cluster, _is_reverse, _read) =
+            stitch_seeds_long_read(&cluster, &read_seq, &index, &scorer, None, 0, "");
+
+        assert_eq!(transcripts.len(), 1);
+        let wt = &transcripts[0];
+        assert_eq!(
+            wt.exons.len(),
+            2,
+            "both seeds must chain into one transcript"
+        );
+        assert_eq!(wt.n_gap, 1, "the 3bp gap is a deletion, not a junction");
+        assert_eq!(wt.n_junction, 0);
+        assert_eq!(wt.exons[0].read_start, 0);
+        assert_eq!(wt.exons[1].read_end, 20);
+        assert_eq!(wt.exons[1].genome_end, 23);
     }
 }
