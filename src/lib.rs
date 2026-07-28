@@ -40,7 +40,6 @@ pub mod rng;
 pub mod signal;
 pub mod solo;
 pub mod stats;
-pub mod swalign;
 pub mod wasp;
 
 use log::info;

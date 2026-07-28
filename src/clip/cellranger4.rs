@@ -7,11 +7,11 @@
 //! - a 5' template-switch-oligo trim, which is an overlap alignment of the TSO
 //!   against the first 91 bases of the read.
 //!
-//! STAR does the 5' alignment with the Opal SIMD library. Here it goes through
-//! [`crate::swalign`], which is required to be bit-identical across
-//! instruction sets, so the clip length cannot depend on the machine.
-
-use crate::swalign::{self, Mode, Scoring};
+//! Only the poly-A trim is implemented here. The 5' TSO trim is an overlap
+//! alignment, for which STAR links the Opal SIMD library; rustar will take
+//! that from a dedicated deterministic-SIMD crate rather than carrying a
+//! second aligner in-tree. Until then `--clipAdapterType CellRanger4` is
+//! rejected rather than silently doing half the job.
 
 /// Number of 3' bases to trim as a CellRanger4 poly-A tail.
 ///
@@ -51,40 +51,6 @@ pub fn poly_tail_3p(seq: &[u8]) -> usize {
     }
 }
 
-/// How much of the read STAR aligns the TSO against (`ClipCR4::opalFillOneSeq`).
-const CR4_TARGET_LEN: usize = 91;
-
-/// Number of 5' bases to trim as the 10x TSO.
-///
-/// STAR aligns the TSO against the first 91 bases of the read in overlap mode,
-/// asking for the score and the position in the target where it ends, then
-/// applies an acceptance gate: a score below 20 is rejected outright, and
-/// scores of exactly 20 or 21 are rejected if they took too long to reach
-/// (more than 26 and 30 bases respectively). A weak alignment that happens to
-/// run a long way is what that gate is there to catch.
-///
-/// The read is padded to 91 bases with `N` when it is shorter, which is why
-/// the scoring scheme has to treat `N` against `N` as neutral rather than as a
-/// mismatch: otherwise the padding would drag every score down.
-///
-/// Both arguments are numeric base codes; the return value is a count of 5'
-/// bases to clip, `0` when the alignment is rejected.
-pub fn tso_clip(read: &[u8], tso: &[u8]) -> usize {
-    if tso.is_empty() {
-        return 0;
-    }
-    let take = read.len().min(CR4_TARGET_LEN);
-    let mut target = Vec::with_capacity(CR4_TARGET_LEN);
-    target.extend_from_slice(&read[..take]);
-    target.resize(CR4_TARGET_LEN, 4); // N padding
-
-    let a = swalign::align(tso, &target, Mode::Ov, &Scoring::CLIP_CR4);
-    let clip = a.target_end as i64 + 1; // 1-based end == number of bases covered
-
-    let reject = a.score < 20 || (a.score == 20 && clip > 26) || (a.score == 21 && clip > 30);
-    if reject { 0 } else { clip as usize }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,28 +66,6 @@ mod tests {
                 _ => 4,
             })
             .collect()
-    }
-
-    /// The 10x template switch oligo.
-    const TSO: &str = "AAGCAGTGGTATCAACGCAGAGTACATGGG";
-
-    #[test]
-    fn cr4_tso_clip_matches_opal() {
-        // Frozen vector shared with STAR-rs's `cr4_tso_clip_matches_opal`,
-        // which validates the same numbers against Opal itself. A read that
-        // starts with the TSO is clipped by exactly its length.
-        let read = code(&format!("{TSO}ACGTACGTACGTACGTACGTACGTACGTAC"));
-        assert_eq!(tso_clip(&read, &code(TSO)), 30);
-
-        // A read with no TSO is not clipped at all.
-        let read = code("ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");
-        assert_eq!(tso_clip(&read, &code(TSO)), 0);
-    }
-
-    #[test]
-    fn tso_clip_is_inert_without_an_adapter() {
-        let read = code(&format!("{TSO}ACGTACGT"));
-        assert_eq!(tso_clip(&read, &[]), 0);
     }
 
     #[test]
