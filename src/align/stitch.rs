@@ -1461,23 +1461,24 @@ fn stitch_align_to_transcript(
         // is motif detection (splice) vs pure positional score (deletion).
         // donor_sa = exclusive end of exon A = STAR's gAend+1. jr_shift = STAR's jR.
         let donor_sa = last_exon.genome_end;
-        let (jr_shift, motif, motif_score, jj_l, jj_r) = scorer.find_best_junction_position(
-            read_seq,
-            last_exon.read_end,
-            donor_sa,
-            read_gap.max(0),
-            genome_gap,
-            &index.genome,
-            cluster.is_reverse,
-            index.genome.n_genome,
-            last_exon.read_end - last_exon.read_start,
-            eff_length,
-        );
+        let (jr_shift, mut motif, motif_score, mut jj_l, mut jj_r) = scorer
+            .find_best_junction_position(
+                read_seq,
+                last_exon.read_end,
+                donor_sa,
+                read_gap.max(0),
+                genome_gap,
+                &index.genome,
+                cluster.is_reverse,
+                index.genome.n_genome,
+                last_exon.read_end - last_exon.read_start,
+                eff_length,
+            );
 
         // Clamp shift: jr_shift = STAR's jR. Lower bound: can't consume entire exon A.
         // Upper bound: scan already limited to < shared+eff_length but clamp for safety.
         let prev_match_len = (last_exon.read_end - last_exon.read_start) as i32;
-        let jr_shift = jr_shift
+        let mut jr_shift = jr_shift
             .max(-prev_match_len)
             .min((eff_length + shared) as i32);
 
@@ -1560,20 +1561,60 @@ fn stitch_align_to_transcript(
 
         // --- Type-specific scoring and tracking ---
         if is_splice {
-            // Check stitch mismatch limit
+            // Look the junction up in the annotation *before* gating on the
+            // motif, because an annotated junction supplies its own motif and
+            // that is what STAR's mismatch gate sees
+            // (`stitchAlignToTranscript.cpp`: `sjdbInd` is resolved, `jcan` is
+            // overwritten from `sjdbMotif`, and only then is the gate applied).
+            let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
+            let donor_fwd =
+                index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
+            let acceptor_fwd = donor_fwd + del as u64 - 1;
+
+            // The metadata-bearing lookup. Junctions inserted by two-pass mode
+            // carry no motif or shift, so they are only visible through the
+            // annotated map below; the two lookups are therefore separate.
+            let sj_entry = junction_db
+                .and_then(|db| db.find(donor_fwd, acceptor_fwd).and_then(|i| db.entry(i)));
+            let is_annotated = sj_entry.is_some()
+                || junction_db.is_some_and(|db| {
+                    db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
+                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
+                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
+                });
+
+            if let Some(pj) = sj_entry {
+                // The annotated entry's motif wins over the one scanned from
+                // the genome (STAR: `jcan = sjdbMotif[ind]`). This is what the
+                // mismatch gate, `outFilterIntronMotifs` and SJ.out.tab see.
+                motif = crate::junction::decode_motif(pj.motif);
+
+                // Non-canonical annotated junction: snap the boundary onto the
+                // annotated coordinates instead of leaving it wherever the
+                // leftmost-flush scan put it (STAR shifts `jR` by `shiftLeft`).
+                // `jr_shift` is consumed below to move exon A's right edge and
+                // exon B's left edge together, so shifting it here relocates
+                // both coherently and leaves the intron length unchanged.
+                if pj.motif == 0 {
+                    let sl = pj.shift_left as i32;
+                    if (eff_length as i32) <= sl || prev_match_len <= sl {
+                        return None; // STAR -1000006
+                    }
+                    jr_shift += sl;
+                    if (last_exon.read_end as i64 + jr_shift as i64)
+                        >= (eff_read_pos + eff_length) as i64
+                    {
+                        return None; // STAR -1000006
+                    }
+                    jj_l = pj.shift_left as u32;
+                    jj_r = pj.shift_right as u32;
+                }
+            }
+
+            // Check stitch mismatch limit (now against the annotated motif).
             if !scorer.stitch_mismatch_allowed(&motif, gap_mm) {
                 return None;
             }
-
-            let is_annotated = junction_db.is_some_and(|db| {
-                let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
-                let donor_fwd =
-                    index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-                let acceptor_fwd = donor_fwd + del as u64 - 1;
-                db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
-                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
-                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
-            });
 
             if is_annotated {
                 d_score += scorer.sjdb_score;
@@ -3847,11 +3888,16 @@ mod tests {
         }
     }
 
+    /// A one-entry table whose stored coordinates are deliberately nowhere near
+    /// the seeds being stitched. The `sjA` path addresses entries by *index*,
+    /// trusting the tag the Gsj hit carried, so it still fires; the general
+    /// path looks entries up by *coordinate* and finds nothing. That is what
+    /// makes the two paths distinguishable here.
     fn sjab_db(motif: u8, shift_left: u8, shift_right: u8) -> crate::junction::SpliceJunctionDb {
         crate::junction::SpliceJunctionDb::from_prepared(vec![crate::junction::PreparedJunction {
             chr_idx: 0,
-            start_pos: 20,
-            end_pos: 199,
+            start_pos: 50_000,
+            end_pos: 50_180,
             motif,
             shift_left,
             shift_right,
@@ -3942,6 +3988,81 @@ mod tests {
             signature(&sjab_wt(20, 0), &sjab_wa(21, 30, 200, 0)),
             fast_path
         );
+    }
+
+    #[test]
+    fn noncanonical_annotated_junction_snaps_to_annotated_coords() {
+        use crate::align::score::AlignmentScorer;
+
+        let index = make_index_with_seq(&[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]);
+        let scorer = AlignmentScorer::from_params_minimal();
+        let cluster = sjab_cluster();
+        let read = [0u8; 50];
+        // No `sj_a` tag, so this exercises the general coordinate-lookup path.
+        let wt = sjab_wt(20, -1);
+        let wa = sjab_wa(20, 30, 200, -1);
+
+        let run = |db: Option<&crate::junction::SpliceJunctionDb>| {
+            stitch_align_to_transcript(&wt, &wa, &read, &index, &scorer, &cluster, db, 0, "t")
+        };
+
+        // Calibrate: where does the unannotated boundary search land?
+        let base = run(None).expect("baseline stitch should succeed");
+        let donor_end = base.exons[0].genome_end;
+        let acceptor_start = base.exons[1].genome_start;
+        let intron_len = acceptor_start - donor_end;
+
+        // Annotate exactly that junction as non-canonical with a 2-base
+        // micro-repeat to its left.
+        let shift_left = 2u8;
+        let annotated = crate::junction::SpliceJunctionDb::from_prepared(vec![
+            crate::junction::PreparedJunction {
+                chr_idx: 0,
+                start_pos: donor_end,
+                end_pos: acceptor_start - 1,
+                motif: 0,
+                shift_left,
+                shift_right: 0,
+                strand: 0,
+            },
+        ]);
+        let snapped = run(Some(&annotated)).expect("annotated stitch should succeed");
+
+        // Both boundaries move right by shift_left; the intron keeps its length.
+        assert_eq!(snapped.exons[0].genome_end, donor_end + shift_left as u64);
+        assert_eq!(
+            snapped.exons[1].genome_start,
+            acceptor_start + shift_left as u64
+        );
+        assert_eq!(
+            snapped.exons[1].genome_start - snapped.exons[0].genome_end,
+            intron_len,
+            "snapping must relocate the junction, not resize the intron"
+        );
+
+        // It is recorded as annotated, with the stored shifts.
+        assert_eq!(snapped.junction_annotated, vec![true]);
+        assert_eq!(snapped.junction_shifts, vec![(shift_left as u32, 0)]);
+
+        // A canonical annotated junction at the same coordinates, carrying the
+        // same micro-repeat, is *not* snapped: STAR only shifts non-canonical
+        // entries. Canonical entries store `start_pos + shift_left`, so the
+        // pre-shift positions are backed off to land on the same stored key.
+        let canonical = crate::junction::SpliceJunctionDb::from_prepared(vec![
+            crate::junction::PreparedJunction {
+                chr_idx: 0,
+                start_pos: donor_end - shift_left as u64,
+                end_pos: acceptor_start - 1 - shift_left as u64,
+                motif: 1,
+                shift_left,
+                shift_right: 0,
+                strand: 1,
+            },
+        ]);
+        let unsnapped = run(Some(&canonical)).expect("canonical annotated stitch should succeed");
+        assert_eq!(unsnapped.exons[0].genome_end, donor_end);
+        assert_eq!(unsnapped.exons[1].genome_start, acceptor_start);
+        assert_eq!(unsnapped.junction_annotated, vec![true]);
     }
 
     #[test]
