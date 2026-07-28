@@ -12,6 +12,7 @@ pub mod sjdb_insert;
 
 pub use sj_output::SpliceJunctionStats;
 pub(crate) use sj_output::{SjKey, encode_motif};
+pub use sjdb_insert::PreparedJunction;
 
 use crate::params::Parameters;
 
@@ -55,6 +56,15 @@ pub struct NovelJunctionKey {
 pub struct SpliceJunctionDb {
     /// Map: (chr_idx, intron_start, intron_end, strand) → annotated
     junctions: HashMap<JunctionKey, JunctionInfo>,
+    /// STAR's `mapGen.sjdb*` arrays: the annotated junctions in the exact
+    /// order they occupy the Gsj buffer, sorted by `(stored_start,
+    /// stored_end)`. Index `i` here is STAR's `sjA` / `sjdbInd`, i.e. the
+    /// value [`sjdb_insert::decode_gsj_hit`] derives from a Gsj SA hit.
+    ///
+    /// Empty when the database was built without motif/shift metadata; in
+    /// that case [`find`](Self::find) always returns `None` and the
+    /// annotated-junction fast paths simply do not engage.
+    table: Vec<PreparedJunction>,
 }
 
 impl SpliceJunctionDb {
@@ -62,7 +72,102 @@ impl SpliceJunctionDb {
     pub fn empty() -> Self {
         Self {
             junctions: HashMap::new(),
+            table: Vec::new(),
         }
+    }
+
+    /// Build from an already sorted-and-deduplicated [`PreparedJunction`]
+    /// list — the form `sjdbInfo.txt` is read back into and the form
+    /// `genomeGenerate` produces before building the Gsj buffer.
+    ///
+    /// The HashMap is keyed on the *stored* (post-`sjdbPrepare`) donor and
+    /// acceptor coordinates, which is what the stitch-time scan produces.
+    pub fn from_prepared(prepared: Vec<PreparedJunction>) -> Self {
+        let mut junctions = HashMap::with_capacity(prepared.len());
+        for j in &prepared {
+            junctions.insert(
+                JunctionKey {
+                    chr_idx: j.chr_idx,
+                    intron_start: j.stored_start(),
+                    intron_end: j.stored_end(),
+                    strand: j.strand,
+                },
+                JunctionInfo { annotated: true },
+            );
+        }
+        Self {
+            junctions,
+            table: prepared,
+        }
+    }
+
+    /// Replace the `sjA`-addressable table without touching the annotated
+    /// lookup map.
+    ///
+    /// Needed because `sj_a` tags come from [`sjdb_insert::decode_gsj_hit`],
+    /// which indexes the junction list stored in the index (`sjdbInfo.txt`).
+    /// When a GTF is *also* supplied at align time the map is rebuilt from
+    /// that GTF, but the table must keep addressing the index's array or the
+    /// tags would point at the wrong junctions.
+    pub fn set_table(&mut self, prepared: Vec<PreparedJunction>) {
+        self.table = prepared;
+    }
+
+    /// STAR's `binarySearch2` (`ReadAlign_stitchAlignToTranscript.cpp` →
+    /// `binarySearch2.h`): the index of the junction whose stored donor and
+    /// acceptor are exactly `x` and `y`, or `None`.
+    ///
+    /// Coordinates are genome-absolute, so no chromosome index is needed:
+    /// STAR's `sjdbStart` / `sjdbEnd` are already unique across contigs.
+    pub fn find(&self, x: u64, y: u64) -> Option<usize> {
+        let n = self.table.len();
+        if n == 0 || x > self.table[n - 1].stored_start() || x < self.table[0].stored_start() {
+            return None;
+        }
+        let (mut i1, mut i2) = (0usize, n - 1);
+        while i2 > i1 + 1 {
+            let i3 = usize::midpoint(i1, i2);
+            if self.table[i3].stored_start() > x {
+                i2 = i3;
+            } else {
+                i1 = i3;
+            }
+        }
+        let i3 = if x == self.table[i1].stored_start() {
+            i1
+        } else if x == self.table[i2].stored_start() {
+            i2
+        } else {
+            return None;
+        };
+        // Scan the run of equal `stored_start` values (backward then forward)
+        // for a matching `stored_end`.
+        for jj in (0..=i3).rev() {
+            if x != self.table[jj].stored_start() {
+                break;
+            } else if y == self.table[jj].stored_end() {
+                return Some(jj);
+            }
+        }
+        for jj in i3..n {
+            if x != self.table[jj].stored_start() {
+                return None;
+            } else if y == self.table[jj].stored_end() {
+                return Some(jj);
+            }
+        }
+        None
+    }
+
+    /// The junction at `sjA` index `i`, or `None` when the table is absent
+    /// or the index is out of range.
+    pub fn entry(&self, i: usize) -> Option<&PreparedJunction> {
+        self.table.get(i)
+    }
+
+    /// Number of entries in the `sjA`-addressable table.
+    pub fn table_len(&self) -> usize {
+        self.table.len()
     }
 
     /// Build junction database from GTF file with configurable GTF attribute names.
@@ -81,7 +186,36 @@ impl SpliceJunctionDb {
         let raw = gtf::extract_junctions_configured(exons, genome, transcript_tag)?;
         log::info!("Extracted {} annotated junctions from GTF", raw.len());
 
-        Ok(Self::from_raw_junctions(&raw))
+        // Keep the historical (raw-coordinate) annotated lookup map, but also
+        // derive the motif/shift/strand table so the annotated-junction fast
+        // paths have something to address. Building the table here makes the
+        // align-time GTF path carry the same metadata the index-loaded path
+        // already had.
+        let mut db = Self::from_raw_junctions(&raw);
+        db.set_table(Self::prepare_table(&raw, genome));
+        Ok(db)
+    }
+
+    /// Run every raw `(chr_idx, intron_start, intron_end, strand)` through
+    /// `sjdbPrepare`'s motif detection and micro-repeat shift computation,
+    /// then apply STAR's post-dedup sort. Produces exactly the array
+    /// `genomeGenerate` writes to `sjdbInfo.txt`.
+    fn prepare_table(raw: &[(usize, u64, u64, u8)], genome: &Genome) -> Vec<PreparedJunction> {
+        let n_genome_real = genome.n_genome_real;
+        let prepared: Vec<PreparedJunction> = raw
+            .iter()
+            .map(|&(chr_idx, intron_start, intron_end, strand)| {
+                sjdb_insert::prepare_junction(
+                    chr_idx,
+                    intron_start,
+                    intron_end,
+                    strand,
+                    genome,
+                    n_genome_real,
+                )
+            })
+            .collect();
+        sjdb_insert::sort_and_dedup(prepared)
     }
 
     /// Build junction database from GTF file (default STAR attribute names).
@@ -94,6 +228,10 @@ impl SpliceJunctionDb {
     /// the `genomeGenerate` path so it can share the parsed GTF with
     /// `TranscriptomeIndex` and the `sjdb_insert` pipeline without
     /// re-parsing the file.
+    ///
+    /// The resulting database has **no** `sjA` table; callers that need
+    /// [`find`](Self::find) must follow up with [`set_table`](Self::set_table)
+    /// or use [`from_prepared`](Self::from_prepared) instead.
     pub fn from_raw_junctions(raw: &[(usize, u64, u64, u8)]) -> Self {
         let mut junctions = HashMap::with_capacity(raw.len());
         for &(chr_idx, intron_start, intron_end, strand) in raw {
@@ -105,7 +243,10 @@ impl SpliceJunctionDb {
             };
             junctions.insert(key, JunctionInfo { annotated: true });
         }
-        Self { junctions }
+        Self {
+            junctions,
+            table: Vec::new(),
+        }
     }
 
     /// Check if a junction is annotated in the GTF.
@@ -406,6 +547,104 @@ mod tests {
         // Only the 35-overhang junction should pass (30bp minimum for non-canonical)
         assert_eq!(novel_junctions.len(), 1);
         assert_eq!(novel_junctions[0].0.intron_start, 300);
+    }
+
+    /// Build a canonical (motif != 0) prepared junction whose stored
+    /// coordinates are exactly `(start, end)`.
+    fn pj(start: u64, end: u64, strand: u8) -> PreparedJunction {
+        PreparedJunction {
+            chr_idx: 0,
+            start_pos: start,
+            end_pos: end,
+            motif: 1,
+            shift_left: 0,
+            shift_right: 0,
+            strand,
+        }
+    }
+
+    #[test]
+    fn find_round_trips_every_prepared_junction() {
+        // Deliberately unsorted input: `sort_and_dedup` establishes the
+        // (stored_start, stored_end) order `find`'s binary search needs.
+        let prepared = sjdb_insert::sort_and_dedup(vec![
+            pj(900, 1000, 1),
+            pj(100, 200, 1),
+            pj(500, 600, 2),
+            pj(300, 400, 1),
+        ]);
+        let db = SpliceJunctionDb::from_prepared(prepared.clone());
+        assert_eq!(db.table_len(), 4);
+
+        // The invariant the sjAB fast path and the annotated snap both rely
+        // on: index i in the table is addressable by its own stored coords.
+        for (i, j) in prepared.iter().enumerate() {
+            assert_eq!(
+                db.find(j.stored_start(), j.stored_end()),
+                Some(i),
+                "junction {i} did not round-trip"
+            );
+            assert_eq!(db.entry(i).unwrap().stored_start(), j.stored_start());
+        }
+
+        // Misses in every direction: below the first, above the last, a
+        // start that exists with a wrong end, and an end that exists with a
+        // wrong start.
+        assert_eq!(db.find(50, 200), None);
+        assert_eq!(db.find(2000, 3000), None);
+        assert_eq!(db.find(100, 201), None);
+        assert_eq!(db.find(101, 200), None);
+    }
+
+    #[test]
+    fn find_disambiguates_a_run_of_equal_starts() {
+        // Several junctions sharing a donor: the backward/forward scan around
+        // the binary-search landing point must pick the right acceptor.
+        let prepared = sjdb_insert::sort_and_dedup(vec![
+            pj(100, 700, 1),
+            pj(100, 200, 1),
+            pj(100, 500, 1),
+            pj(100, 300, 1),
+            pj(900, 1000, 1),
+        ]);
+        let db = SpliceJunctionDb::from_prepared(prepared.clone());
+        for (i, j) in prepared.iter().enumerate() {
+            assert_eq!(db.find(j.stored_start(), j.stored_end()), Some(i));
+        }
+        assert_eq!(db.find(100, 400), None);
+    }
+
+    #[test]
+    fn find_is_inert_without_a_table() {
+        // `from_raw_junctions` carries no motif/shift metadata, so the
+        // annotated fast paths must simply not engage rather than misfire.
+        let db = SpliceJunctionDb::from_raw_junctions(&[(0, 100, 200, 1)]);
+        assert!(db.is_annotated(0, 100, 200, 1));
+        assert_eq!(db.table_len(), 0);
+        assert_eq!(db.find(100, 200), None);
+        assert!(db.entry(0).is_none());
+    }
+
+    #[test]
+    fn from_prepared_keys_the_map_on_stored_coordinates() {
+        // Non-canonical junction: stored coords are the shifted ones, which is
+        // what the stitch-time scan produces.
+        let noncan = PreparedJunction {
+            chr_idx: 0,
+            start_pos: 100,
+            end_pos: 200,
+            motif: 0,
+            shift_left: 3,
+            shift_right: 0,
+            strand: 0,
+        };
+        assert_eq!(noncan.stored_start(), 100);
+        assert_eq!(noncan.original_start(), 103);
+
+        let db = SpliceJunctionDb::from_prepared(vec![noncan]);
+        assert!(db.is_annotated(0, 100, 200, 0));
+        assert!(!db.is_annotated(0, 103, 203, 0));
+        assert_eq!(db.find(100, 200), Some(0));
     }
 
     #[test]
