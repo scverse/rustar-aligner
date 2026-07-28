@@ -19,7 +19,8 @@
 //!
 //! `--clipAdapterType Hamming` (STAR's default) uses the 3' Hamming scan above.
 //! `CellRanger4` instead trims a 3' poly-A tail and a 5' TSO; see
-//! [`cellranger4`]. A 5' *Hamming* adapter is not a thing STAR supports either.
+//! [`cellranger4`]. A 5' *Hamming* adapter is not a thing STAR supports either:
+//! the 5' end only ever carries an adapter under CellRanger4.
 
 pub mod cellranger4;
 
@@ -50,6 +51,12 @@ pub struct ClipParams {
     pub five: ClipEnd,
     /// 3' end (STAR `ClipMate` type 1).
     pub three: ClipEnd,
+    /// `--clipAdapterType CellRanger4`: replace the Hamming rules with the 10x
+    /// poly-A / TSO trims. See [`cellranger4`].
+    pub cellranger4: bool,
+    /// `--clip5pAdapterSeq` as base codes: the 10x TSO, clipped from the 5' end
+    /// under CellRanger4. Empty when none is configured.
+    pub five_adapter: Vec<u8>,
 }
 
 /// Build [`ClipParams`] for `mate` (0 or 1) from the run's `--clip{5,3}pNbases`
@@ -67,7 +74,14 @@ pub fn clip_params_from(params: &Parameters, mate: usize) -> ClipParams {
     } else {
         params.clip3p_adapter_seq.bytes().map(encode_base).collect()
     };
+    let five_adapter = if params.clip5p_adapter_seq == "-" {
+        Vec::new()
+    } else {
+        params.clip5p_adapter_seq.bytes().map(encode_base).collect()
+    };
     ClipParams {
+        cellranger4: params.clip_adapter_type == "CellRanger4",
+        five_adapter,
         five: ClipEnd {
             n: params.clip5p(mate),
             adapter: Vec::new(),
@@ -122,6 +136,10 @@ fn local_search(x: &[u8], y: &[u8], p_mm: f64) -> usize {
 pub fn clip_mate(read: &[u8], p: &ClipParams) -> (usize, usize) {
     let len = read.len();
 
+    if p.cellranger4 {
+        return clip_mate_cellranger4(read, p);
+    }
+
     // ---- 5' end (STAR ClipMate type 0) ----
     let five_active = p.five.n > 0;
     let mut c5 = 0;
@@ -157,6 +175,98 @@ pub fn clip_mate(read: &[u8], p: &ClipParams) -> (usize, usize) {
     (c5, c3)
 }
 
+/// `--clipAdapterType CellRanger4`, which replaces the Hamming rules entirely
+/// (STAR `ClipCR4`): a 5' TSO trim and a 3' poly-A trim.
+///
+/// The fixed `--clip{5,3}pNbases` still apply first, as in the Hamming path.
+/// The 5' TSO is only configured for the first mate, matching STAR, so mate 2
+/// simply has no 5' adapter and the 5' trim reduces to the fixed clip.
+fn clip_mate_cellranger4(read: &[u8], p: &ClipParams) -> (usize, usize) {
+    let len = read.len();
+
+    // 5': fixed clip, then the TSO overlap alignment on what is left.
+    let mut c5 = p.five.n.min(len);
+    if !p.five_adapter.is_empty() {
+        c5 += cellranger4::tso_clip(&read[c5..], &p.five_adapter).min(len - c5);
+    }
+    if p.five.n_after > 0 && c5 < len {
+        c5 += p.five.n_after.min(len - c5);
+    }
+
+    // 3': fixed clip, then the poly-A scan on the 5'-clipped read.
+    let s = &read[c5..];
+    let sl = s.len();
+    let mut c3 = p.three.n.min(sl);
+    let remaining = sl - c3;
+    if remaining > 0 {
+        c3 += cellranger4::poly_tail_3p(&s[..remaining]).min(remaining);
+    }
+    if p.three.n_after > 0 && c3 < sl {
+        c3 += p.three.n_after.min(sl - c3);
+    }
+
+    (c5, c3)
+}
+
+#[cfg(test)]
+mod cr4_wiring_tests {
+    use super::*;
+
+    fn code(s: &str) -> Vec<u8> {
+        s.bytes().map(encode_base).collect()
+    }
+
+    const TSO: &str = "AAGCAGTGGTATCAACGCAGAGTACATGGG";
+
+    fn cr4_params(tso: &str) -> ClipParams {
+        ClipParams {
+            cellranger4: true,
+            five_adapter: code(tso),
+            five: ClipEnd::default(),
+            three: ClipEnd::default(),
+        }
+    }
+
+    #[test]
+    fn cellranger4_clips_the_tso_and_the_polya_tail() {
+        // TSO at the 5' end, a clean poly-A tail at the 3', mappable sequence
+        // in between.
+        let body = "CGTCGTCGTCGTCGTCGTCGTCGTCGTCGT";
+        let read = code(&format!("{TSO}{body}{}", "A".repeat(30)));
+        let (c5, c3) = clip_mate(&read, &cr4_params(TSO));
+        assert_eq!(c5, 30, "the TSO should be clipped from the 5' end");
+        assert_eq!(c3, 30, "the poly-A tail should be clipped from the 3' end");
+        // What survives is exactly the body.
+        assert_eq!(&read[c5..read.len() - c3], code(body).as_slice());
+    }
+
+    #[test]
+    fn cellranger4_leaves_a_read_without_either_feature_alone() {
+        let read = code("CGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGT");
+        assert_eq!(clip_mate(&read, &cr4_params(TSO)), (0, 0));
+    }
+
+    #[test]
+    fn cellranger4_without_a_tso_still_trims_polya() {
+        // Mate 2 has no 5' adapter under STAR, so only the 3' trim applies.
+        let read = code(&format!("CGTCGTCGTCGTCGTCGTCG{}", "A".repeat(30)));
+        let (c5, c3) = clip_mate(&read, &cr4_params("-"));
+        assert_eq!(c5, 0);
+        assert_eq!(c3, 30);
+    }
+
+    #[test]
+    fn cellranger4_applies_the_fixed_clips_first() {
+        let body = "CGTCGTCGTCGTCGTCGTCGTCGTCGTCGT";
+        let read = code(&format!("{TSO}{body}{}", "A".repeat(30)));
+        let mut p = cr4_params(TSO);
+        p.five.n = 5;
+        let (c5, _) = clip_mate(&read, &p);
+        // The fixed 5 bases come off, then the rest of the TSO is still found.
+        assert_eq!(c5, 30);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +295,8 @@ mod tests {
     #[test]
     fn fixed_5p_3p() {
         let p = ClipParams {
+            cellranger4: false,
+            five_adapter: Vec::new(),
             five: ClipEnd {
                 n: 3,
                 ..Default::default()
@@ -219,6 +331,8 @@ mod tests {
     fn after_adapter_alone_is_noop() {
         // STAR's inactive-end short-circuit: n_after with no fixed clip and no adapter clips nothing.
         let p = ClipParams {
+            cellranger4: false,
+            five_adapter: Vec::new(),
             five: ClipEnd {
                 n_after: 4,
                 ..Default::default()
@@ -242,6 +356,8 @@ mod tests {
     #[test]
     fn no_adapter_configured_only_fixed_clips() {
         let p = ClipParams {
+            cellranger4: false,
+            five_adapter: Vec::new(),
             five: ClipEnd {
                 n: 2,
                 ..Default::default()
