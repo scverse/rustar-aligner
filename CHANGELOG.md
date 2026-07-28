@@ -13,6 +13,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`--clipAdapterType CellRanger4`** — the 10x Chromium v4 clipping rules: a
+  5' template-switch-oligo trim and a 3' poly-A trim, with `--clip5pAdapterSeq`
+  and `--clip5pAdapterMMp`.
+
+  The 5' trim is an overlap alignment, for which STAR links the Opal C/C++ SIMD
+  library. New in-tree module `swalign` provides it with no new dependency:
+  affine-gap alignment in `NW`/`HW`/`OV`/`SW` modes, with a portable scalar
+  path that defines the result. Determinism is treated as a correctness
+  property — Opal's overflow buckets are sized by the SIMD vector width, so its
+  recompute path depends on the available instruction set; here the vector
+  width is never observable.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
