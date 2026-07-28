@@ -26,7 +26,10 @@
 //! encoding the rest of the aligner uses. Scores are `i32`; the caller supplies
 //! the scoring scheme.
 
+pub mod backend;
 pub mod scalar;
+
+pub use backend::Backend;
 
 /// How the ends of the two sequences are treated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,10 +111,7 @@ pub struct Alignment {
 /// is required to return exactly what [`scalar::align`] would, so the choice is
 /// invisible in the output.
 pub fn align(query: &[u8], target: &[u8], mode: Mode, scoring: &Scoring) -> Alignment {
-    // Only the scalar backend exists so far. The SIMD backends land next, and
-    // the differential test is already written so they cannot land silently
-    // wrong.
-    scalar::align(query, target, mode, scoring)
+    Backend::detect().align(query, target, mode, scoring)
 }
 
 #[cfg(test)]
