@@ -55,6 +55,8 @@ impl std::str::FromStr for RunMode {
     }
 }
 
+// ---------------------------------------------------------------------------
+
 impl std::fmt::Display for RunMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -713,6 +715,12 @@ pub struct Parameters {
     #[arg(long = "outFilterMismatchNoverLmax", default_value_t = 0.3)]
     pub out_filter_mismatch_nover_lmax: f64,
 
+    /// Max mismatches per pair as a fraction of *read* length (both mates
+    /// summed), as opposed to `outFilterMismatchNoverLmax`, which is a
+    /// fraction of the *mapped* length.
+    #[arg(long = "outFilterMismatchNoverReadLmax", default_value_t = 1.0)]
+    pub out_filter_mismatch_nover_read_lmax: f64,
+
     /// Min alignment score (absolute)
     #[arg(long = "outFilterScoreMin", default_value_t = 0)]
     pub out_filter_score_min: i32,
@@ -818,6 +826,22 @@ pub struct Parameters {
           default_values_t = vec![0, -1, 0, 0], allow_hyphen_values = true)]
     pub align_sj_stitch_mismatch_nmax: Vec<i32>,
 
+    /// Allow protrusion of one mate's alignment past the other's start:
+    /// `ConcordantPair` or `<Nbases> ConcordantPair`.
+    #[arg(long = "alignEndsProtrude", num_args = 1..=2,
+          default_values_t = vec!["0".to_string(), "ConcordantPair".to_string()])]
+    pub align_ends_protrude: Vec<String>,
+
+    /// Allow the soft-clipping of alignments past the ends of chromosomes
+    /// (`Yes`, default) or forbid it (`No`).
+    #[arg(long = "alignSoftClipAtReferenceEnds", default_value = "Yes")]
+    pub align_soft_clip_at_reference_ends: String,
+
+    /// Which end of a repeat-ambiguous insertion the insertion is flushed to:
+    /// `None` (default, no flushing) or `Right`.
+    #[arg(long = "alignInsertionFlush", default_value = "None")]
+    pub align_insertion_flush: String,
+
     /// Splice junction penalty (canonical)
     #[arg(long = "scoreGap", default_value_t = 0)]
     pub score_gap: i32,
@@ -887,6 +911,14 @@ pub struct Parameters {
     #[arg(long = "seedPerWindowNmax", default_value_t = 50)]
     pub seed_per_window_nmax: usize,
 
+    /// Max number of one-seed loci per window.
+    #[arg(long = "seedNoneLociPerWindow", default_value_t = 10)]
+    pub seed_none_loci_per_window: usize,
+
+    /// Min length of the seed sequences split by the seed search.
+    #[arg(long = "seedSplitMin", default_value_t = 12)]
+    pub seed_split_min: usize,
+
     /// Max distance between seed search start positions (defines Nstart = readLen/seedSearchStartLmax + 1)
     #[arg(long = "seedSearchStartLmax", default_value_t = 50)]
     pub seed_search_start_lmax: usize,
@@ -914,6 +946,12 @@ pub struct Parameters {
     /// Max number of transcripts per window
     #[arg(long = "alignTranscriptsPerWindowNmax", default_value_t = 100)]
     pub align_transcripts_per_window_nmax: usize,
+
+    /// Max number of different alignments per read to consider. STAR stops
+    /// collecting once the running total plus one window's worth would exceed
+    /// this.
+    #[arg(long = "alignTranscriptsPerReadNmax", default_value_t = 10000)]
+    pub align_transcripts_per_read_nmax: usize,
 
     // ── Splice junction database ────────────────────────────────────────
     /// GTF file for splice junction annotations
@@ -1551,6 +1589,45 @@ impl Parameters {
             ));
         }
 
+        // Validate --alignSoftClipAtReferenceEnds.
+        if !matches!(
+            params.align_soft_clip_at_reference_ends.as_str(),
+            "Yes" | "No"
+        ) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --alignSoftClipAtReferenceEnds '{}'; expected Yes or No",
+                    params.align_soft_clip_at_reference_ends
+                ),
+            ));
+        }
+        // Validate --alignInsertionFlush.
+        if !matches!(params.align_insertion_flush.as_str(), "None" | "Right") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --alignInsertionFlush '{}'; expected None or Right",
+                    params.align_insertion_flush
+                ),
+            ));
+        }
+        // Validate --alignEndsProtrude: an optional base count followed by
+        // the protrusion type.
+        {
+            let p = &params.align_ends_protrude;
+            let kind = p.last().map_or("ConcordantPair", String::as_str);
+            let n_ok = p.len() < 2 || p[0].parse::<u32>().is_ok();
+            if !n_ok || !matches!(kind, "ConcordantPair") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "invalid --alignEndsProtrude '{}'; expected [<Nbases>] ConcordantPair",
+                        p.join(" ")
+                    ),
+                ));
+            }
+        }
         // ── STARsolo validation ─────────────────────────────────────────
         if params.run_mode == RunMode::AlignReads && params.solo_enabled() {
             // CB_UMI_Complex needs one CB position + whitelist per segment.
@@ -1879,6 +1956,53 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    #[test]
+    fn new_align_knobs_parse_and_reject() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert_eq!(p.align_ends_type, "Local");
+        assert_eq!(p.align_soft_clip_at_reference_ends, "Yes");
+        assert_eq!(p.align_insertion_flush, "None");
+        assert_eq!(p.align_transcripts_per_read_nmax, 10000);
+        assert!((p.out_filter_mismatch_nover_read_lmax - 1.0).abs() < f64::EPSILON);
+        assert_eq!(p.seed_none_loci_per_window, 10);
+        assert_eq!(p.seed_split_min, 12);
+
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--alignEndsType", "EndToEnd"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--alignInsertionFlush", "Right"]).is_ok());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--alignSoftClipAtReferenceEnds",
+                "No"
+            ])
+            .is_ok()
+        );
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--alignEndsProtrude",
+                "5",
+                "ConcordantPair"
+            ])
+            .is_ok()
+        );
+
+        // Off-menu values are rejected loudly rather than silently ignored.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--alignEndsType", "Global"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--alignInsertionFlush", "Left"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--alignSoftClipAtReferenceEnds",
+                "Maybe"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

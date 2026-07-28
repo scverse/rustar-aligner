@@ -1663,14 +1663,15 @@ fn stitch_align_to_transcript(
 
         let mut jr = 0i32; // number of shared bases going to A side
 
+        let genome_offset: u64 = if cluster.is_reverse {
+            index.genome.n_genome
+        } else {
+            0
+        };
+
         if shared > 0 {
             // jR scanning to find optimal insertion placement (STAR lines 265-291)
             let shared_usize = shared as usize;
-            let genome_offset: u64 = if cluster.is_reverse {
-                index.genome.n_genome
-            } else {
-                0
-            };
 
             let mut score1 = 0i32;
             let mut max_score1 = 0i32;
@@ -1699,10 +1700,11 @@ fn stitch_align_to_transcript(
                     }
                 }
 
-                // STAR default (alignInsertionFlush=None): strict > only.
-                // First maximum wins = leftmost insertion in current coordinate space.
-                // For flushRight mode (not yet implemented): Score1 >= maxScore1.
-                if score1 > max_score1 {
+                // `alignInsertionFlush None` (STAR's default): strict `>`, so
+                // the first maximum wins and the insertion sits at its leftmost
+                // position. `Right` accepts ties too, walking the insertion to
+                // the rightmost equally-scoring position.
+                if score1 > max_score1 || (score1 == max_score1 && scorer.flush_right) {
                     max_score1 = score1;
                     jr = jr1 as i32;
                 }
@@ -1739,6 +1741,27 @@ fn stitch_align_to_transcript(
         }
         // shared == 0: simple insertion, no scanning needed, jr stays 0
 
+        // `alignInsertionFlush Right`: walk the insertion further right for as
+        // long as the read keeps matching the genome, so a repeat-ambiguous
+        // insertion lands at the rightmost position it can. Running out of
+        // read on the B side means there is nowhere left to put the insertion
+        // (STAR -1000009).
+        if scorer.flush_right {
+            let jr_limit =
+                (eff_read_pos + eff_length).saturating_sub(last_exon.read_end + ins) as i32;
+            while jr < jr_limit {
+                let r_idx = last_exon.read_end + jr as usize;
+                let g_pos = last_exon.genome_end + jr as u64 + genome_offset;
+                match index.genome.get_base(g_pos) {
+                    Some(gb) if gb < 4 && read_seq.get(r_idx) == Some(&gb) => jr += 1,
+                    _ => break,
+                }
+            }
+            if jr >= jr_limit {
+                return None;
+            }
+        }
+
         let ins_score = scorer.score_ins_open + scorer.score_ins_base * ins as i32;
         d_score += ins_score;
         new_wt.n_gap += 1;
@@ -1768,10 +1791,13 @@ fn stitch_align_to_transcript(
         });
     }
 
-    // Mismatch limit check
+    // Mismatch limit check. STAR's `outFilterMismatchNmaxTotal` is the minimum
+    // of three caps: the absolute one, a fraction of the *mapped* length, and
+    // a fraction of the *read* length. The third was missing here, which made
+    // `--outFilterMismatchNoverReadLmax` unenforceable.
     let total_mm = new_wt.n_mismatch + gap_mm;
     let total_len = new_wt.read_end.max(eff_read_pos + eff_length) - new_wt.read_start;
-    let mm_limit = ((scorer.p_mm_max * total_len as f64) as u32).min(scorer.n_mm_max);
+    let mm_limit = scorer.mismatch_nmax_total(total_len, read_seq.len());
     if total_mm > mm_limit {
         return None;
     }
@@ -3681,6 +3707,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Left overhang (prev.length) = 3, below min of 5
@@ -3725,6 +3754,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Both overhangs >= 5
