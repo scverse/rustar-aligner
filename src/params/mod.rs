@@ -508,6 +508,32 @@ pub struct Parameters {
     #[arg(long = "genomeSAsparseD", default_value_t = 1)]
     pub genome_sa_sparse_d: u32,
 
+    /// Genome representation to build. `Full` (the default) is an ordinary
+    /// genome; `Transcriptome` and `SuperTranscriptome` are not built here.
+    #[arg(long = "genomeType", default_value = "Full")]
+    pub genome_type: String,
+
+    /// Coordinate space alignments are reported in when the genome was built
+    /// with `--genomeTransformType`. `None` (the default) reports transformed
+    /// coordinates; `SAM` and `SJ` map them back to the original genome.
+    #[arg(long = "genomeTransformOutput", num_args = 1.., default_values_t = vec!["None".to_string()])]
+    pub genome_transform_output: Vec<String>,
+
+    /// Upper bound on the suffix length compared during suffix-array
+    /// construction. 0 means no bound.
+    ///
+    /// Accepted but inert: the suffix-array builder does not expose a
+    /// comparison bound, and STAR uses this only to cap work on highly
+    /// repetitive genomes. The resulting index is identical either way, so
+    /// ignoring it changes no output byte.
+    #[arg(long = "genomeSuffixLengthMax", default_value_t = 0u64)]
+    pub genome_suffix_length_max: u64,
+
+    /// Keep the files describing junctions inserted on the fly, rather than
+    /// discarding them after the run.
+    #[arg(long = "sjdbInsertSave", default_value = "Basic")]
+    pub sjdb_insert_save: String,
+
     /// Substitute VCF alleles into the genome at genomeGenerate (`None`,
     /// `Haploid`, or `Diploid`). Requires `--genomeTransformVCF`; incompatible
     /// with `--sjdbGTFfile`. `Diploid` is genotype-aware and duplicates the
@@ -1548,6 +1574,44 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+            ));
+        }
+
+        // --genomeType: only ordinary genomes are built here. The other two
+        // need a different index layout entirely, so refuse rather than build
+        // something that silently is not what was asked for.
+        if params.genome_type != "Full" {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "--genomeType {} is not supported; expected Full",
+                    params.genome_type
+                ),
+            ));
+        }
+        // --genomeTransformOutput: mapping alignments back to original
+        // coordinates is not implemented, so anything but None is refused. A
+        // silent no-op here would report transformed coordinates as if they
+        // were original ones, which is worse than failing.
+        for o in &params.genome_transform_output {
+            if o != "None" {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--genomeTransformOutput {o} is not supported: alignments are \
+                         reported in the transformed coordinate space"
+                    ),
+                ));
+            }
+        }
+        // --sjdbInsertSave: the inserted-junction files are not retained.
+        if !matches!(params.sjdb_insert_save.as_str(), "Basic" | "None") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --sjdbInsertSave '{}'; expected Basic or None",
+                    params.sjdb_insert_save
+                ),
             ));
         }
 
@@ -2635,5 +2699,38 @@ mod tests {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+    }
+
+    #[test]
+    fn genome_flags_accept_their_defaults_and_refuse_the_rest() {
+        let gg = |extra: &[&str]| {
+            let mut a = vec!["--runMode", "genomeGenerate", "--genomeFastaFiles", "g.fa"];
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+
+        // Defaults parse, and are the STAR ones.
+        let p = gg(&[]).unwrap();
+        assert_eq!(p.genome_type, "Full");
+        assert_eq!(p.genome_transform_output, vec!["None".to_string()]);
+        assert_eq!(p.sjdb_insert_save, "Basic");
+        assert_eq!(p.genome_suffix_length_max, 0);
+
+        // The unimplemented genome layouts are refused rather than silently
+        // building an ordinary genome under another name.
+        assert!(gg(&["--genomeType", "SuperTranscriptome"]).is_err());
+        assert!(gg(&["--genomeType", "Transcriptome"]).is_err());
+
+        // Likewise back-transformed output: a silent no-op would report
+        // transformed coordinates as if they were original ones.
+        assert!(gg(&["--genomeTransformOutput", "SAM"]).is_err());
+        assert!(gg(&["--genomeTransformOutput", "SJ"]).is_err());
+        assert!(gg(&["--genomeTransformOutput", "None"]).is_ok());
+
+        assert!(gg(&["--sjdbInsertSave", "All"]).is_err());
+        assert!(gg(&["--sjdbInsertSave", "None"]).is_ok());
+
+        // Inert but accepted, since it changes no output byte.
+        assert!(gg(&["--genomeSuffixLengthMax", "500"]).is_ok());
     }
 }
