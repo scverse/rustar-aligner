@@ -3307,6 +3307,10 @@ pub(crate) fn stitch_seeds_long_read(
                         scorer.p_mm_max,
                         index,
                         false,
+                        // Long-read chaining scores a seed's own extension
+                        // potential; --alignEndsType applies at the read ends,
+                        // not here.
+                        false,
                     );
                     score2 += e.max_score;
                     ext_len = e.extend_len;
@@ -3345,6 +3349,7 @@ pub(crate) fn stitch_seeds_long_read(
                 scorer.p_mm_max,
                 index,
                 false,
+                false, // as above: a chaining-time extension is always local
             );
             score_best[i1] += e.max_score;
             ext_len = e.extend_len;
