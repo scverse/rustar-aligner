@@ -1120,6 +1120,21 @@ pub(crate) struct WorkingTranscript {
     /// STAR's shiftSJ[isj][0] and shiftSJ[isj][1].
     pub(crate) junction_shifts: Vec<(u32, u32)>,
     pub(crate) n_anchor: u32,
+    /// Score used to *rank* this transcript against its siblings inside the
+    /// recursion: `score` plus the genomic-length penalty.
+    ///
+    /// STAR applies `scoreGenomicLengthLog2scale` in the base case of
+    /// `stitchWindowAligns`, before the dedup and eviction that pick which
+    /// transcripts survive, so a compact alignment can beat a sprawling one of
+    /// equal raw score. rustar-aligner applied it only at finalization, i.e.
+    /// after those decisions had already been made.
+    ///
+    /// Kept separate from `score` rather than folded into it: the PE mate-split
+    /// path builds two per-mate transcripts from one combined `score`, and
+    /// splitting an already-penalised score across mates has no clean meaning.
+    /// `finalize_transcript` still applies the penalty to the final score, so
+    /// nothing is counted twice.
+    pub(crate) rank_score: i32,
     // Tight bounds for extension at finalization
     pub(crate) read_start: usize,
     pub(crate) read_end: usize,
@@ -1139,6 +1154,7 @@ impl WorkingTranscript {
             junction_annotated: Vec::new(),
             junction_shifts: Vec::new(),
             n_anchor: 0,
+            rank_score: 0,
             read_start: 0,
             read_end: 0,
             genome_start: 0,
@@ -2520,6 +2536,13 @@ fn stitch_recurse(
                 }
             }
 
+            // STAR applies the genomic-length penalty here, in the base case,
+            // *before* dedup and eviction. Ranking on the raw score instead
+            // lets a sprawling alignment displace a compact one of equal
+            // score, which STAR would never do.
+            wt.rank_score = wt.score
+                + scorer.genomic_length_penalty(wt.genome_end.saturating_sub(wt.genome_start));
+
             // Dedup via blocks_overlap: drop if subset of existing higher-score transcript.
             // Use same_structure guard: only dedup transcripts with same number of exon
             // blocks. A non-spliced path should never be killed by a spliced one here
@@ -2543,11 +2566,11 @@ fn stitch_recurse(
 
                 // Only dedup transcripts with same number of exon blocks (junctions).
                 let same_structure = wt.exons.len() == existing.exons.len();
-                if same_structure && overlap >= wt_len && existing.score >= wt.score {
+                if same_structure && overlap >= wt_len && existing.rank_score >= wt.rank_score {
                     dominated = true;
                     break;
                 }
-                if same_structure && overlap >= ex_len && wt.score >= existing.score {
+                if same_structure && overlap >= ex_len && wt.rank_score >= existing.rank_score {
                     remove_indices.push(idx);
                 }
             }
@@ -2562,8 +2585,8 @@ fn stitch_recurse(
                 } else if let Some(worst_idx) = transcripts
                     .iter()
                     .enumerate()
-                    .min_by_key(|(_, t)| t.score)
-                    .filter(|(_, t)| t.score < wt.score)
+                    .min_by_key(|(_, t)| t.rank_score)
+                    .filter(|(_, t)| t.rank_score < wt.rank_score)
                     .map(|(i, _)| i)
                 {
                     // STAR-faithful eviction: keep the N best transcripts.
@@ -2812,6 +2835,9 @@ pub(crate) fn split_combined_wt(
             junction_annotated: m1_ja,
             junction_shifts: m1_js,
             n_anchor: 0,
+            // Per-mate transcripts are never ranked against each other inside
+            // the recursion; `finalize_transcript` applies the penalty.
+            rank_score: m1_score,
             read_start: m1_read_start,
             read_end: m1_read_end,
             genome_start: m1_genome_start,
@@ -2827,6 +2853,9 @@ pub(crate) fn split_combined_wt(
             junction_annotated: m2_ja,
             junction_shifts: m2_js,
             n_anchor: 0,
+            // Per-mate transcripts are never ranked against each other inside
+            // the recursion; `finalize_transcript` applies the penalty.
+            rank_score: m2_score,
             read_start: m2_read_start,
             read_end: m2_read_end,
             genome_start: m2_genome_start,
