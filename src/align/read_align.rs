@@ -299,6 +299,16 @@ pub fn align_read(
     };
 
     for (ci, cluster) in clusters.iter().enumerate() {
+        // STAR's `alignTranscriptsPerReadNmax` headroom break
+        // (`ReadAlign_stitchPieces.cpp`): stop collecting windows once one more
+        // window's worth of transcripts could overrun the per-read cap. The
+        // test is on the headroom, not on the running total, so the cap is
+        // never exceeded rather than merely noticed afterwards.
+        if transcripts.len() + params.align_transcripts_per_window_nmax
+            >= params.align_transcripts_per_read_nmax
+        {
+            break;
+        }
         let debug_name = if debug_read { read_name } else { "" };
         let cluster_transcripts = stitch_seeds_with_jdb_debug(
             cluster,

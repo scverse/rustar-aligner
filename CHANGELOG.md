@@ -13,6 +13,31 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Annotated-junction stitching, `--alignEndsType`, and the in-recursion
+  genomic-length penalty** — closes items #4b, #7, #8 and part of #9 of
+  `STAR-RS-COMPARISON.md` §7.2.
+
+  - `SpliceJunctionDb` gains STAR's `sjdb*` table and a `binarySearch2`-style
+    `find()`, so an annotated junction can be addressed by index (`sjA`) and
+    not merely tested for existence. No index format change: `sjdbInfo.txt`
+    already carried motif, shiftLeft, shiftRight and strand.
+  - Seeds derived from the sjdb genome insert carry their `sjA` tag through the
+    window into the stitcher, which takes STAR's annotated-junction shortcut
+    when two pieces turn out to be the two flanks of one junction.
+  - Non-canonical annotated junctions are snapped onto their annotated
+    coordinates instead of being left wherever the leftmost-flush scan put
+    them, and the stored motif overrides the one re-derived from the genome.
+  - `--alignEndsType`, `--alignSoftClipAtReferenceEnds`,
+    `--alignInsertionFlush Right` and `--outFilterMismatchNoverReadLmax` are
+    implemented; `--alignEndsProtrude`, `--alignTranscriptsPerReadNmax`,
+    `--seedNoneLociPerWindow` and `--seedSplitMin` are accepted.
+  - The genomic-length penalty is applied inside the stitch recursion, where it
+    can affect which transcripts survive, rather than only at finalisation.
+
+  On 1000 junction-spanning yeast reads against native STAR 2.7.11b, records
+  identical in FLAG/RNAME/POS/CIGAR rise from 835 to 933 out of 1000, with no
+  read regressing. Output against an unannotated index is unchanged.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
