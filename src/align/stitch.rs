@@ -2041,6 +2041,28 @@ pub(crate) fn finalize_transcript(
         return None;
     }
 
+    // `--alignSoftClipAtReferenceEnds No`: an alignment may not be
+    // soft-clipped past the end of its chromosome, so discard any that would
+    // be. `Yes`, the default, leaves behaviour unchanged.
+    if !scorer.soft_clip_at_reference_ends {
+        let chr = cluster.chr_idx;
+        let chr_start = index.genome.chr_start[chr];
+        let chr_end = chr_start + index.genome.chr_length[chr];
+        let span_start = wt
+            .genome_start
+            .saturating_sub(left_extend.extend_len as u64);
+        let span_end = wt.genome_end + right_extend.extend_len as u64;
+        let clipped_left = alignment_start - left_extend.extend_len;
+        let clipped_right = read_seq
+            .len()
+            .saturating_sub(alignment_end + right_extend.extend_len);
+        if (clipped_left > 0 && span_start <= chr_start)
+            || (clipped_right > 0 && span_end >= chr_end)
+        {
+            return None;
+        }
+    }
+
     // STAR finalization check: exon lengths including repeat lengths (shiftSJ)
     // For non-annotated junctions: exon_len >= alignSJoverhangMin + shiftSJ[side]
     // For annotated junctions: exon_len >= alignSJDBoverhangMin
