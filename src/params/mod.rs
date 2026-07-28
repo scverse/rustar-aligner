@@ -1099,6 +1099,17 @@ pub struct Parameters {
     #[arg(long = "genomeLoad", default_value = "NoSharedMemory")]
     pub genome_load: String,
 
+    /// Adapter sequence that `--soloCBposition` / `--soloUMIposition` anchor
+    /// codes 2 and 3 are measured from. `-` (the default) means no adapter, so
+    /// only the read-start and read-end anchors are usable.
+    #[arg(long = "soloAdapterSequence", default_value = "-")]
+    pub solo_adapter_sequence: String,
+
+    /// Mismatches tolerated when locating `--soloAdapterSequence` in the
+    /// barcode read.
+    #[arg(long = "soloAdapterMismatchesNmax", default_value_t = 1)]
+    pub solo_adapter_mismatches_nmax: usize,
+
     /// `CB_UMI_Complex` cell-barcode segment positions, one per segment, as
     /// `startAnchor_startDist_endAnchor_endDist`. Only read-start anchoring
     /// (`anchor = 0`, fixed positions) is supported, e.g. `0_0_0_7 0_8_0_15`.

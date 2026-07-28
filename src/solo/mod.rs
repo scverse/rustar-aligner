@@ -49,11 +49,84 @@ pub enum SoloBarcodeLayout {
         cb_segments: Vec<(usize, usize)>,
         umi: (usize, usize),
     },
+    /// Multi-segment CB whose positions are measured from an adapter rather
+    /// than from the read ends.
+    ///
+    /// The adapter moves from read to read, so unlike every other layout the
+    /// offsets cannot be resolved once at startup; each read is searched. A
+    /// read where the adapter is not found within the mismatch budget yields no
+    /// barcode at all, which is what STAR does — a barcode read at an unknown
+    /// offset is not salvageable.
+    Anchored {
+        cb_segments: Vec<(Anchored, Anchored)>,
+        umi: (Anchored, Anchored),
+        adapter: Vec<u8>,
+        max_mismatches: usize,
+    },
 }
 
 /// Parse a `--soloCBposition`/`--soloUMIposition` spec
 /// (`startAnchor_startDist_endAnchor_endDist`) into a 0-based `(start, len)`.
 /// Only read-start anchoring (`anchor = 0`) is supported.
+/// One end of a `--soloCBposition` / `--soloUMIposition` field: which anchor
+/// it is measured from, and how far.
+///
+/// STAR's anchor codes: 0 = read start, 1 = read end, 2 = adapter start,
+/// 3 = adapter end. Codes 2 and 3 make the position depend on where the
+/// adapter turns out to be in each read, which is why resolution happens per
+/// read rather than once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchored {
+    pub anchor: u8,
+    pub dist: i64,
+}
+
+impl Anchored {
+    /// Absolute offset in a read of length `read_len`, given where the adapter
+    /// was found. `None` when the anchor needs an adapter that was not found,
+    /// or when the offset falls outside the read.
+    fn resolve(self, read_len: usize, adapter: Option<(usize, usize)>) -> Option<usize> {
+        let base = match self.anchor {
+            0 => 0i64,
+            1 => read_len as i64 - 1,
+            2 => adapter?.0 as i64,
+            3 => adapter?.1 as i64 - 1,
+            _ => return None,
+        };
+        let pos = base + self.dist;
+        if pos < 0 || pos as usize >= read_len {
+            None
+        } else {
+            Some(pos as usize)
+        }
+    }
+}
+
+/// Locate `adapter` in `seq`, allowing up to `max_mm` mismatches.
+///
+/// Returns the half-open `(start, end)` of the first position that fits, which
+/// is what STAR takes: the leftmost acceptable match, not the best-scoring one.
+fn find_adapter(seq: &[u8], adapter: &[u8], max_mm: usize) -> Option<(usize, usize)> {
+    if adapter.is_empty() || adapter.len() > seq.len() {
+        return None;
+    }
+    for start in 0..=(seq.len() - adapter.len()) {
+        let mut mm = 0usize;
+        for (a, b) in seq[start..start + adapter.len()].iter().zip(adapter) {
+            if a != b {
+                mm += 1;
+                if mm > max_mm {
+                    break;
+                }
+            }
+        }
+        if mm <= max_mm {
+            return Some((start, start + adapter.len()));
+        }
+    }
+    None
+}
+
 fn parse_position(spec: &str) -> Result<(usize, usize), Error> {
     let f: Vec<&str> = spec.split('_').collect();
     if f.len() != 4 {
@@ -87,6 +160,36 @@ fn invalid_pos(spec: &str, why: &str) -> Error {
     ))
 }
 
+/// Parse a full `startAnchor_startDist_endAnchor_endDist` field, keeping the
+/// anchors rather than collapsing them to read-start offsets.
+fn parse_position_anchored(spec: &str) -> Result<(Anchored, Anchored), Error> {
+    let f: Vec<&str> = spec.split('_').collect();
+    if f.len() != 4 {
+        return Err(invalid_pos(
+            spec,
+            "expected startAnchor_startDist_endAnchor_endDist",
+        ));
+    }
+    let num = |x: &str| x.parse::<i64>().ok();
+    match (num(f[0]), num(f[1]), num(f[2]), num(f[3])) {
+        (Some(sa), Some(sd), Some(ea), Some(ed))
+            if (0..=3).contains(&sa) && (0..=3).contains(&ea) =>
+        {
+            Ok((
+                Anchored {
+                    anchor: sa as u8,
+                    dist: sd,
+                },
+                Anchored {
+                    anchor: ea as u8,
+                    dist: ed,
+                },
+            ))
+        }
+        _ => Err(invalid_pos(spec, "anchor must be 0, 1, 2 or 3")),
+    }
+}
+
 impl SoloBarcodeLayout {
     /// Build the layout from CLI parameters. `CB_UMI_Complex` parses
     /// `--soloCBposition`/`--soloUMIposition`; otherwise fixed Simple geometry.
@@ -98,6 +201,29 @@ impl SoloBarcodeLayout {
                 .filter_map(|s| parse_position(s).ok())
                 .collect();
             let umi = parse_position(&params.solo_umi_position).unwrap_or((0, 0));
+
+            // An adapter turns the position specs into per-read offsets, so it
+            // selects a different layout rather than being a tweak to this one.
+            if params.solo_adapter_sequence != "-" {
+                let adapter: Vec<u8> = params
+                    .solo_adapter_sequence
+                    .bytes()
+                    .map(crate::io::fastq::encode_base)
+                    .collect();
+                let anchored_cb: Vec<_> = params
+                    .solo_cb_position
+                    .iter()
+                    .filter_map(|s| parse_position_anchored(s).ok())
+                    .collect();
+                if let Ok(anchored_umi) = parse_position_anchored(&params.solo_umi_position) {
+                    return Self::Anchored {
+                        cb_segments: anchored_cb,
+                        umi: anchored_umi,
+                        adapter,
+                        max_mismatches: params.solo_adapter_mismatches_nmax,
+                    };
+                }
+            }
             return Self::Complex { cb_segments, umi };
         }
         Self::Simple {
@@ -117,6 +243,9 @@ impl SoloBarcodeLayout {
                 umi_start,
                 umi_len,
             } => (cb_start + cb_len).max(umi_start + umi_len),
+            // Not knowable without the read: the adapter's position decides.
+            // `extract` does its own bounds checking instead.
+            Self::Anchored { .. } => 0,
             Self::Complex { cb_segments, umi } => cb_segments
                 .iter()
                 .map(|&(s, l)| s + l)
@@ -146,6 +275,39 @@ impl SoloBarcodeLayout {
                 umi_seq: seq[*umi_start..umi_start + umi_len].to_vec(),
                 umi_qual: slice_or_empty(qual, *umi_start, *umi_len),
             }),
+            Self::Anchored {
+                cb_segments,
+                umi,
+                adapter,
+                max_mismatches,
+            } => {
+                let found = find_adapter(seq, adapter, *max_mismatches);
+                let span = |(a, b): &(Anchored, Anchored)| -> Option<(usize, usize)> {
+                    let s0 = a.resolve(seq.len(), found)?;
+                    let e0 = b.resolve(seq.len(), found)?;
+                    (e0 >= s0).then_some((s0, e0 - s0 + 1))
+                };
+                let mut cb_seq = Vec::new();
+                let mut cb_qual = Vec::new();
+                for segment in cb_segments {
+                    let (s0, l) = span(segment)?;
+                    if s0 + l > seq.len() {
+                        return None;
+                    }
+                    cb_seq.extend_from_slice(&seq[s0..s0 + l]);
+                    cb_qual.extend_from_slice(&slice_or_empty(qual, s0, l));
+                }
+                let (us, ul) = span(umi)?;
+                if us + ul > seq.len() {
+                    return None;
+                }
+                Some(CellBarcode {
+                    cb_seq,
+                    cb_qual,
+                    umi_seq: seq[us..us + ul].to_vec(),
+                    umi_qual: slice_or_empty(qual, us, ul),
+                })
+            }
             Self::Complex { cb_segments, umi } => {
                 let mut cb_seq = Vec::new();
                 let mut cb_qual = Vec::new();
@@ -1096,5 +1258,108 @@ mod tests {
 
         let mut reader = SoloReadReader::open(cdna.path(), bc.path(), v2_layout(), None).unwrap();
         assert!(reader.read_batch(10).is_err());
+    }
+
+    #[test]
+    fn adapter_anchoring_finds_the_adapter_and_positions_around_it() {
+        // Adapter ACGT sits at offset 4. CB is the 4 bases before it
+        // (anchor 2, the adapter start), UMI the 4 after (anchor 3, adapter
+        // end). Both move with the adapter, which is the whole point.
+        let adapter = vec![0u8, 1, 2, 3];
+        let layout = SoloBarcodeLayout::Anchored {
+            cb_segments: vec![(
+                Anchored {
+                    anchor: 2,
+                    dist: -4,
+                },
+                Anchored {
+                    anchor: 2,
+                    dist: -1,
+                },
+            )],
+            umi: (
+                Anchored { anchor: 3, dist: 1 },
+                Anchored { anchor: 3, dist: 4 },
+            ),
+            adapter: adapter.clone(),
+            max_mismatches: 1,
+        };
+
+        // GGGG ACGT TTTT  →  CB = GGGG, UMI = TTTT
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
+            quality: vec![b'I'; 12],
+        };
+        let bc = layout.extract(&read).expect("adapter present");
+        assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
+        assert_eq!(bc.umi_seq, vec![3, 3, 3, 3]);
+
+        // Shift the adapter two bases right; both fields follow it.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![1, 1, 2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
+            quality: vec![b'I'; 14],
+        };
+        let bc = layout.extract(&read).expect("adapter present, shifted");
+        assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
+        assert_eq!(bc.umi_seq, vec![3, 3, 3, 3]);
+
+        // One mismatch inside the adapter is within budget.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2, 2, 2, 2, 0, 1, 2, 0, 3, 3, 3, 3],
+            quality: vec![b'I'; 12],
+        };
+        assert!(layout.extract(&read).is_some());
+
+        // No adapter at all: no barcode. A barcode read at an unknown offset
+        // is not salvageable, so guessing would be worse than declining.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2; 12],
+            quality: vec![b'I'; 12],
+        };
+        assert!(layout.extract(&read).is_none());
+    }
+
+    #[test]
+    fn find_adapter_takes_the_leftmost_acceptable_match() {
+        // Two copies of ACGT; STAR takes the first that fits, not the best.
+        let seq = [0u8, 1, 2, 3, 9, 0, 1, 2, 3];
+        assert_eq!(find_adapter(&seq, &[0, 1, 2, 3], 0), Some((0, 4)));
+        // Budget 0 and no exact match anywhere.
+        assert_eq!(find_adapter(&[2u8; 8], &[0, 1, 2, 3], 0), None);
+        // An adapter longer than the read cannot match.
+        assert_eq!(find_adapter(&[0u8, 1], &[0, 1, 2, 3], 4), None);
+    }
+
+    #[test]
+    fn anchors_outside_the_read_yield_no_barcode() {
+        // Anchor 2 with a distance that runs off the front.
+        let layout = SoloBarcodeLayout::Anchored {
+            cb_segments: vec![(
+                Anchored {
+                    anchor: 2,
+                    dist: -99,
+                },
+                Anchored {
+                    anchor: 2,
+                    dist: -1,
+                },
+            )],
+            umi: (
+                Anchored { anchor: 3, dist: 1 },
+                Anchored { anchor: 3, dist: 2 },
+            ),
+            adapter: vec![0, 1, 2, 3],
+            max_mismatches: 0,
+        };
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![0, 1, 2, 3, 3, 3, 3],
+            quality: vec![b'I'; 7],
+        };
+        assert!(layout.extract(&read).is_none());
     }
 }
