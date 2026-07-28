@@ -138,6 +138,30 @@ pub fn differential_check(backend: Backend, seed: u64) -> Result<usize, String> 
 mod tests {
     use super::*;
 
+    /// Every backend this machine can run, not just the one `detect()` picks.
+    ///
+    /// On x86 that matters: a machine with AVX2 would otherwise never exercise
+    /// SSE2, and the baseline is what runs on everything older.
+    fn available_backends() -> Vec<Backend> {
+        let mut v = vec![Backend::Scalar];
+        #[cfg(target_arch = "aarch64")]
+        if super::super::neon::is_available() {
+            v.push(Backend::Neon);
+        }
+        v
+    }
+
+    #[test]
+    fn every_available_backend_agrees_with_scalar() {
+        // Not just the detected one: on a machine with AVX2, SSE2 would
+        // otherwise go unchecked despite being what older hardware runs.
+        for backend in available_backends() {
+            if let Err(e) = differential_check(backend, 0x0BAD_5EED) {
+                panic!("{e}");
+            }
+        }
+    }
+
     #[test]
     fn scalar_is_consistent_with_itself() {
         // Tautological for the scalar backend, but it proves the harness runs,
