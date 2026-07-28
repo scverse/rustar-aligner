@@ -293,6 +293,35 @@ where
     Ok(())
 }
 
+/// Peak resident bytes libsais needs for a genome of `n_genome` bases, and
+/// whether that fits inside `limit_bytes`.
+///
+/// libsais is an in-memory SA-IS: it holds the suffix array itself plus its
+/// working arrays. The dominant terms are the SA (`n` entries, 8 bytes each in
+/// the 64-bit path), libsais's own auxiliary array of the same shape, and the
+/// text. `2 * n * 8 + n` is the standard estimate for the 64-bit path and is
+/// what STAR's own sizing guidance amounts to.
+///
+/// A limit of 0 means "no limit" and always selects libsais, matching how STAR
+/// treats a zeroed limit elsewhere.
+pub fn libsais_peak_bytes(n_genome: u64) -> u64 {
+    // SA + libsais working array, 8 bytes per entry each, plus the text.
+    n_genome.saturating_mul(17)
+}
+
+/// Whether the in-memory builder fits the caller's RAM budget.
+///
+/// This is what makes `--limitGenomeGenerateRAM` a real flag rather than one
+/// that is accepted and warned about: below the limit the fast in-memory
+/// builder runs, above it the external-memory builder does. Both produce
+/// byte-identical output, so the choice is purely about resources.
+pub fn libsais_fits_in_ram(n_genome: u64, limit_bytes: u64) -> bool {
+    if limit_bytes == 0 {
+        return true;
+    }
+    libsais_peak_bytes(n_genome) <= limit_bytes
+}
+
 /// Build the suffix array via **libsais** instead of caps-sa.
 ///
 /// libsais is a fast SA-IS construction (index-construction speedup tracked in the
@@ -305,8 +334,8 @@ where
 ///
 /// libsais builds the suffix array **in memory**; for very large sequences (e.g.
 /// the human genome) that needs substantially more RAM than caps-sa's external-
-/// memory path. Wiring libsais in as the default builder — and choosing libsais vs.
-/// caps-sa by available memory — is roadmap follow-up.
+/// memory path. [`libsais_fits_in_ram`] decides between the two from
+/// `--limitGenomeGenerateRAM`.
 pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
     build_libsais_impl(genome, None)
 }
@@ -1249,6 +1278,24 @@ mod tests {
             caps.data.data(),
             "libsais vs caps-sa packed SA differ on `{label}`"
         );
+    }
+
+    #[test]
+    fn libsais_ram_estimate_and_gate() {
+        // ~17 bytes per base: the SA and libsais's working array at 8 bytes an
+        // entry, plus the text.
+        assert_eq!(libsais_peak_bytes(1_000_000), 17_000_000);
+
+        // Yeast (12 Mb) fits in any realistic budget.
+        assert!(libsais_fits_in_ram(12_000_000, 31_000_000_000));
+        // GRCh38 (3.1 Gb, doubled for both strands) does not fit the 31 GB
+        // default, so the external-memory builder is chosen for it.
+        assert!(!libsais_fits_in_ram(6_200_000_000, 31_000_000_000));
+        // It does fit if the user says they have the RAM.
+        assert!(libsais_fits_in_ram(6_200_000_000, 128_000_000_000));
+
+        // 0 means "no limit", matching how STAR treats a zeroed limit.
+        assert!(libsais_fits_in_ram(6_200_000_000, 0));
     }
 
     #[test]
