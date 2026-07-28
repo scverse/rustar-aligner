@@ -17,9 +17,11 @@
 //! `clip5pAfterAdapterNbases`), then 3' on the 5'-clipped read (`clip3pNbases`,
 //! then the 3' adapter Hamming scan, then `clip3pAfterAdapterNbases`).
 //!
-//! Only `--clipAdapterType Hamming` (STAR's default) is supported; a 5' Hamming
-//! adapter is not a thing STAR itself supports either (only `CellRanger4` mode
-//! clips a 5' adapter, the 10x TSO) — that mode is out of scope here.
+//! `--clipAdapterType Hamming` (STAR's default) uses the 3' Hamming scan above.
+//! `CellRanger4` instead trims a 3' poly-A tail and a 5' TSO; see
+//! [`cellranger4`]. A 5' *Hamming* adapter is not a thing STAR supports either.
+
+pub mod cellranger4;
 
 use crate::io::fastq::encode_base;
 use crate::params::Parameters;
