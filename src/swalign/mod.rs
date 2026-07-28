@@ -27,6 +27,8 @@
 //! the scoring scheme.
 
 pub mod backend;
+#[cfg(target_arch = "aarch64")]
+pub mod neon;
 pub mod scalar;
 
 pub use backend::Backend;

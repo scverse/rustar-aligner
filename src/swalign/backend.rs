@@ -19,13 +19,18 @@ pub enum Backend {
     /// The portable reference. Always available, and the definition of the
     /// result.
     Scalar,
+    /// aarch64 NEON, computing one anti-diagonal at a time.
+    #[cfg(target_arch = "aarch64")]
+    Neon,
 }
 
 impl Backend {
     /// The best backend this machine can run.
     pub fn detect() -> Self {
-        // SIMD backends land here as they are written. Each one has to pass
-        // `differential_check` on this machine before being offered.
+        #[cfg(target_arch = "aarch64")]
+        if super::neon::is_available() {
+            return Backend::Neon;
+        }
         Backend::Scalar
     }
 
@@ -33,6 +38,8 @@ impl Backend {
     pub fn align(self, query: &[u8], target: &[u8], mode: Mode, scoring: &Scoring) -> Alignment {
         match self {
             Backend::Scalar => scalar::align(query, target, mode, scoring),
+            #[cfg(target_arch = "aarch64")]
+            Backend::Neon => super::neon::align(query, target, mode, scoring),
         }
     }
 }
@@ -145,6 +152,16 @@ mod tests {
         // The test that matters once SIMD backends exist: whatever this
         // machine selects must match the reference on this machine.
         let backend = Backend::detect();
+
+        // A pass proves nothing if the machine quietly fell back to the
+        // reference, so assert that the hardware backend really was selected.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            backend,
+            Backend::Neon,
+            "aarch64 must select NEON; a silent fallback would make this test vacuous"
+        );
+
         if let Err(e) = differential_check(backend, 0x00C0_FFEE) {
             panic!("{e}");
         }
