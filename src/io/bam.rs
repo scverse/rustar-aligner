@@ -794,9 +794,24 @@ mod tests {
             crate::stats::UnmappedReason::Other,
         )
         .unwrap();
+        writer.write_batch(std::slice::from_ref(&rec)).unwrap();
+        // With binning available (the default), exceeding the bound is no
+        // longer fatal: the sort spills and respects it.
+        writer
+            .finish()
+            .expect("binned sort should honour the bound");
+
+        // With binning disabled there is no way to respect the bound, so the
+        // old behaviour stands and the run stops rather than quietly using
+        // more memory than it was allowed.
+        params.out_bam_sorting_bins_n = 0;
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = SortedBamWriter::create(temp_file.path(), &genome, &params).unwrap();
         writer.write_batch(&[rec]).unwrap();
-        let result = writer.finish();
-        assert!(result.is_err(), "Should fail when RAM limit is exceeded");
+        assert!(
+            writer.finish().is_err(),
+            "with --outBAMsortingBinsN 0 the RAM limit must still be fatal"
+        );
     }
 }
 
