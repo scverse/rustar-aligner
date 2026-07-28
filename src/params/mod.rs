@@ -1123,6 +1123,14 @@ pub struct Parameters {
     #[arg(long = "soloMultiMappers", num_args = 1.., default_values_t = vec!["Unique".to_string()])]
     pub solo_multi_mappers: Vec<String>,
 
+    /// Third column of `features.tsv`. STAR's default is `Gene Expression`;
+    /// the sentinel `-` suppresses the column entirely.
+    #[arg(
+        long = "soloOutFormatFeaturesGeneField3",
+        default_value = "Gene Expression"
+    )]
+    pub solo_out_format_features_gene_field3: String,
+
     /// Output directory name for solo matrices (relative to `--outFileNamePrefix`).
     #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
     pub solo_out_file_names: Vec<String>,

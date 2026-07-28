@@ -1223,6 +1223,7 @@ pub fn write_gene_matrix(
             &raw_dir.join(&features_name),
             &ctx.gene_ann.gene_ids,
             &ctx.gene_ann.gene_names,
+            &params.solo_out_format_features_gene_field3,
             gzip,
         )?;
         write_barcodes(
@@ -1279,6 +1280,7 @@ pub fn write_gene_matrix(
                 &filt_dir.join(&features_name),
                 &ctx.gene_ann.gene_ids,
                 &ctx.gene_ann.gene_names,
+                &params.solo_out_format_features_gene_field3,
                 gzip,
             )?;
             write_barcodes_subset(&filt_dir.join(&barcodes_name), &ctx.whitelist, &cbs, gzip)?;
@@ -1397,6 +1399,7 @@ pub fn write_gene_matrix(
             &velo_dir.join(&features_name),
             &ctx.gene_ann.gene_ids,
             &ctx.gene_ann.gene_names,
+            &params.solo_out_format_features_gene_field3,
             gzip,
         )?;
         write_barcodes(
@@ -1837,12 +1840,17 @@ fn write_cellranger_summary(
     Ok(())
 }
 
-/// `features.tsv`: `gene_id <TAB> gene_name <TAB> "Gene Expression"` (CellRanger
-/// v3 layout). We have no gene names, so the id is repeated.
+/// `features.tsv`: `gene_id <TAB> gene_name <TAB> <field3>` (CellRanger v3
+/// layout).
+///
+/// `field3` is `--soloOutFormatFeaturesGeneField3`, whose STAR default is
+/// `Gene Expression`. The sentinel `-` drops the column, giving the two-column
+/// form some downstream tools expect.
 fn write_features(
     path: &Path,
     gene_ids: &[String],
     gene_names: &[String],
+    field3: &str,
     gzip: bool,
 ) -> Result<(), Error> {
     // CellRanger v3 layout: gene_id <TAB> gene_name <TAB> "Gene Expression".
@@ -1851,7 +1859,12 @@ fn write_features(
     // fallback is already baked into `gene_names`.
     write_file(path, gzip, |w| {
         for (id, name) in gene_ids.iter().zip(gene_names.iter()) {
-            writeln!(w, "{id}\t{name}\tGene Expression").map_err(|e| Error::io(e, path))?;
+            if field3 == "-" {
+                writeln!(w, "{id}\t{name}")
+            } else {
+                writeln!(w, "{id}\t{name}\t{field3}")
+            }
+            .map_err(|e| Error::io(e, path))?;
         }
         Ok(())
     })?;
