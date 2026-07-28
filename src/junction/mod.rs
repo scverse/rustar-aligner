@@ -11,7 +11,7 @@ mod sj_output;
 pub mod sjdb_insert;
 
 pub use sj_output::SpliceJunctionStats;
-pub(crate) use sj_output::{SjKey, encode_motif};
+pub(crate) use sj_output::{SjKey, decode_motif, encode_motif};
 pub use sjdb_insert::PreparedJunction;
 
 use crate::params::Parameters;

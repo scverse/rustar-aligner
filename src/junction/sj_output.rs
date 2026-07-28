@@ -401,6 +401,21 @@ pub(crate) fn encode_motif(motif: SpliceMotif) -> u8 {
     }
 }
 
+/// Inverse of [`encode_motif`]: turn a stored `sjdbMotif` code back into a
+/// [`SpliceMotif`]. Out-of-range codes map to `NonCanonical`, matching
+/// [`SpliceMotif::filter_category_from_encoded`].
+pub(crate) fn decode_motif(encoded: u8) -> SpliceMotif {
+    match encoded {
+        1 => SpliceMotif::GtAg,
+        2 => SpliceMotif::CtAc,
+        3 => SpliceMotif::GcAg,
+        4 => SpliceMotif::CtGc,
+        5 => SpliceMotif::AtAc,
+        6 => SpliceMotif::GtAt,
+        _ => SpliceMotif::NonCanonical,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::params::Parameters;
