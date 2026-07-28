@@ -27,10 +27,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
   - Non-canonical annotated junctions are snapped onto their annotated
     coordinates instead of being left wherever the leftmost-flush scan put
     them, and the stored motif overrides the one re-derived from the genome.
-  - `--alignEndsType`, `--alignSoftClipAtReferenceEnds`,
-    `--alignInsertionFlush Right` and `--outFilterMismatchNoverReadLmax` are
-    implemented; `--alignEndsProtrude`, `--alignTranscriptsPerReadNmax`,
-    `--seedNoneLociPerWindow` and `--seedSplitMin` are accepted.
+  - `--alignSoftClipAtReferenceEnds`, `--alignInsertionFlush Right` and
+    `--outFilterMismatchNoverReadLmax` are implemented; `--alignEndsProtrude`,
+    `--alignTranscriptsPerReadNmax`, `--seedNoneLociPerWindow` and
+    `--seedSplitMin` are accepted. (`--alignEndsType` itself came from #145.)
   - The genomic-length penalty is applied inside the stitch recursion, where it
     can affect which transcripts survive, rather than only at finalisation.
 

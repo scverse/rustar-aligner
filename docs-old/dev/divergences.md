@@ -21,27 +21,7 @@ test that locks the behaviour in.
 
 ---
 
-## D-01 · `--alignEndsType` failure is signalled by rejection, not by a sentinel score
-
-**STAR.** When an end cannot be extended to the end of the read (the chromosome
-runs out first), `extendAlign` returns a score of `-999999999` and lets that
-value propagate; downstream score filters then discard the alignment.
-
-**rustar-aligner.** `ExtendResult::hit_boundary` says so explicitly, and
-`finalize_transcript` drops the transcript.
-
-**Why.** `finalize_transcript` clamps the final score with `.max(0)`. A
-`-999999999` sentinel would be clamped to `0` and the alignment would *survive*
-as a zero-score record rather than being rejected. The sentinel only works in
-STAR because STAR does not clamp. The observable outcome is the same, without
-depending on arithmetic this code path does not perform.
-
-**Test.** `extend_to_end_reports_boundary_when_the_chromosome_runs_out`
-(`src/align/stitch.rs`).
-
----
-
-## D-02 · Non-canonical annotated junctions carry no strand
+## D-01 · Non-canonical annotated junctions carry no strand
 
 **STAR.** Tracks a per-junction strand (`sjStr`) alongside the motif, and for an
 annotated junction takes that strand from `sjdbStrand`. SJ.out.tab column 4 then
