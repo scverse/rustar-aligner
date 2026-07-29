@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn libsais_ram_estimate_and_gate() {
-        // ~17 bytes per base: the SA and libsais's working array at 8 bytes an
+        // ~17 bytes per entry: the SA and libsais's working array at 8 bytes an
         // entry, plus the text.
         assert_eq!(libsais_peak_bytes(1_000_000), 17_000_000);
 
@@ -1299,6 +1299,27 @@ mod tests {
 
         // 0 means "no limit", matching how STAR treats a zeroed limit.
         assert!(libsais_fits_in_ram(6_200_000_000, 0));
+    }
+
+    /// The argument is a count of suffix-array entries, not of genome bases,
+    /// and the two differ by a factor of two because the text libsais sorts is
+    /// both strands. `GenomeIndex::generate_streaming` doubles before calling;
+    /// if it stopped doing so, the estimate would be half the truth and a
+    /// mammalian genome would be handed to the in-memory builder at the
+    /// default limit.
+    #[test]
+    fn the_ram_estimate_counts_suffix_array_entries_not_genome_bases() {
+        let n_genome: u64 = 3_100_000_000;
+        let sa_entries = 2 * n_genome;
+
+        assert_eq!(libsais_peak_bytes(sa_entries), 17 * sa_entries);
+        assert_eq!(libsais_peak_bytes(sa_entries), 34 * n_genome);
+
+        // At the 31 GB default the entry count declines libsais; the base
+        // count, wrongly used, would still decline it here, so pick a limit
+        // that separates them: 60 GB fits 34 * n only if you halve it.
+        assert!(!libsais_fits_in_ram(sa_entries, 60_000_000_000));
+        assert!(libsais_fits_in_ram(n_genome, 60_000_000_000));
     }
 
     #[test]
