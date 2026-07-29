@@ -13,6 +13,46 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`--limitGenomeGenerateRAM` now picks the suffix-array builder.** The flag
+  was accepted and warned about; it now decides between two constructions of
+  the same array:
+
+  - **libsais** (new dependency, see Bumps) when its estimated peak fits the
+    limit. It is an in-memory SA-IS and needs roughly `17` bytes per
+    suffix-array entry, that is `34 × n_genome` for both strands.
+  - **caps-sa's external-memory path** otherwise, which spills to disk and
+    needs a fraction of the RAM.
+
+  `--genomeSAsparseD` above 1 always takes caps-sa, the only builder with a
+  sparse arm. The chosen path and both numbers are logged, so the decision is
+  visible in the run rather than inferred.
+
+  Output cannot differ: the suffix array of a text is unique, and both arms
+  sort the same per-segment sentinel-transformed text. That is checked at four
+  levels, the last of which is the shipping path rather than a unit-test-only
+  one: against caps-sa on three fixtures, with the `i32` large-alphabet arm
+  forced, through the same `PackedStreamWriter` `genomeGenerate` writes with,
+  and on real genomes.
+
+  Construction time and peak RSS, `--runThreadN 8`, same machine, warm cache,
+  `SA` and `SAindex` byte-identical in every row:
+
+  | genome | libsais | caps-sa | ratio |
+  |---|---|---|---|
+  | yeast R64-1-1, 12 Mb | 1.0 s / 0.39 GB | 1.7 s / 0.22 GB | 1.6x |
+  | human chr1, 249 Mb | 27.4 s / 6.5 GB | 47.2 s / 5.6 GB | 1.7x |
+  | GRCh38 primary, 3.1 Gb | 641.6 s / 86.8 GB | 1040.4 s / 14.4 GB | 1.6x |
+
+  The ratio holds across three orders of magnitude even though libsais runs
+  single-threaded here: caps-sa buys its small footprint with about six times
+  the total CPU work for the same array (on GRCh38, 726 s of user time against
+  6135 s).
+
+  The mammalian row needed `--limitGenomeGenerateRAM 0` to produce. At the
+  31 GB default a GRCh38 build is declined, because libsais would need an
+  estimated 106.7 GB against a measured 86.8 GB peak, so it takes the caps-sa
+  path unless the user states they have the RAM.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
@@ -115,6 +155,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - `caps-sa` → `0.5` (adds `build_ext_mem_for_filter*`; see the caps-sa
   v0.5.0 release notes).
+
+- **New: `libsais` 0.2.0** (`MIT OR Apache-2.0`), wrapping the C library of the
+  same name. The C is vendored in `libsais-sys` and compiled by `cc`: no system
+  library, no `bindgen`, no `libclang`. Declared `default-features = false`,
+  which turns off the crate's default `openmp` feature, so nothing outside the
+  vendored sources is required and the C builds single-threaded. Adds
+  `bytemuck` and `either`, plus `cc` as a build dependency.
 
 ### Other
 

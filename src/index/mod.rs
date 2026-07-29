@@ -159,23 +159,56 @@ impl GenomeIndex {
         let sa_buf = BufWriter::with_capacity(8 * 1024 * 1024, sa_file);
         let mut sa_writer = PackedStreamWriter::new(sa_buf, word_length);
 
-        log::info!("Building suffix array...");
-        let (got_gbit, got_gmask, n_entries) = sa_build::build_streaming(
-            &genome,
-            params.temp_dir.as_deref(),
-            params.genome_sa_sparse_d as u64,
-            |packed_value| {
-                // Emit is now lightweight: just bit-pack into the SA
-                // file. caps-sa's phase-4 emit loop is single-threaded,
-                // so anything we do here serialises the whole build.
-                // The SAindex is built afterwards via a parallel pass
-                // over the on-disk SA.
+        // Which builder runs is decided by `--limitGenomeGenerateRAM`. libsais
+        // is an in-memory SA-IS and needs room for the suffix array, its own
+        // working array and the text at once; caps-sa's external-memory path
+        // needs a fraction of that and spills to disk. Both emit the same
+        // packed values, because the suffix array of a text is unique, so the
+        // choice costs nothing in output and everything in resources.
+        //
+        // The sparse builder has no libsais equivalent, so `--genomeSAsparseD`
+        // above 1 always takes the caps-sa path.
+        let sa_entries = 2 * genome.n_genome;
+        let use_libsais = params.genome_sa_sparse_d <= 1
+            && sa_build::libsais_fits_in_ram(sa_entries, params.limit_genome_generate_ram);
+
+        let (got_gbit, got_gmask, n_entries) = if use_libsais {
+            log::info!(
+                "Building suffix array with libsais (estimated peak {:.1} GB, --limitGenomeGenerateRAM {:.1} GB)...",
+                sa_build::libsais_peak_bytes(sa_entries) as f64 / 1e9,
+                params.limit_genome_generate_ram as f64 / 1e9
+            );
+            let sa = sa_build::build_libsais(&genome)?;
+            let n_entries = sa.len();
+            for i in 0..n_entries {
                 sa_writer
-                    .write_one(packed_value)
+                    .write_one(sa.get(i))
                     .map_err(|e| Error::io(e, &sa_path))?;
-                Ok(())
-            },
-        )?;
+            }
+            (gstrand_bit, gstrand_mask, n_entries)
+        } else {
+            log::info!(
+                "Building suffix array with caps-sa external memory (libsais would need an estimated {:.1} GB, --limitGenomeGenerateRAM {:.1} GB)...",
+                sa_build::libsais_peak_bytes(sa_entries) as f64 / 1e9,
+                params.limit_genome_generate_ram as f64 / 1e9
+            );
+            sa_build::build_streaming(
+                &genome,
+                params.temp_dir.as_deref(),
+                params.genome_sa_sparse_d as u64,
+                |packed_value| {
+                    // Emit is now lightweight: just bit-pack into the SA
+                    // file. caps-sa's phase-4 emit loop is single-threaded,
+                    // so anything we do here serialises the whole build.
+                    // The SAindex is built afterwards via a parallel pass
+                    // over the on-disk SA.
+                    sa_writer
+                        .write_one(packed_value)
+                        .map_err(|e| Error::io(e, &sa_path))?;
+                    Ok(())
+                },
+            )?
+        };
         debug_assert_eq!(got_gbit, gstrand_bit);
         debug_assert_eq!(got_gmask, gstrand_mask);
         log::info!("Suffix array streamed to disk: {n_entries} entries");

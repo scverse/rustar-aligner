@@ -259,6 +259,222 @@ pub(crate) fn build_impl(
     })
 }
 
+/// Sort the sentinel-transformed text `t_prime` with **libsais** and emit the kept
+/// ACGT positions (in original coordinates) in suffix-array order via `pack_one`.
+///
+/// A suffix array is unique for a given text, so libsais's SA of `t_prime` is
+/// byte-identical to the caps-sa path's SA of the same `t_prime` — and hence to
+/// STAR's ordering (see [`build_sentinel_transformed_text`]). `t_prime` is
+/// index-aligned with `original` for its first `original.len()` positions, so the
+/// keep predicate is the same `p < n2 && original[p] < 4` used by the caps-sa arm
+/// (this drops per-segment sentinels, N, and the terminal sentinel at index `n2`).
+fn libsais_emit_kept<S>(
+    t_prime: &[S],
+    original: &[u8],
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error>
+where
+    S: libsais::SmallAlphabet,
+    i64: libsais::IsValidOutputFor<S>,
+{
+    use libsais::suffix_array::SuffixArrayConstruction;
+    let n2 = original.len();
+    let sa = SuffixArrayConstruction::for_text(t_prime)
+        .in_owned_buffer64()
+        .single_threaded()
+        .run()
+        .map_err(|e| Error::Index(format!("libsais suffix-array construction failed: {e:?}")))?;
+    for &p in sa.suffix_array() {
+        let p = p as usize;
+        if p < n2 && original[p] < 4 {
+            pack_one(p as u64)?;
+        }
+    }
+    Ok(())
+}
+
+/// Peak resident bytes libsais needs to sort `n_entries` suffixes.
+///
+/// `n_entries` is the length of the text libsais sorts, which for a genome is
+/// **both strands**, `2 * n_genome`. Callers double before calling; passing
+/// `n_genome` would understate the requirement by half.
+///
+/// libsais is an in-memory SA-IS: it holds the suffix array itself plus its
+/// working arrays. The dominant terms are the SA (`n` entries, 8 bytes each in
+/// the 64-bit path), libsais's own auxiliary array of the same shape, and the
+/// text. `2 * n * 8 + n` is the standard estimate for the 64-bit path and is
+/// what STAR's own sizing guidance amounts to.
+pub fn libsais_peak_bytes(n_entries: u64) -> u64 {
+    // SA + libsais working array, 8 bytes per entry each, plus the text.
+    n_entries.saturating_mul(17)
+}
+
+/// Whether the in-memory builder fits the caller's RAM budget.
+///
+/// This is what makes `--limitGenomeGenerateRAM` a real flag rather than one
+/// that is accepted and warned about: below the limit the fast in-memory
+/// builder runs, above it the external-memory builder does. Both produce
+/// byte-identical output, so the choice is purely about resources.
+///
+/// A limit of 0 means "no limit" and always selects libsais, matching how STAR
+/// treats a zeroed limit elsewhere.
+pub fn libsais_fits_in_ram(n_entries: u64, limit_bytes: u64) -> bool {
+    if limit_bytes == 0 {
+        return true;
+    }
+    libsais_peak_bytes(n_entries) <= limit_bytes
+}
+
+/// Build the suffix array via **libsais** instead of caps-sa.
+///
+/// libsais is a fast SA-IS construction (index-construction speedup tracked in the
+/// roadmap). It sorts the same per-segment sentinel-transformed text the caps-sa
+/// sentinel arm uses; because the suffix array is unique, the packed output is
+/// **byte-for-byte identical to [`build`]** (asserted in `build_libsais_matches_*`
+/// tests). The narrowest sentinel alphabet is chosen automatically: `u8`/`u16`
+/// small-alphabet for few segments, `i32` large-alphabet for many-segment genomes
+/// (many chromosomes + sjdb), so every genome is covered.
+///
+/// libsais builds the suffix array **in memory**; for very large sequences (e.g.
+/// the human genome) that needs substantially more RAM than caps-sa's external-
+/// memory path. [`libsais_fits_in_ram`] decides between the two from
+/// `--limitGenomeGenerateRAM`.
+pub fn build_libsais(genome: &Genome) -> Result<SuffixArray, Error> {
+    build_libsais_impl(genome, None)
+}
+
+/// Per-segment sentinel alphabet width fed to libsais.
+#[derive(Clone, Copy, Debug)]
+enum LibsaisWidth {
+    U8,
+    U16,
+    I32,
+}
+
+/// Inner libsais build with an optional forced alphabet width. Production passes
+/// `None` (narrowest width that fits); tests force the `i32` large-alphabet path on
+/// small fixtures to exercise it without a >64 K-segment genome.
+fn build_libsais_impl(genome: &Genome, force: Option<LibsaisWidth>) -> Result<SuffixArray, Error> {
+    let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
+    let gstrand_mask = (1u64 << gstrand_bit) - 1;
+    let word_length = gstrand_bit + 1;
+
+    let n_genome = genome.n_genome as usize;
+    let n2 = 2 * n_genome;
+    if genome.sequence.len() < n2 {
+        return Err(Error::Index(format!(
+            "build_libsais: genome.sequence length {} < 2 * n_genome ({n2})",
+            genome.sequence.len()
+        )));
+    }
+    let original = &genome.sequence.as_slice()[..n2];
+    let n_seg = count_spacer_runs(original);
+    let alphabet_max = SENTINEL_BASE as u32 + n_seg;
+    let n2_bit = 1u64 << gstrand_bit;
+    let n_genome_u64 = n_genome as u64;
+
+    let n_sa_kept = original.par_iter().filter(|&&b| b < 4).count();
+    let mut data = PackedArray::new(word_length, n_sa_kept);
+    let mut out_idx: usize = 0;
+    let mut pack_one = |orig_pos: u64| -> Result<(), Error> {
+        let packed = if (orig_pos as usize) < n_genome {
+            orig_pos
+        } else {
+            (orig_pos - n_genome_u64) | n2_bit
+        };
+        data.write(out_idx, packed);
+        out_idx += 1;
+        Ok(())
+    };
+
+    let width = force.unwrap_or({
+        if alphabet_max <= <u8 as SaSymbol>::MAX_REPRESENTABLE {
+            LibsaisWidth::U8
+        } else if alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
+            LibsaisWidth::U16
+        } else {
+            LibsaisWidth::I32
+        }
+    });
+
+    match width {
+        LibsaisWidth::U8 => {
+            let t_prime: Vec<u8> = build_sentinel_transformed_text(original, n_seg);
+            libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+        }
+        LibsaisWidth::U16 => {
+            let t_prime: Vec<u16> = build_sentinel_transformed_text(original, n_seg);
+            libsais_emit_kept(&t_prime, original, &mut pack_one)?;
+        }
+        LibsaisWidth::I32 => {
+            let mut t_prime: Vec<i32> = build_sentinel_transformed_text_i32(original, n_seg);
+            libsais_emit_kept_i32(&mut t_prime, original, &mut pack_one)?;
+        }
+    }
+
+    debug_assert_eq!(out_idx, n_sa_kept);
+    Ok(SuffixArray {
+        data,
+        gstrand_bit,
+        gstrand_mask,
+    })
+}
+
+/// `i32` variant of [`build_sentinel_transformed_text`] for the libsais
+/// large-alphabet path (symbols exceed `u16`). Identical layout: bases map to
+/// their code, each spacer run to a unique ascending sentinel `SENTINEL_BASE +
+/// run_idx`, and a terminal sentinel `SENTINEL_BASE + n_seg` closes the text.
+fn build_sentinel_transformed_text_i32(genome: &[u8], n_seg: u32) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(genome.len() + 1);
+    let mut run_idx: u32 = 0;
+    let mut in_run = false;
+    for &b in genome {
+        if b == SPACER {
+            in_run = true;
+            out.push((SENTINEL_BASE as u32 + run_idx) as i32);
+        } else {
+            if in_run {
+                in_run = false;
+                run_idx += 1;
+            }
+            out.push(i32::from(b));
+        }
+    }
+    if in_run {
+        run_idx += 1;
+    }
+    debug_assert_eq!(run_idx, n_seg);
+    out.push((SENTINEL_BASE as u32 + n_seg) as i32);
+    out
+}
+
+/// libsais large-alphabet SA over an `i32` sentinel-transformed text. Same kept-
+/// position filter and coordinate semantics as [`libsais_emit_kept`]; the text is
+/// passed mutably because libsais may reuse it as scratch.
+fn libsais_emit_kept_i32(
+    t_prime: &mut [i32],
+    original: &[u8],
+    mut pack_one: impl FnMut(u64) -> Result<(), Error>,
+) -> Result<(), Error> {
+    use libsais::suffix_array::SuffixArrayConstruction;
+    let n2 = original.len();
+    // `i32` text uses an `i32` SA buffer (positions must fit i32); this bounds the
+    // large-alphabet path to texts shorter than 2^31, which is fine for the
+    // many-segment genomes it targets. Huge sequences use the caps-sa ext-mem path.
+    let sa = SuffixArrayConstruction::for_text_mut(t_prime)
+        .in_owned_buffer32()
+        .single_threaded()
+        .run()
+        .map_err(|e| Error::Index(format!("libsais large-alphabet suffix-array failed: {e:?}")))?;
+    for &p in sa.suffix_array() {
+        let p = p as usize;
+        if p < n2 && original[p] < 4 {
+            pack_one(p as u64)?;
+        }
+    }
+    Ok(())
+}
+
 /// Public streaming entry. Calls `emit(packed_value)` for each SA
 /// entry in lexicographic order, packed in STAR's strand-bit
 /// encoding (forward `p → p`, reverse `p → (p - n_genome) |
@@ -1048,6 +1264,115 @@ mod tests {
         assert_eq!(sa_segmented.gstrand_bit, sa_sentinel.gstrand_bit);
     }
 
+    /// libsais must produce a **byte-identical** packed suffix array to the
+    /// caps-sa [`build`] on the same genome. The suffix array of a text is
+    /// unique, so any correct constructor over the same sentinel-transformed
+    /// text agrees — this pins libsais to the STAR-faithful ordering.
+    fn assert_libsais_matches_caps_sa(label: &str, fasta: &str, bin_nbits: u32) {
+        let genome = build_genome_from_fasta(fasta, bin_nbits);
+        let caps = build(&genome).unwrap();
+        let ls = build_libsais(&genome).unwrap();
+        assert_eq!(
+            ls.gstrand_bit, caps.gstrand_bit,
+            "gstrand_bit differs on `{label}`"
+        );
+        assert_eq!(
+            ls.data.data(),
+            caps.data.data(),
+            "libsais vs caps-sa packed SA differ on `{label}`"
+        );
+    }
+
+    #[test]
+    fn libsais_ram_estimate_and_gate() {
+        // ~17 bytes per entry: the SA and libsais's working array at 8 bytes an
+        // entry, plus the text.
+        assert_eq!(libsais_peak_bytes(1_000_000), 17_000_000);
+
+        // Yeast (12 Mb) fits in any realistic budget.
+        assert!(libsais_fits_in_ram(12_000_000, 31_000_000_000));
+        // GRCh38 (3.1 Gb, doubled for both strands) does not fit the 31 GB
+        // default, so the external-memory builder is chosen for it.
+        assert!(!libsais_fits_in_ram(6_200_000_000, 31_000_000_000));
+        // It does fit if the user says they have the RAM.
+        assert!(libsais_fits_in_ram(6_200_000_000, 128_000_000_000));
+
+        // 0 means "no limit", matching how STAR treats a zeroed limit.
+        assert!(libsais_fits_in_ram(6_200_000_000, 0));
+    }
+
+    /// The argument is a count of suffix-array entries, not of genome bases,
+    /// and the two differ by a factor of two because the text libsais sorts is
+    /// both strands. `GenomeIndex::generate_streaming` doubles before calling;
+    /// if it stopped doing so, the estimate would be half the truth and a
+    /// mammalian genome would be handed to the in-memory builder at the
+    /// default limit.
+    #[test]
+    fn the_ram_estimate_counts_suffix_array_entries_not_genome_bases() {
+        let n_genome: u64 = 3_100_000_000;
+        let sa_entries = 2 * n_genome;
+
+        assert_eq!(libsais_peak_bytes(sa_entries), 17 * sa_entries);
+        assert_eq!(libsais_peak_bytes(sa_entries), 34 * n_genome);
+
+        // At the 31 GB default the entry count declines libsais; the base
+        // count, wrongly used, would still decline it here, so pick a limit
+        // that separates them: 60 GB fits 34 * n only if you halve it.
+        assert!(!libsais_fits_in_ram(sa_entries, 60_000_000_000));
+        assert!(libsais_fits_in_ram(n_genome, 60_000_000_000));
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_single_chr() {
+        assert_libsais_matches_caps_sa("single", ">chrA\nACGTACGTACGTACGT\n", 4);
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_multi_chr_with_n() {
+        assert_libsais_matches_caps_sa(
+            "multi",
+            ">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n",
+            4,
+        );
+    }
+
+    #[test]
+    fn build_libsais_matches_caps_sa_repetitive() {
+        assert_libsais_matches_caps_sa(
+            "repeat",
+            ">chrA\nAAAAAAAAAAAAAAAA\n>chrB\nACACACACACAC\n",
+            4,
+        );
+    }
+
+    /// The libsais **large-alphabet (i32)** path must also be byte-identical to
+    /// caps-sa. Small fixtures have a tiny sentinel alphabet, so force the i32 arm
+    /// to exercise it without needing a >64 K-segment genome.
+    fn assert_libsais_i32_matches_caps_sa(label: &str, fasta: &str, bin_nbits: u32) {
+        let genome = build_genome_from_fasta(fasta, bin_nbits);
+        let caps = build(&genome).unwrap();
+        let ls = build_libsais_impl(&genome, Some(LibsaisWidth::I32)).unwrap();
+        assert_eq!(
+            ls.data.data(),
+            caps.data.data(),
+            "libsais i32 large-alphabet vs caps-sa packed SA differ on `{label}`"
+        );
+    }
+
+    #[test]
+    fn build_libsais_i32_matches_caps_sa_single_chr() {
+        assert_libsais_i32_matches_caps_sa("i32-single", ">chrA\nACGTACGTACGTACGT\n", 4);
+    }
+
+    #[test]
+    fn build_libsais_i32_matches_caps_sa_multi_chr_with_n() {
+        assert_libsais_i32_matches_caps_sa(
+            "i32-multi",
+            ">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n",
+            4,
+        );
+    }
+
     /// The streaming entry [`build_streaming`] must produce the same
     /// byte sequence as the in-memory [`build`] when its packed
     /// values are written through [`PackedStreamWriter`]. Drives both
@@ -1129,6 +1454,49 @@ mod tests {
             got,
             in_mem.data.data(),
             "streaming build's byte stream differs from in-memory build"
+        );
+    }
+
+    /// The shipping path, not a unit-test-only one.
+    ///
+    /// `GenomeIndex::generate_streaming` picks libsais from
+    /// `--limitGenomeGenerateRAM` and then pushes `SuffixArray::get(i)` into
+    /// the same [`PackedStreamWriter`] the caps-sa arm emits into. This drives
+    /// libsais exactly that way and compares the resulting bytes with the
+    /// caps-sa streaming byte stream, so the two builders are pinned together
+    /// at the level the file on disk is written, not only at the level of the
+    /// in-memory `PackedArray`.
+    #[test]
+    fn libsais_streamed_matches_the_caps_sa_stream_byte_for_byte() {
+        use crate::index::packed_stream::PackedStreamWriter;
+
+        let genome =
+            build_genome_from_fasta(">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n", 4);
+
+        let mut caps_bytes: Vec<u8> = Vec::new();
+        let caps_word_length = build_impl(&genome, false, 1).unwrap().data.word_length();
+        let mut caps_writer = PackedStreamWriter::new(&mut caps_bytes, caps_word_length);
+        let (caps_gbit, caps_gmask, caps_n) = super::build_streaming(&genome, None, 1, |pv| {
+            caps_writer.write_one(pv).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        caps_writer.finish().unwrap();
+
+        let sa = build_libsais(&genome).unwrap();
+        let mut ls_bytes: Vec<u8> = Vec::new();
+        let mut ls_writer = PackedStreamWriter::new(&mut ls_bytes, sa.data.word_length());
+        for i in 0..sa.len() {
+            ls_writer.write_one(sa.get(i)).unwrap();
+        }
+        ls_writer.finish().unwrap();
+
+        assert_eq!(sa.gstrand_bit, caps_gbit);
+        assert_eq!(sa.gstrand_mask, caps_gmask);
+        assert_eq!(sa.len(), caps_n);
+        assert_eq!(
+            ls_bytes, caps_bytes,
+            "libsais streamed byte stream differs from the caps-sa one"
         );
     }
 
