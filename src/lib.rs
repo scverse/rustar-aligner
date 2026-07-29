@@ -675,21 +675,21 @@ fn run_single_pass(
         OutStd::Sam => {
             info!("Writing SAM to stdout (--outStd SAM)");
             Box::new(crate::io::sam::SamStdoutWriter::create(
-                &index.genome,
+                index.output_genome(),
                 params,
             )?)
         }
         OutStd::BamUnsorted => {
             info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
             Box::new(crate::io::bam::BamStdoutWriter::create(
-                &index.genome,
+                index.output_genome(),
                 params,
             )?)
         }
         OutStd::BamSortedByCoordinate => {
             info!("Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)");
             Box::new(crate::io::bam::SortedBamStdoutWriter::create(
-                &index.genome,
+                index.output_genome(),
                 params,
             )?)
         }
@@ -700,7 +700,11 @@ fn run_single_pass(
                 if let Some(parent) = output_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                Box::new(SamWriter::create(&output_path, &index.genome, params)?)
+                Box::new(SamWriter::create(
+                    &output_path,
+                    index.output_genome(),
+                    params,
+                )?)
             }
             OutSamFormat::Bam => {
                 let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
@@ -716,11 +720,15 @@ fn run_single_pass(
                 if sorted {
                     Box::new(SortedBamWriter::create(
                         &output_path,
-                        &index.genome,
+                        index.output_genome(),
                         params,
                     )?)
                 } else {
-                    Box::new(BamWriter::create(&output_path, &index.genome, params)?)
+                    Box::new(BamWriter::create(
+                        &output_path,
+                        index.output_genome(),
+                        params,
+                    )?)
                 }
             }
             OutSamFormat::None => {
@@ -750,7 +758,7 @@ fn run_single_pass(
         }
         let sj_output_path = params.output_path("SJ.out.tab");
         if !sj_stats.is_empty() {
-            sj_stats.write_output(&sj_output_path, &index.genome, params)?;
+            sj_stats.write_output(&sj_output_path, index.output_genome(), params)?;
         }
         // Per-cell count matrices (raw + filtered), Summary.csv, and the SJ
         // feature matrix — written here where sj_stats is available.
@@ -801,7 +809,7 @@ fn run_single_pass(
             "Writing splice junction statistics to {}",
             sj_output_path.display()
         );
-        sj_stats.write_output(&sj_output_path, &index.genome, params)?;
+        sj_stats.write_output(&sj_output_path, index.output_genome(), params)?;
     }
 
     // 6. Print summary
@@ -829,7 +837,7 @@ fn run_two_pass(
     let pass1_path = pass1_dir.join("SJ.out.tab");
 
     info!("Writing pass 1 junctions to {}", pass1_path.display());
-    sj_stats_pass1.write_output(&pass1_path, &index.genome, params)?;
+    sj_stats_pass1.write_output(&pass1_path, index.output_genome(), params)?;
     info!(
         "Pass 1 discovered {} novel junctions",
         novel_junctions.len()
@@ -1273,8 +1281,11 @@ fn extract_junction_keys(
                 let intron_start = genome_pos;
                 let intron_end = genome_pos + intron_len as u64 - 1;
 
-                let motif =
-                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
+                let motif = scorer.detect_splice_motif(
+                    genome_pos,
+                    intron_len as u32,
+                    index.output_genome(),
+                );
                 let strand = match motif.implied_strand() {
                     Some('+') => 1u8,
                     Some('-') => 2u8,
@@ -1413,7 +1424,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         let write_file = tf
             .reopen()
             .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
-        let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
+        let (hdr, w) =
+            crate::io::sam::create_bysj_writer(write_file, index.output_genome(), params)?;
         (Some(hdr), Some(w))
     } else {
         (None, None)
@@ -1806,6 +1818,21 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         let (transcripts, chimeric_results, n_for_mapq, unmapped_reason) =
                             align_read(&clipped_seq, &read.name, &index, params)?;
 
+                        // `--genomeTransformOutput SAM`: the search ran against the
+                        // transformed genome; everything downstream — records,
+                        // junction counts, statistics — is in the original genome's
+                        // coordinates. Converting here rather than at the writer
+                        // keeps a single space below this line. An alignment that
+                        // does not convert is dropped, as STAR drops it.
+                        let transcripts: Vec<_> = if index.transform_out.is_some() {
+                            transcripts
+                                .into_iter()
+                                .filter_map(|t| index.to_output_space(t, params))
+                                .collect()
+                        } else {
+                            transcripts
+                        };
+
                         // Collect chimeric alignments if enabled
                         if params.chim_segment_min > 0 {
                             chimeric_alns.extend(chimeric_results);
@@ -1891,7 +1918,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     clip5p,
                                     clip3p,
                                     &transcripts,
-                                    &index.genome,
+                                    index.output_genome(),
                                     params,
                                     n_for_mapq,
                                 )?;
@@ -2637,7 +2664,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     clip5p_m2,
                                     clip3p_m2,
                                     &paired_alns,
-                                    &index.genome,
+                                    index.output_genome(),
                                     params,
                                     n_for_mapq,
                                 )?;
@@ -2751,7 +2778,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         let write_file = tf
             .reopen()
             .map_err(|e| anyhow::anyhow!("BySJout: temp file reopen error: {e}"))?;
-        let (hdr, w) = crate::io::sam::create_bysj_writer(write_file, &index.genome, params)?;
+        let (hdr, w) =
+            crate::io::sam::create_bysj_writer(write_file, index.output_genome(), params)?;
         (Some(hdr), Some(w))
     } else {
         (None, None)
@@ -3157,6 +3185,19 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         let (results, pe_chimeric, n_for_mapq, unmapped_reason) =
                             align_paired_read(&m1_seq, &m2_seq, &paired_read.name, &index, params)?;
 
+                        // `--genomeTransformOutput SAM`: as in the single-end path,
+                        // move to the original genome's coordinates before anything
+                        // reads the transcripts. A pair whose mates do not both
+                        // convert is dropped whole rather than half-reported.
+                        let results: Vec<_> = if index.transform_out.is_some() {
+                            results
+                                .into_iter()
+                                .filter_map(|r| transform_pair_result(r, &index, params))
+                                .collect()
+                        } else {
+                            results
+                        };
+
                         // Classify the result for stats and SAM output
                         let has_half_mapped = results
                             .iter()
@@ -3334,7 +3375,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                     m2_clip3p,
                                     mapped_transcript,
                                     *mate1_is_mapped,
-                                    &index.genome,
+                                    index.output_genome(),
                                     params,
                                     n_for_mapq,
                                 )?;
@@ -3360,7 +3401,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 m2_clip5p,
                                 m2_clip3p,
                                 &paired_alns,
-                                &index.genome,
+                                index.output_genome(),
                                 params,
                                 n_for_mapq,
                             )?;
@@ -3480,6 +3521,45 @@ struct ReadJunction {
 /// `is_unique` reflects the read's overall mapping multiplicity (n_loci == 1),
 /// not per-locus. Recording per-locus/per-mate instead double-counts junctions
 /// crossed by both mates of a pair, inflating the SJ.out.tab multi counts.
+/// Move one paired result into the output coordinate space under
+/// `--genomeTransformOutput SAM`.
+///
+/// A `BothMapped` pair is kept only if both mates convert: reporting one mate
+/// in original coordinates and dropping the other would turn a pair into a
+/// half-mapped read that never existed. The insert size is recomputed from the
+/// converted mates, since the transform can change the distance between them.
+fn transform_pair_result(
+    result: crate::align::read_align::PairedAlignmentResult,
+    index: &crate::index::GenomeIndex,
+    params: &Parameters,
+) -> Option<crate::align::read_align::PairedAlignmentResult> {
+    use crate::align::read_align::PairedAlignmentResult;
+    match result {
+        PairedAlignmentResult::BothMapped(pa) => {
+            let mut pa = *pa;
+            let m1 = index.to_output_space(pa.mate1_transcript, params)?;
+            let m2 = index.to_output_space(pa.mate2_transcript, params)?;
+            let (lo, hi) = if m1.genome_start <= m2.genome_start {
+                (&m1, &m2)
+            } else {
+                (&m2, &m1)
+            };
+            let span = (hi.genome_end - lo.genome_start) as i32;
+            pa.insert_size = if pa.insert_size < 0 { -span } else { span };
+            pa.mate1_transcript = m1;
+            pa.mate2_transcript = m2;
+            Some(PairedAlignmentResult::BothMapped(Box::new(pa)))
+        }
+        PairedAlignmentResult::HalfMapped {
+            mapped_transcript,
+            mate1_is_mapped,
+        } => Some(PairedAlignmentResult::HalfMapped {
+            mapped_transcript: index.to_output_space(mapped_transcript, params)?,
+            mate1_is_mapped,
+        }),
+    }
+}
+
 fn record_read_junctions<'a>(
     transcripts: impl IntoIterator<Item = &'a crate::align::transcript::Transcript>,
     index: &crate::index::GenomeIndex,
@@ -3561,8 +3641,11 @@ fn extract_transcript_junctions(
                 let intron_end = genome_pos + intron_len as u64 - 1;
 
                 // Detect splice motif
-                let motif =
-                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
+                let motif = scorer.detect_splice_motif(
+                    genome_pos,
+                    intron_len as u32,
+                    index.output_genome(),
+                );
 
                 // Compute overhang: min(left_exon_length, right_exon_length)
                 let left_exon = exon_lengths[junction_idx];

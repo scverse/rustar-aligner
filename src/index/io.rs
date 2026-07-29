@@ -6,6 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::index::GenomeIndex;
+use crate::index::TransformOut;
 use crate::index::packed_array::PackedArray;
 use crate::index::sa_index::SaIndex;
 use crate::index::suffix_array::SuffixArray;
@@ -138,6 +139,15 @@ impl GenomeIndex {
             );
         }
 
+        // `--genomeTransformOutput SAM`: the original genome and the block map
+        // needed to report alignments in its coordinates rather than the
+        // transformed ones the search runs against.
+        let transform_out = if params.transform_output_sam() {
+            Some(load_transform_out(genome_dir, params)?)
+        } else {
+            None
+        };
+
         Ok(GenomeIndex {
             genome,
             suffix_array,
@@ -146,8 +156,69 @@ impl GenomeIndex {
             transcriptome,
             prepared_junctions,
             sjdb_overhang,
+            transform_out,
         })
     }
+}
+
+/// Load everything `--genomeTransformOutput SAM` needs: the untransformed
+/// genome written to `OriginalGenome/` at build time, its annotated junctions,
+/// and the `transformGenomeBlocks.tsv` conversion map.
+///
+/// Both files exist only in an index built with `--genomeTransformType`, so a
+/// missing one means the flag was asked for against an ordinary index. That is
+/// an error rather than a silent fallback: falling back would report
+/// transformed coordinates while claiming they are original.
+fn load_transform_out(genome_dir: &Path, params: &Parameters) -> Result<TransformOut, Error> {
+    let blocks_path = genome_dir.join("transformGenomeBlocks.tsv");
+    let text = std::fs::read_to_string(&blocks_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Index(format!(
+                "--genomeTransformOutput SAM needs {}, which is only written by a \
+                 --genomeTransformType genomeGenerate run",
+                blocks_path.display()
+            ))
+        } else {
+            Error::io(e, &blocks_path)
+        }
+    })?;
+    let blocks = crate::genome::transform::blocks_from_tsv(&text)?;
+
+    let orig_dir = genome_dir.join("OriginalGenome");
+    if !orig_dir.join("chrName.txt").exists() {
+        return Err(Error::Index(format!(
+            "--genomeTransformOutput SAM needs the untransformed index in {}",
+            orig_dir.display()
+        )));
+    }
+    let genome = load_genome(&orig_dir, params)?;
+
+    // The original genome's annotated junctions, for the motif/annotation flags
+    // recomputed after the back-transform. Absent when the index was built
+    // without a GTF, in which case every junction is novel there too.
+    let sjdb_info_path = orig_dir.join("sjdbInfo.txt");
+    let junctions = if sjdb_info_path.exists() {
+        let tab = sjdb_insert::read_sjdb_info_tab(&sjdb_info_path, &genome)?;
+        let raw: Vec<(usize, u64, u64, u8)> = tab
+            .junctions
+            .iter()
+            .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
+            .collect();
+        SpliceJunctionDb::from_raw_junctions(&raw)
+    } else {
+        SpliceJunctionDb::empty()
+    };
+
+    log::info!(
+        "genomeTransformOutput SAM: original genome {} chromosomes, {} conversion blocks",
+        genome.n_chr_real,
+        blocks.len() - 1, // the sentinel is not a block
+    );
+    Ok(TransformOut {
+        genome,
+        junctions,
+        blocks,
+    })
 }
 
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
