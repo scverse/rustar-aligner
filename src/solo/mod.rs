@@ -104,27 +104,48 @@ impl Anchored {
 
 /// Locate `adapter` in `seq`, allowing up to `max_mm` mismatches.
 ///
-/// Returns the half-open `(start, end)` of the first position that fits, which
-/// is what STAR takes: the leftmost acceptable match, not the best-scoring one.
+/// STAR's `localAlignHammingDist` (`SequenceFuns.cpp:341`), called from
+/// `SoloReadBarcode_getCBandUMI.cpp:340`. Three details decide the result and
+/// none of them are optional:
+///
+/// * It is **best-scoring, not leftmost**. Every offset is scored and the one
+///   with the fewest mismatches wins. An early offset that merely fits the
+///   budget loses to a later exact match, and since the barcode positions are
+///   measured from the adapter, picking the wrong offset shifts the whole
+///   barcode.
+/// * Ties go to the **leftmost** of the best, because STAR replaces its best
+///   only on a strictly smaller distance.
+/// * An `N` in the adapter never counts as a mismatch. It is a wildcard in the
+///   query, not a base that fails to match.
+///
+/// STAR seeds its best distance with the adapter length, so an offset that
+/// mismatches at every position can never win; that only matters when the
+/// budget is as large as the adapter, where it keeps the answer `None` instead
+/// of an arbitrary offset.
 fn find_adapter(seq: &[u8], adapter: &[u8], max_mm: usize) -> Option<(usize, usize)> {
     if adapter.is_empty() || adapter.len() > seq.len() {
         return None;
     }
+    const N_CODE: u8 = 4;
+    let mut best = adapter.len();
+    let mut best_start = None;
     for start in 0..=(seq.len() - adapter.len()) {
         let mut mm = 0usize;
         for (a, b) in seq[start..start + adapter.len()].iter().zip(adapter) {
-            if a != b {
+            if *b != N_CODE && a != b {
                 mm += 1;
-                if mm > max_mm {
-                    break;
+                if mm >= best {
+                    break; // cannot beat the incumbent
                 }
             }
         }
-        if mm <= max_mm {
-            return Some((start, start + adapter.len()));
+        if mm < best {
+            best = mm;
+            best_start = Some(start);
         }
     }
-    None
+    let start = best_start?;
+    (best <= max_mm).then_some((start, start + adapter.len()))
 }
 
 fn parse_position(spec: &str) -> Result<(usize, usize), Error> {
@@ -1323,15 +1344,43 @@ mod tests {
         assert!(layout.extract(&read).is_none());
     }
 
+    /// The discriminating case: an early offset that fits the budget against a
+    /// later one that fits it better. STAR scores every offset and keeps the
+    /// best, so the later exact match wins. Taking the first acceptable one
+    /// instead would anchor the barcode four bases off.
     #[test]
-    fn find_adapter_takes_the_leftmost_acceptable_match() {
-        // Two copies of ACGT; STAR takes the first that fits, not the best.
+    fn find_adapter_takes_the_best_scoring_match_not_the_leftmost() {
+        // ACGT at 0 with one mismatch, ACGT exactly at 5.
+        let seq = [0u8, 1, 2, 0, 9, 0, 1, 2, 3];
+        assert_eq!(find_adapter(&seq, &[0, 1, 2, 3], 1), Some((5, 9)));
+    }
+
+    /// Among equally good offsets STAR keeps the first, because it replaces its
+    /// best only on a strictly smaller distance.
+    #[test]
+    fn find_adapter_breaks_ties_leftmost() {
         let seq = [0u8, 1, 2, 3, 9, 0, 1, 2, 3];
         assert_eq!(find_adapter(&seq, &[0, 1, 2, 3], 0), Some((0, 4)));
+    }
+
+    /// An `N` in the adapter is a wildcard in STAR's query, not a base that
+    /// fails to match, so it costs nothing against any read base.
+    #[test]
+    fn an_n_in_the_adapter_is_not_a_mismatch() {
+        let seq = [0u8, 1, 2, 3];
+        // N at position 1 matches C without spending the budget.
+        assert_eq!(find_adapter(&seq, &[0, 4, 2, 3], 0), Some((0, 4)));
+    }
+
+    #[test]
+    fn find_adapter_rejects_what_cannot_match() {
         // Budget 0 and no exact match anywhere.
         assert_eq!(find_adapter(&[2u8; 8], &[0, 1, 2, 3], 0), None);
         // An adapter longer than the read cannot match.
         assert_eq!(find_adapter(&[0u8, 1], &[0, 1, 2, 3], 4), None);
+        // Every position mismatches everywhere: STAR seeds its best distance
+        // with the adapter length, so nothing wins even at a budget that large.
+        assert_eq!(find_adapter(&[2u8; 8], &[0, 0, 0, 0], 4), None);
     }
 
     #[test]
