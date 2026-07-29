@@ -3023,6 +3023,74 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
     transcripts
 }
 
+/// Collapse window alignments that are redundant copies of one another before
+/// the recursive stitcher runs.
+///
+/// For each diagonal (`genome_pos - positive_strand_read_start`), overlapping
+/// entries are merged into intervals and only the longest entry of each merged
+/// interval is kept. Without this the stitcher's include/exclude recursion
+/// explodes on the many redundant seeds that cover the same diagonal.
+///
+/// The grouping key is `(diagonal, mate_id, sjA)`, which is what STAR's
+/// `assignAlignToWindow` compares before treating two aligns as duplicates: it
+/// guards the overlap test with both `aFrag == WA[iA][WA_iFrag]` and
+/// `sjA == WA[iA][WA_sjA]`. Entries split out of *different* annotated
+/// junctions are therefore never duplicates of each other, even when they sit
+/// on the same diagonal and cover the same read bases.
+fn dedup_wa_by_diagonal(wa_entries: &mut Vec<WindowAlignment>, read_len: usize, is_rev: bool) {
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    type DiagKey = (i64, u8, i64);
+    type DiagSeeds = Vec<(usize, usize, usize)>;
+    let mut diag_seeds: FxHashMap<DiagKey, DiagSeeds> = FxHashMap::default();
+    for (idx, wa) in wa_entries.iter().enumerate() {
+        let ps = if is_rev {
+            read_len - (wa.length + wa.read_pos)
+        } else {
+            wa.read_pos
+        };
+        let diag = wa.genome_pos as i64 - ps as i64;
+        diag_seeds
+            .entry((diag, wa.mate_id, wa.sj_a))
+            .or_default()
+            .push((ps, ps + wa.length, idx));
+    }
+
+    let mut keep_indices = FxHashSet::default();
+    for (_key, mut seeds) in diag_seeds {
+        seeds.sort_unstable();
+        let mut merged_end = seeds[0].1;
+        let mut best_idx = seeds[0].2;
+        let mut best_len = seeds[0].1 - seeds[0].0;
+
+        for &(s, e, idx) in &seeds[1..] {
+            if s <= merged_end {
+                // Overlapping: extend the interval, track the longest entry in it.
+                merged_end = merged_end.max(e);
+                let len = e - s;
+                if len > best_len {
+                    best_len = len;
+                    best_idx = idx;
+                }
+            } else {
+                // Disjoint: commit the previous interval's best and start a new one.
+                keep_indices.insert(best_idx);
+                merged_end = e;
+                best_len = e - s;
+                best_idx = idx;
+            }
+        }
+        keep_indices.insert(best_idx);
+    }
+
+    let mut idx = 0usize;
+    wa_entries.retain(|_| {
+        let keep = keep_indices.contains(&idx);
+        idx += 1;
+        keep
+    });
+}
+
 /// Shared core: preprocessing + recursive stitcher, returns working transcripts + context.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stitch_seeds_core(
@@ -3044,72 +3112,7 @@ pub(crate) fn stitch_seeds_core(
     // of repetitive seeds, matching STAR's WA_Anchor=2 "last anchor" logic.
     let mut wa_entries: Vec<WindowAlignment> = cluster.alignments.clone();
 
-    // Diagonal dedup: for each diagonal (genome_pos - ps_rstart), merge overlapping
-    // seeds into intervals, keeping only the longest seed per merged interval.
-    // This prevents combinatorial explosion in the recursive stitcher when many
-    // redundant seeds cover the same diagonal region.
-    // Uses positive-strand coordinates consistent with cluster_seeds overlap detection.
-    {
-        use rustc_hash::{FxHashMap, FxHashSet};
-        let read_len = read_seq.len();
-        let is_rev = cluster.is_reverse;
-        // For each (diagonal, mate_id) pair, find the longest seed per merged interval.
-        // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] before overlap test:
-        // seeds from different fragments are never treated as duplicates.
-        type DiagMateKey = (i64, u8);
-        type DiagSeeds = Vec<(usize, usize, usize)>;
-        let mut diag_seeds: FxHashMap<DiagMateKey, DiagSeeds> = FxHashMap::default();
-        for (idx, wa) in wa_entries.iter().enumerate() {
-            let ps = if is_rev {
-                read_len - (wa.length + wa.read_pos)
-            } else {
-                wa.read_pos
-            };
-            let diag = wa.genome_pos as i64 - ps as i64;
-            diag_seeds
-                .entry((diag, wa.mate_id))
-                .or_default()
-                .push((ps, ps + wa.length, idx));
-        }
-
-        let mut keep_indices = FxHashSet::default();
-        for (_diag, mut seeds) in diag_seeds {
-            // Sort by start position
-            seeds.sort_unstable();
-            // Merge intervals, keeping the index of the longest seed in each merged group
-            let mut merged_end = seeds[0].1;
-            let mut best_idx = seeds[0].2;
-            let mut best_len = seeds[0].1 - seeds[0].0;
-
-            for &(s, e, idx) in &seeds[1..] {
-                if s <= merged_end {
-                    // Overlapping — extend and track longest
-                    merged_end = merged_end.max(e);
-                    let len = e - s;
-                    if len > best_len {
-                        best_len = len;
-                        best_idx = idx;
-                    }
-                } else {
-                    // New interval — commit previous best
-                    keep_indices.insert(best_idx);
-                    merged_end = e;
-                    best_len = e - s;
-                    best_idx = idx;
-                }
-            }
-            // Commit last group
-            keep_indices.insert(best_idx);
-        }
-
-        // Retain only the kept indices
-        let mut idx = 0usize;
-        wa_entries.retain(|_| {
-            let keep = keep_indices.contains(&idx);
-            idx += 1;
-            keep
-        });
-    }
+    dedup_wa_by_diagonal(&mut wa_entries, read_seq.len(), cluster.is_reverse);
 
     // STAR-faithful coordinate conversion for stitching:
     // STAR stores WA_gStart in FORWARD genome coordinates (converting RC positions via
@@ -3185,8 +3188,15 @@ pub(crate) fn stitch_seeds_core(
         );
         for (i, wa) in wa_entries.iter().enumerate().take(30) {
             eprintln!(
-                "  wa[{}]: read_pos={}, sa_pos={}, genome_pos={}, length={}, anchor={}, mate={}",
-                i, wa.read_pos, wa.sa_pos, wa.genome_pos, wa.length, wa.is_anchor, wa.mate_id
+                "  wa[{}]: read_pos={}, sa_pos={}, genome_pos={}, length={}, anchor={}, mate={}, sjA={}",
+                i,
+                wa.read_pos,
+                wa.sa_pos,
+                wa.genome_pos,
+                wa.length,
+                wa.is_anchor,
+                wa.mate_id,
+                wa.sj_a
             );
         }
         if wa_entries.len() > 30 {
@@ -3379,6 +3389,65 @@ mod tests {
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
+
+    fn wa(read_pos: usize, length: usize, genome_pos: u64, sj_a: i64) -> WindowAlignment {
+        WindowAlignment {
+            seed_idx: 0,
+            read_pos,
+            length,
+            genome_pos,
+            sa_pos: genome_pos,
+            n_rep: 1,
+            is_anchor: true,
+            mate_id: 2,
+            pre_ext_score: length as i32,
+            sj_a,
+        }
+    }
+
+    /// A read whose last exon is a few bases long produces two window
+    /// alignments covering the same donor-side bases: one tagged with the
+    /// annotated junction the read arrives on, one tagged with the junction it
+    /// leaves by. STAR keeps both, because `assignAlignToWindow` only treats
+    /// two aligns as duplicates when their `sjA` match as well as their
+    /// fragment and diagonal.
+    ///
+    /// Keying the dedup on the diagonal alone dropped the departing copy, which
+    /// left the micro-exon entry without a partner carrying the same `sjA`, so
+    /// the terminal exon came out soft-clipped instead of spliced.
+    #[test]
+    fn same_diagonal_entries_from_different_junctions_both_survive() {
+        let mut entries = vec![
+            wa(61, 36, 14_434_354, 348),
+            wa(61, 36, 14_434_354, 349),
+            wa(97, 3, 14_436_873, 349),
+        ];
+        dedup_wa_by_diagonal(&mut entries, 100, false);
+
+        assert_eq!(entries.len(), 3, "no entry may be dropped: {entries:?}");
+        let tags: Vec<i64> = entries.iter().map(|e| e.sj_a).collect();
+        assert!(tags.contains(&348) && tags.contains(&349));
+        assert!(
+            entries.iter().any(|e| e.length == 3 && e.sj_a == 349),
+            "the micro-exon entry must keep a partner with the same sjA"
+        );
+    }
+
+    /// The dedup still collapses what it is there to collapse: redundant
+    /// overlapping copies on one diagonal that carry the same `sjA`.
+    #[test]
+    fn same_diagonal_overlapping_entries_collapse_to_the_longest() {
+        let mut entries = vec![
+            wa(0, 20, 1000, -1),
+            wa(5, 40, 1005, -1),
+            wa(80, 10, 1080, -1),
+        ];
+        dedup_wa_by_diagonal(&mut entries, 100, false);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].length, 40, "longest of the merged interval wins");
+        assert_eq!(entries[1].read_pos, 80, "the disjoint interval survives");
+    }
 
     fn make_simple_index() -> GenomeIndex {
         // Simple genome: ACGTACGTNN (10 bases)
