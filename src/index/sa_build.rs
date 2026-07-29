@@ -1457,6 +1457,49 @@ mod tests {
         );
     }
 
+    /// The shipping path, not a unit-test-only one.
+    ///
+    /// `GenomeIndex::generate_streaming` picks libsais from
+    /// `--limitGenomeGenerateRAM` and then pushes `SuffixArray::get(i)` into
+    /// the same [`PackedStreamWriter`] the caps-sa arm emits into. This drives
+    /// libsais exactly that way and compares the resulting bytes with the
+    /// caps-sa streaming byte stream, so the two builders are pinned together
+    /// at the level the file on disk is written, not only at the level of the
+    /// in-memory `PackedArray`.
+    #[test]
+    fn libsais_streamed_matches_the_caps_sa_stream_byte_for_byte() {
+        use crate::index::packed_stream::PackedStreamWriter;
+
+        let genome =
+            build_genome_from_fasta(">chrA\nACGTACGTAC\n>chrB\nGGGGCCCC\n>chrC\nNNACGTNN\n", 4);
+
+        let mut caps_bytes: Vec<u8> = Vec::new();
+        let caps_word_length = build_impl(&genome, false, 1).unwrap().data.word_length();
+        let mut caps_writer = PackedStreamWriter::new(&mut caps_bytes, caps_word_length);
+        let (caps_gbit, caps_gmask, caps_n) = super::build_streaming(&genome, None, 1, |pv| {
+            caps_writer.write_one(pv).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        caps_writer.finish().unwrap();
+
+        let sa = build_libsais(&genome).unwrap();
+        let mut ls_bytes: Vec<u8> = Vec::new();
+        let mut ls_writer = PackedStreamWriter::new(&mut ls_bytes, sa.data.word_length());
+        for i in 0..sa.len() {
+            ls_writer.write_one(sa.get(i)).unwrap();
+        }
+        ls_writer.finish().unwrap();
+
+        assert_eq!(sa.gstrand_bit, caps_gbit);
+        assert_eq!(sa.gstrand_mask, caps_gmask);
+        assert_eq!(sa.len(), caps_n);
+        assert_eq!(
+            ls_bytes, caps_bytes,
+            "libsais streamed byte stream differs from the caps-sa one"
+        );
+    }
+
     #[test]
     fn segmented_arm_matches_sentinel_arm_byte_for_byte_three_chrs() {
         // Three chromosomes including one with internal N's.
