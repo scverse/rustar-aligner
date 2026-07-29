@@ -2024,3 +2024,111 @@ fn test_wasp_samtag() {
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --genomeType SuperTranscriptome
+// ---------------------------------------------------------------------------
+
+/// The condensed index holds only exonic sequence, so a read spanning the
+/// planted intron aligns without an `N` operation: in the condensed genome the
+/// two exons are contiguous.
+#[test]
+fn test_genome_type_supertranscriptome_condenses_to_exons() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome_st");
+    fs::create_dir_all(&genome_dir).unwrap();
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "genomeGenerate",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--genomeFastaFiles",
+            fasta.to_str().unwrap(),
+            "--genomeSAindexNbases",
+            "5",
+            "--genomeType",
+            "SuperTranscriptome",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--sjdbOverhang",
+            "24",
+        ])
+        .assert()
+        .success();
+
+    // The two annotated exons are the whole reference now.
+    let chr_names = fs::read_to_string(genome_dir.join("chrName.txt")).unwrap();
+    assert_eq!(chr_names.trim(), "st0");
+    let chr_lengths = fs::read_to_string(genome_dir.join("chrLength.txt")).unwrap();
+    assert_eq!(
+        chr_lengths.trim(),
+        "100",
+        "50 bp of exon 1 plus 50 bp of exon 2, and none of the 200 bp intron"
+    );
+
+    // The side files STAR writes alongside the condensed index.
+    let super_fasta =
+        fs::read_to_string(genome_dir.join("superTranscriptSequences.fasta")).unwrap();
+    assert!(super_fasta.starts_with(">st0\n"));
+    let expected: String = genome[10000..10050]
+        .iter()
+        .chain(genome[10250..10300].iter())
+        .map(|&b| b as char)
+        .collect();
+    assert_eq!(super_fasta.trim_end(), format!(">st0\n{expected}"));
+
+    let conversion =
+        fs::read_to_string(genome_dir.join("fullGenome/conversionToFullGenome.tsv")).unwrap();
+    let mut lines = conversion.lines();
+    assert_eq!(lines.next().unwrap().split('\t').next().unwrap(), "2");
+    assert_eq!(lines.next().unwrap(), "0\t50\t10000");
+    assert_eq!(lines.next().unwrap(), "50\t50\t10250");
+
+    assert!(genome_dir.join("transcriptSequences.fasta").exists());
+    assert!(genome_dir.join("superTranscriptSJcollapsed.tsv").exists());
+
+    // A read straddling the junction aligns end to end, no intron to cross.
+    let mut read = genome[10025..10050].to_vec();
+    read.extend_from_slice(&genome[10250..10275]);
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        writeln!(f, "@spanning").unwrap();
+        f.write_all(&read).unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "+").unwrap();
+        writeln!(f, "{}", "I".repeat(read.len())).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_st");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let sam = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    let record = sam
+        .lines()
+        .find(|l| !l.starts_with('@'))
+        .expect("the spanning read should align");
+    let fields: Vec<&str> = record.split('\t').collect();
+    assert_eq!(fields[2], "st0");
+    assert_eq!(fields[3], "26", "25 bases into exon 1, 1-based");
+    assert_eq!(fields[5], "50M", "contiguous in the condensed genome");
+}

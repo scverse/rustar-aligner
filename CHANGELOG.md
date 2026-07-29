@@ -97,6 +97,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
+- **`--genomeType SuperTranscriptome`** condenses the genome to the union
+  of its annotated exons: overlapping exons are merged, the merged
+  intervals concatenated, and overlapping transcripts grouped into
+  superTranscripts, one per condensed chromosome (`st0`, `st1`, ...).
+  The index then covers only exonic sequence, and introns cannot be
+  crossed because they are not present. Requires `--sjdbGTFfile`.
+  Writes `superTranscriptSequences.fasta`, `transcriptSequences.fasta`,
+  `superTranscriptSJcollapsed.tsv` and
+  `fullGenome/conversionToFullGenome.tsv` alongside the index.
+
+  Diverges from STAR on minus-strand exons, deliberately. STAR condenses
+  the sequence before filling the reverse-complement half of its genome
+  buffer, so minus-strand superTranscripts read uninitialised memory;
+  here they hold the actual reverse complement. Recorded in
+  `docs-old/dev/divergences.md` and locked by a test asserting the
+  hand-derived sequence.
+
 ### Bug fixes
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching

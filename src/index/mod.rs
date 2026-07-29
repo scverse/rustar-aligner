@@ -53,6 +53,8 @@ struct BuildPrep {
     junction_db: SpliceJunctionDb,
     transcriptome: Option<TranscriptomeIndex>,
     prepared_junctions: Vec<PreparedJunction>,
+    /// The condensed-genome side files, under `--genomeType SuperTranscriptome`.
+    super_transcriptome: Option<crate::genome::supertranscript::SuperTranscriptome>,
 }
 
 impl GenomeIndex {
@@ -63,6 +65,7 @@ impl GenomeIndex {
             junction_db,
             transcriptome,
             prepared_junctions,
+            super_transcriptome: _, // side files are written by the streaming path
         } = Self::build_prep(params)?;
 
         log::info!("Building suffix array...");
@@ -131,6 +134,7 @@ impl GenomeIndex {
             junction_db: _,
             transcriptome,
             prepared_junctions,
+            super_transcriptome,
         } = Self::build_prep(params)?;
 
         let dir = &params.genome_dir;
@@ -140,6 +144,23 @@ impl GenomeIndex {
 
         log::info!("Writing genome files to {}...", dir.display());
         genome.write_index_files(dir, params)?;
+
+        // The four condensed-genome files STAR writes alongside the index.
+        // `conversionToFullGenome.tsv` goes under `fullGenome/`, where STAR
+        // puts it, since it describes the genome this one was condensed from.
+        if let Some(ref st) = super_transcriptome {
+            let write = |name: &str, bytes: &[u8]| -> Result<(), Error> {
+                let path = dir.join(name);
+                fs::write(&path, bytes).map_err(|e| Error::io(e, &path))
+            };
+            write("superTranscriptSequences.fasta", &st.supertranscript_fasta)?;
+            write("transcriptSequences.fasta", &st.transcript_fasta)?;
+            write("superTranscriptSJcollapsed.tsv", &st.sj_collapsed_tsv)?;
+            let full = dir.join("fullGenome");
+            fs::create_dir_all(&full).map_err(|e| Error::io(e, &full))?;
+            let path = full.join("conversionToFullGenome.tsv");
+            fs::write(&path, &st.conversion_tsv).map_err(|e| Error::io(e, &path))?;
+        }
 
         let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
         let gstrand_mask = (1u64 << gstrand_bit) - 1;
@@ -272,6 +293,46 @@ impl GenomeIndex {
             genome.n_genome
         );
 
+        // `--genomeType SuperTranscriptome`: replace the genome with the union
+        // of its annotated exons before anything else looks at it. Everything
+        // downstream — transcriptome tables, junctions, suffix array — then
+        // works on the condensed genome without knowing it is condensed,
+        // because the annotation comes back addressed to it.
+        let super_transcriptome = if params.genome_type == "SuperTranscriptome" {
+            let gtf_path = params.sjdb_gtf_file.as_ref().ok_or_else(|| {
+                Error::Index(
+                    "--genomeType SuperTranscriptome requires --sjdbGTFfile: there is nothing \
+                     to condense without an annotation"
+                        .to_string(),
+                )
+            })?;
+            let records = crate::junction::gtf::parse_gtf_configured(
+                gtf_path,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+            )?;
+            let st = crate::genome::supertranscript::condense(
+                &genome,
+                &records,
+                &params.sjdb_gtf_tag_exon_parent_transcript,
+                params.genome_chr_bin_nbits,
+            )?;
+            log::info!(
+                "SuperTranscriptome: {} chromosomes condensed to {} superTranscripts",
+                genome.n_chr_real,
+                st.chromosomes.len()
+            );
+            let full_size = genome.n_genome;
+            genome = Genome::from_chromosomes(&st.chromosomes, params.genome_chr_bin_nbits, None)?;
+            log::info!(
+                "Condensed genome: {} bytes, down from {full_size}",
+                genome.n_genome
+            );
+            Some(st)
+        } else {
+            None
+        };
+
         // Parse GTF once and share the result between the junction database,
         // the transcriptome index, and the sjdb insertion pipeline. Junction
         // preparation + Gsj append must happen BEFORE the suffix array is
@@ -283,11 +344,17 @@ impl GenomeIndex {
         let mut transcriptome = None;
 
         if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            let exons = crate::junction::gtf::parse_gtf_configured(
-                gtf_path,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-            )?;
+            // Under SuperTranscriptome the annotation was already rewritten
+            // into condensed coordinates; re-parsing the GTF here would
+            // address chromosomes the genome no longer has.
+            let exons = match &super_transcriptome {
+                Some(st) => st.exons.clone(),
+                None => crate::junction::gtf::parse_gtf_configured(
+                    gtf_path,
+                    &params.sjdb_gtf_feature_exon,
+                    &params.sjdb_gtf_chr_prefix,
+                )?,
+            };
             log::debug!("Parsed {} exon features from GTF", exons.len());
 
             let tr = TranscriptomeIndex::from_gtf_exons_configured(
@@ -375,6 +442,7 @@ impl GenomeIndex {
             junction_db,
             transcriptome,
             prepared_junctions,
+            super_transcriptome,
         })
     }
 
