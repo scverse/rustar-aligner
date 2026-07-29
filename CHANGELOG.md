@@ -13,6 +13,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **CellRanger4 3' poly-A trim** (`clip::cellranger4::poly_tail_3p`) and the
+  `--clipAdapterType CellRanger4` clip plumbing, plus `--clip5pAdapterSeq` and
+  `--clip5pAdapterMMp`. The 5' TSO trim is an overlap alignment and waits on a
+  dedicated deterministic-SIMD crate, so `CellRanger4` is still rejected at
+  parse time rather than half-applied.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
