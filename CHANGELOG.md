@@ -97,19 +97,6 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
-- **`--genomeTransformOutput SAM`** reports alignments in the original
-  genome's coordinates. `--genomeTransformType Haploid` bakes a VCF's
-  variants into the genome, so reads carrying those alleles align
-  without mismatches, but every reported coordinate then refers to a
-  genome nobody else has. This maps each alignment back through the
-  conversion blocks written at build time: an indel baked into the
-  sequence reappears as an `I`/`D` CIGAR operation at the original
-  position, and junction motifs are reclassified against the original
-  genome rather than the transformed one. The SAM header comes from
-  the original genome too. `SJ` and `Quant` remain unimplemented and
-  are refused, as are the flag combinations whose other outputs would
-  stay in transformed coordinates.
-
 - **`--genomeType SuperTranscriptome`** condenses the genome to the union
   of its annotated exons: overlapping exons are merged, the merged
   intervals concatenated, and overlapping transcripts grouped into

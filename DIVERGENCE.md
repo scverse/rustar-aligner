@@ -30,6 +30,18 @@ This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast b
 
 **Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`), `src/params/mod.rs` (`MultimapperOrder`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlignChunk` RNG seeding.
 
+### 1.2 `--genomeType SuperTranscriptome` minus-strand sequence
+
+**What STAR does.** `GTF::superTranscript` builds the condensed sequence by reading the doubled genome buffer `G`, reflecting minus-strand exons into its second half. That half is not filled until roughly twenty-five lines later in `Genome_genomeGenerate.cpp`. Every minus-strand exon therefore reads the allocation's spacer bytes, and a minus-strand superTranscript comes out as uninitialised memory rather than sequence.
+
+**What rustar-aligner does.** The reverse-complement half is already filled when condensing runs, so a minus-strand exon yields its actual reverse complement.
+
+**Why.** STAR's output on this path is not a rule; it is a read of memory that has not been written. Reproducing it would mean writing code whose correct behaviour is to emit garbage, and a test asserting that garbage.
+
+**Impact.** Any annotation containing minus-strand transcripts — which is essentially all of them. A superTranscript built here holds real sequence where STAR's holds spacer bytes, so the two indices differ for those transcripts and the alignments against them are not comparable.
+
+**Source.** `src/genome/supertranscript.rs`, locked by `minus_strand_supertranscript_is_reverse_complement_not_spacer`, which asserts the hand-derived reverse complement of a non-palindromic exon and that no `0x00` byte reaches the output. STAR: `GTF_superTranscript.cpp`, `Genome_genomeGenerate.cpp`.
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR
