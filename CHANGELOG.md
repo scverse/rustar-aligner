@@ -13,6 +13,36 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`rustar-aligner-long`, mirroring STAR's STARlong**, with the long-read
+  window-coverage filter (`--winReadCoverageRelativeMin`, and the new
+  `--winReadCoverageBasesMin`). STAR selects the long-read path by binary
+  rather than by flag, and so does this.
+
+  Two places where the long-read path diverged from STARlong and now does not:
+
+  - **The per-motif stitch mismatch cap does not apply.**
+    `stitchAlignToTranscript.cpp:308-315` keeps only the total mismatch budget
+    under `COMPILE_FOR_LONG_READS` and puts `alignSJstitchMismatchNmax` in the
+    `#else`, so it is compiled out of STARlong. Applying it cost whole reads,
+    not single junctions: the chaining DP split into a chain either side of the
+    rejected junction and neither half cleared
+    `--outFilterScoreMinOverLread`.
+  - **A traceback edge that fails to re-stitch no longer discards its window.**
+    STAR's `stitchWindowSeeds` adds whatever `stitchAlignToTranscript` returns
+    without checking, its failure `return` commented out and marked "this
+    should not happen".
+
+  On 500 simulated spliced long reads against STARlong 2.7.11b (STAR maps 430
+  of 500):
+
+  | | primaries | exact records | same locus | unmapped by rustar |
+  |---|---|---|---|---|
+  | before | 419 | 360 | 405 | 13 |
+  | after | 432 | 372 | 423 | 1 |
+
+  Three of the extra primaries are reads STARlong leaves unmapped and
+  rustar-aligner places correctly; see `DIVERGENCE.md` §2.2.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
