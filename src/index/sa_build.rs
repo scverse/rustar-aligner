@@ -293,20 +293,20 @@ where
     Ok(())
 }
 
-/// Peak resident bytes libsais needs for a genome of `n_genome` bases, and
-/// whether that fits inside `limit_bytes`.
+/// Peak resident bytes libsais needs to sort `n_entries` suffixes.
+///
+/// `n_entries` is the length of the text libsais sorts, which for a genome is
+/// **both strands**, `2 * n_genome`. Callers double before calling; passing
+/// `n_genome` would understate the requirement by half.
 ///
 /// libsais is an in-memory SA-IS: it holds the suffix array itself plus its
 /// working arrays. The dominant terms are the SA (`n` entries, 8 bytes each in
 /// the 64-bit path), libsais's own auxiliary array of the same shape, and the
 /// text. `2 * n * 8 + n` is the standard estimate for the 64-bit path and is
 /// what STAR's own sizing guidance amounts to.
-///
-/// A limit of 0 means "no limit" and always selects libsais, matching how STAR
-/// treats a zeroed limit elsewhere.
-pub fn libsais_peak_bytes(n_genome: u64) -> u64 {
+pub fn libsais_peak_bytes(n_entries: u64) -> u64 {
     // SA + libsais working array, 8 bytes per entry each, plus the text.
-    n_genome.saturating_mul(17)
+    n_entries.saturating_mul(17)
 }
 
 /// Whether the in-memory builder fits the caller's RAM budget.
@@ -315,11 +315,14 @@ pub fn libsais_peak_bytes(n_genome: u64) -> u64 {
 /// that is accepted and warned about: below the limit the fast in-memory
 /// builder runs, above it the external-memory builder does. Both produce
 /// byte-identical output, so the choice is purely about resources.
-pub fn libsais_fits_in_ram(n_genome: u64, limit_bytes: u64) -> bool {
+///
+/// A limit of 0 means "no limit" and always selects libsais, matching how STAR
+/// treats a zeroed limit elsewhere.
+pub fn libsais_fits_in_ram(n_entries: u64, limit_bytes: u64) -> bool {
     if limit_bytes == 0 {
         return true;
     }
-    libsais_peak_bytes(n_genome) <= limit_bytes
+    libsais_peak_bytes(n_entries) <= limit_bytes
 }
 
 /// Build the suffix array via **libsais** instead of caps-sa.

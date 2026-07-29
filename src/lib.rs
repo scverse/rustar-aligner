@@ -98,13 +98,6 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     );
 
-    if params.limit_genome_generate_ram != 31_000_000_000 {
-        log::warn!(
-            "--limitGenomeGenerateRAM {} accepted but not enforced; rustar manages genome-generation memory independently",
-            params.limit_genome_generate_ram
-        );
-    }
-
     info!("Building genome index (streaming SA + on-the-fly SAindex)...");
     // Streaming path: opens SA file early, packs each caps-sa emit
     // directly to disk + into the SAindex builder, never holding the
