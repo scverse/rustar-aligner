@@ -1,5 +1,6 @@
 pub mod fasta;
 pub mod transform;
+pub mod transform_align;
 
 use std::path::Path;
 
