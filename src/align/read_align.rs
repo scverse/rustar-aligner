@@ -374,11 +374,16 @@ pub fn align_read(
         });
     }
 
-    // Deterministic primary tie-break (score, then a fixed positional order).
+    // Deterministic primary tie-break. STAR compares `maxScore`, then
+    // `gLength` — the alignment's genomic span — and leaves anything still
+    // tied to whichever window it reached first
+    // (`ReadAlign_stitchPieces.cpp:340`). The span is reproducible here; the
+    // window order is not, since windows are built per read in parallel, so
+    // the remaining keys are positional and fixed (see DIVERGENCE.md §1.1).
     transcripts.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
-            .then_with(|| a.n_junction.cmp(&b.n_junction))
+            .then_with(|| (a.genome_end - a.genome_start).cmp(&(b.genome_end - b.genome_start)))
             .then_with(|| a.chr_idx.cmp(&b.chr_idx))
             .then_with(|| a.genome_start.cmp(&b.genome_start))
             .then_with(|| a.is_reverse.cmp(&b.is_reverse))
