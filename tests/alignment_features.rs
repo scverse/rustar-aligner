@@ -2024,3 +2024,116 @@ fn test_wasp_samtag() {
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --genomeTransformOutput SAM — alignments reported in original coordinates
+// ---------------------------------------------------------------------------
+
+/// A transformed genome carries a deletion the original does not. Reads align
+/// against the transformed genome, where every downstream coordinate has moved
+/// by the deleted length; `--genomeTransformOutput SAM` has to undo that.
+///
+/// Without the back-transform the reported POS is 5 short, which is exactly the
+/// kind of error that looks plausible in a browser and is wrong everywhere.
+#[test]
+fn test_genome_transform_output_sam_reports_original_coordinates() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+
+    // A 5-base deletion at 1-based position 5001: REF spans 6 bases, ALT keeps
+    // the first. Everything after it shifts down by 5 in the transformed genome.
+    let del_pos_1based = 5001usize;
+    let vcf_path = tmpdir.path().join("variants.vcf");
+    {
+        let mut f = fs::File::create(&vcf_path).unwrap();
+        writeln!(f, "##fileformat=VCFv4.2").unwrap();
+        writeln!(f, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO").unwrap();
+        let start = del_pos_1based - 1;
+        let reference = String::from_utf8(genome[start..start + 6].to_vec()).unwrap();
+        let alt = String::from_utf8(genome[start..start + 1].to_vec()).unwrap();
+        writeln!(
+            f,
+            "chr1\t{del_pos_1based}\t.\t{reference}\t{alt}\t.\tPASS\t."
+        )
+        .unwrap();
+    }
+
+    let genome_dir = tmpdir.path().join("genome_transformed");
+    fs::create_dir_all(&genome_dir).unwrap();
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "genomeGenerate",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--genomeFastaFiles",
+            fasta.to_str().unwrap(),
+            "--genomeSAindexNbases",
+            "7",
+            "--genomeTransformType",
+            "Haploid",
+            "--genomeTransformVCF",
+            vcf_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // One 60 bp read taken from the original genome well downstream of the
+    // deletion. Its sequence is unchanged by the substitution, so it aligns
+    // cleanly in both coordinate systems — only the position differs.
+    let read_start_0based = 6000usize;
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        writeln!(f, "@r1").unwrap();
+        f.write_all(&genome[read_start_0based..read_start_0based + 60])
+            .unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "+").unwrap();
+        writeln!(f, "{}", "I".repeat(60)).unwrap();
+    }
+
+    let run = |extra: &[&str], out_name: &str| -> Vec<Vec<String>> {
+        let output_dir = tmpdir.path().join(out_name);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        let mut args = vec![
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ];
+        args.extend_from_slice(extra);
+        cargo_bin_cmd!("rustar-aligner")
+            .args(&args)
+            .assert()
+            .success();
+        fs::read_to_string(output_dir.join("Aligned.out.sam"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('@'))
+            .map(|l| l.split('\t').map(str::to_string).collect())
+            .collect()
+    };
+
+    let transformed = run(&[], "out_transformed");
+    let original = run(&["--genomeTransformOutput", "SAM"], "out_original");
+
+    assert_eq!(transformed.len(), 1, "expected one alignment");
+    assert_eq!(original.len(), 1, "expected one alignment");
+
+    let pos_transformed: usize = transformed[0][3].parse().unwrap();
+    let pos_original: usize = original[0][3].parse().unwrap();
+
+    // 1-based SAM position in the original genome.
+    assert_eq!(pos_original, read_start_0based + 1);
+    // The transformed genome is 5 bases shorter ahead of this read.
+    assert_eq!(pos_transformed, pos_original - 5);
+    // The read itself spans no variant, so the CIGAR is unaffected.
+    assert_eq!(original[0][5], transformed[0][5]);
+}

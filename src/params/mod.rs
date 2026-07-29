@@ -1201,6 +1201,12 @@ impl Parameters {
         !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
     }
 
+    /// Whether `--genomeTransformOutput` asks for SAM records in the original
+    /// genome's coordinates rather than the transformed genome's.
+    pub fn transform_output_sam(&self) -> bool {
+        self.genome_transform_output.iter().any(|o| o == "SAM")
+    }
+
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
     pub fn chim_out_junctions(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "Junctions")
@@ -1589,19 +1595,48 @@ impl Parameters {
                 ),
             ));
         }
-        // --genomeTransformOutput: mapping alignments back to original
-        // coordinates is not implemented, so anything but None is refused. A
-        // silent no-op here would report transformed coordinates as if they
-        // were original ones, which is worse than failing.
+        // --genomeTransformOutput: `SAM` maps alignments back to the original
+        // genome's coordinates. `SJ` and `Quant` do the same for the junction
+        // table and the transcriptome BAM and are not implemented, so they are
+        // refused: a silent no-op would report transformed coordinates as if
+        // they were original ones, which is worse than failing.
         for o in &params.genome_transform_output {
-            if o != "None" {
+            if o != "None" && o != "SAM" {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     format!(
-                        "--genomeTransformOutput {o} is not supported: alignments are \
-                         reported in the transformed coordinate space"
+                        "--genomeTransformOutput {o} is not supported: only SAM output is \
+                         mapped back to original coordinates"
                     ),
                 ));
+            }
+        }
+        // The back-transform moves the SAM records alone. Everything else that
+        // reports coordinates — the junction table, the transcriptome BAM, the
+        // count matrices, the coverage signal — would still be in transformed
+        // space, and a file that mixes the two spaces is worse than no file.
+        if params.transform_output_sam() {
+            let conflicting = [
+                (!params.quant_mode.iter().all(|m| m == "-"), "--quantMode"),
+                (params.solo_type != SoloType::None, "--soloType"),
+                (
+                    params
+                        .out_wig_type
+                        .iter()
+                        .any(|t| !t.eq_ignore_ascii_case("None")),
+                    "--outWigType",
+                ),
+            ];
+            for (hit, flag) in conflicting {
+                if hit {
+                    return Err(command.error(
+                        ErrorKind::ArgumentConflict,
+                        format!(
+                            "--genomeTransformOutput SAM cannot be combined with {flag}: only \
+                             the SAM records are mapped back to original coordinates"
+                        ),
+                    ));
+                }
             }
         }
         // --sjdbInsertSave: the inserted-junction files are not retained.
@@ -2721,10 +2756,12 @@ mod tests {
         assert!(gg(&["--genomeType", "SuperTranscriptome"]).is_err());
         assert!(gg(&["--genomeType", "Transcriptome"]).is_err());
 
-        // Likewise back-transformed output: a silent no-op would report
-        // transformed coordinates as if they were original ones.
-        assert!(gg(&["--genomeTransformOutput", "SAM"]).is_err());
+        // SAM output is mapped back to the original genome's coordinates. The
+        // junction table and the transcriptome BAM are not, and a silent no-op
+        // there would report transformed coordinates as if they were original.
+        assert!(gg(&["--genomeTransformOutput", "SAM"]).is_ok());
         assert!(gg(&["--genomeTransformOutput", "SJ"]).is_err());
+        assert!(gg(&["--genomeTransformOutput", "Quant"]).is_err());
         assert!(gg(&["--genomeTransformOutput", "None"]).is_ok());
 
         assert!(gg(&["--sjdbInsertSave", "All"]).is_err());
