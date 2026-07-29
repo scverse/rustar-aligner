@@ -49,6 +49,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
     `sjA` as well as fragment and diagonal; keying the pre-stitch dedup on the
     diagonal alone unpaired the two halves of a terminal micro-exon, which then
     came out soft-clipped instead of spliced.
+  - A genome spacer compares as the larger byte in the seed search, as it does
+    in STAR's `compareSeqToGenome`. It was hardcoded to the opposite, which
+    made the binary search in `max_mappable_length` read the suffix array as
+    unsorted wherever the sjdb inserts sit and drop the half holding the real
+    maximum, returning a short MMP.
 
   Measured against native STAR 2.7.11b, raw exact records (FLAG, RNAME, POS,
   MAPQ, CIGAR, NH, AS, NM), with the index rebuilt from this branch:
@@ -56,8 +61,8 @@ Sections commonly used: Features, Bug fixes, Other changes.
   | tier | records | main | this branch |
   |---|---|---|---|
   | junction-spanning yeast reads | 1000 | 835 | 958 |
-  | 10k single-end yeast reads | 8927 | 8785 | 8796 |
-  | 10k paired-end yeast reads | 16782 | 16572 | 16582 |
+  | 10k single-end yeast reads | 8927 | 8785 | 8797 |
+  | 10k paired-end yeast reads | 16782 | 16572 | 16583 |
 
   No read regressed. Every remaining difference on all three tiers is a read
   where both tools found alignments of identical score at different loci.
