@@ -37,14 +37,21 @@ Sections commonly used: Features, Bug fixes, Other changes.
   Construction time and peak RSS, `--runThreadN 8`, same machine, warm cache,
   `SA` and `SAindex` byte-identical in every row:
 
-  | genome | libsais | caps-sa |
-  |---|---|---|
-  | yeast R64-1-1, 12 Mb | 1.0 s / 0.39 GB | 1.7 s / 0.22 GB |
-  | human chr1, 249 Mb | 27.4 s / 6.5 GB | 47.2 s / 5.6 GB |
+  | genome | libsais | caps-sa | ratio |
+  |---|---|---|---|
+  | yeast R64-1-1, 12 Mb | 1.0 s / 0.39 GB | 1.7 s / 0.22 GB | 1.6x |
+  | human chr1, 249 Mb | 27.4 s / 6.5 GB | 47.2 s / 5.6 GB | 1.7x |
+  | GRCh38 primary, 3.1 Gb | 641.6 s / 86.8 GB | 1040.4 s / 14.4 GB | 1.6x |
 
-  At the 31 GB default limit a mammalian genome is declined: GRCh38 needs an
-  estimated 106.7 GB, so it takes the caps-sa path unless the user raises the
-  limit.
+  The ratio holds across three orders of magnitude even though libsais runs
+  single-threaded here: caps-sa buys its small footprint with about six times
+  the total CPU work for the same array (on GRCh38, 726 s of user time against
+  6135 s).
+
+  The mammalian row needed `--limitGenomeGenerateRAM 0` to produce. At the
+  31 GB default a GRCh38 build is declined, because libsais would need an
+  estimated 106.7 GB against a measured 86.8 GB peak, so it takes the caps-sa
+  path unless the user states they have the RAM.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
