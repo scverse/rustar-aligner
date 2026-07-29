@@ -1575,30 +1575,34 @@ fn stitch_align_to_transcript(
         gap_mm += shared_mm;
         d_score += shared_score;
 
+        // Look the junction up in the annotation *before* deciding what kind of
+        // gap this is. STAR resolves `sjdbInd` first and, on a hit, takes the
+        // annotated branch whatever the gap length: `Del >= alignIntronMin`
+        // only decides between junction and deletion for gaps the annotation
+        // does not know (`stitchAlignToTranscript.cpp:198-241`). An annotated
+        // one-base gap is a junction to STAR, not a deletion.
+        //
+        // The lookup also supplies the motif, which is what the mismatch gate
+        // below sees rather than the one scanned from the genome.
+        let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
+        let donor_fwd = index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
+        let acceptor_fwd = donor_fwd + del as u64 - 1;
+
+        // The metadata-bearing lookup. Junctions inserted by two-pass mode
+        // carry no motif or shift, so they are only visible through the
+        // annotated map below; the two lookups are therefore separate.
+        let sj_entry =
+            junction_db.and_then(|db| db.find(donor_fwd, acceptor_fwd).and_then(|i| db.entry(i)));
+        let is_annotated = sj_entry.is_some()
+            || junction_db.is_some_and(|db| {
+                db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
+                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
+                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
+            });
+        let is_splice = is_annotated || is_splice;
+
         // --- Type-specific scoring and tracking ---
         if is_splice {
-            // Look the junction up in the annotation *before* gating on the
-            // motif, because an annotated junction supplies its own motif and
-            // that is what STAR's mismatch gate sees
-            // (`stitchAlignToTranscript.cpp`: `sjdbInd` is resolved, `jcan` is
-            // overwritten from `sjdbMotif`, and only then is the gate applied).
-            let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
-            let donor_fwd =
-                index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-            let acceptor_fwd = donor_fwd + del as u64 - 1;
-
-            // The metadata-bearing lookup. Junctions inserted by two-pass mode
-            // carry no motif or shift, so they are only visible through the
-            // annotated map below; the two lookups are therefore separate.
-            let sj_entry = junction_db
-                .and_then(|db| db.find(donor_fwd, acceptor_fwd).and_then(|i| db.entry(i)));
-            let is_annotated = sj_entry.is_some()
-                || junction_db.is_some_and(|db| {
-                    db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
-                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
-                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
-                });
-
             if let Some(pj) = sj_entry {
                 // The annotated entry's motif wins over the one scanned from
                 // the genome (STAR: `jcan = sjdbMotif[ind]`). This is what the
@@ -2079,6 +2083,28 @@ pub(crate) fn finalize_transcript(
         }
     }
 
+    // Whether a genome gap of `del` bases starting at `donor_end` (SA space) is
+    // a junction rather than a deletion. `--alignIntronMin` decides for gaps the
+    // annotation does not know; an annotated junction is a junction whatever its
+    // length, which is how STAR reads it (`stitchAlignToTranscript.cpp:198-241`)
+    // and the reason yeast's three one-base introns come out as `1N`, not `1D`.
+    let gap_is_junction = |donor_end: u64, del: usize| -> bool {
+        if del >= scorer.align_intron_min as usize && del <= scorer.align_intron_max as usize {
+            return true;
+        }
+        if del == 0 {
+            return false;
+        }
+        let donor_fwd = index.sa_pos_to_forward(donor_end, cluster.is_reverse, del);
+        let acceptor_fwd = donor_fwd + del as u64 - 1;
+        index.junction_db.find(donor_fwd, acceptor_fwd).is_some()
+            || (0..=2).any(|strand| {
+                index
+                    .junction_db
+                    .is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, strand)
+            })
+    };
+
     // STAR finalization check: exon lengths including repeat lengths (shiftSJ)
     // For non-annotated junctions: exon_len >= alignSJoverhangMin + shiftSJ[side]
     // For annotated junctions: exon_len >= alignSJDBoverhangMin
@@ -2094,7 +2120,10 @@ pub(crate) fn finalize_transcript(
             let genome_gap = next_exon.genome_start as i64 - exon.genome_end as i64;
             let read_gap = next_exon.read_start as i64 - exon.read_end as i64;
             let del = genome_gap - read_gap.max(0);
-            if del >= scorer.align_intron_min as i64 && junction_idx < wt.junction_shifts.len() {
+            if del > 0
+                && gap_is_junction(exon.genome_end, del as usize)
+                && junction_idx < wt.junction_shifts.len()
+            {
                 // This is a junction — check exon lengths with repeat
                 let (shift_l, shift_r) = wt.junction_shifts[junction_idx];
                 let is_annotated = wt.junction_annotated[junction_idx];
@@ -2186,9 +2215,7 @@ pub(crate) fn finalize_transcript(
                     append_match(&mut final_cigar, shared);
                 }
                 let del = (genome_gap - read_gap.max(0)) as usize;
-                if del >= scorer.align_intron_min as usize
-                    && del <= scorer.align_intron_max as usize
-                {
+                if gap_is_junction(prev.genome_end, del) {
                     final_cigar.push(Op::new(Kind::Skip, del));
                 } else {
                     final_cigar.push(Op::new(Kind::Deletion, del));
@@ -4146,6 +4173,76 @@ mod tests {
         assert_eq!(unsnapped.exons[0].genome_end, donor_end);
         assert_eq!(unsnapped.exons[1].genome_start, acceptor_start);
         assert_eq!(unsnapped.junction_annotated, vec![true]);
+    }
+
+    /// A gap shorter than `--alignIntronMin` is a deletion unless the
+    /// annotation knows it, in which case it is a junction however short.
+    ///
+    /// STAR resolves `sjdbInd` before testing `Del >= alignIntronMin`
+    /// (`stitchAlignToTranscript.cpp:198-241`), so the length test only decides
+    /// for gaps the annotation has never heard of. Yeast R64-1-1 has three
+    /// one-base introns; before this, reads crossing them scored as deletions
+    /// and came out `1D` where STAR writes `1N`.
+    #[test]
+    fn a_short_annotated_gap_is_a_junction_not_a_deletion() {
+        use crate::align::score::AlignmentScorer;
+
+        let index = make_index_with_seq(&[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]);
+        let scorer = AlignmentScorer::from_params_minimal();
+        assert!(
+            scorer.align_intron_min > 5,
+            "the fixture's 5-base gap must be below the intron threshold"
+        );
+        let cluster = sjab_cluster();
+        let read = [0u8; 50];
+
+        // Exon A covers read[0,20) at genome[0,20); the next seed sits five
+        // bases further along the genome, so the gap is a 5-base deletion.
+        let wt = sjab_wt(20, -1);
+        let wa = sjab_wa(20, 20, 25, -1);
+
+        let plain =
+            stitch_align_to_transcript(&wt, &wa, &read, &index, &scorer, &cluster, None, 0, "t")
+                .expect("unannotated stitch should succeed");
+        assert_eq!(plain.n_gap, 1, "unannotated: a deletion");
+        assert_eq!(plain.n_junction, 0);
+
+        // The same gap, annotated.
+        let donor_end = plain.exons[0].genome_end;
+        let acceptor_start = plain.exons[1].genome_start;
+        let db = crate::junction::SpliceJunctionDb::from_prepared(vec![
+            crate::junction::PreparedJunction {
+                chr_idx: 0,
+                start_pos: donor_end,
+                end_pos: acceptor_start - 1,
+                motif: 1,
+                shift_left: 0,
+                shift_right: 0,
+                strand: 1,
+            },
+        ]);
+        let annotated = stitch_align_to_transcript(
+            &wt,
+            &wa,
+            &read,
+            &index,
+            &scorer,
+            &cluster,
+            Some(&db),
+            0,
+            "t",
+        )
+        .expect("annotated stitch should succeed");
+        assert_eq!(annotated.n_junction, 1, "annotated: a junction");
+        assert_eq!(annotated.n_gap, 0);
+        assert_eq!(annotated.junction_annotated, vec![true]);
+        assert!(
+            annotated.score > plain.score,
+            "the annotated form earns sjdbScore rather than a deletion penalty: \
+             {} vs {}",
+            annotated.score,
+            plain.score
+        );
     }
 
     #[test]
