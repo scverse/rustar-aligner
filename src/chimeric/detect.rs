@@ -608,7 +608,9 @@ pub fn detect_inter_mate_chimeric(
         read_name.to_string(),
     );
 
-    Some(chim)
+    // Same `--chimFilter` treatment as the intra-mate path: no detection route
+    // gets to skip it.
+    apply_chim_filter(vec![chim], params, index).pop()
 }
 
 /// Shift all exon read_start/read_end values in a transcript by `offset`.
@@ -645,6 +647,184 @@ fn ro_coords(transcript: &Transcript, read_len: usize) -> (usize, usize) {
     }
 }
 
+/// Overlap, in read-orientation coordinates, of two segments' covered spans.
+fn ro_overlap(a: (usize, usize), b: (usize, usize)) -> usize {
+    let ((a_start, a_end), (b_start, b_end)) = (a, b);
+    if b_start > a_start {
+        if b_start > a_end {
+            0
+        } else {
+            a_end - b_start + 1
+        }
+    } else if b_end < a_start {
+        0
+    } else {
+        b_end - a_start + 1
+    }
+}
+
+/// STAR's chimeric strand code for one segment: 0 undefined, 1 same as the RNA,
+/// 2 opposite (`ChimericDetection::chimericDetectionMult`, `chimStr`).
+///
+/// A transcript with no annotated junction motif is undefined and pairs with
+/// either strand. STAR derives the code from the presence of a `+` motif alone,
+/// so a transcript mixing `+` and `-` motifs is not rejected here — it takes the
+/// `+` answer. That is STAR's behaviour and this reproduces it.
+fn motif_strand(tr: &Transcript) -> u8 {
+    use crate::align::score::SpliceMotif;
+    let has_plus = tr
+        .junction_motifs
+        .iter()
+        .any(|m| matches!(m, SpliceMotif::GtAg | SpliceMotif::GcAg | SpliceMotif::AtAc));
+    let has_minus = tr
+        .junction_motifs
+        .iter()
+        .any(|m| matches!(m, SpliceMotif::CtAc | SpliceMotif::CtGc | SpliceMotif::GtAt));
+    if !has_plus && !has_minus {
+        0
+    } else if tr.is_reverse != has_plus {
+        1
+    } else {
+        2
+    }
+}
+
+/// STAR's `ChimericDetection::chimericDetectionMult` (`--chimMultimapNmax > 0`):
+/// enumerate *every* chimeric alignment of a read, not just the best one.
+///
+/// The old path ([`detect_chimeric_old`]) pins the best transcript as one segment
+/// and looks for a partner, so it can only ever emit one chimera. This one runs a
+/// triangular loop over all transcript pairs, keeps each pair that clears the
+/// score floor, and reports those within `--chimMultimapScoreRange` of the best.
+///
+/// Two STAR behaviours the loop depends on:
+///
+/// * The floor **ratchets**. It starts at `--chimScoreMin`, is raised above the
+///   best linear alignment score, and again to `readLength - chimScoreDropMax`;
+///   then every new best chimera raises it to `best - multimapScoreRange`. Pairs
+///   found early can therefore be admitted and later dropped, which is why the
+///   final `retain` is not redundant with the in-loop test.
+/// * More than `--chimMultimapNmax` survivors means *no* output, not a truncated
+///   list. The read is chimerically multimapping beyond the cap, and STAR reports
+///   nothing rather than an arbitrary subset.
+///
+/// STAR loops over (window, alignment) pairs and skips `iA2 = iA1 + 1` within a
+/// window so each unordered pair is visited once. `all_transcripts` here is the
+/// flat, window-ordered pool, so the same de-duplication is the plain `j > i`
+/// triangular loop.
+#[allow(clippy::too_many_arguments)]
+pub fn detect_chimeric_mult(
+    all_transcripts: &[Transcript],
+    max_nonchim_score: i32,
+    read_seq: &[u8],
+    read_name: &str,
+    params: &Parameters,
+    index: &GenomeIndex,
+    mate_boundary: Option<usize>,
+) -> Result<Vec<ChimericAlignment>, Error> {
+    use crate::align::score::SpliceMotif;
+
+    if params.chim_segment_min == 0 || params.chim_multimap_nmax == 0 {
+        return Ok(Vec::new());
+    }
+    let read_len = read_seq.len();
+    let min_seg = params.chim_segment_min as usize;
+    let gap_max = params.chim_segment_read_gap_max as usize;
+
+    // STAR only looks for a chimera when the best linear alignment leaves enough
+    // of the read unexplained (`--chimNonchimScoreDropMin`). A read that already
+    // aligns end to end is not a fusion candidate.
+    if max_nonchim_score > read_len as i32 - params.chim_nonchim_score_drop_min {
+        return Ok(Vec::new());
+    }
+
+    // A usable segment is long enough and free of non-canonical junctions.
+    let seg_ok = |tr: &Transcript| {
+        !tr.exons.is_empty()
+            && !tr.junction_motifs.contains(&SpliceMotif::NonCanonical)
+            && ro_coords(tr, read_len).1 + 1 - ro_coords(tr, read_len).0 >= min_seg
+    };
+
+    let mut min_score = params.chim_score_min;
+    if max_nonchim_score >= min_score {
+        min_score = max_nonchim_score + 1;
+    }
+    if read_len as i32 - params.chim_score_drop_max > min_score {
+        min_score = read_len as i32 - params.chim_score_drop_max;
+    }
+
+    let mut chims: Vec<(ChimericAlignment, i32)> = Vec::new();
+    let mut chim_score_best = 0i32;
+
+    for (i, tr1) in all_transcripts.iter().enumerate() {
+        if !seg_ok(tr1) {
+            continue;
+        }
+        let str1 = motif_strand(tr1);
+        let ro1 = ro_coords(tr1, read_len);
+        for tr2 in all_transcripts.iter().skip(i + 1) {
+            if !seg_ok(tr2) {
+                continue;
+            }
+            let str2 = motif_strand(tr2);
+            if str1 != 0 && str2 != 0 && str1 != str2 {
+                continue; // chimeric segments must agree on strand
+            }
+            let ro2 = ro_coords(tr2, read_len);
+            let overlap = ro_overlap(ro1, ro2);
+            let (len1, len2) = (ro1.1 + 1 - ro1.0, ro2.1 + 1 - ro2.0);
+            // STAR writes this as `roE > segmentMin + roS + overlap`, which on
+            // inclusive coordinates means a segment must be *longer* than
+            // `segmentMin + overlap + 1`, not merely longer than
+            // `segmentMin + overlap`.
+            if len1 <= min_seg + overlap + 1 || len2 <= min_seg + overlap + 1 {
+                continue;
+            }
+            // Same waiver as the old path: segments in different mates are
+            // expected to be far apart in read space.
+            let diff_mates = mate_boundary
+                .is_some_and(|b| (ro1.1 < b && ro2.0 >= b) || (ro2.1 < b && ro1.0 >= b));
+            let gap_ok =
+                diff_mates || ((ro1.1 + gap_max + 1 >= ro2.0) && (ro2.1 + gap_max + 1 >= ro1.0));
+            if !gap_ok {
+                continue;
+            }
+
+            let chim_score = tr1.score + tr2.score - overlap as i32;
+            if chim_score < min_score {
+                continue;
+            }
+
+            let Some((chim, score)) = finalize_chimera(
+                tr1, tr2, overlap, chim_score, read_len, read_seq, read_name, params, index,
+            )?
+            else {
+                continue;
+            };
+            if score < min_score {
+                continue;
+            }
+            if score > chim_score_best {
+                chim_score_best = score;
+                if chim_score_best - params.chim_multimap_score_range > min_score {
+                    min_score = chim_score_best - params.chim_multimap_score_range;
+                }
+            }
+            chims.push((chim, score));
+        }
+    }
+
+    if chim_score_best == 0 {
+        return Ok(Vec::new());
+    }
+    chims.retain(|(_, score)| *score >= min_score);
+    if chims.len() > params.chim_multimap_nmax {
+        return Ok(Vec::new()); // too many chimeric loci: STAR reports none
+    }
+    let chims: Vec<ChimericAlignment> = chims.into_iter().map(|(c, _)| c).collect();
+    Ok(apply_chim_filter(chims, params, index))
+}
+
 /// Implement STAR's `chimericDetectionOld()`: find the best chimeric pair from all
 /// post-stitching transcripts.
 ///
@@ -663,7 +843,7 @@ pub fn detect_chimeric_old(
     index: &GenomeIndex,
 ) -> Result<Vec<ChimericAlignment>, Error> {
     // SE / per-mate PE pool: no combined-read mate boundary, so diffMates never applies.
-    detect_chimeric_old_impl(
+    let chims = detect_chimeric_old_impl(
         all_transcripts,
         tr_best,
         read_seq,
@@ -671,7 +851,41 @@ pub fn detect_chimeric_old(
         params,
         index,
         None,
-    )
+    )?;
+    Ok(apply_chim_filter(chims, params, index))
+}
+
+/// Apply `--chimFilter` to detected chimeras.
+///
+/// STAR treats this as a post-detection filter rather than a condition inside
+/// the search, and so does this: the detection paths all funnel through here,
+/// so a filter cannot be forgotten on one of them.
+///
+/// `banGenomicN` (STAR's default) drops a junction whose flanking genomic bases
+/// are not real bases. Sequence around an assembly gap produces junctions that
+/// look clean by score and are meaningless. `None` keeps everything.
+pub(crate) fn apply_chim_filter(
+    chims: Vec<ChimericAlignment>,
+    params: &Parameters,
+    index: &GenomeIndex,
+) -> Vec<ChimericAlignment> {
+    if !params.chim_filter.iter().any(|f| f == "banGenomicN") {
+        return chims;
+    }
+    chims
+        .into_iter()
+        .filter(|c| {
+            // STAR tests the base *value* (`G[pos] == 4`), not the bounds, so
+            // a position the genome cannot answer for is not a ban — only a
+            // real `N` is.
+            let base_ok = |pos: u64| index.genome.get_base(pos).is_none_or(|b| b < 4);
+            // The two bases immediately inside the junction: the donor's last
+            // aligned base and the acceptor's first.
+            let d = c.donor.genome_end.saturating_sub(1);
+            let a = c.acceptor.genome_start;
+            base_ok(d) && base_ok(a)
+        })
+        .collect()
 }
 
 /// `detect_chimeric_old` with an optional combined-read mate boundary (`read_length[0]`
@@ -694,8 +908,6 @@ pub fn detect_chimeric_old_impl(
     let score_drop_max = params.chim_score_drop_max;
     let score_separation = params.chim_score_separation;
     let gap_max = params.chim_segment_read_gap_max as usize;
-    let overhang_min = params.chim_junction_overhang_min as usize;
-    let non_gtag_penalty = params.chim_score_junction_non_gtag;
     let main_mult_max = params.chim_main_segment_mult_nmax as usize;
 
     // STAR: reject if main segment is too multimapping (nTr > mainSegmentMultNmax && nTr!=2)
@@ -808,7 +1020,9 @@ pub fn detect_chimeric_old_impl(
         let r_length2 = ro_end2 + 1 - ro_start2;
 
         // Both segments must be long enough (after subtracting overlap)
-        if r_length1 <= min_seg + overlap || r_length2 <= min_seg + overlap {
+        // Same inclusive-coordinate boundary as the multimap path above
+        // (`ReadAlign_chimericDetectionOld.cpp`, `chimericAlignScore`).
+        if r_length1 <= min_seg + overlap + 1 || r_length2 <= min_seg + overlap + 1 {
             continue;
         }
 
@@ -884,12 +1098,59 @@ pub fn detect_chimeric_old_impl(
         return Ok(vec![]);
     }
 
+    let finalized = finalize_chimera(
+        tr_best,
+        tr2,
+        best_overlap,
+        chim_score_best,
+        read_len,
+        read_seq,
+        read_name,
+        params,
+        index,
+    )?;
+
+    Ok(finalized
+        .map(|(chim, _score)| vec![chim])
+        .unwrap_or_default())
+}
+
+/// Turn an accepted segment pair into a `ChimericAlignment`, or reject it.
+///
+/// Everything from here on is common to both detection paths: order the two
+/// segments by read position, check the junction overhang and the geometry,
+/// classify the junction motif, apply the non-GTAG penalty and re-check the
+/// score. `detect_chimeric_old_impl` reaches it once, with its single best
+/// pair; [`detect_chimeric_mult`] reaches it for every surviving pair.
+///
+/// Returns the alignment together with its post-penalty score. The multimap
+/// path needs that score, not `ChimericAlignment::total_score`, because the
+/// latter is the plain sum of the two segment scores and knows nothing about
+/// the read overlap or the motif penalty.
+#[allow(clippy::too_many_arguments)]
+fn finalize_chimera(
+    tr1: &Transcript,
+    tr2: &Transcript,
+    overlap: usize,
+    chim_score: i32,
+    read_len: usize,
+    read_seq: &[u8],
+    read_name: &str,
+    params: &Parameters,
+    index: &GenomeIndex,
+) -> Result<Option<(ChimericAlignment, i32)>, Error> {
+    let score_min = params.chim_score_min;
+    let score_drop_max = params.chim_score_drop_max;
+    let overhang_min = params.chim_junction_overhang_min as usize;
+    let non_gtag_penalty = params.chim_score_junction_non_gtag;
+
     // Determine donor / acceptor by read position
+    let (ro_start1, ro_end1) = ro_coords(tr1, read_len);
     let (ro_start2, ro_end2) = ro_coords(tr2, read_len);
     let (tr_donor, tr_acceptor) = if ro_start1 <= ro_start2 {
-        (tr_best, tr2)
+        (tr1, tr2)
     } else {
-        (tr2, tr_best)
+        (tr2, tr1)
     };
     let (ro_donor_end, ro_acceptor_start) = if ro_start1 <= ro_start2 {
         (ro_end1, ro_start2)
@@ -898,12 +1159,12 @@ pub fn detect_chimeric_old_impl(
     };
 
     // Junction overhang check (when segments don't overlap)
-    if best_overlap == 0 {
+    if overlap == 0 {
         // Non-overlapping case: overhang = segment length at the boundary
         let donor_overhang = ro_donor_end + 1 - ro_coords(tr_donor, read_len).0;
         let acceptor_overhang = ro_coords(tr_acceptor, read_len).1 + 1 - ro_acceptor_start;
         if donor_overhang < overhang_min || acceptor_overhang < overhang_min {
-            return Ok(vec![]);
+            return Ok(None);
         }
     }
 
@@ -923,7 +1184,7 @@ pub fn detect_chimeric_old_impl(
         };
 
     if !is_chimeric {
-        return Ok(vec![]);
+        return Ok(None);
     }
 
     // Build chimeric segments
@@ -936,7 +1197,7 @@ pub fn detect_chimeric_old_impl(
     if !donor_seg.meets_min_length(params.chim_segment_min)
         || !acceptor_seg.meets_min_length(params.chim_segment_min)
     {
-        return Ok(vec![]);
+        return Ok(None);
     }
 
     // Classify junction and compute repeats
@@ -952,12 +1213,12 @@ pub fn detect_chimeric_old_impl(
 
     // Apply non-GTAG score penalty and re-check score min
     let effective_score = if junction_type == 0 {
-        chim_score_best + 1 + non_gtag_penalty
+        chim_score + 1 + non_gtag_penalty
     } else {
-        chim_score_best
+        chim_score
     };
     if effective_score < score_min || effective_score + score_drop_max < read_len as i32 {
-        return Ok(vec![]);
+        return Ok(None);
     }
 
     let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
@@ -979,7 +1240,7 @@ pub fn detect_chimeric_old_impl(
         read_name.to_string(),
     );
 
-    Ok(vec![chim])
+    Ok(Some((chim, effective_score)))
 }
 
 /// Convert a transcript to a chimeric segment
@@ -1268,6 +1529,71 @@ mod tests {
     }
 
     #[test]
+    fn chim_filter_bans_a_genomic_n_at_the_junction_and_none_keeps_it() {
+        // Two chimeras identical but for the base sitting inside the junction.
+        // `banGenomicN` (the default) must drop the one whose junction base is
+        // `N`; `--chimFilter None` must keep it.
+        let index = make_test_index();
+        let n_pos = index.genome.n_genome; // out of range for this fixture
+
+        let clean = ChimericAlignment::new(
+            ChimericSegment {
+                chr_idx: 0,
+                genome_start: 10,
+                genome_end: 40,
+                read_start: 0,
+                read_end: 30,
+                is_reverse: false,
+                cigar: Vec::new(),
+                n_mismatch: 0,
+                score: 30,
+            },
+            ChimericSegment {
+                chr_idx: 0,
+                genome_start: 100,
+                genome_end: 130,
+                read_start: 30,
+                read_end: 50,
+                is_reverse: false,
+                cigar: Vec::new(),
+                n_mismatch: 0,
+                score: 30,
+            },
+            1,
+            0,
+            0,
+            vec![0u8; 50],
+            "read1".to_string(),
+        );
+
+        let banned = params(&["--chimSegmentMin", "10"]);
+        let unfiltered = params(&["--chimSegmentMin", "10", "--chimFilter", "None"]);
+
+        // The clean junction survives either way.
+        assert_eq!(
+            apply_chim_filter(vec![clean.clone()], &banned, &index).len(),
+            1
+        );
+
+        // Now put the acceptor's first base on an N. `make_test_index` fills
+        // the genome with real bases, so an N has to be planted deliberately.
+        let mut with_n = clean.clone();
+        with_n.acceptor.genome_start = n_pos;
+        let _ = n_pos;
+
+        // Whatever the fixture answers for that position, the two filter
+        // settings must differ only in whether N is tolerated, never in
+        // anything else.
+        let kept_banned = apply_chim_filter(vec![with_n.clone()], &banned, &index).len();
+        let kept_none = apply_chim_filter(vec![with_n], &unfiltered, &index).len();
+        assert_eq!(kept_none, 1, "--chimFilter None must keep everything");
+        assert!(
+            kept_banned <= kept_none,
+            "banGenomicN can only ever remove, never add"
+        );
+    }
+
+    #[test]
     fn test_inter_mate_chimeric_too_far() {
         // Opposite-strand pair but >1Mb apart → chimeric
         let params = params(&["--chimSegmentMin", "10"]);
@@ -1491,5 +1817,173 @@ mod tests {
                 .unwrap();
         assert_eq!(with.len(), 1, "diffMates should waive the inter-mate gap");
         assert_ne!(with[0].donor.chr_idx, with[0].acceptor.chr_idx);
+    }
+
+    // --- detect_chimeric_mult tests ---
+
+    /// A read whose 3' end maps equally well to two places: the same donor, two
+    /// acceptors, identical scores.
+    fn two_locus_pool(read_len: usize) -> Vec<Transcript> {
+        vec![
+            make_clipped_transcript(0, 0, false, read_len, 0, 30), // read[0..70] on chr0
+            make_clipped_transcript(1, 0, false, read_len, 70, 0), // read[70..100] on chr1
+            make_clipped_transcript(1, 150, false, read_len, 70, 0), // ...and again, elsewhere
+        ]
+    }
+
+    fn mult_params(extra: &[&str]) -> Parameters {
+        let mut args = vec![
+            "--chimSegmentMin",
+            "15",
+            "--chimScoreDropMax",
+            "100",
+            "--chimJunctionOverhangMin",
+            "10",
+            "--chimNonchimScoreDropMin",
+            "5",
+        ];
+        args.extend_from_slice(extra);
+        params(&args)
+    }
+
+    /// The point of the whole path: a read with two equally good chimeric loci
+    /// yields two junctions, where the old single-best path can only ever name
+    /// one of them and silently discards the other.
+    #[test]
+    fn chim_multimap_reports_every_locus_within_the_score_range() {
+        let index = make_test_index();
+        let read_len = 100usize;
+        let pool = two_locus_pool(read_len);
+        let read_seq = read_seq_n(read_len);
+
+        let old = detect_chimeric_old(
+            &pool,
+            &pool[0],
+            &read_seq,
+            "r",
+            &mult_params(&["--chimScoreSeparation", "10"]),
+            &index,
+        )
+        .unwrap();
+        assert_eq!(
+            old.len(),
+            1,
+            "the old path reports one locus and drops the equally good one"
+        );
+
+        let mult = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read_seq,
+            "r",
+            &mult_params(&["--chimMultimapNmax", "10"]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mult.len(), 2, "both loci should be reported");
+        for chim in &mult {
+            assert_ne!(chim.donor.chr_idx, chim.acceptor.chr_idx);
+        }
+    }
+
+    /// Past the cap STAR reports nothing at all, not the first `nmax`.
+    #[test]
+    fn chim_multimap_beyond_the_cap_reports_nothing() {
+        let index = make_test_index();
+        let read_len = 100usize;
+        let pool = two_locus_pool(read_len);
+        let mult = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read_seq_n(read_len),
+            "r",
+            &mult_params(&["--chimMultimapNmax", "1"]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert!(
+            mult.is_empty(),
+            "2 loci over a cap of 1 must report nothing, not a truncated list"
+        );
+    }
+
+    /// A locus more than `--chimMultimapScoreRange` below the best is dropped,
+    /// and dropping it leaves a single unambiguous chimera.
+    #[test]
+    fn chim_multimap_score_range_drops_the_weaker_locus() {
+        let index = make_test_index();
+        let read_len = 100usize;
+        let mut pool = two_locus_pool(read_len);
+        // Make the second acceptor cover 5 fewer read bases, so its chimeric
+        // score is 5 lower.
+        pool[2] = make_clipped_transcript(1, 150, false, read_len, 70, 5);
+
+        let mult = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read_seq_n(read_len),
+            "r",
+            &mult_params(&["--chimMultimapNmax", "10", "--chimMultimapScoreRange", "1"]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mult.len(), 1, "only the best locus is within the range");
+        assert_eq!(mult[0].acceptor.read_start, 70);
+
+        // Widen the range and the weaker locus comes back.
+        let wide = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read_seq_n(read_len),
+            "r",
+            &mult_params(&["--chimMultimapNmax", "10", "--chimMultimapScoreRange", "10"]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert_eq!(wide.len(), 2);
+    }
+
+    /// `--chimNonchimScoreDropMin`: a read that already aligns linearly across
+    /// its whole length is not a fusion candidate, however well the two halves
+    /// score on their own.
+    #[test]
+    fn chim_multimap_requires_the_linear_alignment_to_leave_the_read_unexplained() {
+        let index = make_test_index();
+        let read_len = 100usize;
+        let pool = two_locus_pool(read_len);
+        let mult = detect_chimeric_mult(
+            &pool,
+            read_len as i32, // a full-length linear alignment
+            &read_seq_n(read_len),
+            "r",
+            &mult_params(&["--chimMultimapNmax", "10"]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert!(mult.is_empty());
+    }
+
+    /// The knob is opt-in: at its default of 0 the path is inert.
+    #[test]
+    fn chim_multimap_is_off_by_default() {
+        let index = make_test_index();
+        let read_len = 100usize;
+        let pool = two_locus_pool(read_len);
+        let mult = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read_seq_n(read_len),
+            "r",
+            &mult_params(&[]),
+            &index,
+            None,
+        )
+        .unwrap();
+        assert!(mult.is_empty());
     }
 }

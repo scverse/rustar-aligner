@@ -97,6 +97,22 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
+- **Chimeric multimapping detection (`--chimMultimapNmax`)**, STAR's
+  newer enumeration path. Instead of pinning the best transcript and
+  looking for one partner, it walks every transcript pair, keeps those
+  within `--chimMultimapScoreRange` of the best chimeric score, and
+  reports them all. A read whose fusion partner maps equally well to two
+  places yields two junctions rather than an arbitrary one.
+  `--chimNonchimScoreDropMin` gates the search on the linear alignment
+  leaving enough of the read unexplained, and a read with more surviving
+  loci than the cap reports none at all, as STAR does. The default of 0
+  keeps the old single-best path.
+
+- **`--chimFilter banGenomicN`** (STAR's default) drops a chimeric
+  junction whose flanking genomic bases are not real bases: sequence
+  around an assembly gap yields junctions that look clean by score and
+  mean nothing. `--chimFilter None` keeps everything.
+
 ### Bug fixes
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
