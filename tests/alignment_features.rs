@@ -2024,3 +2024,86 @@ fn test_wasp_samtag() {
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// --clipAdapterType CellRanger4
+// ---------------------------------------------------------------------------
+
+/// End to end: a read carrying a poly-A tail aligns over its non-A prefix only.
+///
+/// Before this, `--clipAdapterType CellRanger4` parsed and then did nothing, so
+/// the tail was carried into the alignment as soft-clipped or mismatching
+/// bases. The check is that the flag changes the CIGAR at all, and changes it
+/// the way a trim should.
+#[test]
+fn test_clip_adapter_type_cellranger4() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // 60 genomic bases followed by a 40-base poly-A tail the genome does not
+    // have. The tail is long enough to clear the trim's score-20 floor.
+    let start = 3000usize;
+    let mut read = genome[start..start + 60].to_vec();
+    read.extend(std::iter::repeat_n(b'A', 40));
+
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        writeln!(f, "@polya").unwrap();
+        f.write_all(&read).unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "+").unwrap();
+        writeln!(f, "{}", "I".repeat(read.len())).unwrap();
+    }
+
+    let run = |extra: &[&str], out_name: &str| -> Vec<String> {
+        let output_dir = tmpdir.path().join(out_name);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        let mut args = vec![
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ];
+        args.extend_from_slice(extra);
+        cargo_bin_cmd!("rustar-aligner")
+            .args(&args)
+            .assert()
+            .success();
+        fs::read_to_string(output_dir.join("Aligned.out.sam"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('@'))
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    let plain = run(&[], "out_plain");
+    let clipped = run(&["--clipAdapterType", "CellRanger4"], "out_cr4");
+
+    // Untrimmed, 40 of 100 bases mismatch and the read fails the mismatch
+    // filters outright. That is the cost of the flag having been inert.
+    assert!(
+        plain.is_empty(),
+        "without trimming the poly-A read should not pass the mismatch filters, got {plain:?}"
+    );
+
+    assert_eq!(clipped.len(), 1, "trimmed, the read aligns");
+    let cigar = clipped[0].split('\t').nth(5).unwrap();
+    assert!(
+        cigar.ends_with("40S"),
+        "the 40-base poly-A tail should be clipped, got {cigar}"
+    );
+    assert!(
+        cigar.starts_with("60M"),
+        "the genomic prefix should still align in full, got {cigar}"
+    );
+}
