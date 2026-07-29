@@ -746,15 +746,20 @@ pub fn align_paired_read(
     // → Nstart=7, starts={0,43,...,129,...}). Using combined length creates a spurious
     // start at position 129 (between mates) that can produce anchors widening windows
     // beyond STAR's range, causing window overflow and eviction of valid 7M exon seeds.
-    let mut combined_seeds = Seed::find_seeds(
+    // The piece offsets are STAR's `splitR[0][ip]`: mate1 starts the concatenated
+    // read, mate2 starts one base past the spacer. Only the `flagDirMap`
+    // shortcut consults them.
+    let mut combined_seeds = Seed::find_seeds_at(
         &combined_read[..len1],
+        0,
         index,
         params.seed_map_min,
         params,
         debug_name,
     )?;
-    let mut m2_seeds = Seed::find_seeds(
+    let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
+        len1 + 1,
         index,
         params.seed_map_min,
         params,
