@@ -1577,17 +1577,29 @@ impl Parameters {
             ));
         }
 
-        // --genomeType: only ordinary genomes are built here. The other two
-        // need a different index layout entirely, so refuse rather than build
-        // something that silently is not what was asked for.
-        if params.genome_type != "Full" {
-            return Err(command.error(
-                ErrorKind::InvalidValue,
-                format!(
-                    "--genomeType {} is not supported; expected Full",
-                    params.genome_type
-                ),
-            ));
+        // --genomeType: `Transcriptome` needs a different index layout
+        // entirely, so it is refused rather than built as something that
+        // silently is not what was asked for. `SuperTranscriptome` condenses
+        // the genome to its annotated exons and therefore needs an annotation.
+        match params.genome_type.as_str() {
+            "Full" => {}
+            "SuperTranscriptome" => {
+                if params.sjdb_gtf_file.is_none() {
+                    return Err(command.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "--genomeType SuperTranscriptome requires --sjdbGTFfile: there is \
+                         nothing to condense without an annotation",
+                    ));
+                }
+            }
+            other => {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--genomeType {other} is not supported; expected Full or SuperTranscriptome"
+                    ),
+                ));
+            }
         }
         // --genomeTransformOutput: mapping alignments back to original
         // coordinates is not implemented, so anything but None is refused. A
@@ -2718,6 +2730,7 @@ mod tests {
 
         // The unimplemented genome layouts are refused rather than silently
         // building an ordinary genome under another name.
+        // SuperTranscriptome is built, but only with an annotation to condense.
         assert!(gg(&["--genomeType", "SuperTranscriptome"]).is_err());
         assert!(gg(&["--genomeType", "Transcriptome"]).is_err());
 
