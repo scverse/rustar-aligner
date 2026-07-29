@@ -3416,14 +3416,17 @@ pub(crate) fn stitch_seeds_long_read(
             align_mates_gap_max,
             debug_read_name,
         ) else {
-            // The traceback replays exactly the edges Phase A already validated; a
-            // failure here means this window yields no long-read alignment.
-            return (
-                Vec::new(),
-                stitch_cluster,
-                stitch_is_reverse,
-                stitch_read_owned,
-            );
+            // STAR does not abandon the chain here. `stitchWindowSeeds`
+            // (`ReadAlign_stitchWindowSeeds.cpp:130-138`) calls
+            // `stitchAlignToTranscript` in the traceback and adds whatever it
+            // returns unconditionally; the `return` on failure is commented out
+            // and marked "this should not happen". Phase A scores an edge with
+            // one function and the traceback re-stitches it with another, so
+            // the two can disagree, and treating that as "this window has no
+            // alignment" throws away chains that are otherwise the best in
+            // their window. Keep what has been assembled and let the score
+            // filters decide.
+            break;
         };
         wt = new_wt;
     }
