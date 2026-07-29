@@ -559,10 +559,9 @@ fn compare_seq_to_genome(
                 let genome_chunk = &genome_slice_all[genome_start + i..genome_start + simd_end];
                 if let Some(off) = crate::align::simd_scan::find_stop(read_chunk, genome_chunk) {
                     let genome_base = genome_chunk[off];
-                    if genome_base >= 5 {
-                        return (i + off, true);
-                    }
                     let read_base = read_chunk[off];
+                    // A spacer (5) is larger than any read base, so the query
+                    // sorts *before* this suffix. See the scalar branch below.
                     return (i + off, read_base > genome_base);
                 }
                 match_len = simd_end;
@@ -575,19 +574,27 @@ fn compare_seq_to_genome(
         let genome_idx = genome_start + i;
 
         if genome_idx >= index.genome.sequence.len() {
-            // Past end of genome array — treat like padding (STAR: comp_res > 0)
-            return (match_len, true);
+            // Past the end of the genome array. Treated as a spacer, so the
+            // query sorts before this suffix, same as the branch below.
+            return (match_len, false);
         }
 
         let genome_base = index.genome.sequence.base(genome_idx);
-
-        if genome_base >= 5 {
-            // Padding character — STAR returns comp_res > 0 (read > genome)
-            return (match_len, true);
-        }
-
         let read_base = read_seq[read_pos + i];
 
+        // The comparison result is what orders the binary search in
+        // `max_mappable_length`, so it has to agree with the order the suffix
+        // array was built in. STAR compares the raw bytes
+        // (`compareSeqToGenome`, `SuffixArrayFuns.cpp`): read bases are 0-3,
+        // `N` is 4 and the spacer is 5, so a read base is never greater than
+        // either of those and the query always sorts *before* such a suffix.
+        // `comp_res` was hardcoded to `true` for the spacer, the opposite.
+        //
+        // It matters where the sjdb inserts sit in the suffix array. A probe
+        // landing on a spacer inside an insert reported "query is greater",
+        // the search discarded everything below that probe, and the entry
+        // holding the real maximum went with it: on ERR12389696.20597455 the
+        // MMP came back 24 where the genome matches 29.
         if read_base != genome_base {
             return (match_len, read_base > genome_base);
         }
@@ -1153,6 +1160,33 @@ mod tests {
             "Sparse ({}) should produce <= dense ({}) seeds",
             sparse_seeds.len(),
             dense_count
+        );
+    }
+
+    /// A read base is 0-3, `N` is 4 and the spacer is 5, so a read base is
+    /// never greater than either. When the comparison runs off a chromosome
+    /// into the padding, the query sorts *before* that suffix, and
+    /// `compare_seq_to_genome` must say so: it is this value that orders the
+    /// binary search in `max_mappable_length`, so getting it backwards makes
+    /// the search discard the half of the range holding the real maximum.
+    #[test]
+    fn a_query_running_into_the_padding_sorts_before_that_suffix() {
+        let index = make_test_index("ACGTACGT");
+        let read = encode_sequence("ACGTACGTA");
+
+        // The suffix array entry for forward position 0.
+        let sa_idx = (0..index.suffix_array.len())
+            .find(|&i| {
+                let (pos, rev) = index.suffix_array.decode(index.suffix_array.get(i));
+                pos == 0 && !rev
+            })
+            .expect("forward position 0 must be in the suffix array");
+
+        let (len, comp) = compare_seq_to_genome(&read, 0, &index, sa_idx, 0);
+        assert_eq!(len, 8, "the whole chromosome matches before the padding");
+        assert!(
+            !comp,
+            "at the padding the read base is the smaller one, so the query sorts first"
         );
     }
 
