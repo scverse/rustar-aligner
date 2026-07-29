@@ -24,9 +24,11 @@ Divergences are grouped by kind:
 
 **Why.** Determinism and thread-count invariance: the same read produces the same primary regardless of `--runThreadN`. STAR's exact mt19937 stream cannot be reproduced under per-read parallelism, and matching it would forfeit reproducibility.
 
-**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all** — the primary is the deterministic best alignment (max score → smaller genomic length → earliest discovered), which is STAR-faithful. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary — never in the set of reported alignments.
+**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all**: the primary is the deterministic best alignment. The first two keys are STAR's own (`ReadAlign_stitchPieces.cpp:340` compares `maxScore`, then `gLength`). Where those two tie, STAR takes the earliest window in its iteration order and rustar-aligner takes the smallest genomic position; that last key is a divergence, and it is the one described below. The RNG divergence proper is observable only under `--outMultimapperOrder Random`, and in both cases only in *which* equal-scoring locus is marked primary, never in the set of reported alignments.
 
-This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast benchmark, 299 SE and 475 PE primary-selection differences are all genuine ties: both tools find the identical alignment set, and differ only in which equal-scoring member is primary (from SA-iteration order or the RNG-seed difference above). Excluding those ties, SE is 99.815% and PE 99.883% exact.
+**On the residual ties.** STAR's window order is deterministic per read (anchor pieces in `PC` order, positions in suffix-array order) and rustar-aligner also builds windows per read, so reproducing it would not cost thread-invariance. It has been measured, not assumed: substituting seed discovery order for the positional key gained 21 reads on the annotated-junction tier and lost 142 on the 10k single-end tier, because this codebase's anchor iteration order is not STAR's `PC` order. Closing the gap means matching how MMP results are recorded, which has not been done. Until it is, the positional key stays, because it is total, cheap and thread-invariant.
+
+This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast benchmark, 130 of the 131 differing single-end records and 197 of the 202 differing paired-end mate records are genuine ties: both tools find the identical alignment set and differ only in which equal-scoring member is primary. On the annotated-junction tier all 42 remaining differences are of this kind, which is what its 100.000% tie-adjusted figure means. The handful that are not ties are in [§5](#5-known-residual-single-read-differences). Raw counts are reported alongside, never the tie-adjusted figure alone.
 
 **Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`), `src/params/mod.rs` (`MultimapperOrder`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlignChunk` RNG seeding.
 
@@ -85,9 +87,11 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 These are **not** deliberate divergences — they are tracked residual diffs on the 10k yeast benchmark, kept here for completeness. Each is a single read; none is a systematic behaviour difference.
 
-- **1 SE CIGAR-only diff** — `ERR12389696.13573895`: both tools align to XV:218357, MAPQ 255, identical score (AS=133), but place a 1-base insertion differently (`100M1I45M4S` vs STAR's `108M1I37M4S`). The 71-base seed is found at a different position within a long homopolymer run (a seed-level tie); resolving it requires reproducing STAR's exact Lmapped chain path.
-- **1 STAR-only PE mate** — `ERR12389696.18919121`: an SA-level difference.
-- **1 rustar-aligner-only PE mate** — `ERR12389696.6302610`: a pre-existing false positive.
+- **1 SE insertion-placement diff**: `ERR12389696.20597455`, XIV:545446, MAPQ 255, identical score (AS=143), with the 1-base insertion four bases to the left of STAR's choice (`25M1I124M` against STAR's `29M1I120M`). The same read shows on the PE tier. Insertion placement inside `stitchAlignToTranscript`, not a tie-break.
+- **1 PE pair where rustar-aligner scores lower**: `ERR12389696.11539725`, AS 224 against STAR's 235; mate 1 is soft-clipped to `31S95M459N24M` where STAR reaches back across a second junction to `22S10M468N94M459N24M`.
+- **1 PE pair where rustar-aligner scores higher**: `ERR12389696.4972950`, AS 260 against STAR's 248; mate 2 is spliced `1S33M72N50M186N65M1S` where STAR soft-clips 27 bases to `27S122M1S`. Recorded here rather than in [§2](#2-cases-where-rustar-aligner-outperforms-star) because it is a single observed read, not a characterised behaviour.
+
+Counts are from the 10k yeast SE and PE tiers with an index built by the same binary; the annotated-junction tier has no non-tie residual.
 
 See `CLAUDE.md` ("Known Issues" / "PE Status") for the current status of these.
 
