@@ -1054,12 +1054,6 @@ pub struct Parameters {
     #[arg(long = "soloCBwhitelist", num_args = 1.., default_values_t = vec!["None".to_string()])]
     pub solo_cb_whitelist: Vec<String>,
 
-    /// 10x chemistry preset. Sets the CB/UMI geometry so it does not have to be
-    /// spelled out with `--soloCBstart` and friends. `-` (the default) leaves
-    /// the geometry to those flags.
-    #[arg(long = "soloChemistry", default_value = "-")]
-    pub solo_chemistry: String,
-
     /// How cell barcodes are represented: `Sequence` (2-bit packed ACGT, the
     /// default).
     #[arg(long = "soloCBtype", default_value = "Sequence")]
@@ -1579,46 +1573,6 @@ impl Parameters {
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
             ));
-        }
-
-        // --soloChemistry presets. STAR applies these before validating the
-        // geometry, so a preset and an explicit --soloCBstart cannot disagree:
-        // the preset wins and says so, rather than half-applying.
-        if params.solo_chemistry != "-" {
-            let geometry = match params.solo_chemistry.as_str() {
-                // (cb_start, cb_len, umi_start, umi_len), 1-based as STAR takes them.
-                "CR_2" | "CR_3" | "CR_3.1" | "CR_4" | "SC3Pv1" => Some((1, 14, 15, 10)),
-                "SC3Pv2" => Some((1, 16, 17, 10)),
-                "SC3Pv3" | "SC3Pv4" | "SC5P" => Some((1, 16, 17, 12)),
-                _ => None,
-            };
-            let Some((cb_start, cb_len, umi_start, umi_len)) = geometry else {
-                return Err(command.error(
-                    ErrorKind::InvalidValue,
-                    format!(
-                        "unknown --soloChemistry '{}'; expected SC3Pv1, SC3Pv2, SC3Pv3, \
-                         SC3Pv4, SC5P, or -",
-                        params.solo_chemistry
-                    ),
-                ));
-            };
-            for (flag, given) in [
-                ("--soloCBstart", params.solo_cb_start),
-                ("--soloCBlen", params.solo_cb_len),
-                ("--soloUMIstart", params.solo_umi_start),
-                ("--soloUMIlen", params.solo_umi_len),
-            ] {
-                if given != 0 {
-                    log::warn!(
-                        "--soloChemistry {} overrides the geometry given by {flag}",
-                        params.solo_chemistry
-                    );
-                }
-            }
-            params.solo_cb_start = cb_start;
-            params.solo_cb_len = cb_len;
-            params.solo_umi_start = umi_start;
-            params.solo_umi_len = umi_len;
         }
 
         // --soloCBtype: only 2-bit packed ACGT barcodes are supported. `String`
@@ -2718,61 +2672,6 @@ mod tests {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
-    }
-
-    #[test]
-    fn solo_chemistry_presets_set_the_geometry() {
-        let base = [
-            "--readFilesIn",
-            "cdna.fq",
-            "bc.fq",
-            "--soloType",
-            "CB_UMI_Simple",
-            "--soloCBwhitelist",
-            "wl.txt",
-            "--sjdbGTFfile",
-            "genes.gtf",
-        ];
-        let with = |extra: &[&str]| {
-            let mut a = base.to_vec();
-            a.extend_from_slice(extra);
-            try_parse(&a)
-        };
-
-        // v2: 16-base CB, 10-base UMI.
-        let p = with(&["--soloChemistry", "SC3Pv2"]).unwrap();
-        assert_eq!(
-            (
-                p.solo_cb_start,
-                p.solo_cb_len,
-                p.solo_umi_start,
-                p.solo_umi_len
-            ),
-            (1, 16, 17, 10)
-        );
-
-        // v3 lengthened the UMI to 12.
-        let p = with(&["--soloChemistry", "SC3Pv3"]).unwrap();
-        assert_eq!(
-            (
-                p.solo_cb_start,
-                p.solo_cb_len,
-                p.solo_umi_start,
-                p.solo_umi_len
-            ),
-            (1, 16, 17, 12)
-        );
-
-        // v1 used a 14-base CB.
-        let p = with(&["--soloChemistry", "SC3Pv1"]).unwrap();
-        assert_eq!((p.solo_cb_len, p.solo_umi_len), (14, 10));
-
-        // The preset wins over an explicit geometry rather than half-applying.
-        let p = with(&["--soloChemistry", "SC3Pv3", "--soloCBlen", "14"]).unwrap();
-        assert_eq!(p.solo_cb_len, 16);
-
-        // Unknown presets are refused.
-        assert!(with(&["--soloChemistry", "SC9Pv9"]).is_err());
     }
 
     #[test]
