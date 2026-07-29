@@ -773,7 +773,11 @@ pub fn detect_chimeric_mult(
             let ro2 = ro_coords(tr2, read_len);
             let overlap = ro_overlap(ro1, ro2);
             let (len1, len2) = (ro1.1 + 1 - ro1.0, ro2.1 + 1 - ro2.0);
-            if len1 <= min_seg + overlap || len2 <= min_seg + overlap {
+            // STAR writes this as `roE > segmentMin + roS + overlap`, which on
+            // inclusive coordinates means a segment must be *longer* than
+            // `segmentMin + overlap + 1`, not merely longer than
+            // `segmentMin + overlap`.
+            if len1 <= min_seg + overlap + 1 || len2 <= min_seg + overlap + 1 {
                 continue;
             }
             // Same waiver as the old path: segments in different mates are
@@ -1016,7 +1020,9 @@ pub fn detect_chimeric_old_impl(
         let r_length2 = ro_end2 + 1 - ro_start2;
 
         // Both segments must be long enough (after subtracting overlap)
-        if r_length1 <= min_seg + overlap || r_length2 <= min_seg + overlap {
+        // Same inclusive-coordinate boundary as the multimap path above
+        // (`ReadAlign_chimericDetectionOld.cpp`, `chimericAlignScore`).
+        if r_length1 <= min_seg + overlap + 1 || r_length2 <= min_seg + overlap + 1 {
             continue;
         }
 
