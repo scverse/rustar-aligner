@@ -13,6 +13,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- `--outBAMsortingBinsN` spills the coordinate sort to disk bins
+  instead of holding every record in memory, which is what finally gives
+  `--limitBAMsortRAM` something to bound. Output is unchanged: the
+  binned and unbinned sorts produce identical BAM.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
