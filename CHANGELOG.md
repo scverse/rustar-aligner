@@ -133,6 +133,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
 Initial release of Rust rewrite of STAR.
 ### Other changes
 
+- The per-read transcript-filter bookkeeping is a fixed set of counters
+  rather than a `HashMap<&str, i32>`, removing a heap allocation per read
+  and a string hash per filtered transcript. Output is unchanged.
+
 - The splice-motif check in the junction scan carries a sliding window
   and looks the motif up in a table instead of re-reading four genome
   bases and matching on them at every position. Output is unchanged
