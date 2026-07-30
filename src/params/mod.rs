@@ -1054,6 +1054,11 @@ pub struct Parameters {
     #[arg(long = "soloCBwhitelist", num_args = 1.., default_values_t = vec!["None".to_string()])]
     pub solo_cb_whitelist: Vec<String>,
 
+    /// How cell barcodes are represented: `Sequence` (2-bit packed ACGT, the
+    /// default).
+    #[arg(long = "soloCBtype", default_value = "Sequence")]
+    pub solo_cb_type: String,
+
     /// 1-based start position of the cell barcode in the barcode read.
     #[arg(long = "soloCBstart", default_value_t = 1)]
     pub solo_cb_start: u32,
@@ -1087,6 +1092,17 @@ pub struct Parameters {
     /// STAR's shared-memory genome-loading modes are a no-op here.
     #[arg(long = "genomeLoad", default_value = "NoSharedMemory")]
     pub genome_load: String,
+
+    /// Adapter sequence that `--soloCBposition` / `--soloUMIposition` anchor
+    /// codes 2 and 3 are measured from. `-` (the default) means no adapter, so
+    /// only the read-start and read-end anchors are usable.
+    #[arg(long = "soloAdapterSequence", default_value = "-")]
+    pub solo_adapter_sequence: String,
+
+    /// Mismatches tolerated when locating `--soloAdapterSequence` in the
+    /// barcode read.
+    #[arg(long = "soloAdapterMismatchesNmax", default_value_t = 1)]
+    pub solo_adapter_mismatches_nmax: usize,
 
     /// `CB_UMI_Complex` cell-barcode segment positions, one per segment, as
     /// `startAnchor_startDist_endAnchor_endDist`. Only read-start anchoring
@@ -1122,6 +1138,14 @@ pub struct Parameters {
     /// write `UniqueAndMult-<method>.mtx` (real-valued) per Gene/GeneFull feature.
     #[arg(long = "soloMultiMappers", num_args = 1.., default_values_t = vec!["Unique".to_string()])]
     pub solo_multi_mappers: Vec<String>,
+
+    /// Third column of `features.tsv`. STAR's default is `Gene Expression`;
+    /// the sentinel `-` suppresses the column entirely.
+    #[arg(
+        long = "soloOutFormatFeaturesGeneField3",
+        default_value = "Gene Expression"
+    )]
+    pub solo_out_format_features_gene_field3: String,
 
     /// Output directory name for solo matrices (relative to `--outFileNamePrefix`).
     #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
@@ -1548,6 +1572,19 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+            ));
+        }
+
+        // --soloCBtype: only 2-bit packed ACGT barcodes are supported. `String`
+        // needs a different whitelist representation entirely, so refuse rather
+        // than silently pack a non-ACGT barcode into nonsense.
+        if params.solo_cb_type != "Sequence" {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "--soloCBtype {} is not supported; expected Sequence",
+                    params.solo_cb_type
+                ),
             ));
         }
 
@@ -2635,5 +2672,37 @@ mod tests {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+    }
+
+    #[test]
+    fn solo_cb_type_string_is_refused_rather_than_mispacked() {
+        let base = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "10",
+        ];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        assert!(with(&["--soloCBtype", "Sequence"]).is_ok());
+        // `String` needs a whitelist representation this does not have; packing
+        // a non-ACGT barcode into 2 bits per base would produce nonsense.
+        assert!(with(&["--soloCBtype", "String"]).is_err());
     }
 }

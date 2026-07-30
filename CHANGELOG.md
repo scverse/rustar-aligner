@@ -13,6 +13,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **STARsolo barcode resolution**: `--soloCBtype`,
+  `--soloAdapterSequence` / `--soloAdapterMismatchesNmax` for
+  adapter-anchored `CB_UMI_Complex` geometry, and
+  `--soloOutFormatFeaturesGeneField3`. Barcode correction now applies
+  STAR's `cbMinP` posterior threshold (0.975) and its `oneExact`
+  guard, so a low-confidence correction is dropped rather than accepted.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
@@ -98,6 +105,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
   the OS when abandoned, so allocator cache size stays bounded.
 
 ### Bug fixes
+
+- The STARsolo adapter search took the leftmost match inside the
+  mismatch budget; STAR's `localAlignHammingDist` takes the
+  best-scoring one. Since `CB_UMI_Complex` measures barcode positions
+  from the adapter, the wrong offset shifted the whole barcode. Ties now
+  go to the leftmost of the best, and an `N` in the adapter is a
+  wildcard rather than a mismatch.
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block

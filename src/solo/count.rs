@@ -258,11 +258,26 @@ fn directional(umis: &HashMap<u64, u32>, umi_len: usize, dir_count_add: i64) -> 
 // Cell-barcode multi-match resolution (deferred 1MM_multi)
 // ---------------------------------------------------------------------------
 
+/// STAR's posterior threshold for accepting a corrected cell barcode
+/// (`SoloReadBarcode` `cbMinP`). The winner must hold at least this share of
+/// the total posterior mass, otherwise the read is discarded rather than
+/// assigned to a barcode the evidence does not actually single out.
+const CB_MIN_P: f64 = 0.975;
+
 /// Resolve a 1MM_multi cell barcode to a single whitelist index using the
 /// count+quality posterior: weight = `(exactCount[cand] + pseudocount) · 10^(−q/10)`
 /// where `q` is the mismatch-position Phred score. `pseudocount` is 1 for the
-/// `*_pseudocounts` match types (CellRanger ≥ 3.0). Returns the argmax, or
-/// `None` if no candidate has positive weight.
+/// `*_pseudocounts` match types (CellRanger ≥ 3.0).
+///
+/// Returns the argmax, subject to two conditions STAR imposes and this did not:
+///
+/// - the winner's share of the total posterior must reach [`CB_MIN_P`]. Taking
+///   the argmax unconditionally assigns a barcode whenever any candidate has
+///   positive weight, including when two candidates are all but tied, which is
+///   exactly the case the threshold exists to reject;
+/// - unless pseudocounts are in use, the winner must have been observed as an
+///   exact match at least once (`oneExact`). A candidate whose only support is
+///   a pseudocount is not evidence.
 fn resolve_multi_cb(
     candidates: &[crate::solo::whitelist::CbCandidate],
     exact_counts: &[u64],
@@ -280,10 +295,20 @@ fn resolve_multi_cb(
             _ => best = Some((c.wl_index, weight)),
         }
     }
-    match best {
-        Some((idx, w)) if total > 0.0 && w > 0.0 => Some(idx),
-        _ => None,
+    let (idx, w) = best?;
+    if total <= 0.0 || w <= 0.0 {
+        return None;
     }
+    // Posterior threshold: the winner has to actually win.
+    if w / total < CB_MIN_P {
+        return None;
+    }
+    // `oneExact`: required by every match type except the pseudocount ones,
+    // where the pseudocount is deliberately standing in for absent evidence.
+    if pseudocount == 0.0 && exact_counts.get(idx as usize).copied().unwrap_or(0) == 0 {
+        return None;
+    }
+    Some(idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1223,7 @@ pub fn write_gene_matrix(
             &raw_dir.join(&features_name),
             &ctx.gene_ann.gene_ids,
             &ctx.gene_ann.gene_names,
+            &params.solo_out_format_features_gene_field3,
             gzip,
         )?;
         write_barcodes(
@@ -1254,6 +1280,7 @@ pub fn write_gene_matrix(
                 &filt_dir.join(&features_name),
                 &ctx.gene_ann.gene_ids,
                 &ctx.gene_ann.gene_names,
+                &params.solo_out_format_features_gene_field3,
                 gzip,
             )?;
             write_barcodes_subset(&filt_dir.join(&barcodes_name), &ctx.whitelist, &cbs, gzip)?;
@@ -1372,6 +1399,7 @@ pub fn write_gene_matrix(
             &velo_dir.join(&features_name),
             &ctx.gene_ann.gene_ids,
             &ctx.gene_ann.gene_names,
+            &params.solo_out_format_features_gene_field3,
             gzip,
         )?;
         write_barcodes(
@@ -1812,12 +1840,17 @@ fn write_cellranger_summary(
     Ok(())
 }
 
-/// `features.tsv`: `gene_id <TAB> gene_name <TAB> "Gene Expression"` (CellRanger
-/// v3 layout). We have no gene names, so the id is repeated.
+/// `features.tsv`: `gene_id <TAB> gene_name <TAB> <field3>` (CellRanger v3
+/// layout).
+///
+/// `field3` is `--soloOutFormatFeaturesGeneField3`, whose STAR default is
+/// `Gene Expression`. The sentinel `-` drops the column, giving the two-column
+/// form some downstream tools expect.
 fn write_features(
     path: &Path,
     gene_ids: &[String],
     gene_names: &[String],
+    field3: &str,
     gzip: bool,
 ) -> Result<(), Error> {
     // CellRanger v3 layout: gene_id <TAB> gene_name <TAB> "Gene Expression".
@@ -1826,7 +1859,12 @@ fn write_features(
     // fallback is already baked into `gene_names`.
     write_file(path, gzip, |w| {
         for (id, name) in gene_ids.iter().zip(gene_names.iter()) {
-            writeln!(w, "{id}\t{name}\tGene Expression").map_err(|e| Error::io(e, path))?;
+            if field3 == "-" {
+                writeln!(w, "{id}\t{name}")
+            } else {
+                writeln!(w, "{id}\t{name}\t{field3}")
+            }
+            .map_err(|e| Error::io(e, path))?;
         }
         Ok(())
     })?;
@@ -2091,12 +2129,70 @@ mod tests {
                 mismatch_qual: b'I',
             },
         ];
-        // Same quality → higher exact-count prior wins.
-        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), Some(0));
-        assert_eq!(resolve_multi_cb(&cands, &[3, 10], 0.0), Some(1));
+        // Same quality, so the exact-count priors decide. The winner must also
+        // clear STAR's posterior threshold: 10 against 3 is only a 77% share,
+        // which is exactly the ambiguous case cbMinP exists to reject.
+        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), None);
+        assert_eq!(resolve_multi_cb(&cands, &[3, 10], 0.0), None);
+
+        // A decisive prior does clear it (1000/1003 = 99.7%).
+        assert_eq!(resolve_multi_cb(&cands, &[1000, 3], 0.0), Some(0));
+        assert_eq!(resolve_multi_cb(&cands, &[3, 1000], 0.0), Some(1));
+
         // No prior signal and no pseudocount → rejected.
         assert_eq!(resolve_multi_cb(&cands, &[0, 0], 0.0), None);
-        // Pseudocount gives every candidate positive weight → argmax accepted.
-        assert!(resolve_multi_cb(&cands, &[0, 0], 1.0).is_some());
+
+        // Pseudocounts alone leave the two candidates tied at 50%, far below
+        // the threshold, so they are still rejected: a pseudocount makes a
+        // candidate *eligible*, it does not make it *evidence*.
+        assert_eq!(resolve_multi_cb(&cands, &[0, 0], 1.0), None);
+
+        // With pseudocounts and a decisive prior, accepted.
+        assert_eq!(resolve_multi_cb(&cands, &[1000, 0], 1.0), Some(0));
+
+        // oneExact: without pseudocounts a winner that was never seen exactly
+        // is refused even when it dominates the posterior.
+        assert_eq!(resolve_multi_cb(&cands[..1], &[0, 0], 0.0), None);
+    }
+
+    /// Two candidates of equal quality, so the exact-count priors decide the
+    /// posterior, and STAR accepts the winner only once its share reaches
+    /// `CB_MIN_P` (0.975, `SoloReadBarcode_getCBandUMI.cpp`). Named apart from
+    /// the ordering test above because this is the threshold rather than the
+    /// ordering: it decides between correcting a barcode and dropping the read.
+    #[test]
+    fn cb_posterior_below_min_p_is_rejected() {
+        use crate::solo::whitelist::CbCandidate;
+        let cands = vec![
+            CbCandidate {
+                wl_index: 0,
+                mismatch_pos: 1,
+                mismatch_qual: b'I',
+            },
+            CbCandidate {
+                wl_index: 1,
+                mismatch_pos: 2,
+                mismatch_qual: b'I',
+            },
+        ];
+        // 10/13 = 0.769: a clear winner on ordering, still short of the bar.
+        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), None);
+        // 1000/1003 = 0.997 clears it.
+        assert_eq!(resolve_multi_cb(&cands, &[1000, 3], 0.0), Some(0));
+    }
+
+    /// STAR's `oneExact`: a correction needs at least one candidate that was
+    /// seen exactly in the whitelist counts. A sole candidate with no exact
+    /// support holds the whole posterior and is still refused, so this guard is
+    /// not implied by the threshold.
+    #[test]
+    fn a_cb_never_seen_exactly_is_refused_without_pseudocounts() {
+        use crate::solo::whitelist::CbCandidate;
+        let one = vec![CbCandidate {
+            wl_index: 0,
+            mismatch_pos: 1,
+            mismatch_qual: b'I',
+        }];
+        assert_eq!(resolve_multi_cb(&one, &[0, 0], 0.0), None);
     }
 }
