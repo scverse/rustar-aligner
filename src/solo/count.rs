@@ -2154,4 +2154,45 @@ mod tests {
         // is refused even when it dominates the posterior.
         assert_eq!(resolve_multi_cb(&cands[..1], &[0, 0], 0.0), None);
     }
+
+    /// Two candidates of equal quality, so the exact-count priors decide the
+    /// posterior, and STAR accepts the winner only once its share reaches
+    /// `CB_MIN_P` (0.975, `SoloReadBarcode_getCBandUMI.cpp`). Named apart from
+    /// the ordering test above because this is the threshold rather than the
+    /// ordering: it decides between correcting a barcode and dropping the read.
+    #[test]
+    fn cb_posterior_below_min_p_is_rejected() {
+        use crate::solo::whitelist::CbCandidate;
+        let cands = vec![
+            CbCandidate {
+                wl_index: 0,
+                mismatch_pos: 1,
+                mismatch_qual: b'I',
+            },
+            CbCandidate {
+                wl_index: 1,
+                mismatch_pos: 2,
+                mismatch_qual: b'I',
+            },
+        ];
+        // 10/13 = 0.769: a clear winner on ordering, still short of the bar.
+        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), None);
+        // 1000/1003 = 0.997 clears it.
+        assert_eq!(resolve_multi_cb(&cands, &[1000, 3], 0.0), Some(0));
+    }
+
+    /// STAR's `oneExact`: a correction needs at least one candidate that was
+    /// seen exactly in the whitelist counts. A sole candidate with no exact
+    /// support holds the whole posterior and is still refused, so this guard is
+    /// not implied by the threshold.
+    #[test]
+    fn a_cb_never_seen_exactly_is_refused_without_pseudocounts() {
+        use crate::solo::whitelist::CbCandidate;
+        let one = vec![CbCandidate {
+            wl_index: 0,
+            mismatch_pos: 1,
+            mismatch_qual: b'I',
+        }];
+        assert_eq!(resolve_multi_cb(&one, &[0, 0], 0.0), None);
+    }
 }
