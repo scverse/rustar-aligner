@@ -71,6 +71,8 @@ pub struct SortedBamWriter {
     header: sam::Header,
     compression: i32,
     limit_bam_sort_ram: u64,
+    /// `--outBAMsortingBinsN`. 0 sorts entirely in memory.
+    bins_n: usize,
 }
 
 impl BamWriter {
@@ -155,7 +157,102 @@ impl SortedBamWriter {
             header,
             compression: params.out_bam_compression,
             limit_bam_sort_ram: params.limit_bam_sort_ram,
+            bins_n: params.out_bam_sorting_bins_n,
         })
+    }
+
+    /// Whether the buffered records should be sorted through disk bins rather
+    /// than all at once in memory.
+    ///
+    /// Only when a RAM bound was actually asked for and the estimate exceeds
+    /// it: without `--limitBAMsortRAM` there is nothing to respect, and paying
+    /// for temporary files would be a cost with no benefit.
+    fn should_spill(&self) -> bool {
+        self.bins_n > 0
+            && self.limit_bam_sort_ram > 0
+            && self.estimated_ram() > self.limit_bam_sort_ram
+    }
+
+    /// Coordinate-sort through on-disk bins.
+    ///
+    /// Records are partitioned by reference sequence into bins that are already
+    /// in coordinate order relative to one another, each bin is written to its
+    /// own temporary BAM, and the bins are then read back one at a time, sorted
+    /// and appended. Because the bins are coordinate-disjoint and ordered, no
+    /// k-way merge is needed.
+    ///
+    /// The point is residency: only one bin is held in memory at a time during
+    /// the sort, so peak usage is the largest bin rather than the whole run.
+    /// Unmapped records sort after everything else and get the last bin.
+    fn finish_binned(&mut self) -> Result<(), Error> {
+        let n_refs = self.header.reference_sequences().len().max(1);
+        let bins = self.bins_n.min(n_refs).max(1);
+        let bin_of = |rec: &RecordBuf| -> usize {
+            match rec.reference_sequence_id() {
+                Some(chr) => (chr * bins) / n_refs,
+                None => bins, // the unmapped tail
+            }
+        };
+
+        let dir = tempfile::tempdir().map_err(|e| Error::io(e, &self.output_path))?;
+        let paths: Vec<std::path::PathBuf> = (0..=bins)
+            .map(|i| dir.path().join(format!("bin{i}.bam")))
+            .collect();
+
+        // Pass 1: stream every buffered record out to its bin, dropping it from
+        // memory as we go. Uncompressed, since these files are read back
+        // immediately and compressing them would be pure cost.
+        {
+            let mut writers: Vec<bam::io::Writer<bgzf::io::Writer<BufWriter<File>>>> = Vec::new();
+            for path in &paths {
+                let f = File::create(path).map_err(|e| Error::io(e, path))?;
+                let mut bgzf = make_bgzf_writer(BufWriter::new(f), 0);
+                write_bam_header_lenient(&mut bgzf, &self.header, None)?;
+                writers.push(bam::io::Writer::from(bgzf));
+            }
+            for rec in self.records.drain(..) {
+                let b = bin_of(&rec);
+                writers[b].write_alignment_record(&self.header, &rec)?;
+            }
+            for w in &mut writers {
+                w.finish(&self.header)?;
+            }
+        }
+
+        // Pass 2: one bin at a time.
+        let buf_writer = BufWriter::new(File::create(&self.output_path)?);
+        let mut bgzf = make_bgzf_writer(buf_writer, self.compression);
+        write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
+        let mut out = bam::io::Writer::from(bgzf);
+
+        let mut total = 0usize;
+        let mut peak = 0usize;
+        for path in &paths {
+            let mut reader = bam::io::reader::Builder
+                .build_from_path(path)
+                .map_err(|e| Error::io(e, path))?;
+            let hdr = reader.read_header().map_err(|e| Error::io(e, path))?;
+            let mut bucket: Vec<RecordBuf> = Vec::new();
+            for rec in reader.record_bufs(&hdr) {
+                bucket.push(rec.map_err(|e| Error::io(e, path))?);
+            }
+            peak = peak.max(bucket.len());
+            total += bucket.len();
+            bucket.sort_by_key(|r| match (r.reference_sequence_id(), r.alignment_start()) {
+                (Some(chr), Some(pos)) => (chr, pos.get()),
+                _ => (usize::MAX, 0),
+            });
+            for record in &bucket {
+                out.write_alignment_record(&self.header, record)?;
+            }
+            // `bucket` drops here: the next bin starts from nothing.
+        }
+        out.finish(&self.header)?;
+        log::info!(
+            "Sorted BAM written ({total} records) through {} bins; largest bin {peak} records",
+            bins + 1
+        );
+        Ok(())
     }
 
     /// Buffer records — no disk I/O yet.
@@ -190,6 +287,12 @@ impl SortedBamWriter {
     /// Sort key: (reference_sequence_id, alignment_start).
     /// Unmapped records (no reference) sort to the end.
     pub fn finish(&mut self) -> Result<(), Error> {
+        // Spilling keeps only one bin's worth of records resident at a time, so
+        // `--limitBAMsortRAM` becomes a bound the sort respects rather than a
+        // threshold it dies on.
+        if self.should_spill() {
+            return self.finish_binned();
+        }
         self.check_ram_limit()?;
         self.records
             .sort_by_key(|r| match (r.reference_sequence_id(), r.alignment_start()) {
@@ -691,8 +794,77 @@ mod tests {
             crate::stats::UnmappedReason::Other,
         )
         .unwrap();
+        writer.write_batch(std::slice::from_ref(&rec)).unwrap();
+        // With binning available (the default), exceeding the bound is no
+        // longer fatal: the sort spills and respects it.
+        writer
+            .finish()
+            .expect("binned sort should honour the bound");
+
+        // With binning disabled there is no way to respect the bound, so the
+        // old behaviour stands and the run stops rather than quietly using
+        // more memory than it was allowed.
+        params.out_bam_sorting_bins_n = 0;
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = SortedBamWriter::create(temp_file.path(), &genome, &params).unwrap();
         writer.write_batch(&[rec]).unwrap();
-        let result = writer.finish();
-        assert!(result.is_err(), "Should fail when RAM limit is exceeded");
+        assert!(
+            writer.finish().is_err(),
+            "with --outBAMsortingBinsN 0 the RAM limit must still be fatal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sort_bin_tests {
+    use super::*;
+
+    fn params_with(extra: &[&str]) -> Parameters {
+        let mut a = vec!["rustar-aligner", "--readFilesIn", "r.fq"];
+        a.extend_from_slice(extra);
+        Parameters::try_parse_from(&a).unwrap()
+    }
+
+    #[test]
+    fn spilling_is_off_unless_a_ram_bound_was_asked_for() {
+        // No --limitBAMsortRAM means no bound to respect, so paying for
+        // temporary files would be cost without benefit.
+        let p = params_with(&[]);
+        assert_eq!(p.limit_bam_sort_ram, 0);
+        assert_eq!(p.out_bam_sorting_bins_n, 50);
+
+        let dir = tempfile::tempdir().unwrap();
+        let genome = crate::genome::Genome {
+            transform_blocks: None,
+            sequence: vec![0u8; 128].into(),
+            n_genome: 64,
+            n_genome_real: 64,
+            n_chr_real: 1,
+            chr_name: vec!["chr1".to_string()],
+            chr_length: vec![64],
+            chr_start: vec![0, 64],
+        };
+        let w = SortedBamWriter::create(&dir.path().join("o.bam"), &genome, &p).unwrap();
+        assert!(!w.should_spill(), "no RAM bound: must not spill");
+
+        // A bound that the (empty) buffer cannot exceed still must not spill.
+        let p = params_with(&["--limitBAMsortRAM", "1G"]);
+        let w = SortedBamWriter::create(&dir.path().join("o2.bam"), &genome, &p).unwrap();
+        assert!(!w.should_spill());
+
+        // Zero bins disables spilling outright, whatever the bound.
+        let p = params_with(&["--limitBAMsortRAM", "1", "--outBAMsortingBinsN", "0"]);
+        let mut w = SortedBamWriter::create(&dir.path().join("o3.bam"), &genome, &p).unwrap();
+        w.records.push(RecordBuf::default());
+        assert!(
+            !w.should_spill(),
+            "--outBAMsortingBinsN 0 disables spilling"
+        );
+
+        // With bins and a bound of 1 byte, a single record is already over.
+        let p = params_with(&["--limitBAMsortRAM", "1"]);
+        let mut w = SortedBamWriter::create(&dir.path().join("o4.bam"), &genome, &p).unwrap();
+        w.records.push(RecordBuf::default());
+        assert!(w.should_spill());
     }
 }
