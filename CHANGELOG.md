@@ -13,6 +13,47 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- On 10x geometry, `--soloFeatures` now defaults to `GeneFull` rather than
+  `Gene`: CellRanger has counted intronic reads toward the gene since v7.0.
+  Measured on 10x's `pbmc_1k_v3`, exonic-only counting is 30.5% below
+  CellRanger and `GeneFull` brings it to 1.6%. **This changes default counts
+  on 10x runs**; naming `--soloFeatures` explicitly still wins. See
+  `DIVERGENCE.md` §1.3.
+
+- `--soloCellFilter OrdMag` implements CellRanger's cell call: the same
+  quantile-over-ratio rule as `CellRanger2.2`, but searching for the expected
+  cell count by minimising `(OrdMag(x) - x)^2 / x` instead of fixing it at
+  3 000. `EmptyDrops_CR` now uses it for its initial cell set, which is the
+  order CellRanger runs the two steps in; `CellRanger2.2` is unchanged and
+  remains the default. See `DIVERGENCE.md` §3.5.
+
+- Under `--soloOutLayout CellRanger`, `metrics_summary.csv` is written with
+  CellRanger 10.0.0's 20 metrics, in its order and value formats. STARsolo's
+  `Summary.csv` is unchanged and still written alongside. Twelve of the 20
+  match a real `cellranger count` run exactly on the test fixture; the
+  interpretation behind the other eight is in `DIVERGENCE.md` §3.4.
+
+- `--soloOutLayout CellRanger` writes the solo matrices in the shape
+  `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
+  `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
+  on every barcode and one raw column per observed barcode. It implies
+  `--soloOutGzip yes`, `--soloOutRawBarcodes Observed` and an `outs/`
+  output directory, each still overridable on the command line. Counts are
+  unchanged. It is the default on 10x geometry, which **changes where
+  output files are written** on those runs; see `DIVERGENCE.md` §3.3.
+
+- On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
+  UMI), the five CellRanger-matching flags now **default** to their
+  CellRanger values. Any flag named on the command line wins, and the
+  substitution is logged. **This changes default output on 10x runs** and
+  diverges from STARsolo; see `DIVERGENCE.md` §1.3.
+
+- `--soloOutRawBarcodes Observed` writes the raw matrix with one column
+  per *observed* barcode instead of one per whitelist barcode, matching
+  what CellRanger's `raw_feature_bc_matrix` contains. Counts are
+  unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
+  **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
@@ -98,6 +139,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
   the OS when abandoned, so allocator cache size stays bounded.
 
 ### Bug fixes
+
+- `--soloUMIfiltering MultiGeneUMI_CR` kept every gene tied at the
+  highest read count; CellRanger gives a tied UMI to no gene at all.
+  Since one read per gene is the ordinary shape of a multi-gene UMI, the
+  flag removed nothing in practice. On a 20k-read 10x fixture the count
+  matrix moves from 16 465 to 15 414 against STAR's 15 423.
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block
