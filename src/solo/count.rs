@@ -476,6 +476,27 @@ fn build_matrix_body(
     ))
 }
 
+/// The whitelist indices that actually appear as a column in the streamed
+/// matrix body, ascending.
+///
+/// Reads the body once rather than tracking the set during counting, so the
+/// default path pays nothing for a feature it does not use.
+fn observed_barcodes(body: &tempfile::NamedTempFile) -> Result<Vec<u32>, Error> {
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        // "<gene> <cb1based> <count>", the layout `finalize_matrix` also parses.
+        if let Some(cb1) = line.split(' ').nth(1)
+            && let Ok(cb) = cb1.parse::<u32>()
+        {
+            seen.insert(cb.saturating_sub(1));
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 /// Write a final `matrix.mtx[.gz]` = MatrixMarket header + (optionally
 /// cb-remapped/filtered) body. With `remap = None` the body is copied verbatim
 /// (raw); with `Some(map)` only columns in the map survive, renumbered to the
@@ -822,8 +843,43 @@ fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> 
             let thresh = if max == 1 { 2 } else { max };
             genes.iter().filter(|&(_, &rc)| rc >= thresh).collect()
         }
-        // CellRanger > 3.0: keep the highest-read-count gene(s); no singleton drop.
-        UmiFiltering::MultiGeneUmiCr => genes.iter().filter(|&(_, &rc)| rc >= max).collect(),
+        // CellRanger: the gene with the strictly highest read count takes the
+        // UMI, and a tie gives it to nobody.
+        //
+        // STAR `SoloFeature_collapseUMIall.cpp:212-224` walks the genes keeping
+        // a running maximum, and clears its winner whenever it meets an equal
+        // count:
+        //
+        // ```cpp
+        // if (ig.second>maxu) { maxu=ig.second; maxg=ig.first; }
+        // else if (ig.second==maxu) { maxg=-1; };
+        // ...
+        // if ( maxg+1==0 ) continue; // not counted for any gene
+        // ```
+        //
+        // The outcome does not depend on the order the genes are visited: a
+        // strict maximum always ends as the winner, and any tie at the maximum
+        // always ends with none. So iterating a `HashMap` here is safe.
+        //
+        // This previously kept every gene tied at the maximum, which is the
+        // opposite decision on exactly the case the rule exists for, and made
+        // the flag inert on the common shape of one read per gene.
+        UmiFiltering::MultiGeneUmiCr => {
+            let mut best_count = 0u32;
+            let mut winner: Option<&u32> = None;
+            for (gene, &rc) in genes {
+                if rc > best_count {
+                    best_count = rc;
+                    winner = Some(gene);
+                } else if rc == best_count {
+                    winner = None;
+                }
+            }
+            match winner {
+                Some(gene) => vec![(gene, genes.get(gene).expect("winner is a key"))],
+                None => Vec::new(),
+            }
+        }
         UmiFiltering::None => unreachable!(),
     }
 }
@@ -1200,20 +1256,45 @@ pub fn write_gene_matrix(
             &ctx.gene_ann.gene_names,
             gzip,
         )?;
-        write_barcodes(
-            &raw_dir.join(&barcodes_name),
-            &ctx.whitelist,
-            sorted.len(),
-            gzip,
-        )?;
+        // `--soloOutRawBarcodes Observed` narrows the raw matrix to the
+        // barcodes that actually carry a count, which is what CellRanger's
+        // `raw_feature_bc_matrix` holds. STARsolo's raw matrix has a column per
+        // whitelist barcode, so the default keeps that.
+        let observed: Option<Vec<u32>> = if params.solo_out_raw_barcodes == "Observed" {
+            Some(observed_barcodes(&body)?)
+        } else {
+            None
+        };
+        let (raw_cols, raw_remap) = match &observed {
+            Some(cbs) => {
+                let map: HashMap<u32, u32> = cbs
+                    .iter()
+                    .enumerate()
+                    .map(|(col, &cb)| (cb, col as u32 + 1))
+                    .collect();
+                (cbs.len(), Some(map))
+            }
+            None => (sorted.len(), None),
+        };
+        match &observed {
+            Some(cbs) => {
+                write_barcodes_subset(&raw_dir.join(&barcodes_name), &ctx.whitelist, cbs, gzip)?;
+            }
+            None => write_barcodes(
+                &raw_dir.join(&barcodes_name),
+                &ctx.whitelist,
+                sorted.len(),
+                gzip,
+            )?,
+        }
         finalize_matrix(
             &body,
             &raw_dir.join(&matrix_name),
             gzip,
             n_genes,
-            sorted.len(),
+            raw_cols,
             mstats.nnz,
-            None,
+            raw_remap.as_ref(),
         )?;
         log::info!(
             "STARsolo: wrote {}/raw matrix ({} genes × {} barcodes, {} entries){}",
@@ -2055,6 +2136,43 @@ mod tests {
             UmiFiltering::MultiGeneUmiCr
         );
         assert!("bogus".parse::<UmiFiltering>().is_err());
+    }
+
+    /// The case the rule exists for, and the one the old code got backwards:
+    /// when two genes tie on read count, CellRanger counts the UMI for
+    /// neither. STAR clears its winner on an equal count
+    /// (`SoloFeature_collapseUMIall.cpp:212-224`) and skips the UMI when no
+    /// strict maximum survives.
+    ///
+    /// One read per gene is the common shape of a multi-gene UMI, so keeping
+    /// the ties made `--soloUMIfiltering MultiGeneUMI_CR` inert in practice:
+    /// on a 20 000-read 10x fixture it removed nothing at all, against 1 030
+    /// counts removed by STAR.
+    #[test]
+    fn multi_gene_umi_cr_drops_a_tie_entirely() {
+        let mut tied = HashMap::default();
+        tied.insert(0u32, 1u32);
+        tied.insert(1u32, 1u32);
+        assert!(filter_multi_gene_umi(&tied, UmiFiltering::MultiGeneUmiCr).is_empty());
+
+        // A tie at the maximum loses even when a third gene sits below it.
+        let mut tied_with_loser = HashMap::default();
+        tied_with_loser.insert(0u32, 5u32);
+        tied_with_loser.insert(1u32, 5u32);
+        tied_with_loser.insert(2u32, 3u32);
+        assert!(
+            filter_multi_gene_umi(&tied_with_loser, UmiFiltering::MultiGeneUmiCr).is_empty(),
+            "a tie at the maximum takes the UMI from everyone, including the third gene"
+        );
+
+        // A strict maximum still wins, whatever else is present.
+        let mut strict = HashMap::default();
+        strict.insert(0u32, 5u32);
+        strict.insert(1u32, 4u32);
+        strict.insert(2u32, 4u32);
+        let kept = filter_multi_gene_umi(&strict, UmiFiltering::MultiGeneUmiCr);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(*kept[0].0, 0);
     }
 
     #[test]

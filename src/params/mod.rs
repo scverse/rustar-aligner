@@ -1133,6 +1133,21 @@ pub struct Parameters {
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
 
+    /// Which barcodes the **raw** matrix has columns for. **Not a STAR
+    /// parameter**; a rustar-aligner addition, default `Whitelist`, which is
+    /// what STARsolo writes.
+    ///
+    /// `Whitelist` gives one column per whitelist barcode — 3.7 million of them
+    /// for 10x v3, whether or not a read ever carried them. `Observed` gives
+    /// one column per barcode that actually holds a count, which is what
+    /// CellRanger's `raw_feature_bc_matrix` contains, and turns a
+    /// hundreds-of-megabytes `barcodes.tsv` into a few kilobytes.
+    ///
+    /// The counts are identical either way; only the columns present differ.
+    #[arg(long = "soloOutRawBarcodes", default_value = "Whitelist",
+          value_parser = ["Whitelist", "Observed"])]
+    pub solo_out_raw_barcodes: String,
+
     /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
     /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
     /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
