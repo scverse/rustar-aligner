@@ -951,6 +951,11 @@ fn test_starsolo_gene_matrix() {
             "Gene",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1029,6 +1034,122 @@ fn test_starsolo_gene_matrix() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9a'' — --soloOutLayout CellRanger writes the same numbers where
+// `cellranger count` writes them: outs/{raw,filtered}_feature_bc_matrix/,
+// gzipped, with a -1 GEM-well suffix on every barcode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_solo_out_layout_cellranger() {
+    use std::io::Read;
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // Same fixture as test_starsolo_gene_matrix: 8 reads, one cell, two UMI
+    // clouds, so the expected counts are already known.
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi_a = "ACGTACGTAC";
+    let umi_b = "TGCATGCATG";
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        let exon1 = &genome[10000..10050];
+        for i in 0..8usize {
+            writeln!(cf, "@read{i}").unwrap();
+            cf.write_all(exon1).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            let umi = if i < 4 { umi_a } else { umi_b };
+            writeln!(bf, "@read{i}").unwrap();
+            writeln!(bf, "{cb}{umi}").unwrap();
+            writeln!(bf, "+\n{}", "I".repeat(26)).unwrap();
+        }
+    }
+    {
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}").unwrap();
+        writeln!(wf, "CCCCGGGGTTTTAAAA").unwrap();
+        writeln!(wf, "GGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_crlayout");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+
+    // No --soloOutLayout on the command line: 16 bp CB + 12 bp UMI with a
+    // whitelist is 10x geometry, so the CellRanger layout is the default.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+            "Gene",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let gunzip = |p: &std::path::Path| -> String {
+        let f = fs::File::open(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(f)
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    };
+
+    // CellRanger's directory names, under outs/, with no per-feature level.
+    let raw = output_dir.join("outs").join("raw_feature_bc_matrix");
+    assert!(raw.is_dir(), "expected {}", raw.display());
+    assert!(
+        !output_dir.join("Solo.out").exists(),
+        "Solo.out/ should not be written under the CellRanger layout"
+    );
+
+    // Every barcode carries the -1 GEM-well suffix, and the raw matrix has one
+    // column per observed barcode (one), not one per whitelist entry (three).
+    let barcodes = gunzip(&raw.join("barcodes.tsv.gz"));
+    assert_eq!(barcodes.lines().count(), 1);
+    assert_eq!(barcodes.lines().next().unwrap(), format!("{cb}-1"));
+
+    let features = gunzip(&raw.join("features.tsv.gz"));
+    assert!(features.starts_with("G1\tG1\tGene Expression"));
+
+    // The 2 deduped molecules test_starsolo_gene_matrix asserts, in a matrix
+    // that is now 1 gene × 1 observed barcode.
+    let matrix = gunzip(&raw.join("matrix.mtx.gz"));
+    let dims = matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(dims, "1 1 1", "unexpected matrix dimensions");
+    assert_eq!(matrix.lines().last().unwrap(), "1 1 2");
+
+    let filt = output_dir.join("outs").join("filtered_feature_bc_matrix");
+    let f_barcodes = gunzip(&filt.join("barcodes.tsv.gz"));
+    assert_eq!(f_barcodes.lines().next().unwrap(), format!("{cb}-1"));
+    let f_matrix = gunzip(&filt.join("matrix.mtx.gz"));
+    assert_eq!(f_matrix.lines().last().unwrap(), "1 1 2");
+}
+
+// ---------------------------------------------------------------------------
 // Test 9a' — Summary.csv stays STARsolo-faithful; the CellRanger mapping funnel
 // (exonic/intronic/intergenic/antisense) is split out into a separate
 // CellRanger.summary.csv (PR #90 review: keep the faithful Summary.csv unaltered).
@@ -1091,6 +1212,11 @@ fn test_starsolo_summary_split() {
             "Forward",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1179,6 +1305,11 @@ fn test_starsolo_sj_feature() {
             "Forward",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1284,6 +1415,11 @@ fn test_starsolo_multimappers() {
             "Uniform",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1523,6 +1659,11 @@ fn test_starsolo_velocyto() {
             "Forward",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1611,6 +1752,11 @@ fn test_starsolo_velocyto_fold_ambiguous() {
             "Forward",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
@@ -1900,6 +2046,11 @@ fn test_starsolo_cellranger_style_matrix() {
             "1MM_CR",
             "--outSAMtype",
             "SAM",
+            // This fixture's 16 bp CB + 12 bp UMI is 10x geometry, which now
+            // defaults to CellRanger's output layout; the assertions below are
+            // about STARsolo's, so state it.
+            "--soloOutLayout",
+            "STARsolo",
             "--outFileNamePrefix",
             &prefix,
         ])
