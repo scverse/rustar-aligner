@@ -65,6 +65,157 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
+### 1.3 CellRanger behaviour is the default on 10x geometry
+
+**What STAR does.** STARsolo's defaults are its own (`1MM_multi`,
+`1MM_All`, no UMI filtering, `Hamming` clipping, `outFilterScoreMin 0`)
+whatever the barcode geometry. Matching CellRanger requires passing five flags,
+listed in STAR's `docs/STARsolo.md`.
+
+**What rustar-aligner does.** When the run is unambiguously 10x —
+`CB_UMI_Simple`, a whitelist, a 16-base CB and a 10- or 12-base UMI — those
+five flags default to their CellRanger values. Any flag given on the command
+line wins, and the substitution is logged in full.
+
+**Why.** A user aligning 10x data and comparing against CellRanger otherwise
+gets a successful run and different numbers, with nothing pointing at the five
+flags that explain it. Measured against CellRanger 10.0.0 on a 20 000-read
+fixture, those flags move the count matrix from 8.96% above CellRanger to
+0.03% above it, once #165's `cbMinP` posterior threshold is also applied.
+STAR 2.7.11b with the same flags is at +0.09%, so all three agree to within a
+fraction of a percent.
+
+**Impact.** This is a **change of default output behaviour** and therefore the
+largest divergence in this file. It is confined to a geometry nothing else in
+common use shares, it is escapable by naming any flag explicitly, and it is
+announced at `INFO` on every run it touches. It needs maintainer sign-off.
+
+**Source.** `src/params/mod.rs` (`looks_like_10x`,
+`apply_cellranger_defaults_on_10x`). STAR: `docs/STARsolo.md`, "Matching
+CellRanger 4.x and 5.x results".
+
+---
+
+### 3.2 `--soloOutRawBarcodes Observed` (opt-in, non-STAR)
+
+**What STAR does.** STARsolo's raw matrix has one column per whitelist
+barcode, whether or not any read carried it. For 10x v3 that is 3 686 400
+columns and a 62 MB `barcodes.tsv`, nearly all of it zeros.
+
+**What rustar-aligner does.** The same, by default. `--soloOutRawBarcodes
+Observed` narrows the raw matrix to the barcodes that actually hold a count,
+which is what CellRanger's `raw_feature_bc_matrix` contains. On a 200-cell
+fixture that is 200 columns and a 3.4 kB `barcodes.tsv`.
+
+**Why.** Someone comparing our raw matrix against CellRanger's finds no
+overlapping keys at all, because the two files mean different things by "raw".
+The flag makes the comparison possible without changing what STARsolo users
+get.
+
+**Impact.** The counts are identical either way — same entries, same values,
+verified on the fixture — only the columns present differ. This is a non-STAR
+flag and needs maintainer sign-off; it is off by default so STARsolo parity is
+untouched.
+
+**Source.** `src/solo/count.rs` (`observed_barcodes`), `src/params/mod.rs`
+(`solo_out_raw_barcodes`). CellRanger: `outs/raw_feature_bc_matrix/` from a
+`cellranger count` run, observed directly rather than taken from its source.
+
+---
+
+### 3.3 `--soloOutLayout CellRanger` (non-STAR; on by default on 10x geometry)
+
+**What STAR does.** STARsolo writes
+`Solo.out/<feature>/{raw,filtered}/{matrix.mtx, barcodes.tsv, features.tsv}`,
+uncompressed, with bare barcodes.
+
+**What rustar-aligner does.** The same, by default, on non-10x geometry.
+`--soloOutLayout CellRanger` writes the same numbers in the shape
+`cellranger count` produces: `outs/{raw,filtered}_feature_bc_matrix/`, all three
+files gzipped, a `-1` GEM-well suffix on every barcode, one raw column per
+observed barcode, and no per-feature subdirectory when a single feature is
+requested. It implies `--soloOutGzip yes`, `--soloOutRawBarcodes Observed` and
+`--soloOutFileNames outs/ ...`, each still overridable on the command line.
+
+Under §1.3 the same 10x detection turns this on by default, so a bare 10x run
+lands in CellRanger's layout.
+
+**Why.** Tools written against CellRanger's `outs/` (scanpy's `read_10x_mtx`,
+Seurat's `Read10X`, any in-house loader) key on those directory names and on
+the `-1` suffix. Without them the numbers are right and nothing downstream can
+read them without a rename step.
+
+**Impact.** No count changes: verified entry by entry on the 20 000-read
+fixture, 13 959 entries and 15 439 counts in both layouts. On 10x geometry it
+**changes where output files are written**, which needs maintainer sign-off
+alongside §1.3. Against a real `cellranger count` run on the same fixture the
+raw barcode sets match exactly, 200 of 200.
+
+**Source.** `src/solo/count.rs` (`write_gene_matrix`, `write_one_barcode`),
+`src/params/mod.rs` (`solo_out_layout`, `apply_cellranger_layout`). CellRanger:
+`outs/` from a `cellranger count` 10.0.0 run, observed directly rather than
+taken from its source.
+
+---
+
+### 3.4 `metrics_summary.csv` under the CellRanger layout (non-STAR)
+
+**What STAR does.** STARsolo writes `Summary.csv`, its own metric set with its
+own names. It has no `metrics_summary.csv`.
+
+**What rustar-aligner does.** The same, by default. Under
+`--soloOutLayout CellRanger` it *additionally* writes
+`metrics_summary.csv` with CellRanger 10.0.0's 20 metrics, in CellRanger's
+order and value formats. `Summary.csv` is written unchanged alongside it, so
+nothing STARsolo-faithful is altered. Under the CellRanger layout the older
+`CellRanger.summary.csv` is not written: its four rows are a subset of the
+metrics file.
+
+**Why.** The file is how a 10x pipeline reads run quality. Its 20 names are
+also the clearest public statement of what CellRanger measures, which makes it
+useful as a target even where our value differs.
+
+**Impact.** No count changes. It costs one extra gene-body overlap query per
+read, because the exonic/intronic split needs it and a `Gene`-only run does not
+otherwise do it.
+
+**Not all 20 are certainties.** Twelve match a real `cellranger count` 10.0.0
+run exactly on the 20 000-read fixture. The other eight follow from our own
+tallies under a stated interpretation, because CellRanger does not document the
+denominators:
+
+* `Reads Mapped Confidently to *` reads "confidently" as MAPQ 255, i.e. our
+  uniquely-mapped set.
+* `Reads Mapped Confidently to Transcriptome` is the `Gene` feature's own
+  uniquely-assigned read tally.
+* `Valid UMI Sequences` is measured over reads that reached the UMI check, i.e.
+  those with a valid barcode.
+* `Sequencing Saturation` is `1 - molecules / reads` over the reads that
+  entered the matrix. This is the largest disagreement on the fixture: 12.7%
+  against CellRanger's 7.4%. 10x define it as
+  `1 - n_deduped_reads / n_reads`, with `n_deduped_reads` the number of unique
+  `(barcode, UMI, gene)` combinations among confidently mapped reads. Taking
+  that literally — counting distinct triples *before* UMI correction — gives
+  **0.0%** on this fixture, because no two reads here share an exact triple, so
+  the literal reading is ruled out and their numerator is the corrected
+  molecule count, as ours is. The residual is therefore the denominator: at
+  7.4% theirs implies about 16 300 reads where ours counts about 17 300. The
+  difference is which reads are "confidently mapped", not the formula.
+* `Mean Reads per Cell` is total reads over called cells, not reads-in-cells
+  over called cells, which is what reproduces CellRanger's value.
+
+The cell-count-dependent metrics (`Median Genes per Cell`,
+`Median UMI Counts per Cell`, `Total Genes Detected`) differ by 2-4 on the
+fixture, following the count differences recorded in §1.3 rather than a
+different definition.
+
+**Source.** `src/solo/count.rs` (`write_metrics_summary`, `metric_int`,
+`metric_pct`), `src/solo/mod.rs` (`Q30Stats`). CellRanger: the
+`metrics_summary.csv` of a `cellranger count` 10.0.0 run, observed directly
+rather than taken from its source.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
