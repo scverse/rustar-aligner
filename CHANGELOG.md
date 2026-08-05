@@ -13,6 +13,43 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`--clipAdapterType CellRanger4` now matches STAR exactly**, both halves of the
+  clip. The 5' TSO trim is an overlap alignment against the first 91 bases of the
+  read, replicating `ClipCR4`'s Opal call (ACGTN alphabet; match +1, mismatch -2,
+  any-vs-N -2, N-vs-N 0; gap open = gap extend = 2; overlap mode with end
+  tracking), followed by STAR's acceptance gate
+  `S<20 || (S==20 && L>26) || (S==21 && L>30)`. The 3' trim is STAR's scored
+  `polyTail3p` scan, replacing a "trailing run of A >= 8" approximation that was
+  wrong in both directions (a read ending in 10 A's was trimmed by 10 where STAR
+  trims 0; `A*15 + C + A*15` was trimmed by 15 where STAR trims 31). The poly-A
+  transcription is taken from Benjamin Demaille's #148 and moved onto the solo
+  path, which is where `CellRanger4` is actually reached; #148's `clip_mate`
+  wiring is not used and that PR is superseded.
+
+  The overlap alignment comes from [`hyalite`](https://crates.io/crates/hyalite)
+  0.2 — a new dependency, pure Rust with no dependencies of its own. Reads are
+  scanned a batch at a time via `Database::scan_all`, mirroring STAR's
+  `ClipMate::clipChunk`, which aligns the adapter against a chunk of reads in one
+  Opal call.
+
+  Both halves are gated against STAR's own C++: `tests/data/cr4_opal_oracle.cpp`
+  links STAR's `opal.cpp` and reproduces `ClipCR4` + `ClipMate::clipChunk`
+  verbatim, and the committed `cr4_opal_oracle.tsv` is its output over 938 reads
+  chosen to straddle both decision boundaries. `cr4_tso_matches_star_opal_oracle`
+  checks every one against the scalar path, a forced-SIMD path, and the
+  production batch path.
+
+  Measured on 10x mouse chr19 with both tools under `--clipAdapterType
+  CellRanger4`: clip-amount differences against STARsolo drop from 154 to **0**,
+  and the soft-clipped share moves from 39% (STAR 41%) to 34.9% (STAR 35.0%).
+  Default SE/PE alignment is untouched, as `CellRanger4` is opt-in: SE 8788/8926
+  and PE 8390 both-mapped / 0 half-mapped, both unchanged.
+
+  Known limitation: `CellRanger4` combined with a non-zero `--clip5pNbases` /
+  `--clip3pNbases` misplaces most reads by `clip5pNbases`. That is a pre-existing
+  bug, not introduced here, and is tracked separately; `CellRanger4` on its own
+  and the fixed clips on their own are both unaffected.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).

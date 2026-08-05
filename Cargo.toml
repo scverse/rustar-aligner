@@ -65,6 +65,11 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.49", features = ["libdeflate"] }
+# Deterministic SIMD overlap aligner for the CellRanger4 5' TSO clip (STAR
+# links Opal for this). Pure Rust, zero dependencies, bit-identical across
+# backends. 0.2 is the first release with `Database::scan_all`, the per-target
+# scan the batched clip path needs.
+hyalite = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

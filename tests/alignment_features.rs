@@ -2024,3 +2024,134 @@ fn test_wasp_samtag() {
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test — CellRanger4 TSO clip is applied per read within a batch
+//
+// The 5' TSO clip is resolved for a whole read batch in one hyalite
+// `Database::scan_all` pass (`solo::tso_clip_lens_cr4_batch`), then indexed back
+// out per read in the parallel align loop. This test interleaves TSO-bearing and
+// TSO-free reads so that any off-by-one or reordering between the batched scan
+// and the per-read loop lands a clip on the wrong read and fails here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_starsolo_cr4_tso_clip_is_per_read_within_batch() {
+    const TSO: &str = "AAGCAGTGGTATCAACGCAGAGTACATGGG";
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+
+    let cb = "AAAACCCCGGGGTTTT";
+    // Exon2 (chr1:10251-10300) — the 50 bp the cDNA part of every read carries.
+    let exon2 = String::from_utf8(genome[10250..10300].to_vec()).unwrap();
+    assert!(
+        !exon2.ends_with("AAAAAAAA"),
+        "exon2 must not end in a polyA run, or the 3' CR4 trim would confound this test"
+    );
+
+    // 12 reads, alternating TSO-prefixed and bare, each with a distinct UMI so
+    // none are deduplicated away.
+    let n_pairs = 6;
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..n_pairs {
+            for tso in [true, false] {
+                let name = if tso { "tso" } else { "bare" };
+                let seq = if tso {
+                    format!("{TSO}{exon2}")
+                } else {
+                    exon2.clone()
+                };
+                writeln!(cf, "@{name}{i}\n{seq}\n+\n{}", "I".repeat(seq.len())).unwrap();
+                // Distinct 10 bp UMI per record: "UMI" + 7 digits.
+                let umi = format!("ACG{:07}", i * 2 + usize::from(!tso))
+                    .replace('0', "T")
+                    .replace(['1', '2', '3', '4', '5', '6', '7', '8', '9'], "C");
+                let umi: String = umi.chars().take(10).collect();
+                writeln!(
+                    bf,
+                    "@{name}{i}\n{cb}{umi}\n+\n{}",
+                    "I".repeat(cb.len() + umi.len())
+                )
+                .unwrap();
+            }
+        }
+    }
+    fs::write(&wl_path, format!("{cb}\n")).unwrap();
+
+    let output_dir = tmpdir.path().join("out_cr4_tso");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "10",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--clipAdapterType",
+            "CellRanger4",
+            "--outSAMtype",
+            "SAM",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let sam = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+
+    let mut n_tso = 0;
+    let mut n_bare = 0;
+    for line in sam.lines().filter(|l| !l.starts_with('@')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (qname, pos, cigar) = (f[0], f[3], f[5]);
+        assert_eq!(pos, "10251", "{qname}: cDNA should map to Exon2");
+
+        if qname.starts_with("tso") {
+            // The 30 nt TSO is clipped from the 5' and retained as a soft clip.
+            assert_eq!(
+                cigar, "30S50M",
+                "{qname}: TSO-bearing read should carry a 30 base 5' soft clip"
+            );
+            n_tso += 1;
+        } else {
+            assert_eq!(
+                cigar, "50M",
+                "{qname}: TSO-free read must not be clipped (a clip here means the \
+                 batched TSO scan was indexed onto the wrong read)"
+            );
+            n_bare += 1;
+        }
+    }
+    assert_eq!(n_tso, n_pairs, "every TSO read should be reported");
+    assert_eq!(n_bare, n_pairs, "every TSO-free read should be reported");
+}
