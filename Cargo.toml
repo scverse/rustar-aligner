@@ -33,7 +33,7 @@ log = "0.4"
 env_logger = "0.11"
 memmap2 = "0.9"
 byteorder = "1"
-noodles = { version = "0.113", features = ["fastq", "sam", "bam", "bgzf"] }
+noodles = { version = "0.115", features = ["fastq", "sam", "bam", "bgzf"] }
 bstr = "1"
 # Use the pure-Rust `zlib-rs` backend instead of flate2's default `miniz_oxide`:
 # ~2-3x faster inflate/deflate on the FASTQ decode + BGZF (BAM) paths, with no C
@@ -64,7 +64,7 @@ caps-sa = "0.6"
 mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
-noodles-bgzf = { version = "0.49", features = ["libdeflate"] }
+noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
 
 [dev-dependencies]
 assert_cmd = "2"
