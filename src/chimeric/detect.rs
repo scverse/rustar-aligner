@@ -1111,6 +1111,7 @@ mod tests {
                 is_anchor: true,
                 mate_id: 2,
                 pre_ext_score: (genome_end - genome_start) as i32,
+                sj_a: -1,
             }],
             chr_idx,
             genome_start,

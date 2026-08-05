@@ -327,8 +327,6 @@ impl GenomeIndex {
         }
 
         let (junction_db, prepared_junctions) = if !raw.is_empty() {
-            let jdb = SpliceJunctionDb::from_raw_junctions(&raw);
-
             let prepared: Vec<PreparedJunction> = raw
                 .iter()
                 .map(|&(chr_idx, intron_start, intron_end, strand)| {
@@ -343,6 +341,10 @@ impl GenomeIndex {
                 })
                 .collect();
             let prepared = sjdb_insert::sort_and_dedup(prepared);
+            // Build the annotated db from the prepared array itself, so the
+            // `sjA` table and the Gsj buffer are the same list in the same
+            // order by construction.
+            let jdb = SpliceJunctionDb::from_prepared(prepared.clone());
 
             let gsj =
                 sjdb_insert::build_gsj(&prepared, &genome, n_genome_real, params.sjdb_overhang)?;

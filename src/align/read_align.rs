@@ -298,6 +298,16 @@ pub fn align_read(
     };
 
     for (ci, cluster) in clusters.iter().enumerate() {
+        // STAR's `alignTranscriptsPerReadNmax` headroom break
+        // (`ReadAlign_stitchPieces.cpp`): stop collecting windows once one more
+        // window's worth of transcripts could overrun the per-read cap. The
+        // test is on the headroom, not on the running total, so the cap is
+        // never exceeded rather than merely noticed afterwards.
+        if transcripts.len() + params.align_transcripts_per_window_nmax
+            >= params.align_transcripts_per_read_nmax
+        {
+            break;
+        }
         let debug_name = if debug_read { read_name } else { "" };
         let cluster_transcripts = stitch_seeds_with_jdb_debug(
             cluster,
@@ -363,11 +373,16 @@ pub fn align_read(
         });
     }
 
-    // Deterministic primary tie-break (score, then a fixed positional order).
+    // Deterministic primary tie-break. STAR compares `maxScore`, then
+    // `gLength` — the alignment's genomic span — and leaves anything still
+    // tied to whichever window it reached first
+    // (`ReadAlign_stitchPieces.cpp:340`). The span is reproducible here; the
+    // window order is not, since windows are built per read in parallel, so
+    // the remaining keys are positional and fixed (see DIVERGENCE.md §1.1).
     transcripts.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
-            .then_with(|| a.n_junction.cmp(&b.n_junction))
+            .then_with(|| (a.genome_end - a.genome_start).cmp(&(b.genome_end - b.genome_start)))
             .then_with(|| a.chr_idx.cmp(&b.chr_idx))
             .then_with(|| a.genome_start.cmp(&b.genome_start))
             .then_with(|| a.is_reverse.cmp(&b.is_reverse))
@@ -730,15 +745,20 @@ pub fn align_paired_read(
     // → Nstart=7, starts={0,43,...,129,...}). Using combined length creates a spurious
     // start at position 129 (between mates) that can produce anchors widening windows
     // beyond STAR's range, causing window overflow and eviction of valid 7M exon seeds.
-    let mut combined_seeds = Seed::find_seeds(
+    // The piece offsets are STAR's `splitR[0][ip]`: mate1 starts the concatenated
+    // read, mate2 starts one base past the spacer. Only the `flagDirMap`
+    // shortcut consults them.
+    let mut combined_seeds = Seed::find_seeds_at(
         &combined_read[..len1],
+        0,
         index,
         params.seed_map_min,
         params,
         debug_name,
     )?;
-    let mut m2_seeds = Seed::find_seeds(
+    let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
+        len1 + 1,
         index,
         params.seed_map_min,
         params,

@@ -13,6 +13,65 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Annotated-junction stitching, `--alignEndsType`, and the in-recursion
+  genomic-length penalty** — closes items #4b, #7, #8 and part of #9 of
+  `STAR-RS-COMPARISON.md` §7.2.
+
+  - `SpliceJunctionDb` gains STAR's `sjdb*` table and a `binarySearch2`-style
+    `find()`, so an annotated junction can be addressed by index (`sjA`) and
+    not merely tested for existence. No index format change: `sjdbInfo.txt`
+    already carried motif, shiftLeft, shiftRight and strand.
+  - Seeds derived from the sjdb genome insert carry their `sjA` tag through the
+    window into the stitcher, which takes STAR's annotated-junction shortcut
+    when two pieces turn out to be the two flanks of one junction.
+  - Non-canonical annotated junctions are snapped onto their annotated
+    coordinates instead of being left wherever the leftmost-flush scan put
+    them, and the stored motif overrides the one re-derived from the genome.
+  - `--alignSoftClipAtReferenceEnds`, `--alignInsertionFlush Right` and
+    `--outFilterMismatchNoverReadLmax` are implemented; `--alignEndsProtrude`,
+    `--alignTranscriptsPerReadNmax`, `--seedNoneLociPerWindow` and
+    `--seedSplitMin` are accepted. (`--alignEndsType` itself came from #145.)
+  - The genomic-length penalty is applied inside the stitch recursion, where it
+    can affect which transcripts survive, rather than only at finalisation.
+  - A one-base intron is a junction. `GTF_transcriptGeneSJ.cpp:123` skips an
+    exon pair only when `exon2.start <= exon1.end + 1`; rustar-aligner also
+    skipped `exon2.start == exon1.end + 2`, so three yeast junctions were
+    missing from the index and reads crossing them were written with `1D`
+    rather than `1N`.
+  - An annotated gap is never a deletion. `--alignIntronMin` decides between
+    `N` and `D` only for unannotated gaps, so the sjdb is consulted before the
+    length test at both CIGAR decision sites.
+  - The primary transcript is chosen by score, then by genomic span, which is
+    the comparison `ReadAlign_stitchPieces.cpp:340` makes
+    (`maxScore`, then `gLength`).
+  - Window alignments split out of different annotated junctions are no longer
+    treated as duplicates of one another. STAR's `assignAlignToWindow` compares
+    `sjA` as well as fragment and diagonal; keying the pre-stitch dedup on the
+    diagonal alone unpaired the two halves of a terminal micro-exon, which then
+    came out soft-clipped instead of spliced.
+  - A genome spacer compares as the larger byte in the seed search, as it does
+    in STAR's `compareSeqToGenome`. It was hardcoded to the opposite, which
+    made the binary search in `max_mappable_length` read the suffix array as
+    unsorted wherever the sjdb inserts sit and drop the half holding the real
+    maximum, returning a short MMP.
+
+  Measured against native STAR 2.7.11b, raw exact records (FLAG, RNAME, POS,
+  MAPQ, CIGAR, NH, AS, NM), with the index rebuilt from this branch:
+
+  | tier | records | main | this branch |
+  |---|---|---|---|
+  | junction-spanning yeast reads | 1000 | 835 | 958 |
+  | 10k single-end yeast reads | 8927 | 8785 | 8797 |
+  | 10k paired-end yeast reads | 16782 | 16572 | 16583 |
+
+  No read regressed. Every remaining difference on all three tiers is a read
+  where both tools found alignments of identical score at different loci.
+  Output against an unannotated index is unchanged.
+
+  Reproducing this needs an index built by this branch: the one-base-intron
+  fix changes `genomeGenerate` output (364 yeast junctions, not 361), and a
+  cached index built before it silently reproduces the old numbers.
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).

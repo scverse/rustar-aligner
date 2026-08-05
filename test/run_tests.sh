@@ -44,6 +44,15 @@ TEST_CASES=(
     "yeast_1k_paired:yeast:ERR12389696_sub_1_1000.fastq.gz,ERR12389696_sub_2_1000.fastq.gz:paired:--outSAMtype SAM"
     "yeast_1k_twopass:yeast:ERR12389696_sub_1_1000.fastq.gz:single:--twopassMode Basic --outSAMtype SAM"
     "yeast_10k:yeast:ERR12389696_sub_1_10k.fastq.gz:single:--outSAMtype SAM"
+    # Annotated-junction tier. The tiers above use real RNA-seq reads, of which
+    # only a small fraction cross an intron -- yeast has a few hundred -- so the
+    # annotated-junction code paths (the sjA shortcut, annotated-boundary
+    # snapping) are barely exercised and a divergence in them is easy to miss.
+    # These reads are drawn from spliced transcripts and every one of them
+    # crosses an annotated junction. Generate with:
+    #   test/simulate_junction_reads.py <genome.fa> <annotation.gtf> \
+    #       test/data/small/yeast/reads/sim_junction_1k.fastq 1000 100
+    "yeast_junction_gtf:yeast_gtf:sim_junction_1k.fastq:single:--outSAMtype SAM"
 )
 
 # ==============================================================================
@@ -349,6 +358,7 @@ run_test_case() {
 
     # Parse test specification
     IFS=':' read -r name dataset reads mode extra_args <<< "$test_spec"
+
 
     local test_dir="$RESULTS_DIR/${TIMESTAMP}_${name}"
     local star_dir="$test_dir/star"

@@ -140,7 +140,8 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
 /// should use the original `(fwd_pos, length)` directly and not invoke
 /// this function.
 ///
-/// Returns a vector of `(real_fwd_pos, read_offset, length)` tuples:
+/// Returns a vector of `(real_fwd_pos, read_offset, length, junction_idx)`
+/// tuples:
 /// - **One** entry when the hit lies entirely within a single junction's
 ///   donor flank or acceptor flank — the read↔genome correspondence is a
 ///   single contiguous run with `read_offset = 0` and `length` unchanged.
@@ -151,6 +152,11 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
 ///   read window but at non-adjacent genome positions — the downstream
 ///   stitch DP can then chain them via its splice branch.
 ///
+/// `junction_idx` is the entry's index in `junctions` — STAR's `sjA`, the tag
+/// its stitcher carries on every align derived from the sjdb region. Both
+/// halves of a boundary-crossing hit share the same index, since they are the
+/// two flanks of one junction.
+///
 /// Returns an empty vector when the hit's Gsj junction index is out of
 /// bounds, when the hit's slot offset lands on the trailing spacer byte,
 /// or when the hit would extend past the spacer.
@@ -160,7 +166,7 @@ pub fn decode_gsj_hit(
     n_genome_real: u64,
     sjdb_overhang: u32,
     junctions: &[PreparedJunction],
-) -> Vec<(u64, usize, usize)> {
+) -> Vec<(u64, usize, usize, usize)> {
     if fwd_pos < n_genome_real {
         return Vec::new();
     }
@@ -200,8 +206,8 @@ pub fn decode_gsj_hit(
         let donor_real = donor_genome_start + slot_offset;
         let acceptor_real = acceptor_genome_start;
         vec![
-            (donor_real, 0, donor_len),
-            (acceptor_real, donor_len, acceptor_len),
+            (donor_real, 0, donor_len, junction_idx),
+            (acceptor_real, donor_len, acceptor_len, junction_idx),
         ]
     }
 }
@@ -1052,9 +1058,9 @@ mod tests {
         let out = decode_gsj_hit(hit_pos, 12, n_genome_real, overhang, &junctions);
         assert_eq!(out.len(), 2);
         // Donor: real_fwd = 990 + 6 = 996, read_offset = 0, sub_len = 4.
-        assert_eq!(out[0], (996, 0, 4));
+        assert_eq!(out[0], (996, 0, 4, 0));
         // Acceptor: real_fwd = 2001, read_offset = 4, sub_len = 8.
-        assert_eq!(out[1], (2001, 4, 8));
+        assert_eq!(out[1], (2001, 4, 8, 0));
     }
 
     #[test]
@@ -1086,9 +1092,9 @@ mod tests {
         let out = decode_gsj_hit(hit_pos, 10, n_genome_real, overhang, &junctions);
         assert_eq!(out.len(), 2);
         // original_start = 1003 → donor flank [993..1003). Hit at slot 5 = 993+5 = 998.
-        assert_eq!(out[0], (998, 0, 5));
+        assert_eq!(out[0], (998, 0, 5, 0));
         // original_end = 2003 → acceptor flank starts at 2004.
-        assert_eq!(out[1], (2004, 5, 5));
+        assert_eq!(out[1], (2004, 5, 5, 0));
     }
 
     #[test]

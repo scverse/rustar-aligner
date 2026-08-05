@@ -69,7 +69,7 @@ impl GenomeIndex {
         //     db would be empty), losing all `sjdbScore` bonuses and annotated
         //     junction recognition. Keyed on the stored (post-sjdbPrepare) donor/
         //     acceptor coordinates, matching what the stitch scan produces.
-        let junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
+        let mut junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
             SpliceJunctionDb::from_gtf_configured(
                 gtf_path,
                 &genome,
@@ -78,19 +78,26 @@ impl GenomeIndex {
                 &params.sjdb_gtf_tag_exon_parent_transcript,
             )?
         } else if !prepared_junctions.is_empty() {
-            let raw: Vec<(usize, u64, u64, u8)> = prepared_junctions
-                .iter()
-                .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
-                .collect();
             log::info!(
                 "No GTF at align time; loaded {} annotated junctions from index sjdbInfo.txt",
-                raw.len()
+                prepared_junctions.len()
             );
-            SpliceJunctionDb::from_raw_junctions(&raw)
+            SpliceJunctionDb::from_prepared(prepared_junctions.clone())
         } else {
             log::info!("No GTF file provided, all junctions will be novel");
             SpliceJunctionDb::empty()
         };
+
+        // `sj_a` tags come out of `decode_gsj_hit`, which indexes the junction
+        // array stored in the index. Whenever that array exists it must also be
+        // what `find()` searches, otherwise a tag would address a different
+        // junction than the one the SA hit came from — silently wrong CIGARs
+        // rather than a missed optimisation. An align-time GTF may rebuild the
+        // annotated lookup map, but never the table.
+        if !prepared_junctions.is_empty() {
+            junction_db.set_table(prepared_junctions.clone());
+        }
+        let junction_db = junction_db;
 
         log::info!(
             "Junction database loaded: {} annotated junctions",

@@ -204,9 +204,16 @@ pub fn extract_junctions_configured(
             let intron_start_local_1b = exon1.end + 1;
             let intron_end_local_1b = exon2.start.saturating_sub(1);
 
-            if intron_end_local_1b <= intron_start_local_1b {
+            // STAR skips a pair only when the exons touch or overlap
+            // (`GTF_transcriptGeneSJ.cpp:123`, `exonLoci[iex][exS] <=
+            // exonLoci[iex-1][exE] + 1`). A one-base intron — `exon2.start ==
+            // exon1.end + 2` — is a junction it keeps, and yeast has three of
+            // them. Requiring `end > start` here dropped exactly those, so the
+            // aligner never saw them as annotated and emitted `1D` where STAR
+            // emits `1N`.
+            if intron_end_local_1b < intron_start_local_1b {
                 log::warn!(
-                    "Invalid junction coordinates: {intron_start_local_1b}-{intron_end_local_1b} (possibly overlapping exons)"
+                    "Invalid junction coordinates: {intron_start_local_1b}-{intron_end_local_1b} (overlapping exons)"
                 );
                 continue;
             }
@@ -358,6 +365,54 @@ mod tests {
         assert_eq!(start, 200);
         assert_eq!(end, 298);
         assert_eq!(strand, 1);
+    }
+
+    /// A one-base intron is a junction, and touching exons are not.
+    ///
+    /// STAR skips a pair only when `exon2.start <= exon1.end + 1`
+    /// (`GTF_transcriptGeneSJ.cpp:123`), so `exon2.start == exon1.end + 2`
+    /// yields a one-base intron it keeps. Yeast R64-1-1 has three; requiring
+    /// `end > start` here dropped all three from the index, and reads crossing
+    /// them then came out with `1D` where STAR writes `1N`.
+    #[test]
+    fn a_one_base_intron_is_a_junction_and_touching_exons_are_not() {
+        let genome = Genome {
+            transform_blocks: None,
+            sequence: vec![0; 1000].into(),
+            n_genome: 1000,
+            n_genome_real: 1000,
+            n_chr_real: 1,
+            chr_start: vec![0, 1000],
+            chr_length: vec![1000],
+            chr_name: vec!["chr1".to_string()],
+        };
+        let exon = |start: u64, end: u64, transcript: &str| GtfRecord {
+            seqname: "chr1".to_string(),
+            feature: "exon".to_string(),
+            start,
+            end,
+            strand: '+',
+            attributes: vec![
+                ("gene_id".to_string(), "G1".to_string()),
+                ("transcript_id".to_string(), transcript.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        // T1: exons 100-200 and 202-300 — a one-base intron at 201.
+        let junctions =
+            extract_junctions_from_exons(vec![exon(100, 200, "T1"), exon(202, 300, "T1")], &genome)
+                .unwrap();
+        assert_eq!(junctions.len(), 1, "the one-base intron must survive");
+        let (_, start, end, _) = junctions[0];
+        assert_eq!((start, end), (200, 200), "0-based, inclusive, length one");
+
+        // T2: exons 100-200 and 201-300 — adjacent, no intron between them.
+        let touching =
+            extract_junctions_from_exons(vec![exon(100, 200, "T2"), exon(201, 300, "T2")], &genome)
+                .unwrap();
+        assert!(touching.is_empty(), "touching exons are not a junction");
     }
 
     #[test]

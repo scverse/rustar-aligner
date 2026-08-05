@@ -52,6 +52,9 @@ pub struct AlignmentScorer {
     /// Read-end extension policy (alignEndsType). `ext[iMate][iEnd]==true` forces
     /// full end-to-end extension (no terminal soft-clip) of that mate/end.
     pub align_ends_type: crate::params::AlignEndsType,
+    pub flush_right: bool,
+    pub soft_clip_at_reference_ends: bool,
+    pub p_mm_max_read: f64,
 }
 
 impl AlignmentScorer {
@@ -80,6 +83,9 @@ impl AlignmentScorer {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         }
     }
 
@@ -120,6 +126,9 @@ impl AlignmentScorer {
             out_filter_score_min_over_lread: params.out_filter_score_min_over_lread,
             // Parsed+validated in Parameters::validate; default to Local if unset.
             align_ends_type: params.align_ends_type.parse().unwrap_or_default(),
+            flush_right: params.align_insertion_flush == "Right",
+            soft_clip_at_reference_ends: params.align_soft_clip_at_reference_ends != "No",
+            p_mm_max_read: params.out_filter_mismatch_nover_read_lmax,
         }
     }
 
@@ -130,6 +139,17 @@ impl AlignmentScorer {
             return 0;
         }
         ((genomic_span as f64).log2() * self.score_genomic_length_log2_scale - 0.5).ceil() as i32
+    }
+
+    /// STAR's `outFilterMismatchNmaxTotal`: the tightest of the absolute cap,
+    /// a fraction of the mapped length, and a fraction of the read length.
+    ///
+    /// `mapped_len` is the alignment's span in the read; `read_len` is the
+    /// whole read (both mates summed, for a pair).
+    pub fn mismatch_nmax_total(&self, mapped_len: usize, read_len: usize) -> u32 {
+        let by_mapped = (self.p_mm_max * mapped_len as f64) as u32;
+        let by_read = (self.p_mm_max_read * read_len as f64) as u32;
+        self.n_mm_max.min(by_mapped).min(by_read)
     }
 
     /// Annotated junctions score `sjdb_score`; unannotated junctions score `motif_score`.
@@ -693,6 +713,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -738,6 +761,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -782,6 +808,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -824,6 +853,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -859,6 +891,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -892,6 +927,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -933,6 +971,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -972,6 +1013,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1012,6 +1056,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1120,6 +1167,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1157,6 +1207,24 @@ mod tests {
         assert_eq!(SpliceMotif::CtGc.filter_category(), 2);
         assert_eq!(SpliceMotif::AtAc.filter_category(), 3);
         assert_eq!(SpliceMotif::GtAt.filter_category(), 3);
+    }
+
+    #[test]
+    fn mismatch_nmax_total_takes_the_tightest_of_three_caps() {
+        let mut s = AlignmentScorer::from_params_minimal();
+        s.n_mm_max = 10;
+        s.p_mm_max = 0.3; // fraction of MAPPED length
+        s.p_mm_max_read = 1.0; // fraction of READ length
+
+        // Mapped fraction binds: 0.3 * 20 = 6.
+        assert_eq!(s.mismatch_nmax_total(20, 100), 6);
+        // Absolute cap binds: 0.3 * 100 = 30, capped at 10.
+        assert_eq!(s.mismatch_nmax_total(100, 100), 10);
+
+        // The read-length cap is the term that was previously missing: with a
+        // 100-base alignment it now binds before either of the other two.
+        s.p_mm_max_read = 0.02;
+        assert_eq!(s.mismatch_nmax_total(100, 100), 2);
     }
 
     #[test]
@@ -1200,6 +1268,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1252,6 +1323,9 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            flush_right: false,
+            soft_clip_at_reference_ends: true,
+            p_mm_max_read: 1.0,
         }
     }
 
