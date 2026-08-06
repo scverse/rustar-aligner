@@ -166,6 +166,20 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - **STARsolo `features.tsv` column 2 now emits the GTF `gene_name`**
   (symbol), with the STAR gene_id fallback, instead of duplicating the
   gene_id.
+- **`--outSAMtype BAM SortedByCoordinate` no longer buffers the whole
+  output in RAM.** The coordinate sort is now external: it fills a
+  `--limitBAMsortRAM` buffer, spills sorted runs beside the output, and
+  k-way merges them on finish. Peak memory is flat in output size
+  (measured: 610 MB at a 64 MiB budget for 300 k through 2.4 M records,
+  versus 648 MB → 2,132 MB before, a growth of 723 B/record that
+  extrapolated to ~116 GB for a 160 M-record human sample). Output is
+  byte-identical to the previous in-memory sort — coordinate ties still
+  resolve to input order, since runs merge with the run index as
+  tiebreak (verified at 2.4 M records through a 219-run multi-pass
+  merge). `--limitBAMsortRAM N` now spills above `N` rather than
+  aborting the run, and `--limitBAMsortRAM 0` means 512 MiB instead of
+  "unlimited". Runs beyond 64 are merged in balanced passes so a small
+  budget on a large run cannot exhaust file descriptors.
 
 ### Bumps
 

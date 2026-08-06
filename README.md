@@ -6,7 +6,7 @@ A Rust reimplementation of [STAR](https://github.com/alexdobin/STAR) (Spliced Tr
 
 rustar-aligner aims to be a faithful port of STAR, matching the original behavior as closely as possible. It uses the same genome index format, accepts the same `--camelCase` command-line parameters, and produces compatible SAM/BAM output.
 
-**Current status**: End-to-end single-end and paired-end RNA-seq alignment with splice junction detection, two-pass mode, chimeric alignment detection (including multi-junction Tier 3), gene-level quantification, **single-cell quantification (STARsolo: Gene / GeneFull / SJ / Velocyto features, barcode correction, UMI dedup, EmptyDrops_CR cell calling)**, WASP allele-specific filtering, paired-end mate-overlap merging, coverage-track output, adapter/CellRanger clipping, and multi-threaded parallel processing. Default SAM output is byte-identical to STAR's (`NH HI AS nM` attributes); solo count matrices are byte-identical to STARsolo's. Pure-Rust core with an in-tree deterministic RNG (no `rand` dependency). 578 tests passing (553 unit + 25 integration), 0 clippy warnings. See [Performance & Benchmarks](#performance--benchmarks) for a native three-way comparison against STARsolo and CellRanger.
+**Current status**: End-to-end single-end and paired-end RNA-seq alignment with splice junction detection, two-pass mode, chimeric alignment detection (including multi-junction Tier 3), gene-level quantification, **single-cell quantification (STARsolo: Gene / GeneFull / SJ / Velocyto features, barcode correction, UMI dedup, EmptyDrops_CR cell calling)**, WASP allele-specific filtering, paired-end mate-overlap merging, coverage-track output, adapter/CellRanger clipping, and multi-threaded parallel processing. Default SAM output is byte-identical to STAR's (`NH HI AS nM` attributes); solo count matrices are byte-identical to STARsolo's. Pure-Rust core with an in-tree deterministic RNG for alignment tie-breaking. 622 tests passing (591 unit + 31 integration), 0 clippy warnings. See [Performance & Benchmarks](#performance--benchmarks) for a native three-way comparison against STARsolo and CellRanger.
 
 ## Quick Start
 
@@ -208,7 +208,7 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 
 - Single-end and paired-end alignment with mate rescue
 - Read-end alignment mode (`--alignEndsType Local` (default) / `EndToEnd` / `Extend5pOfRead1` / `Extend5pOfReads12` / `Extend3pOfRead1`)
-- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, or `BAM SortedByCoordinate`)
+- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, or `BAM SortedByCoordinate`). The coordinate sort is external: it buffers up to `--limitBAMsortRAM`, spills sorted runs beside the output, and merges them, so peak memory is independent of output size
 - Multi-threaded parallel alignment (`--runThreadN`)
 - GTF-based junction annotation with scoring bonus (`--sjdbGTFfile`)
 - Two-pass mode for novel junction discovery (`--twopassMode Basic`)
@@ -227,8 +227,8 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 - Unmapped read output to FASTQ (`--outReadsUnmapped Fastx` → `Unmapped.out.mate1` / `mate2`)
 - Gzip-compressed FASTQ input (`--readFilesCommand zcat`)
 - Read group tags (`--outSAMattrRGline`)
-- Deterministic input-order output regardless of thread count (`--outSAMorder Paired` / `PairedKeepInputOrder`, both accepted; rustar always preserves FASTQ order)
-- Deterministic in-tree RNG for reproducible tie-breaking (`--runRNGseed`; no `rand` dependency)
+- Deterministic input-order output regardless of thread count (`--outSAMorder Paired` / `PairedKeepInputOrder`, both accepted)
+- Deterministic in-tree RNG for reproducible alignment tie-breaking (`--runRNGseed`)
 - SAM optional tags: NH, HI, AS, nM, NM, XS, jM, jI, MD (default `NH HI AS nM` matches STAR; `NM` opt-in)
 - `--outSAMattributes` control (Standard/All/None/explicit list)
 - SECONDARY flag (0x100) on multi-mapper alignments

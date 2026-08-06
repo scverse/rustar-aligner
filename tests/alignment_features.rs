@@ -2024,6 +2024,112 @@ fn test_wasp_samtag() {
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
     );
 }
+// ---------------------------------------------------------------------------
+// Coordinate-sort spilling (--limitBAMsortRAM)
+// ---------------------------------------------------------------------------
+
+/// A low `--limitBAMsortRAM` must spill sorted runs to disk and merge them into
+/// a BAM identical to the unbounded in-memory sort — same records, same order.
+#[test]
+fn test_sorted_bam_spills_to_disk_and_matches_unbounded_sort() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // 2000 reads across the genome, emitted in an order that does not match
+    // coordinate order so the sort is actually doing work.
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for i in 0..2000usize {
+            let start = (i * 7919) % (genome.len() - 60);
+            let seq = &genome[start..start + 50];
+            writeln!(f, "@read{i}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let run = |label: &str, limit: &str| -> (PathBuf, PathBuf) {
+        let output_dir = tmpdir.path().join(label);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        cargo_bin_cmd!("rustar-aligner")
+            .args([
+                "--runMode",
+                "alignReads",
+                "--genomeDir",
+                genome_dir.to_str().unwrap(),
+                "--readFilesIn",
+                fastq_path.to_str().unwrap(),
+                "--outSAMtype",
+                "BAM",
+                "SortedByCoordinate",
+                "--limitBAMsortRAM",
+                limit,
+                "--outFileNamePrefix",
+                &prefix,
+            ])
+            .assert()
+            .success();
+        (output_dir.join("Aligned.sortedByCoord.out.bam"), output_dir)
+    };
+
+    // 64 KiB forces many spill runs; 1 GiB holds everything in memory.
+    let (spilled_bam, spilled_dir) = run("out_sort_spill", "65536");
+    let (memory_bam, _) = run("out_sort_memory", "1G");
+
+    let read_bam = |path: &PathBuf| -> Vec<(String, Option<usize>, Option<usize>, String)> {
+        let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+        reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|record| {
+                let record = record.unwrap();
+                (
+                    String::from_utf8(record.name().unwrap().to_vec()).unwrap(),
+                    record.reference_sequence_id().transpose().unwrap(),
+                    record
+                        .alignment_start()
+                        .transpose()
+                        .unwrap()
+                        .map(|p| p.get()),
+                    format!("{:?}", record.cigar().iter().collect::<Vec<_>>()),
+                )
+            })
+            .collect()
+    };
+
+    let spilled = read_bam(&spilled_bam);
+    let in_memory = read_bam(&memory_bam);
+
+    assert!(!spilled.is_empty(), "expected alignments");
+    assert_eq!(
+        spilled, in_memory,
+        "spill+merge output must equal the unbounded in-memory sort"
+    );
+
+    // Coordinate-sorted, and no spill scratch left behind.
+    let keys: Vec<_> = spilled
+        .iter()
+        .map(|(_, chr, pos, _)| (chr.unwrap_or(usize::MAX), pos.unwrap_or(0)))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] <= w[1]),
+        "output must be non-decreasing by (chr, pos)"
+    );
+    let leftover: Vec<_> = fs::read_dir(&spilled_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("rustar-bamsort-"))
+        .collect();
+    assert!(leftover.is_empty(), "spill files left behind: {leftover:?}");
+}
+
+
 
 // ---------------------------------------------------------------------------
 // --runMode soloCellFiltering
