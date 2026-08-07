@@ -13,7 +13,7 @@
 
 use crate::error::Error;
 use crate::io::fastq::{decode_base, encode_base};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -535,7 +535,7 @@ fn open_maybe_gzip(path: &Path) -> Result<Box<dyn BufRead>, Error> {
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gz"));
     if is_gz {
-        Ok(Box::new(BufReader::new(GzDecoder::new(file))))
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
     } else {
         Ok(Box::new(BufReader::new(file)))
     }

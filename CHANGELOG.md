@@ -42,6 +42,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Multi-member gzip input is no longer truncated.** Compressed input was
+  decoded with `flate2::read::GzDecoder`, which stops at the end of the first
+  gzip member; a `.gz` made of several concatenated members (bcl2fastq output,
+  `cat a.fq.gz b.fq.gz`, any BGZF file) was read partially with no error and no
+  warning. All four read paths now use `MultiGzDecoder`: FASTQ input, the solo
+  barcode whitelist, solo counting, and the `emptydrops` binary.
+
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
 
