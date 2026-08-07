@@ -2320,7 +2320,9 @@ fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
     {
-        Ok(Box::new(BufReader::new(flate2::read::GzDecoder::new(file))))
+        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
+            file,
+        ))))
     } else {
         Ok(Box::new(BufReader::new(file)))
     }

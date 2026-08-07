@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use rustar_aligner::rng::{SplitMix64, cumulative_weights, sample_cumulative};
 
 struct Args {
@@ -89,7 +89,7 @@ fn find(d: &Path, base: &str) -> PathBuf {
 fn reader(p: &Path) -> Box<dyn BufRead> {
     let f = File::open(p).unwrap();
     if p.extension().is_some_and(|e| e == "gz") {
-        Box::new(BufReader::new(GzDecoder::new(f)))
+        Box::new(BufReader::new(MultiGzDecoder::new(f)))
     } else {
         Box::new(BufReader::new(f))
     }
