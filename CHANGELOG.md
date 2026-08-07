@@ -204,6 +204,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - `caps-sa` → `0.5` (adds `build_ext_mem_for_filter*`; see the caps-sa
   v0.5.0 release notes).
 
+- `noodles` → `0.115`, `noodles-bgzf` → `0.51`. The bgzf releases move
+  the multithreaded reader/writer off rayon's global thread pool onto
+  their own local pools, restore the `with_worker_count` builders, and
+  sync the worker count to the number of managed buffers so that merely
+  constructing one no longer initialises rayon's global pool. No code
+  change was needed; BAM output is byte-identical.
+
 ### Other
 
 - New module `index::packed_stream` — bit-for-bit-compatible streaming
