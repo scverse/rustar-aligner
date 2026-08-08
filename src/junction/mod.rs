@@ -17,7 +17,7 @@ use crate::params::Parameters;
 
 use crate::error::Error;
 use crate::genome::Genome;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 
 /// Key for junction lookup: (chr_idx, intron_start, intron_end, strand).
@@ -54,14 +54,19 @@ pub struct NovelJunctionKey {
 #[derive(Clone)]
 pub struct SpliceJunctionDb {
     /// Map: (chr_idx, intron_start, intron_end, strand) → annotated
-    junctions: HashMap<JunctionKey, JunctionInfo>,
+    ///
+    /// `FxHashMap`, not the default `HashMap`: this is queried once per
+    /// candidate junction while stitching, and SipHash of a 25-byte key showed
+    /// up in the profile. Only `get` and `insert` are ever called on it and it
+    /// is never iterated, so the hasher cannot reach the output.
+    junctions: FxHashMap<JunctionKey, JunctionInfo>,
 }
 
 impl SpliceJunctionDb {
     /// Create empty database (for no-GTF mode)
     pub fn empty() -> Self {
         Self {
-            junctions: HashMap::new(),
+            junctions: FxHashMap::default(),
         }
     }
 
@@ -95,7 +100,8 @@ impl SpliceJunctionDb {
     /// `TranscriptomeIndex` and the `sjdb_insert` pipeline without
     /// re-parsing the file.
     pub fn from_raw_junctions(raw: &[(usize, u64, u64, u8)]) -> Self {
-        let mut junctions = HashMap::with_capacity(raw.len());
+        let mut junctions =
+            FxHashMap::with_capacity_and_hasher(raw.len(), rustc_hash::FxBuildHasher);
         for &(chr_idx, intron_start, intron_end, strand) in raw {
             let key = JunctionKey {
                 chr_idx,
@@ -411,7 +417,6 @@ mod tests {
     #[test]
     fn test_db_keyed_in_genome_absolute_zero_based_multi_chr() {
         use crate::junction::gtf::{GtfRecord, extract_junctions_configured};
-        use std::collections::HashMap;
 
         // Two-chromosome toy genome so chr_start[1] != 0.
         let genome = Genome {
@@ -426,7 +431,8 @@ mod tests {
         };
 
         let make_exon = |seqname: &str, start: u64, end: u64, transcript: &str| -> GtfRecord {
-            let mut attrs: HashMap<String, String> = HashMap::new();
+            let mut attrs: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             attrs.insert("gene_id".to_string(), "G".to_string());
             attrs.insert("transcript_id".to_string(), transcript.to_string());
             GtfRecord {

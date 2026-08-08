@@ -231,3 +231,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
   2M-read run, measured with `test/bench_ab.sh`.
 
 Initial release of Rust rewrite of STAR.
+### Other changes
+
+- The per-read transcript-filter bookkeeping is a fixed set of counters
+  rather than a `HashMap<&str, i32>`, removing a heap allocation per read
+  and a string hash per filtered transcript. Output is unchanged.
+
+- The splice-motif check in the junction scan carries a sliding window
+  and looks the motif up in a table instead of re-reading four genome
+  bases and matching on them at every position. Output is unchanged
+  (SAM byte-identical on 200k reads); the scan itself goes from 8.5 ns
+  to 5.2 ns per iteration, measured by `examples/jrbench.rs`.
+
