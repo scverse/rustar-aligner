@@ -5,7 +5,7 @@ use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::stitch::{cluster_seeds, stitch_seeds, stitch_seeds_with_jdb};
 use crate::align::transcript::Transcript;
-use crate::chimeric::score::{calculate_repeat_length, classify_junction_type};
+use crate::chimeric::score::{chim_repeat_lengths, classify_junction_type};
 use crate::chimeric::segment::{ChimericAlignment, ChimericSegment, ExonSpan};
 use crate::error::Error;
 use crate::index::GenomeIndex;
@@ -169,14 +169,8 @@ impl<'a> ChimericDetector<'a> {
             let acceptor_seg = transcript_to_segment(tr_acceptor)
                 .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {e}")))?;
 
-            let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-                &index.genome,
-                donor_seg.chr_idx,
-                donor_seg.genome_end,
-                acceptor_seg.chr_idx,
-                acceptor_seg.genome_start,
-                20,
-            );
+            let (repeat_len_donor, repeat_len_acceptor) =
+                chim_repeat_lengths(&index.genome, &donor_seg, &acceptor_seg);
 
             let chim = ChimericAlignment::new(
                 donor_seg,
@@ -349,14 +343,8 @@ impl<'a> ChimericDetector<'a> {
                 continue;
             }
 
-            let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-                &index.genome,
-                donor_seg.chr_idx,
-                donor_seg.genome_end,
-                acceptor_seg.chr_idx,
-                acceptor_seg.genome_start,
-                20,
-            );
+            let (repeat_len_donor, repeat_len_acceptor) =
+                chim_repeat_lengths(&index.genome, donor_seg, acceptor_seg);
 
             results.push(ChimericAlignment::new(
                 donor_seg.clone(),
@@ -471,14 +459,8 @@ impl<'a> ChimericDetector<'a> {
         );
 
         // Calculate repeat lengths
-        let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-            &index.genome,
-            donor.chr_idx,
-            donor.genome_end,
-            acceptor.chr_idx,
-            acceptor.genome_start,
-            20, // max check distance
-        );
+        let (repeat_len_donor, repeat_len_acceptor) =
+            chim_repeat_lengths(&index.genome, &donor, &acceptor);
 
         // Create chimeric alignment
         let chim = ChimericAlignment::new(
@@ -589,14 +571,10 @@ pub fn detect_inter_mate_chimeric(
         )
     };
 
-    let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-        &index.genome,
-        donor.chr_idx,
-        donor.genome_end,
-        acceptor.chr_idx,
-        acceptor.genome_start,
-        20,
-    );
+    // Zero, as STAR sets it for mates that bracket the junction
+    // (`ReadAlign_chimericDetectionOld.cpp:132`): there is no junction position
+    // within a mate, so there is no repeat to measure around it.
+    let (repeat_len_donor, repeat_len_acceptor) = (0, 0);
 
     let chim = ChimericAlignment::new(
         donor,
@@ -1374,14 +1352,8 @@ fn finalize_chimera(
         return Ok(None);
     }
 
-    let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-        &index.genome,
-        donor_seg.chr_idx,
-        donor_seg.genome_end,
-        acceptor_seg.chr_idx,
-        acceptor_seg.genome_start,
-        20,
-    );
+    let (repeat_len_donor, repeat_len_acceptor) =
+        chim_repeat_lengths(&index.genome, &donor_seg, &acceptor_seg);
 
     let chim = ChimericAlignment::new(
         donor_seg,

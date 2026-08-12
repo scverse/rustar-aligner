@@ -90,56 +90,94 @@ fn extract_motif(
 ///
 /// STAR definition: Number of bases at junction that are identical
 /// on both sides (donor and acceptor)
-pub fn calculate_repeat_length(
+/// Repeat lengths either side of a chimeric junction, as STAR computes them.
+///
+/// STAR walks outward from the two junction positions and counts how far the
+/// sequences agree (`ReadAlign_chimericDetectionOld.cpp:260-294`). A repeat
+/// there means the junction could be placed anywhere within it, which is what
+/// columns 8 and 9 of `Chimeric.out.junction` report.
+///
+/// Three things the earlier version got wrong:
+///
+/// - It returned `(0, 0)` whenever the two segments were on different
+///   chromosomes. STAR does no such check — the positions are genome-absolute,
+///   so the comparison is well defined across chromosomes, and inter-chromosomal
+///   fusions are precisely the interesting case. This alone zeroed both columns
+///   for every chimera in an inter-chromosomal test set.
+/// - It added `chr_start` to positions that were already absolute, so it read
+///   the wrong bases whenever it read any.
+/// - It ignored strand. STAR walks a reverse segment in the opposite direction
+///   and complements the base.
+///
+/// `chimJ0` is the first base past the leading segment's block, `chimJ1` the
+/// base before the trailing segment's; both follow STAR's `EX_G`/`EX_L`
+/// arithmetic at `:244-257`. Returns `(chimRepeat0, chimRepeat1)`, the order the
+/// junction file prints them in.
+pub fn chim_repeat_lengths(
     genome: &Genome,
-    donor_chr: usize,
-    donor_pos: u64,
-    acceptor_chr: usize,
-    acceptor_pos: u64,
-    max_check: usize,
+    leading: &crate::chimeric::ChimericSegment,
+    trailing: &crate::chimeric::ChimericSegment,
 ) -> (u32, u32) {
-    // If different chromosomes, no repeat
-    if donor_chr != acceptor_chr {
+    const MAX_REPEAT: u64 = 100; // STAR's loop bound
+
+    let ex0 = leading.junction_exon(true);
+    let ex1 = trailing.junction_exon(false);
+    let (rev0, rev1) = (leading.is_reverse, trailing.is_reverse);
+
+    // First base past the leading block / base before the trailing block.
+    let chim_j0 = if rev0 {
+        ex0.genome_start.checked_sub(1)
+    } else {
+        Some(ex0.genome_end)
+    };
+    let chim_j1 = if rev1 {
+        Some(ex1.genome_end)
+    } else {
+        ex1.genome_start.checked_sub(1)
+    };
+    let (Some(j0), Some(j1)) = (chim_j0, chim_j1) else {
         return (0, 0);
-    }
+    };
 
-    let chr_start = genome.chr_start[donor_chr];
-    let chr_len = genome.chr_length[donor_chr];
-
-    // Calculate how far we can check
-    let donor_idx = chr_start + donor_pos;
-    //let acceptor_idx = chr_start + acceptor_pos;
-
-    let mut repeat_len_donor = 0u32;
-    let mut repeat_len_acceptor = 0u32;
-
-    // Check forward from donor and backward from acceptor
-    for i in 0..max_check {
-        let d_pos = donor_idx + i as u64;
-        let a_pos = if acceptor_pos < i as u64 {
-            break;
+    // A base read in the segment's own orientation: reverse segments are walked
+    // the other way and complemented, exactly as STAR does.
+    let base = |pos: Option<u64>, rev: bool| -> Option<u8> {
+        let b = genome.get_base(pos?)?;
+        Some(if rev && b < 4 { 3 - b } else { b })
+    };
+    let step = |p: u64, delta: i64| -> Option<u64> {
+        if delta < 0 {
+            p.checked_sub(delta.unsigned_abs())
         } else {
-            chr_start + (acceptor_pos - i as u64 - 1)
-        };
-
-        // Bounds check
-        if d_pos >= chr_start + chr_len || a_pos < chr_start {
-            break;
+            p.checked_add(delta as u64)
         }
+    };
 
-        let d_base = genome.sequence.get(d_pos as usize).unwrap_or(4);
-        let a_base = genome.sequence.get(a_pos as usize).unwrap_or(4);
-
-        if d_base == a_base && d_base < 4 {
-            // Only count ACGT, not N
-            repeat_len_donor += 1;
-            repeat_len_acceptor += 1;
-        } else {
-            break;
+    // Forward: chimRepeat1.
+    let mut repeat1 = 0u32;
+    for jr in 0..MAX_REPEAT {
+        let jr = jr as i64;
+        let b0 = base(step(j0, if rev0 { -jr } else { jr }), rev0);
+        let b1 = base(step(j1, if rev1 { -(jr + 1) } else { jr + 1 }), rev1);
+        match (b0, b1) {
+            (Some(a), Some(b)) if a == b => repeat1 += 1,
+            _ => break,
         }
     }
 
-    (repeat_len_donor, repeat_len_acceptor)
+    // Reverse: chimRepeat0.
+    let mut repeat0 = 0u32;
+    for jr in 0..MAX_REPEAT {
+        let jr = jr as i64;
+        let b0 = base(step(j0, if rev0 { jr + 1 } else { -(jr + 1) }), rev0);
+        let b1 = base(step(j1, if rev1 { jr } else { -jr }), rev1);
+        match (b0, b1) {
+            (Some(a), Some(b)) if a == b => repeat0 += 1,
+            _ => break,
+        }
+    }
+
+    (repeat0, repeat1)
 }
 
 /// Convert base encoding to character
@@ -246,36 +284,69 @@ mod tests {
         assert_eq!(jtype, 0); // Strand break always non-canonical
     }
 
-    #[test]
-    fn test_calculate_repeat_length_no_repeat() {
-        // No repeating bases at junction
-        let seq = vec![0, 1, 2, 3, 0, 1]; // ACGTAC
-        let genome = mock_genome_with_sequence(seq);
-
-        let (rep_donor, rep_acceptor) = calculate_repeat_length(&genome, 0, 2, 0, 4, 10);
-        assert_eq!(rep_donor, 0);
-        assert_eq!(rep_acceptor, 0);
+    /// Build a forward, single-exon segment spanning `[gs, ge)`.
+    fn rep_seg(chr_idx: usize, gs: u64, ge: u64) -> crate::chimeric::ChimericSegment {
+        use crate::chimeric::{ChimericSegment, ExonSpan};
+        ChimericSegment {
+            chr_idx,
+            genome_start: gs,
+            genome_end: ge,
+            is_reverse: false,
+            read_start: 0,
+            read_end: (ge - gs) as usize,
+            cigar: Vec::new(),
+            score: 0,
+            n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: ge,
+                read_start: 0,
+                read_end: (ge - gs) as usize,
+            },
+            last_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: ge,
+                read_start: 0,
+                read_end: (ge - gs) as usize,
+            },
+        }
     }
 
     #[test]
-    fn test_calculate_repeat_length_with_repeat() {
-        // AAA at junction: ...CAAA|AAAG...
-        // Positions:       0   1234 5678
-        let seq = vec![1, 0, 0, 0, 0, 0, 0, 2]; // CAAAAAAG
-        let genome = mock_genome_with_sequence(seq);
-
-        // Donor breakpoint at 4, acceptor at 7
-        // Repeating region: positions 4,5,6 (3 As)
-        let (rep_donor, rep_acceptor) = calculate_repeat_length(&genome, 0, 4, 0, 7, 10);
-        assert_eq!(rep_donor, 3);
-        assert_eq!(rep_acceptor, 3);
+    fn repeat_length_is_zero_when_the_flanks_disagree() {
+        // ACGTAC. Leading ends at 2 (so chimJ0 = 2), trailing starts at 4
+        // (chimJ1 = 3). Forward compares G[2]=G vs G[4]=A, reverse G[1]=C vs
+        // G[3]=T — neither agrees, so there is no repeat either side.
+        let genome = mock_genome_with_sequence(vec![0, 1, 2, 3, 0, 1]);
+        let (r0, r1) = chim_repeat_lengths(&genome, &rep_seg(0, 0, 2), &rep_seg(0, 4, 6));
+        assert_eq!((r0, r1), (0, 0));
     }
 
     #[test]
-    fn test_calculate_repeat_length_inter_chromosomal() {
-        let genome = mock_genome_with_sequence(vec![0; 10]);
-        let (rep_donor, rep_acceptor) = calculate_repeat_length(&genome, 0, 5, 1, 10, 10);
-        assert_eq!(rep_donor, 0);
-        assert_eq!(rep_acceptor, 0);
+    fn repeat_length_counts_a_homopolymer_either_side_of_the_junction() {
+        // CAAAAAAG: the junction sits inside a run of six As, so it could be
+        // placed anywhere within it — which is what the repeat columns report.
+        let genome = mock_genome_with_sequence(vec![1, 0, 0, 0, 0, 0, 0, 2]);
+        // chimJ0 = 4, chimJ1 = 6.
+        let (r0, r1) = chim_repeat_lengths(&genome, &rep_seg(0, 0, 4), &rep_seg(0, 7, 8));
+        assert_eq!(r0, 3, "three bases of agreement walking back");
+        assert_eq!(r1, 0, "G[4]=A vs G[7]=G stops the forward walk immediately");
+    }
+
+    #[test]
+    fn repeat_length_is_computed_across_chromosomes_too() {
+        // STAR applies no same-chromosome check: the positions are
+        // genome-absolute, so the comparison is well defined either way, and an
+        // inter-chromosomal fusion is exactly the case worth reporting. This
+        // previously returned (0, 0) for any cross-chromosome pair, which
+        // zeroed both columns for every chimera in an inter-chromosomal set.
+        let genome = mock_genome_with_sequence(vec![1, 0, 0, 0, 0, 0, 0, 2]);
+        let same = chim_repeat_lengths(&genome, &rep_seg(0, 0, 4), &rep_seg(0, 7, 8));
+        let cross = chim_repeat_lengths(&genome, &rep_seg(0, 0, 4), &rep_seg(1, 7, 8));
+        assert_eq!(
+            same, cross,
+            "the chromosome index must not change the result"
+        );
+        assert_ne!(cross, (0, 0), "and it must not be short-circuited to zero");
     }
 }
