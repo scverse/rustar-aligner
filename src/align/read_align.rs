@@ -42,6 +42,36 @@ fn shuffle_tied_prefix<T>(items: &mut [T], score_fn: impl Fn(&T) -> i32, seed: u
     crate::rng::shuffle_deterministic(&mut items[..tied], seed);
 }
 
+/// Attach STAR's multimap context to every chimera of a read.
+///
+/// Under `--chimMultimapNmax > 0` STAR writes a wider file, and every record in
+/// it carries the same six run-level columns. Our chimeras reach the writer from
+/// several detection tiers, only one of which is the enumerating path, so the
+/// context is applied once here where the full per-read set is known — otherwise
+/// the file comes out ragged, some rows 14 columns and some 20.
+fn attach_multimap_context(
+    chims: Vec<crate::chimeric::ChimericAlignment>,
+    read_len: usize,
+    max_non_chim_score: i32,
+) -> Vec<crate::chimeric::ChimericAlignment> {
+    let chim_n = chims.len();
+    let best = chims.iter().map(|c| c.total_score).max().unwrap_or(0);
+    chims
+        .into_iter()
+        .map(|c| {
+            let score = c.total_score;
+            c.with_multimap(crate::chimeric::MultimapInfo {
+                chim_n,
+                max_possible_score: read_len as i32,
+                max_non_chim_score,
+                chim_score: score,
+                best_chim_score: best,
+                pe_merged: false,
+            })
+        })
+        .collect()
+}
+
 /// Result of aligning a single read: (transcripts, chimeric_alignments, n_for_mapq, unmapped_reason)
 pub type AlignReadResult = (
     Vec<Transcript>,
@@ -618,6 +648,19 @@ pub fn align_read(
         });
         chimeric_alignments =
             crate::chimeric::apply_chim_filter(chimeric_alignments, params, index);
+        if params.chim_multimap_nmax > 0 {
+            // STAR's `maxNonChimAlignScore` is the best *raw* linear score
+            // (`trBest`), taken before the quality filters — a chimeric read
+            // often has its linear alignment filtered away, and reporting 0
+            // there would misstate how well the read aligns unsplit.
+            let best_linear = all_raw_transcripts
+                .iter()
+                .map(|t| t.score)
+                .max()
+                .unwrap_or(0);
+            chimeric_alignments =
+                attach_multimap_context(chimeric_alignments, read_seq.len(), best_linear);
+        }
     }
 
     // n_for_mapq = transcripts.len() after dedup and filtering.

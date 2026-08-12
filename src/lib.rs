@@ -1449,7 +1449,10 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -2791,7 +2794,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };

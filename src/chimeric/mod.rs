@@ -21,7 +21,7 @@ pub use detect::{
     detect_inter_mate_chimeric,
 };
 pub use output::{ChimericJunctionWriter, build_within_bam_records};
-pub use segment::{ChimericAlignment, ChimericSegment, ExonSpan};
+pub use segment::{ChimericAlignment, ChimericSegment, ExonSpan, MultimapInfo};
 
 #[cfg(test)]
 mod tests {

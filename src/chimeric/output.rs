@@ -21,6 +21,27 @@ impl ChimericJunctionWriter {
     /// Create a new chimeric junction writer
     ///
     /// Creates file: {prefix}Chimeric.out.junction
+    /// `multimap` selects STAR's wider file: `--chimMultimapNmax > 0` writes a
+    /// header line and six extra columns per record
+    /// (`ParametersChimeric_initialize.cpp:48-71`).
+    pub fn new_with_multimap(prefix: &str, multimap: bool) -> Result<Self, Error> {
+        let mut w = Self::new(prefix)?;
+        if multimap {
+            // STAR names 21 columns here, `readgrp` included, even though the
+            // record itself only carries it when a read group is configured.
+            writeln!(
+                w.writer,
+                "chr_donorA\tbrkpt_donorA\tstrand_donorA\tchr_acceptorB\tbrkpt_acceptorB\t\
+                 strand_acceptorB\tjunction_type\trepeat_left_lenA\trepeat_right_lenB\t\
+                 read_name\tstart_alnA\tcigar_alnA\tstart_alnB\tcigar_alnB\tnum_chim_aln\t\
+                 max_poss_aln_score\tnon_chim_aln_score\tthis_chim_aln_score\t\
+                 bestall_chim_aln_score\tPEmerged_bool\treadgrp"
+            )
+            .map_err(|e| Error::Chimeric(format!("Failed to write chimeric header: {e}")))?;
+        }
+        Ok(w)
+    }
+
     pub fn new(prefix: &str) -> Result<Self, Error> {
         let path = PathBuf::from(format!("{prefix}Chimeric.out.junction"));
 
@@ -96,10 +117,24 @@ impl ChimericJunctionWriter {
         let donor_cigar = alignment.donor.cigar_string();
         let acceptor_cigar = alignment.acceptor.cigar_string();
 
-        // Write line
+        // Write line. Under `--chimMultimapNmax` STAR appends six run-level
+        // columns (`ChimericAlign_chimericJunctionOutput.cpp:14-19`); without it
+        // the file stays at the classic 14.
+        let extra = match &alignment.multimap {
+            Some(m) => format!(
+                "\t{}\t{}\t{}\t{}\t{}\t{}",
+                m.chim_n,
+                m.max_possible_score,
+                m.max_non_chim_score,
+                m.chim_score,
+                m.best_chim_score,
+                u8::from(m.pe_merged)
+            ),
+            None => String::new(),
+        };
         writeln!(
             self.writer,
-            "{donor_chr}\t{donor_bp}\t{donor_strand}\t{acceptor_chr}\t{acceptor_bp}\t{acceptor_strand}\t{junction_type}\t{repeat_donor}\t{repeat_acceptor}\t{read_name}\t{donor_start}\t{donor_cigar}\t{acceptor_start}\t{acceptor_cigar}",
+            "{donor_chr}\t{donor_bp}\t{donor_strand}\t{acceptor_chr}\t{acceptor_bp}\t{acceptor_strand}\t{junction_type}\t{repeat_donor}\t{repeat_acceptor}\t{read_name}\t{donor_start}\t{donor_cigar}\t{acceptor_start}\t{acceptor_cigar}{extra}",
         )
         .map_err(|e| Error::Chimeric(format!("Failed to write chimeric junction: {e}")))?;
 
@@ -444,6 +479,102 @@ mod tests {
         assert_eq!(fields[11], "63M"); // donor CIGAR
         assert_eq!(fields[12], "3632601"); // acceptor start (1-based, per-chr)
         assert_eq!(fields[13], "37M"); // acceptor CIGAR
+    }
+
+    fn chr_names() -> Vec<String> {
+        vec!["chr9".to_string(), "chr22".to_string()]
+    }
+
+    fn chr_starts() -> Vec<u64> {
+        vec![1_000_000, 20_000_000]
+    }
+
+    /// A minimal two-segment chimera for output-format tests.
+    fn mock_alignment() -> ChimericAlignment {
+        let seg = |chr_idx: usize, gs: u64, ge: u64, rs: usize, re: usize| ChimericSegment {
+            chr_idx,
+            genome_start: gs,
+            genome_end: ge,
+            is_reverse: false,
+            read_start: rs,
+            read_end: re,
+            cigar: vec![cigar::Op::new(cigar::op::Kind::Match, re - rs)],
+            score: (re - rs) as i32,
+            n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: ge,
+                read_start: rs,
+                read_end: re,
+            },
+            last_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: ge,
+                read_start: rs,
+                read_end: re,
+            },
+        };
+        ChimericAlignment::new(
+            seg(0, 1_100_000, 1_100_060, 0, 60),
+            seg(1, 20_100_000, 20_100_060, 60, 120),
+            1,
+            0,
+            0,
+            vec![0u8; 120],
+            "READ_001".to_string(),
+        )
+    }
+
+    /// `--chimMultimapNmax` selects STAR's wider file: a 21-name header and six
+    /// extra per-record columns. Without it the file stays at the classic 14
+    /// with no header. STAR-Fusion parses on that header, so the shape matters
+    /// as much as the values.
+    #[test]
+    fn multimap_mode_writes_stars_header_and_six_extra_columns() {
+        use crate::chimeric::MultimapInfo;
+        let dir = tempdir().unwrap();
+
+        let build = |multimap: bool| -> String {
+            let prefix = format!("{}/mm{}_", dir.path().display(), u8::from(multimap));
+            let mut w = ChimericJunctionWriter::new_with_multimap(&prefix, multimap).unwrap();
+            let mut aln = mock_alignment();
+            if multimap {
+                aln = aln.with_multimap(MultimapInfo {
+                    chim_n: 3,
+                    max_possible_score: 120,
+                    max_non_chim_score: 61,
+                    chim_score: 116,
+                    best_chim_score: 118,
+                    pe_merged: false,
+                });
+            }
+            w.write_alignment(&aln, &chr_names(), &chr_starts(), "READ_001")
+                .unwrap();
+            w.flush().unwrap();
+            std::fs::read_to_string(format!("{prefix}Chimeric.out.junction")).unwrap()
+        };
+
+        // Off: no header, 14 columns.
+        let plain = build(false);
+        let plain_lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(plain_lines.len(), 1, "no header without the flag");
+        assert_eq!(plain_lines[0].split('\t').count(), 14);
+
+        // On: STAR's header verbatim, then 20 columns.
+        let multi = build(true);
+        let lines: Vec<&str> = multi.lines().collect();
+        assert_eq!(lines.len(), 2, "header plus one record");
+        assert_eq!(
+            lines[0],
+            "chr_donorA\tbrkpt_donorA\tstrand_donorA\tchr_acceptorB\tbrkpt_acceptorB\t\
+             strand_acceptorB\tjunction_type\trepeat_left_lenA\trepeat_right_lenB\tread_name\t\
+             start_alnA\tcigar_alnA\tstart_alnB\tcigar_alnB\tnum_chim_aln\tmax_poss_aln_score\t\
+             non_chim_aln_score\tthis_chim_aln_score\tbestall_chim_aln_score\tPEmerged_bool\treadgrp",
+            "header must match STAR's byte for byte"
+        );
+        let f: Vec<&str> = lines[1].split('\t').collect();
+        assert_eq!(f.len(), 20, "STAR emits 20 columns; readgrp only with a RG");
+        assert_eq!(&f[14..], &["3", "120", "61", "116", "118", "0"]);
     }
 
     #[test]

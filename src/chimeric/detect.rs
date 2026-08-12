@@ -847,7 +847,27 @@ pub fn detect_chimeric_mult(
         return Ok(Vec::new()); // too many chimeric loci: STAR reports none
     }
     // No filter pass here: candidates were banned as they were scored, above.
-    Ok(chims.into_iter().map(|(c, _)| c).collect())
+    //
+    // Attach the run-level context STAR reports in the multimap file. It is the
+    // same for every chimera of this read, and is only known once enumeration
+    // has finished, so it is applied on the way out.
+    let chim_n = chims.len();
+    Ok(chims
+        .into_iter()
+        .map(|(c, score)| {
+            c.with_multimap(crate::chimeric::MultimapInfo {
+                chim_n,
+                // STAR uses the (paired) read length as the ceiling.
+                max_possible_score: read_len as i32,
+                max_non_chim_score: max_nonchim_score,
+                chim_score: score,
+                best_chim_score: chim_score_best,
+                // We never merge mates before detection, so this is always
+                // false; STAR sets it from `PEunmergedRA != NULL`.
+                pe_merged: false,
+            })
+        })
+        .collect())
 }
 
 /// Implement STAR's `chimericDetectionOld()`: find the best chimeric pair from all
@@ -2190,6 +2210,49 @@ mod tests {
     }
 
     /// Past the cap STAR reports nothing at all, not the first `nmax`.
+    /// Inter-mate chimeras are exempt from the `N` scan, and must stay exempt.
+    ///
+    /// STAR only scans a junction that lies *within* one mate. When the mates
+    /// bracket the junction there is no such position, and STAR takes the
+    /// `EX_iFrag[0] < EX_iFrag[1]` branch
+    /// (`ReadAlign_chimericDetectionOld.cpp:130-143`,
+    /// `ChimericAlign_chimericStitching.cpp:22-33`), which sets `chimMotif=-1`
+    /// and returns before reading `b0`, `b1` or `bR`.
+    ///
+    /// This is otherwise protected only by the *order* of two statements in
+    /// `align_paired_read` — the Tier-2 filter runs before inter-mate chimeras
+    /// are appended — so it would regress silently if they were swapped.
+    #[test]
+    fn inter_mate_chimeras_are_not_subject_to_the_genomic_n_ban() {
+        let read_len = 60usize;
+        // Discordant pair: different chromosomes, so the inter-mate path fires.
+        let t1 = make_clipped_transcript(0, 10, false, read_len, 0, 30);
+        let t2 = make_clipped_transcript(1, 10, false, read_len, 30, 0);
+        let read = read_seq_n(read_len);
+        let p = params(&["--chimSegmentMin", "10"]);
+
+        // Blanket the genome with Ns. An intra-mate chimera would be banned
+        // outright; an inter-mate one is never scanned, so it must survive.
+        let all_n: Vec<u64> = (0..200u64).collect();
+        let index = make_test_index_with_ns(&all_n);
+
+        let got = detect_inter_mate_chimeric(&t1, &t2, &read, "r", &p, &index);
+        assert!(
+            got.is_some(),
+            "an inter-mate chimera must not be filtered by banGenomicN"
+        );
+
+        // And the exemption is a property of the path, not of the filter: the
+        // same alignment handed to apply_chim_filter directly IS banned, which
+        // is why the ordering in align_paired_read matters.
+        let chim = got.unwrap();
+        assert_eq!(
+            apply_chim_filter(vec![chim], &p, &index).len(),
+            0,
+            "the filter itself would ban it; only the inter-mate path exempts it"
+        );
+    }
+
     /// A banned locus must not be counted against `--chimMultimapNmax`.
     ///
     /// STAR zeroes a candidate's score inside stitching when it meets an `N`

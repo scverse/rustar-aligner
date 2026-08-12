@@ -19,6 +19,30 @@ pub struct ExonSpan {
     pub read_end: usize,
 }
 
+/// Run-level context STAR reports alongside each chimera under
+/// `--chimMultimapNmax > 0`.
+///
+/// The multimap file carries six extra columns and a header line
+/// (`ParametersChimeric_initialize.cpp:48-71`,
+/// `ChimericAlign_chimericJunctionOutput.cpp:14-19`). They describe the read as
+/// a whole, not the individual junction, so they are attached when the
+/// enumerating path produces the alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultimapInfo {
+    /// `num_chim_aln` — chimeras reported for this read.
+    pub chim_n: usize,
+    /// `max_poss_aln_score` — STAR uses the (paired) read length.
+    pub max_possible_score: i32,
+    /// `non_chim_aln_score` — best linear alignment score for this read.
+    pub max_non_chim_score: i32,
+    /// `this_chim_aln_score` — this alignment's score.
+    pub chim_score: i32,
+    /// `bestall_chim_aln_score` — best score among this read's chimeras.
+    pub best_chim_score: i32,
+    /// `PEmerged_bool` — whether the mates were merged before detection.
+    pub pe_merged: bool,
+}
+
 /// A single segment of a chimeric alignment
 #[derive(Debug, Clone)]
 pub struct ChimericSegment {
@@ -89,6 +113,9 @@ pub struct ChimericAlignment {
     pub total_score: i32,
     pub read_seq: Vec<u8>,
     pub read_name: String,
+    /// Present only for chimeras from the `--chimMultimapNmax` path, which
+    /// writes a wider file. `None` selects the 14-column format.
+    pub multimap: Option<MultimapInfo>,
 }
 
 impl ChimericAlignment {
@@ -112,7 +139,15 @@ impl ChimericAlignment {
             total_score,
             read_seq,
             read_name,
+            multimap: None,
         }
+    }
+
+    /// Attach the multimap context, selecting STAR's wider output format.
+    #[must_use]
+    pub fn with_multimap(mut self, info: MultimapInfo) -> Self {
+        self.multimap = Some(info);
+        self
     }
 
     /// Check if both segments meet minimum length requirement
