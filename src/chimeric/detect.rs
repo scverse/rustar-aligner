@@ -741,6 +741,7 @@ pub fn detect_chimeric_mult(
     let read_len = read_seq.len();
     let min_seg = params.chim_segment_min as usize;
     let gap_max = params.chim_segment_read_gap_max as usize;
+    let ban_genomic_n = params.chim_filter.iter().any(|f| f == "banGenomicN");
 
     // STAR only looks for a chimera when the best linear alignment leaves enough
     // of the read unexplained (`--chimNonchimScoreDropMin`). A read that already
@@ -812,6 +813,19 @@ pub fn detect_chimeric_mult(
             else {
                 continue;
             };
+            // STAR bans an `N`-bearing candidate *inside* stitching, by zeroing
+            // its chimScore (`ChimericAlign_chimericStitching.cpp:63-66`). The
+            // caller then only pushes candidates that still clear
+            // `minScoreToConsider`, so a banned one never enters the list, never
+            // raises `chimScoreBest`, never narrows the score floor, and is not
+            // counted against `--chimMultimapNmax`
+            // (`ChimericDetection_chimericDetectionMult.cpp:79-95`). Filtering
+            // after selection instead would let a banned locus evict legitimate
+            // ones, or push the survivor count over the cap so nothing is
+            // reported at all.
+            if !junction_scan_is_clean(&chim, index, ban_genomic_n) {
+                continue;
+            }
             if score < min_score {
                 continue;
             }
@@ -832,8 +846,8 @@ pub fn detect_chimeric_mult(
     if chims.len() > params.chim_multimap_nmax {
         return Ok(Vec::new()); // too many chimeric loci: STAR reports none
     }
-    let chims: Vec<ChimericAlignment> = chims.into_iter().map(|(c, _)| c).collect();
-    Ok(apply_chim_filter(chims, params, index))
+    // No filter pass here: candidates were banned as they were scored, above.
+    Ok(chims.into_iter().map(|(c, _)| c).collect())
 }
 
 /// Implement STAR's `chimericDetectionOld()`: find the best chimeric pair from all
@@ -2073,6 +2087,57 @@ mod tests {
     }
 
     /// Past the cap STAR reports nothing at all, not the first `nmax`.
+    /// A banned locus must not be counted against `--chimMultimapNmax`.
+    ///
+    /// STAR zeroes a candidate's score inside stitching when it meets an `N`
+    /// (`ChimericAlign_chimericStitching.cpp:63-66`), so it never reaches the
+    /// list the cap is measured against
+    /// (`ChimericDetection_chimericDetectionMult.cpp:79-95`). Filtering after
+    /// selection instead makes a banned locus push the survivor count over the
+    /// cap, and STAR's "over the cap, report nothing" rule then throws away the
+    /// clean locus too.
+    #[test]
+    fn chim_multimap_does_not_count_a_banned_locus_against_the_cap() {
+        let read_len = 100usize;
+        let pool = two_locus_pool(read_len);
+        let read = read_seq_n(read_len);
+        let cap1 = mult_params(&["--chimMultimapNmax", "1"]);
+
+        // Both loci clean: two survivors over a cap of 1, so nothing is
+        // reported. This is the control that the cap is live.
+        let clean = make_test_index();
+        assert!(
+            detect_chimeric_mult(&pool, pool[0].score, &read, "r", &cap1, &clean, None)
+                .unwrap()
+                .is_empty(),
+            "two clean loci over a cap of 1 must report nothing"
+        );
+
+        // Ban only the second acceptor locus. With the donor on read[0..70] and
+        // the acceptors on read[70..100], the scan spans are: donor 0..98,
+        // acceptor-at-0 -70..28, acceptor-at-150 80..178. So 160 sits inside the
+        // second acceptor's span and outside both the donor's and the first
+        // acceptor's, banning exactly one candidate. One survivor remains, which
+        // is within the cap, so it must be reported rather than the whole read
+        // being discarded.
+        let banned_second = make_test_index_with_ns(&[160]);
+        let got = detect_chimeric_mult(
+            &pool,
+            pool[0].score,
+            &read,
+            "r",
+            &cap1,
+            &banned_second,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "a banned locus must not count towards --chimMultimapNmax"
+        );
+    }
+
     #[test]
     fn chim_multimap_beyond_the_cap_reports_nothing() {
         let index = make_test_index();
