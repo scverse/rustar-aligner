@@ -42,6 +42,39 @@ fn shuffle_tied_prefix<T>(items: &mut [T], score_fn: impl Fn(&T) -> i32, seed: u
     crate::rng::shuffle_deterministic(&mut items[..tied], seed);
 }
 
+/// Reduce a read's chimeras to the single best, as STAR's default path does.
+///
+/// `chimericDetectionOld` reports at most one chimera per read: it selects the
+/// best pair and returns, so `Chimeric.out.junction` has exactly one line per
+/// chimeric read. Only `--chimMultimapNmax > 0` enumerates more, which STAR
+/// confirms — with the flag it emits two lines for several reads of the same
+/// input.
+///
+/// Our detection runs several tiers over the same read (Tier 1, plus the
+/// soft-clip, multi-cluster and residual tiers), and more than one can produce
+/// a chimera for it — sometimes the same junction with the donor and acceptor
+/// roles swapped. Without this the file carries more lines than chimeric reads.
+///
+/// Ties break on the segment coordinates so the choice does not depend on the
+/// order the tiers happened to run in.
+fn keep_best_chimera(
+    mut chims: Vec<crate::chimeric::ChimericAlignment>,
+) -> Vec<crate::chimeric::ChimericAlignment> {
+    if chims.len() <= 1 {
+        return chims;
+    }
+    chims.sort_by(|a, b| {
+        b.total_score
+            .cmp(&a.total_score)
+            .then_with(|| a.donor.chr_idx.cmp(&b.donor.chr_idx))
+            .then_with(|| a.donor.genome_start.cmp(&b.donor.genome_start))
+            .then_with(|| a.acceptor.chr_idx.cmp(&b.acceptor.chr_idx))
+            .then_with(|| a.acceptor.genome_start.cmp(&b.acceptor.genome_start))
+    });
+    chims.truncate(1);
+    chims
+}
+
 /// Attach STAR's multimap context to every chimera of a read.
 ///
 /// Under `--chimMultimapNmax > 0` STAR writes a wider file, and every record in
@@ -648,6 +681,9 @@ pub fn align_read(
         });
         chimeric_alignments =
             crate::chimeric::apply_chim_filter(chimeric_alignments, params, index);
+        if params.chim_multimap_nmax == 0 {
+            chimeric_alignments = keep_best_chimera(chimeric_alignments);
+        }
         if params.chim_multimap_nmax > 0 {
             // STAR's `maxNonChimAlignScore` is the best *raw* linear score
             // (`trBest`), taken before the quality filters — a chimeric read
@@ -872,6 +908,9 @@ pub fn align_paired_read(
         // here. Inter-mate chimeras are appended after this point and stay
         // exempt, which is what STAR does — see `detect_inter_mate_chimeric`.
         pe_chimeric = crate::chimeric::apply_chim_filter(pe_chimeric, params, index);
+    }
+    if params.chim_segment_min > 0 && params.chim_multimap_nmax == 0 {
+        pe_chimeric = keep_best_chimera(pe_chimeric);
     }
 
     // Combined score threshold: use len1+len2 as denominator
@@ -1614,6 +1653,71 @@ pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STAR's default path reports one chimera per read; ours can produce
+    /// several because the detection tiers overlap. Verified against STAR on a
+    /// synthetic fixture: 10 chimeric reads give STAR 10 junction lines, while
+    /// before this we emitted 11 — one read appearing twice from two tiers with
+    /// the donor and acceptor roles swapped.
+    #[test]
+    fn keep_best_chimera_reports_one_per_read_deterministically() {
+        use crate::chimeric::{ChimericAlignment, ChimericSegment, ExonSpan};
+
+        let seg = |chr_idx: usize, gs: u64, score: i32| ChimericSegment {
+            chr_idx,
+            genome_start: gs,
+            genome_end: gs + 50,
+            is_reverse: false,
+            read_start: 0,
+            read_end: 50,
+            cigar: Vec::new(),
+            score,
+            n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: gs + 50,
+                read_start: 0,
+                read_end: 50,
+            },
+            last_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: gs + 50,
+                read_start: 0,
+                read_end: 50,
+            },
+        };
+        let chim = |gs: u64, score: i32| {
+            ChimericAlignment::new(
+                seg(0, gs, score),
+                seg(1, 500, 0),
+                0,
+                0,
+                0,
+                vec![0u8; 100],
+                "r".to_string(),
+            )
+        };
+
+        // Highest total score wins.
+        let kept = keep_best_chimera(vec![chim(10, 30), chim(20, 60), chim(30, 45)]);
+        assert_eq!(kept.len(), 1, "one chimera per read");
+        assert_eq!(kept[0].total_score, 60);
+        assert_eq!(kept[0].donor.genome_start, 20);
+
+        // A tie resolves on coordinates, not on the order the tiers ran in.
+        let a = keep_best_chimera(vec![chim(70, 50), chim(40, 50)]);
+        let b = keep_best_chimera(vec![chim(40, 50), chim(70, 50)]);
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a[0].donor.genome_start, b[0].donor.genome_start,
+            "tie-break must not depend on input order"
+        );
+        assert_eq!(a[0].donor.genome_start, 40);
+
+        // Nothing to do for zero or one.
+        assert!(keep_best_chimera(Vec::new()).is_empty());
+        assert_eq!(keep_best_chimera(vec![chim(10, 5)]).len(), 1);
+    }
     use crate::genome::Genome;
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
