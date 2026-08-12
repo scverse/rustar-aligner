@@ -16,10 +16,19 @@ Writes into DIR:
 
     genome_N.fa          the reference with `N` runs planted
     gaps.tsv             chr, 0-based start, length -- one row per planted run
-    chimeric_reads.fq    synthetic chimeric reads
+    chimeric_reads.fq    synthetic chimeric reads (single-end)
+    pe_intra_{1,2}.fq    paired: mate1 is itself chimeric, mate2 is a normal
+                         read from the donor locus. Exercises the intra-mate
+                         (Tier 2) PE path, where the junction lies inside one
+                         mate and STAR's `N` scan applies.
+    pe_inter_{1,2}.fq    paired: donor on mate1, acceptor on mate2, so the mates
+                         *bracket* the junction. STAR takes its `EX_iFrag`
+                         branch here and applies no `N` scan at all, so these
+                         two files together separate the filtered path from the
+                         exempt one.
     reads.tsv            read name, the two loci, strands, and the expected
                          relationship to a gap (`clean` / `donor_gap` /
-                         `acceptor_gap`)
+                         `acceptor_gap` / `read_n`)
 
 The read table deliberately covers both strands on both sides of the junction:
 the genomic base STAR examines differs by strand (it mirrors the offset within
@@ -146,6 +155,53 @@ def build_reads(original, mutated, gaps, seg_len):
     return reads, table
 
 
+def write_pe(outdir, reads, table, original, seg_len):
+    """Two paired layouts from the same chimeric reads.
+
+    `pe_intra`: the chimeric read stays whole as mate1 and gets an ordinary
+    mate2 drawn downstream of the donor locus. The junction is inside mate1, so
+    detection runs the intra-mate path and the `N` scan applies.
+
+    `pe_inter`: the same read split at the junction, donor to mate1 and acceptor
+    to mate2. The mates now bracket the junction, which STAR handles in a branch
+    that never reads a genomic base.
+
+    Mate2 is reverse-complemented in both, as an FR pair.
+    """
+    # table rows are (name, donor_chr, donor_pos0, donor_strand,
+    #                 acceptor_chr, acceptor_pos0, acceptor_strand, kind)
+    by_name = {t[0]: (t[4], t[5]) for t in table}
+
+    def fq(path, records):
+        with open(path, "w") as fh:
+            for n, s in records:
+                fh.write(f"@{n}\n{s}\n+\n{'I' * len(s)}\n")
+
+    intra1, intra2, inter1, inter2 = [], [], [], []
+    for name, seq in reads:
+        acc_chr, acc_pos = by_name[name]
+        # Mate2 for the intra layout sits on the ACCEPTOR, downstream of the
+        # junction — the shape of a real fusion-spanning pair. Drawing it from
+        # the donor instead leaves most of the fragment explainable linearly,
+        # and STAR then rejects the chimera on `chimScoreDropMax`.
+        m2_start = acc_pos + seg_len
+        mate2 = original[acc_chr][m2_start : m2_start + seg_len]
+        if len(mate2) < seg_len:
+            continue
+        intra1.append((name, seq))
+        intra2.append((name, revcomp(mate2)))
+
+        half = len(seq) // 2
+        inter1.append((name, seq[:half]))
+        inter2.append((name, revcomp(seq[half:])))
+
+    fq(os.path.join(outdir, "pe_intra_1.fq"), intra1)
+    fq(os.path.join(outdir, "pe_intra_2.fq"), intra2)
+    fq(os.path.join(outdir, "pe_inter_1.fq"), inter1)
+    fq(os.path.join(outdir, "pe_inter_2.fq"), inter2)
+    print(f"wrote {len(intra1)} intra-mate and {len(inter1)} inter-mate PE pairs")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fasta", required=True, help="reference FASTA to mutate")
@@ -170,6 +226,8 @@ def main():
     with open(os.path.join(args.out, "chimeric_reads.fq"), "w") as fh:
         for name, seq in reads:
             fh.write(f"@{name}\n{seq}\n+\n{'I' * len(seq)}\n")
+
+    write_pe(args.out, reads, table, dict(records), args.seg_len)
     with open(os.path.join(args.out, "reads.tsv"), "w") as fh:
         fh.write("read\tdonor_chr\tdonor_pos0\tdonor_strand\tacceptor_chr\tacceptor_pos0\tacceptor_strand\texpect\n")
         for row in table:
