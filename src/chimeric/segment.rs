@@ -3,6 +3,22 @@
 use crate::align::transcript::cigar_to_string;
 use noodles::sam::alignment::record::cigar;
 
+/// Genome and read span of one exon, as STAR's `exons[i]` row.
+///
+/// The chimeric junction scan works on a *single* exon, not the whole segment:
+/// STAR picks `e0 = Str==1 ? 0 : nExons-1` for the read-leading segment and
+/// `e1 = Str==0 ? 0 : nExons-1` for the trailing one, then reads `EX_G`, `EX_L`
+/// and `EX_R` from it. For a single-exon segment that is the segment itself,
+/// but a spliced or indel-carrying segment has `genome_end - genome_start !=
+/// read_end - read_start`, and the scan must not use the wider span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExonSpan {
+    pub genome_start: u64,
+    pub genome_end: u64,
+    pub read_start: usize,
+    pub read_end: usize,
+}
+
 /// A single segment of a chimeric alignment
 #[derive(Debug, Clone)]
 pub struct ChimericSegment {
@@ -15,9 +31,32 @@ pub struct ChimericSegment {
     pub cigar: Vec<cigar::Op>,
     pub score: i32,
     pub n_mismatch: u32,
+    /// This segment's first and last exon. Equal to the segment span when the
+    /// segment is a single gapless block; see [`ExonSpan`].
+    pub first_exon: ExonSpan,
+    pub last_exon: ExonSpan,
 }
 
 impl ChimericSegment {
+    /// The exon STAR scans for this segment, by strand and position in the pair.
+    ///
+    /// `leading` is true for the segment that comes first in the *read*
+    /// (STAR's `trChim[0]`, after it orders the pair by `roStart`). STAR then
+    /// takes `e0 = Str==1 ? 0 : nExons-1` and `e1 = Str==0 ? 0 : nExons-1`, i.e.
+    /// in both cases the exon on the junction side.
+    pub fn junction_exon(&self, leading: bool) -> ExonSpan {
+        let take_first = if leading {
+            self.is_reverse
+        } else {
+            !self.is_reverse
+        };
+        if take_first {
+            self.first_exon
+        } else {
+            self.last_exon
+        }
+    }
+
     /// Get segment length in read coordinates
     pub fn read_length(&self) -> usize {
         self.read_end - self.read_start
@@ -137,6 +176,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 2,
+            first_exon: ExonSpan {
+                genome_start,
+                genome_end,
+                read_start,
+                read_end,
+            },
+            last_exon: ExonSpan {
+                genome_start,
+                genome_end,
+                read_start,
+                read_end,
+            },
         }
     }
 

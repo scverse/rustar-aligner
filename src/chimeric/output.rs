@@ -259,6 +259,7 @@ fn build_segment_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chimeric::segment::ExonSpan;
     use crate::chimeric::segment::{ChimericAlignment, ChimericSegment};
     use noodles::sam::alignment::record::cigar;
     use std::io::Read;
@@ -356,6 +357,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 100,
             n_mismatch: 2,
+            first_exon: ExonSpan {
+                genome_start: 133_738_300,
+                genome_end: 133_738_363,
+                read_start: 0,
+                read_end: 63,
+            },
+            last_exon: ExonSpan {
+                genome_start: 133_738_300,
+                genome_end: 133_738_363,
+                read_start: 0,
+                read_end: 63,
+            },
         };
 
         let acceptor = ChimericSegment {
@@ -368,6 +381,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 37)],
             score: 80,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 23_632_600,
+                genome_end: 23_632_637,
+                read_start: 63,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 23_632_600,
+                genome_end: 23_632_637,
+                read_start: 63,
+                read_end: 100,
+            },
         };
 
         let alignment = ChimericAlignment::new(
@@ -440,6 +465,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 1000,
+                genome_end: 1050,
+                read_start: 0,
+                read_end: 50,
+            },
+            last_exon: ExonSpan {
+                genome_start: 1000,
+                genome_end: 1050,
+                read_start: 0,
+                read_end: 50,
+            },
         };
 
         let acceptor = ChimericSegment {
@@ -452,6 +489,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 2000,
+                genome_end: 2050,
+                read_start: 50,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 2000,
+                genome_end: 2050,
+                read_start: 50,
+                read_end: 100,
+            },
         };
 
         let alignment = ChimericAlignment::new(
@@ -526,6 +575,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
+            last_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
         };
         let acceptor = ChimericSegment {
             chr_idx: 1,
@@ -537,6 +598,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
         };
         let alignment = ChimericAlignment::new(
             donor,
@@ -566,6 +639,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
+            last_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
         };
         let acceptor = ChimericSegment {
             chr_idx: 1,
@@ -577,6 +662,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
         };
         let alignment = ChimericAlignment::new(
             donor,
@@ -617,6 +714,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 2,
+            first_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
+            last_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
         };
         let acceptor = ChimericSegment {
             chr_idx: 1,
@@ -628,6 +737,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
+            first_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
         };
         let alignment = ChimericAlignment::new(
             donor,
@@ -681,6 +802,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
+            last_exon: ExonSpan {
+                genome_start: 100,
+                genome_end: 163,
+                read_start: 0,
+                read_end: 63,
+            },
         };
         let acceptor = ChimericSegment {
             chr_idx: 1,
@@ -692,6 +825,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
+            last_exon: ExonSpan {
+                genome_start: 600,
+                genome_end: 637,
+                read_start: 63,
+                read_end: 100,
+            },
         };
         let read_seq = vec![0u8; 100]; // 100 A bases
         let alignment =

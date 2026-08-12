@@ -6,7 +6,7 @@ use crate::align::seed::Seed;
 use crate::align::stitch::{cluster_seeds, stitch_seeds, stitch_seeds_with_jdb};
 use crate::align::transcript::Transcript;
 use crate::chimeric::score::{calculate_repeat_length, classify_junction_type};
-use crate::chimeric::segment::{ChimericAlignment, ChimericSegment};
+use crate::chimeric::segment::{ChimericAlignment, ChimericSegment, ExonSpan};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::Parameters;
@@ -935,7 +935,20 @@ fn junction_scan_is_clean(c: &ChimericAlignment, index: &GenomeIndex, ban_genomi
     // same conversion is needed or the scan walks the wrong span for a reverse
     // segment -- and the span is what decides how far into a gap it reaches.
     let read_len = c.read_seq.len();
-    let ro = |seg: &ChimericSegment| -> usize {
+    // STAR takes roStart from the scanned EXON, not the whole segment:
+    // `roStart = Str==0 ? exons[e][EX_R] : Lread - exons[e][EX_R] - exons[e][EX_L]`.
+    let ro_of = |ex: &ExonSpan, is_reverse: bool| -> usize {
+        if is_reverse {
+            read_len.saturating_sub(ex.read_end)
+        } else {
+            ex.read_start
+        }
+    };
+    // Ordering uses the SEGMENT's roStart, as STAR does: it compares
+    // `trChim[].roStart`, a transcript-level field, and only picks `e0`/`e1`
+    // afterwards. Using an exon-derived offset here would be circular, since
+    // which exon applies depends on the ordering.
+    let ro_seg = |seg: &ChimericSegment| -> usize {
         if seg.is_reverse {
             read_len.saturating_sub(seg.read_end)
         } else {
@@ -947,15 +960,21 @@ fn junction_scan_is_clean(c: &ChimericAlignment, index: &GenomeIndex, ban_genomi
     // two are the other way round, silently skipping the scan. Our donor and
     // acceptor are ordered by the junction, not by read position, so order them
     // here rather than trusting the field names.
-    let (seg0, seg1) = if ro(&c.donor) <= ro(&c.acceptor) {
+    let (seg0, seg1) = if ro_seg(&c.donor) <= ro_seg(&c.acceptor) {
         (&c.donor, &c.acceptor)
     } else {
         (&c.acceptor, &c.donor)
     };
-    let ro_start0 = ro(seg0);
-    let ro_start1 = ro(seg1);
+    // Once ordered, each segment's scanned exon follows from its role: the
+    // leading segment contributes `e0`, the trailing one `e1`.
+    let ex0 = seg0.junction_exon(true);
+    let ex1 = seg1.junction_exon(false);
+    let ro_start0 = ro_of(&ex0, seg0.is_reverse);
+    let ro_start1 = ro_of(&ex1, seg1.is_reverse);
     // jRmax = roStart1 + L1 - roStart0 - 1, clamped at 0 as STAR clamps it.
-    let acceptor_read_end = ro_start1 + seg1.read_length();
+    // jRmax uses the exon's length (`EX_L`), which for a gapless exon is both
+    // its read and its reference length.
+    let acceptor_read_end = ro_start1 + (ex1.read_end - ex1.read_start);
     let jr_max = acceptor_read_end
         .saturating_sub(ro_start0)
         .saturating_sub(1);
@@ -980,18 +999,18 @@ fn junction_scan_is_clean(c: &ChimericAlignment, index: &GenomeIndex, ban_genomi
 
         let jr64 = jr as u64;
         let b0 = if seg0.is_reverse {
-            base(seg0.genome_end.wrapping_sub(1).wrapping_sub(jr64))
+            base(ex0.genome_end.wrapping_sub(1).wrapping_sub(jr64))
         } else {
-            base(seg0.genome_start.wrapping_add(jr64))
+            base(ex0.genome_start.wrapping_add(jr64))
         };
         // The acceptor is walked in the donor's read frame, so its genome
         // offset carries the (roStart0 - roStart1) shift STAR applies.
         let shift = ro_start0 as i64 + jr as i64 - ro_start1 as i64;
         let b1 = if seg1.is_reverse {
-            let pos = seg1.genome_end as i64 - 1 - shift;
+            let pos = ex1.genome_end as i64 - 1 - shift;
             if pos < 0 { None } else { base(pos as u64) }
         } else {
-            let pos = seg1.genome_start as i64 + shift;
+            let pos = ex1.genome_start as i64 + shift;
             if pos < 0 { None } else { base(pos as u64) }
         };
 
@@ -1369,6 +1388,16 @@ pub(crate) fn transcript_to_segment(transcript: &Transcript) -> Result<ChimericS
     let read_start = transcript.exons[0].read_start;
     let read_end = transcript.exons.last().unwrap().read_end;
 
+    // STAR's junction scan reads a single exon, so carry the outer two through
+    // rather than only the transcript-wide span. They coincide for a gapless
+    // single-exon segment and diverge as soon as there is a splice or an indel.
+    let exon_span = |e: &crate::align::transcript::Exon| ExonSpan {
+        genome_start: e.genome_start,
+        genome_end: e.genome_end,
+        read_start: e.read_start,
+        read_end: e.read_end,
+    };
+
     Ok(ChimericSegment {
         chr_idx: transcript.chr_idx,
         genome_start: transcript.genome_start,
@@ -1379,6 +1408,8 @@ pub(crate) fn transcript_to_segment(transcript: &Transcript) -> Result<ChimericS
         cigar: transcript.cigar.clone(),
         score: transcript.score,
         n_mismatch: transcript.n_mismatch,
+        first_exon: exon_span(&transcript.exons[0]),
+        last_exon: exon_span(transcript.exons.last().unwrap()),
     })
 }
 
@@ -1707,6 +1738,54 @@ mod tests {
         );
     }
 
+    /// A spliced reverse segment must be scanned from its junction-side exon,
+    /// not from the whole-transcript span.
+    ///
+    /// STAR reads `exons[e0]` with `e0 = Str==1 ? 0 : nExons-1`, so a reverse
+    /// leading segment is walked down from its *first* exon's `genome_end`. If
+    /// the transcript-wide `genome_end` is used instead, every base examined is
+    /// shifted by the intron length, and a gap beside the real junction is
+    /// missed while an unrelated position is banned.
+    #[test]
+    fn chim_filter_scans_the_junction_exon_of_a_spliced_segment() {
+        let banned = params(&["--chimSegmentMin", "10"]);
+        let mut chim = forward_chimera();
+        // Donor becomes reverse and spliced: exon1 [10,25), intron, exon2
+        // [125,140). The transcript span stays [10,140), so the two disagree by
+        // the 100-base intron.
+        chim.donor.is_reverse = true;
+        chim.donor.genome_end = 140;
+        chim.donor.first_exon = ExonSpan {
+            genome_start: 10,
+            genome_end: 25,
+            read_start: 0,
+            read_end: 15,
+        };
+        chim.donor.last_exon = ExonSpan {
+            genome_start: 125,
+            genome_end: 140,
+            read_start: 15,
+            read_end: 30,
+        };
+
+        // Reverse + leading => first exon, so the walk starts at 25 - 1 = 24.
+        let at_exon = make_test_index_with_ns(&[24]);
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &banned, &at_exon).len(),
+            0,
+            "the junction-side exon's end must be the first base scanned"
+        );
+
+        // 139 is the transcript-wide genome_end - 1: what the old code scanned.
+        // It belongs to the far exon and must not ban.
+        let at_transcript_end = make_test_index_with_ns(&[139]);
+        assert_eq!(
+            apply_chim_filter(vec![chim], &banned, &at_transcript_end).len(),
+            1,
+            "the transcript-wide span must not be used for a spliced segment"
+        );
+    }
+
     /// The strand case, which a position-blind filter gets wrong.
     ///
     /// STAR walks a reverse segment from the far end
@@ -1773,6 +1852,18 @@ mod tests {
                 cigar: Vec::new(),
                 n_mismatch: 0,
                 score: 30,
+                first_exon: ExonSpan {
+                    genome_start: 10,
+                    genome_end: 40,
+                    read_start: 0,
+                    read_end: 30,
+                },
+                last_exon: ExonSpan {
+                    genome_start: 10,
+                    genome_end: 40,
+                    read_start: 0,
+                    read_end: 30,
+                },
             },
             ChimericSegment {
                 chr_idx: 0,
@@ -1784,6 +1875,18 @@ mod tests {
                 cigar: Vec::new(),
                 n_mismatch: 0,
                 score: 30,
+                first_exon: ExonSpan {
+                    genome_start: 100,
+                    genome_end: 130,
+                    read_start: 30,
+                    read_end: 50,
+                },
+                last_exon: ExonSpan {
+                    genome_start: 100,
+                    genome_end: 130,
+                    read_start: 30,
+                    read_end: 50,
+                },
             },
             1,
             0,
