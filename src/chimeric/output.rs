@@ -185,6 +185,26 @@ pub fn build_within_bam_records(
     let donor = &alignment.donor;
     let acceptor = &alignment.acceptor;
 
+    // Which end of the supplementary segment's CIGAR covers the OTHER segment's
+    // bases. STAR hard-clips exactly that end (`chimericBAMoutput.cpp:55`
+    // picks -11 for a left junction, -12 for a right one) and drops those bases
+    // from SEQ (`ReadAlign_alignBAM.cpp:503-511`), which is the ordinary SAM
+    // rule: hard-clipped bases are absent from SEQ, soft-clipped ones present.
+    //
+    // In original-read order the other segment is 5' of this one when this one
+    // trails. The CIGAR is in reference orientation, so a reverse segment has
+    // that end on the opposite side.
+    let read_len = alignment.read_seq.len();
+    let ro = |seg: &ChimericSegment| {
+        if seg.is_reverse {
+            read_len.saturating_sub(seg.read_end)
+        } else {
+            seg.read_start
+        }
+    };
+    let acceptor_trails = ro(acceptor) > ro(donor);
+    let hard_leading = acceptor_trails != acceptor.is_reverse;
+
     let donor_sa = format_sa_entry(donor, &genome.chr_name, &genome.chr_start, mapq);
     let acceptor_sa = format_sa_entry(acceptor, &genome.chr_name, &genome.chr_start, mapq);
 
@@ -194,7 +214,7 @@ pub fn build_within_bam_records(
         donor,
         genome,
         mapq,
-        false,
+        None,
         &acceptor_sa,
     )?;
     let acceptor_record = build_segment_record(
@@ -203,7 +223,7 @@ pub fn build_within_bam_records(
         acceptor,
         genome,
         mapq,
-        true,
+        Some(hard_leading),
         &donor_sa,
     )?;
 
@@ -235,7 +255,9 @@ fn build_segment_record(
     seg: &ChimericSegment,
     genome: &Genome,
     mapq: u8,
-    is_supplementary: bool,
+    // `None` for the representative record; `Some(hard_leading)` for the
+    // supplementary one, naming which CIGAR end to hard-clip.
+    supplementary: Option<bool>,
     sa_tag: &str,
 ) -> Result<RecordBuf, Error> {
     use crate::io::fastq::{complement_base, decode_base};
@@ -248,7 +270,7 @@ fn build_segment_record(
     if seg.is_reverse {
         flags |= sam::alignment::record::Flags::REVERSE_COMPLEMENTED;
     }
-    if is_supplementary {
+    if supplementary.is_some() {
         flags |= sam::alignment::record::Flags::SUPPLEMENTARY;
     }
     *record.flags_mut() = flags;
@@ -264,24 +286,76 @@ fn build_segment_record(
 
     *record.mapping_quality_mut() = MappingQuality::new(mapq);
 
-    *record.cigar_mut() = seg.cigar.iter().copied().collect();
+    // SEQ in reference orientation, matching the CIGAR.
+    let mut seq_bytes: Vec<u8> = if seg.is_reverse {
+        read_seq
+            .iter()
+            .rev()
+            .map(|&b| decode_base(complement_base(b)))
+            .collect()
+    } else {
+        read_seq.iter().map(|&b| decode_base(b)).collect()
+    };
 
-    // Primary record carries the full read sequence; supplementary uses * (empty).
-    if !is_supplementary {
-        if seg.is_reverse {
-            let seq_bytes: Vec<u8> = read_seq
-                .iter()
-                .rev()
-                .map(|&b| decode_base(complement_base(b)))
-                .collect();
-            *record.sequence_mut() = Sequence::from(seq_bytes);
-        } else {
-            let seq_bytes: Vec<u8> = read_seq.iter().map(|&b| decode_base(b)).collect();
-            *record.sequence_mut() = Sequence::from(seq_bytes);
+    let mut cigar_ops = seg.cigar.clone();
+
+    // Pad the CIGAR out to the full read with soft clips where the segment does
+    // not already carry them. STAR always emits these (`trimL1`/`trimR1`,
+    // `ReadAlign_alignBAM.cpp:235,269`), but our segments sometimes arrive as a
+    // bare match block, and a record whose CIGAR claims fewer query bases than
+    // SEQ holds cannot be written. Read coordinates are in original-read order,
+    // so a reverse segment's leading clip is the one past its 3' end.
+    {
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        let q: usize = cigar_ops
+            .iter()
+            .filter(|op| op.kind().consumes_read())
+            .map(|op| op.len())
+            .sum();
+        if q < read_seq.len() {
+            let before = seg.read_start;
+            let after = read_seq.len().saturating_sub(seg.read_end);
+            let (lead, trail) = if seg.is_reverse {
+                (after, before)
+            } else {
+                (before, after)
+            };
+            let lead_present = matches!(cigar_ops.first(), Some(o) if o.kind() == Kind::SoftClip);
+            let trail_present = matches!(cigar_ops.last(), Some(o) if o.kind() == Kind::SoftClip);
+            if trail > 0 && !trail_present {
+                cigar_ops.push(Op::new(Kind::SoftClip, trail));
+            }
+            if lead > 0 && !lead_present {
+                cigar_ops.insert(0, Op::new(Kind::SoftClip, lead));
+            }
         }
-        // Leave QUAL empty (not available for chimeric segments)
-        *record.quality_scores_mut() = QualityScores::default();
     }
+
+    // Supplementary: hard-clip the end covering the other segment and drop
+    // those bases from SEQ. Leaving them soft-clipped with an empty SEQ, as
+    // this did before, is not representable -- soft clips consume the query, so
+    // a 55S65M CIGAR asserts a 120-base SEQ and the record fails to write.
+    if let Some(hard_leading) = supplementary {
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        let idx = if hard_leading { 0 } else { cigar_ops.len() - 1 };
+        if let Some(op) = cigar_ops.get(idx).copied()
+            && op.kind() == Kind::SoftClip
+        {
+            let n = op.len();
+            cigar_ops[idx] = Op::new(Kind::HardClip, n);
+            if hard_leading {
+                seq_bytes.drain(..n.min(seq_bytes.len()));
+            } else {
+                let keep = seq_bytes.len().saturating_sub(n);
+                seq_bytes.truncate(keep);
+            }
+        }
+    }
+
+    *record.cigar_mut() = cigar_ops.iter().copied().collect();
+    *record.sequence_mut() = Sequence::from(seq_bytes);
+    // QUAL is not carried for chimeric segments.
+    *record.quality_scores_mut() = QualityScores::default();
 
     let data = record.data_mut();
     data.insert(Tag::new(b'S', b'A'), Value::String(BString::from(sa_tag)));
@@ -703,6 +777,8 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
+            // Real segments span the whole read: the part belonging to the
+            // other segment is soft-clipped, not absent.
             cigar: vec![Op::new(Kind::Match, 63)],
             score: 63,
             n_mismatch: 0,
@@ -726,7 +802,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![Op::new(Kind::Match, 37)],
+            cigar: vec![Op::new(Kind::SoftClip, 63), Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 1,
             first_exon: ExonSpan {
@@ -920,8 +996,72 @@ mod tests {
         );
     }
 
+    /// A segment whose CIGAR is a bare match block must still produce a record
+    /// whose CIGAR spans the read.
+    ///
+    /// Detection sometimes hands us a segment with no clip ops at all (a bare
+    /// `59M` on a 120-base read). STAR always emits the surrounding soft clips
+    /// (`trimL1`/`trimR1`, `ReadAlign_alignBAM.cpp:235,269`); without them the
+    /// record claims fewer query bases than SEQ carries and BAM writing fails
+    /// with "read length-sequence length mismatch".
     #[test]
-    fn test_within_bam_donor_has_sequence() {
+    fn test_within_bam_pads_a_bare_cigar_to_span_the_read() {
+        use cigar::op::{Kind, Op};
+        let bare = |chr_idx: usize, gs: u64, rs: usize, re: usize, rev: bool| ChimericSegment {
+            chr_idx,
+            genome_start: gs,
+            genome_end: gs + (re - rs) as u64,
+            is_reverse: rev,
+            read_start: rs,
+            read_end: re,
+            // No clips, deliberately.
+            cigar: vec![Op::new(Kind::Match, re - rs)],
+            score: (re - rs) as i32,
+            n_mismatch: 0,
+            first_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: gs + (re - rs) as u64,
+                read_start: rs,
+                read_end: re,
+            },
+            last_exon: ExonSpan {
+                genome_start: gs,
+                genome_end: gs + (re - rs) as u64,
+                read_start: rs,
+                read_end: re,
+            },
+        };
+        // Reverse acceptor, mirroring the fixture read that first tripped this.
+        let alignment = ChimericAlignment::new(
+            bare(0, 100, 0, 61, false),
+            bare(1, 600, 61, 120, true),
+            0,
+            0,
+            0,
+            vec![0u8; 120],
+            "READ_BARE".to_string(),
+        );
+        let records = build_within_bam_records(&alignment, &make_genome_2chr(), 255).unwrap();
+
+        for rec in &records {
+            let q: usize = rec
+                .cigar()
+                .as_ref()
+                .iter()
+                .filter(|op| op.kind().consumes_read())
+                .map(|op| op.len())
+                .sum();
+            assert_eq!(
+                q,
+                rec.sequence().len(),
+                "CIGAR query length must match SEQ: {}",
+                crate::align::transcript::cigar_to_string(rec.cigar().as_ref())
+            );
+        }
+    }
+
+    #[test]
+    fn test_within_bam_supplementary_is_hard_clipped_with_trimmed_seq() {
         use cigar::op::{Kind, Op};
         let donor = ChimericSegment {
             chr_idx: 0,
@@ -930,7 +1070,9 @@ mod tests {
             is_reverse: false,
             read_start: 0,
             read_end: 63,
-            cigar: vec![Op::new(Kind::Match, 63)],
+            // Real segments span the whole read: the part belonging to the
+            // other segment is soft-clipped, not absent.
+            cigar: vec![Op::new(Kind::Match, 63), Op::new(Kind::SoftClip, 37)],
             score: 63,
             n_mismatch: 0,
             first_exon: ExonSpan {
@@ -953,7 +1095,7 @@ mod tests {
             is_reverse: false,
             read_start: 63,
             read_end: 100,
-            cigar: vec![Op::new(Kind::Match, 37)],
+            cigar: vec![Op::new(Kind::SoftClip, 63), Op::new(Kind::Match, 37)],
             score: 37,
             n_mismatch: 0,
             first_exon: ExonSpan {
@@ -975,14 +1117,40 @@ mod tests {
         let genome = make_genome_2chr();
         let records = build_within_bam_records(&alignment, &genome, 255).unwrap();
 
-        // Donor has sequence, acceptor has empty sequence (*)
-        assert!(
-            !records[0].sequence().is_empty(),
-            "donor record must have SEQ"
+        // The representative record carries the whole read against a CIGAR that
+        // spans it.
+        assert_eq!(records[0].sequence().len(), 100, "donor keeps the full SEQ");
+        assert_eq!(
+            crate::align::transcript::cigar_to_string(records[0].cigar().as_ref()),
+            "63M37S"
         );
-        assert!(
-            records[1].sequence().is_empty(),
-            "supplementary record must have empty SEQ"
+
+        // The supplementary hard-clips the end covering the donor and drops
+        // those bases from SEQ, as STAR does (chimericBAMoutput.cpp:55,
+        // alignBAM.cpp:503-511). Leaving them soft-clipped with an empty SEQ is
+        // not representable: soft clips consume the query, so the record would
+        // claim 100 bases and carry none.
+        assert_eq!(
+            crate::align::transcript::cigar_to_string(records[1].cigar().as_ref()),
+            "63H37M",
+            "supplementary hard-clips the other segment's bases"
         );
+        assert_eq!(
+            records[1].sequence().len(),
+            37,
+            "SEQ excludes hard-clipped bases"
+        );
+
+        // The invariant the SAM writer enforces: CIGAR query length == SEQ length.
+        for rec in &records {
+            let q: usize = rec
+                .cigar()
+                .as_ref()
+                .iter()
+                .filter(|op| op.kind().consumes_read())
+                .map(|op| op.len())
+                .sum();
+            assert_eq!(q, rec.sequence().len(), "CIGAR query length must match SEQ");
+        }
     }
 }
