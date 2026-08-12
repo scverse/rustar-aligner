@@ -17,7 +17,8 @@ mod score;
 mod segment;
 
 pub use detect::{
-    ChimericDetector, detect_chimeric_mult, detect_chimeric_old, detect_inter_mate_chimeric,
+    ChimericDetector, apply_chim_filter, detect_chimeric_mult, detect_chimeric_old,
+    detect_inter_mate_chimeric,
 };
 pub use output::{ChimericJunctionWriter, build_within_bam_records};
 pub use segment::{ChimericAlignment, ChimericSegment};

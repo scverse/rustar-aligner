@@ -1632,6 +1632,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 chim_writer.write_alignment(
                                     chim_aln,
                                     &index.genome.chr_name,
+                                    &index.genome.chr_start,
                                     &chim_aln.read_name,
                                 )?;
                             }
@@ -1698,6 +1699,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     chim_writer.write_alignment(
                                         chim_aln,
                                         &index.genome.chr_name,
+                                        &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
                                 }

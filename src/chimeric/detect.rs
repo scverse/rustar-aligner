@@ -610,7 +610,18 @@ pub fn detect_inter_mate_chimeric(
 
     // Same `--chimFilter` treatment as the intra-mate path: no detection route
     // gets to skip it.
-    apply_chim_filter(vec![chim], params, index).pop()
+    // No `N` check here, deliberately. STAR runs the junction scan only in the
+    // "chimeric junction is within one of the mates" branch
+    // (`ReadAlign_chimericDetectionOld.cpp:144` onward). The branch above it,
+    // for mates that *bracket* the junction
+    // (`exons[e0][EX_iFrag] < exons[e1][EX_iFrag]`, `:130-143`), sets
+    // `chimMotif=-1` and returns without ever reading `b0`, `b1` or `bR`;
+    // `ChimericAlign_chimericStitching.cpp:22` short-circuits the same way.
+    // There is no junction position within a mate to scan, so filtering here
+    // would drop pairs STAR reports — and would run the scan over a
+    // fragment-wide geometry it was never derived for.
+    let _ = index;
+    Some(chim)
 }
 
 /// Shift all exon read_start/read_end values in a transcript by `offset`.
@@ -864,28 +875,117 @@ pub fn detect_chimeric_old(
 /// `banGenomicN` (STAR's default) drops a junction whose flanking genomic bases
 /// are not real bases. Sequence around an assembly gap produces junctions that
 /// look clean by score and are meaningless. `None` keeps everything.
-pub(crate) fn apply_chim_filter(
+pub fn apply_chim_filter(
     chims: Vec<ChimericAlignment>,
     params: &Parameters,
     index: &GenomeIndex,
 ) -> Vec<ChimericAlignment> {
-    if !params.chim_filter.iter().any(|f| f == "banGenomicN") {
-        return chims;
-    }
+    let ban_genomic_n = params.chim_filter.iter().any(|f| f == "banGenomicN");
     chims
         .into_iter()
-        .filter(|c| {
-            // STAR tests the base *value* (`G[pos] == 4`), not the bounds, so
-            // a position the genome cannot answer for is not a ban — only a
-            // real `N` is.
-            let base_ok = |pos: u64| index.genome.get_base(pos).is_none_or(|b| b < 4);
-            // The two bases immediately inside the junction: the donor's last
-            // aligned base and the acceptor's first.
-            let d = c.donor.genome_end.saturating_sub(1);
-            let a = c.acceptor.genome_start;
-            base_ok(d) && base_ok(a)
-        })
+        .filter(|c| junction_scan_is_clean(c, index, ban_genomic_n))
         .collect()
+}
+
+/// STAR's `N` check across the chimeric junction scan.
+///
+/// This is not a test of the two bases beside the breakpoint. STAR walks the
+/// candidate junction positions — the same scan that picks the canonical motif —
+/// and abandons the whole chimera on the first `N` it meets
+/// (`ReadAlign_chimericDetectionOld.cpp:145-180`,
+/// `ChimericAlign_chimericStitching.cpp`):
+///
+/// ```cpp
+/// uint jRmax = roStart1+trChim[1].exons[e1][EX_L];
+/// jRmax = jRmax>roStart0 ? jRmax-roStart0-1 : 0;
+/// for (jR=0; jR<jRmax; jR++) {
+///     char bR=Read1[0][roStart0+jR];
+///     ...
+///     if ( ( P.pCh.filter.genomicN && (b0>3 || b1>3) ) || bR>3 ) { chimN=0; break; };
+/// }
+/// ```
+///
+/// Two details that a two-base check cannot express:
+///
+/// - **Strand.** For a reverse segment STAR walks the offset from the other end
+///   and complements the base (`b0 = G[EX_G + EX_L - 1 - jR]; if (b0<4) b0=3-b0`).
+///   Complementing does not change whether the base is `N`, but *which* base is
+///   read does, so a forward-only check bans the wrong chimeras.
+/// - **The read `N` ban is unconditional.** `bR>3` sits outside the
+///   `filter.genomicN` guard, so a read carrying `N` across the junction is
+///   rejected even under `--chimFilter None`.
+fn junction_scan_is_clean(c: &ChimericAlignment, index: &GenomeIndex, ban_genomic_n: bool) -> bool {
+    // STAR works in ORIGINAL-read coordinates, converting a reverse segment's
+    // aligned offset back: `roStart = Str==0 ? EX_R : Lread - EX_R - EX_L`.
+    // Our `read_start`/`read_end` are the aligned-orientation offsets, so the
+    // same conversion is needed or the scan walks the wrong span for a reverse
+    // segment -- and the span is what decides how far into a gap it reaches.
+    let read_len = c.read_seq.len();
+    let ro = |seg: &ChimericSegment| -> usize {
+        if seg.is_reverse {
+            read_len.saturating_sub(seg.read_end)
+        } else {
+            seg.read_start
+        }
+    };
+    // STAR's scan assumes segment 0 is the one that leads in the read: `jRmax`
+    // is derived as `roStart1 + L1 - roStart0 - 1`, which clamps to zero if the
+    // two are the other way round, silently skipping the scan. Our donor and
+    // acceptor are ordered by the junction, not by read position, so order them
+    // here rather than trusting the field names.
+    let (seg0, seg1) = if ro(&c.donor) <= ro(&c.acceptor) {
+        (&c.donor, &c.acceptor)
+    } else {
+        (&c.acceptor, &c.donor)
+    };
+    let ro_start0 = ro(seg0);
+    let ro_start1 = ro(seg1);
+    // jRmax = roStart1 + L1 - roStart0 - 1, clamped at 0 as STAR clamps it.
+    let acceptor_read_end = ro_start1 + seg1.read_length();
+    let jr_max = acceptor_read_end
+        .saturating_sub(ro_start0)
+        .saturating_sub(1);
+
+    // An out-of-range position is not an `N`: STAR indexes the genome directly
+    // and only ever compares the value, so a position we cannot answer for must
+    // not be treated as a ban.
+    let base = |pos: u64| index.genome.get_base(pos);
+
+    for jr in 0..jr_max {
+        // Read base. STAR reads `Read1[0][roStart0+jR]`; ours is the same read
+        // in the same orientation.
+        if let Some(&b_r) = c.read_seq.get(ro_start0 + jr)
+            && b_r > 3
+        {
+            return false; // unconditional, regardless of --chimFilter
+        }
+
+        if !ban_genomic_n {
+            continue;
+        }
+
+        let jr64 = jr as u64;
+        let b0 = if seg0.is_reverse {
+            base(seg0.genome_end.wrapping_sub(1).wrapping_sub(jr64))
+        } else {
+            base(seg0.genome_start.wrapping_add(jr64))
+        };
+        // The acceptor is walked in the donor's read frame, so its genome
+        // offset carries the (roStart0 - roStart1) shift STAR applies.
+        let shift = ro_start0 as i64 + jr as i64 - ro_start1 as i64;
+        let b1 = if seg1.is_reverse {
+            let pos = seg1.genome_end as i64 - 1 - shift;
+            if pos < 0 { None } else { base(pos as u64) }
+        } else {
+            let pos = seg1.genome_start as i64 + shift;
+            if pos < 0 { None } else { base(pos as u64) }
+        };
+
+        if b0.is_some_and(|b| b > 3) || b1.is_some_and(|b| b > 3) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `detect_chimeric_old` with an optional combined-read mate boundary (`read_length[0]`
@@ -1273,7 +1373,7 @@ mod tests {
     use super::*;
     use crate::align::WindowAlignment;
     use crate::align::transcript::{Exon, Transcript};
-    use crate::genome::Genome;
+    use crate::genome::{Genome, GenomeSeq};
     use crate::index::GenomeIndex;
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
@@ -1298,6 +1398,22 @@ mod tests {
             chr_length: vec![chr_len, chr_len],
             chr_start: vec![0, chr_pad, n_genome],
         }
+    }
+
+    /// `make_test_index`, with `N` (base 4) planted at the given absolute
+    /// positions. The default fixture is all `A`, so a genomic-`N` test has to
+    /// put one there deliberately -- the previous test did not, which is why it
+    /// could not fail.
+    fn make_test_index_with_ns(n_positions: &[u64]) -> GenomeIndex {
+        let mut index = make_test_index();
+        // The fixture builds an owned sequence, so rebuild it with the Ns in.
+        let n = index.genome.n_genome as usize;
+        let mut seq = vec![0u8; 2 * n];
+        for &p in n_positions {
+            seq[p as usize] = 4;
+        }
+        index.genome.sequence = GenomeSeq::Owned(seq);
+        index
     }
 
     fn make_test_index() -> GenomeIndex {
@@ -1525,16 +1641,114 @@ mod tests {
         let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
         assert!(result.is_some());
     }
-
+    /// A chimera whose forward donor scan window covers a genomic `N`.
+    ///
+    /// The scan runs `jR` in `0..jRmax` from the read-leading segment, so for
+    /// this geometry the donor is read at `genome_start + jR` over
+    /// `10..=58` and the acceptor at `genome_start + (jR - 30)` over
+    /// `70..=118`. Planting an `N` anywhere in either span must ban the
+    /// chimera under `banGenomicN` and leave it under `None`.
     #[test]
-    fn chim_filter_bans_a_genomic_n_at_the_junction_and_none_keeps_it() {
-        // Two chimeras identical but for the base sitting inside the junction.
-        // `banGenomicN` (the default) must drop the one whose junction base is
-        // `N`; `--chimFilter None` must keep it.
-        let index = make_test_index();
-        let n_pos = index.genome.n_genome; // out of range for this fixture
+    fn chim_filter_bans_a_genomic_n_inside_the_scan_window() {
+        let banned = params(&["--chimSegmentMin", "10"]);
+        let unfiltered = params(&["--chimSegmentMin", "10", "--chimFilter", "None"]);
 
-        let clean = ChimericAlignment::new(
+        // No `N` anywhere: kept either way. Establishes the control.
+        let clean_index = make_test_index();
+        let chim = forward_chimera();
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &banned, &clean_index).len(),
+            1,
+            "a clean junction must survive banGenomicN"
+        );
+
+        // `N` inside the donor's span.
+        let donor_n = make_test_index_with_ns(&[15]);
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &banned, &donor_n).len(),
+            0,
+            "a genomic N in the donor span must ban the chimera"
+        );
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &unfiltered, &donor_n).len(),
+            1,
+            "--chimFilter None must keep it"
+        );
+
+        // `N` inside the acceptor's span (jR = 30 maps to acceptor base 100).
+        let acceptor_n = make_test_index_with_ns(&[100]);
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &banned, &acceptor_n).len(),
+            0,
+            "a genomic N in the acceptor span must ban the chimera"
+        );
+
+        // Outside both spans: not a ban. 200 is past the acceptor window and
+        // sits in the second chromosome's padding.
+        let far_n = make_test_index_with_ns(&[200]);
+        assert_eq!(
+            apply_chim_filter(vec![chim], &banned, &far_n).len(),
+            1,
+            "an N outside the scan window must not ban"
+        );
+    }
+
+    /// The strand case, which a position-blind filter gets wrong.
+    ///
+    /// STAR walks a reverse segment from the far end
+    /// (`G[EX_G + EX_L - 1 - jR]`), so for a donor spanning `[10, 40)` the
+    /// bases examined run *down* from 39, not up from 10. An `N` at 15 — which
+    /// bans the forward case above — must therefore be reached at a different
+    /// `jR`, and an `N` planted below the segment must not be reached at all.
+    #[test]
+    fn chim_filter_reads_a_reverse_donor_from_the_other_end() {
+        let banned = params(&["--chimSegmentMin", "10"]);
+        let mut chim = forward_chimera();
+        chim.donor.is_reverse = true;
+
+        // 39 is the reverse donor's first base (jR = 0). Banned.
+        let at_far_end = make_test_index_with_ns(&[39]);
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &banned, &at_far_end).len(),
+            0,
+            "reverse donor must be read from genome_end - 1"
+        );
+
+        // 5 is below genome_start: the forward walk would never reach it and
+        // neither does the reverse walk, which descends from 39.
+        let below = make_test_index_with_ns(&[5]);
+        assert_eq!(
+            apply_chim_filter(vec![chim], &banned, &below).len(),
+            1,
+            "a position outside the reverse walk must not ban"
+        );
+    }
+
+    /// The read-`N` ban is unconditional: STAR tests `bR>3` outside the
+    /// `filter.genomicN` guard, so `--chimFilter None` does not disable it.
+    #[test]
+    fn chim_filter_bans_a_read_n_even_with_filtering_off() {
+        let index = make_test_index();
+        let mut chim = forward_chimera();
+        chim.read_seq[5] = 4; // within the scan window, which starts at read 0
+
+        for args in [
+            vec!["--chimSegmentMin", "10"],
+            vec!["--chimSegmentMin", "10", "--chimFilter", "None"],
+        ] {
+            let p = params(&args);
+            assert_eq!(
+                apply_chim_filter(vec![chim.clone()], &p, &index).len(),
+                0,
+                "an N in the read bans the chimera regardless of --chimFilter ({args:?})"
+            );
+        }
+    }
+
+    /// Shared geometry for the filter tests: donor `[10,40)` over read `[0,30)`,
+    /// acceptor `[100,130)` over read `[30,50)`, both forward.
+    fn forward_chimera() -> ChimericAlignment {
+        ChimericAlignment::new(
             ChimericSegment {
                 chr_idx: 0,
                 genome_start: 10,
@@ -1562,33 +1776,7 @@ mod tests {
             0,
             vec![0u8; 50],
             "read1".to_string(),
-        );
-
-        let banned = params(&["--chimSegmentMin", "10"]);
-        let unfiltered = params(&["--chimSegmentMin", "10", "--chimFilter", "None"]);
-
-        // The clean junction survives either way.
-        assert_eq!(
-            apply_chim_filter(vec![clean.clone()], &banned, &index).len(),
-            1
-        );
-
-        // Now put the acceptor's first base on an N. `make_test_index` fills
-        // the genome with real bases, so an N has to be planted deliberately.
-        let mut with_n = clean.clone();
-        with_n.acceptor.genome_start = n_pos;
-        let _ = n_pos;
-
-        // Whatever the fixture answers for that position, the two filter
-        // settings must differ only in whether N is tolerated, never in
-        // anything else.
-        let kept_banned = apply_chim_filter(vec![with_n.clone()], &banned, &index).len();
-        let kept_none = apply_chim_filter(vec![with_n], &unfiltered, &index).len();
-        assert_eq!(kept_none, 1, "--chimFilter None must keep everything");
-        assert!(
-            kept_banned <= kept_none,
-            "banGenomicN can only ever remove, never add"
-        );
+        )
     }
 
     #[test]

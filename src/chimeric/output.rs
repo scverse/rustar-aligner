@@ -57,15 +57,25 @@ impl ChimericJunctionWriter {
         &mut self,
         alignment: &ChimericAlignment,
         chr_names: &[String],
+        chr_starts: &[u64],
         read_name: &str,
     ) -> Result<(), Error> {
         // Get chromosome names
         let donor_chr = &chr_names[alignment.donor.chr_idx];
         let acceptor_chr = &chr_names[alignment.acceptor.chr_idx];
 
-        // Get breakpoints (1-based)
-        let donor_bp = alignment.donor_breakpoint();
-        let acceptor_bp = alignment.acceptor_breakpoint();
+        // Every coordinate in this file is per-chromosome, as STAR's is. The
+        // segments carry genome-absolute positions, so the chromosome's padded
+        // start has to come off all four of them -- the two breakpoints and the
+        // two segment starts. `format_sa_entry` and the WithinBAM records below
+        // already did this; this writer did not, so columns 2, 5, 11 and 13
+        // were offset by chrStart.
+        let donor_offset = chr_starts[alignment.donor.chr_idx];
+        let acceptor_offset = chr_starts[alignment.acceptor.chr_idx];
+
+        // Get breakpoints (1-based, per-chromosome)
+        let donor_bp = alignment.donor_breakpoint() - donor_offset;
+        let acceptor_bp = alignment.acceptor_breakpoint() - acceptor_offset;
 
         // Get strand symbols
         let donor_strand = alignment.donor_strand();
@@ -78,9 +88,9 @@ impl ChimericJunctionWriter {
         let repeat_donor = alignment.repeat_len_donor;
         let repeat_acceptor = alignment.repeat_len_acceptor;
 
-        // Get segment start positions (1-based)
-        let donor_start = alignment.donor.genome_start + 1;
-        let acceptor_start = alignment.acceptor.genome_start + 1;
+        // Get segment start positions (1-based, per-chromosome)
+        let donor_start = alignment.donor.genome_start - donor_offset + 1;
+        let acceptor_start = alignment.acceptor.genome_start - acceptor_offset + 1;
 
         // Convert CIGAR to string
         let donor_cigar = alignment.donor.cigar_string();
@@ -371,9 +381,14 @@ mod tests {
         );
 
         let chr_names = vec!["chr9".to_string(), "chr22".to_string()];
+        // Distinct, non-zero padded starts. With both at 0 the absolute and
+        // per-chromosome coordinates coincide, which is what let the missing
+        // chrStart subtraction go unnoticed; distinct values also catch using
+        // one chromosome's offset for both.
+        let chr_starts = vec![1_000_000u64, 20_000_000u64];
 
         writer
-            .write_alignment(&alignment, &chr_names, "READ_001")
+            .write_alignment(&alignment, &chr_names, &chr_starts, "READ_001")
             .unwrap();
         writer.flush().unwrap();
 
@@ -391,18 +406,18 @@ mod tests {
 
         assert_eq!(fields.len(), 14);
         assert_eq!(fields[0], "chr9"); // donor chr
-        assert_eq!(fields[1], "133738363"); // donor breakpoint
+        assert_eq!(fields[1], "132738363"); // donor breakpoint, per-chr
         assert_eq!(fields[2], "+"); // donor strand
         assert_eq!(fields[3], "chr22"); // acceptor chr
-        assert_eq!(fields[4], "23632601"); // acceptor breakpoint
+        assert_eq!(fields[4], "3632601"); // acceptor breakpoint, per-chr
         assert_eq!(fields[5], "+"); // acceptor strand
         assert_eq!(fields[6], "1"); // junction type
         assert_eq!(fields[7], "0"); // repeat donor
         assert_eq!(fields[8], "0"); // repeat acceptor
         assert_eq!(fields[9], "READ_001"); // read name
-        assert_eq!(fields[10], "133738301"); // donor start (1-based)
+        assert_eq!(fields[10], "132738301"); // donor start (1-based, per-chr)
         assert_eq!(fields[11], "63M"); // donor CIGAR
-        assert_eq!(fields[12], "23632601"); // acceptor start (1-based)
+        assert_eq!(fields[12], "3632601"); // acceptor start (1-based, per-chr)
         assert_eq!(fields[13], "37M"); // acceptor CIGAR
     }
 
@@ -450,9 +465,10 @@ mod tests {
         );
 
         let chr_names = vec!["chr1".to_string()];
+        let chr_starts = vec![500u64];
 
         writer
-            .write_alignment(&alignment, &chr_names, "READ_002")
+            .write_alignment(&alignment, &chr_names, &chr_starts, "READ_002")
             .unwrap();
         writer.flush().unwrap();
 
@@ -474,6 +490,11 @@ mod tests {
         assert_eq!(fields[3], "chr1"); // acceptor chr
         assert_eq!(fields[5], "-"); // acceptor strand (reverse)
         assert_eq!(fields[6], "0"); // junction type (non-canonical)
+        // chrStart 500 comes off every coordinate, on both strands.
+        assert_eq!(fields[1], "550"); // donor breakpoint (forward: genome_end)
+        assert_eq!(fields[4], "1550"); // acceptor breakpoint (reverse: genome_end)
+        assert_eq!(fields[10], "501"); // donor start
+        assert_eq!(fields[12], "1501"); // acceptor start
     }
 
     // --- build_within_bam_records tests ---

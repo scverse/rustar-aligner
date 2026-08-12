@@ -605,11 +605,19 @@ pub fn align_read(
     // would be a better approach than post-hoc enumeration.
 
     // Step 6: Filter chimeric alignments
+    //
+    // Applied here, where every detection tier has already contributed, rather
+    // than inside the individual detectors: Tier 2 (`detect_from_multi_clusters`),
+    // Tier 1b (`detect_from_soft_clips`) and Tier 3
+    // (`detect_from_chimeric_residuals`) all append to this vector, so a filter
+    // living in one detector silently misses the others.
     if params.chim_segment_min > 0 {
         chimeric_alignments.retain(|chim| {
             chim.meets_min_segment_length(params.chim_segment_min)
                 && chim.meets_min_score(params.chim_score_min)
         });
+        chimeric_alignments =
+            crate::chimeric::apply_chim_filter(chimeric_alignments, params, index);
     }
 
     // n_for_mapq = transcripts.len() after dedup and filtering.
@@ -816,6 +824,11 @@ pub fn align_paired_read(
             c.meets_min_segment_length(params.chim_segment_min)
                 && c.meets_min_score(params.chim_score_min)
         });
+        // Tier 2 reaches the output (`--chimOutType WithinBAM`) without passing
+        // through any detector that filters, so the `N` check has to be applied
+        // here. Inter-mate chimeras are appended after this point and stay
+        // exempt, which is what STAR does — see `detect_inter_mate_chimeric`.
+        pe_chimeric = crate::chimeric::apply_chim_filter(pe_chimeric, params, index);
     }
 
     // Combined score threshold: use len1+len2 as denominator
