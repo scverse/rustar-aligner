@@ -1045,6 +1045,12 @@ pub struct Parameters {
     #[arg(long = "seedMapMin", default_value_t = 5)]
     pub seed_map_min: usize,
 
+    /// Min length of a run of ACGT bases for the seed search to consider it
+    /// (STAR default: 12). Reads are split on `N` first, and shorter pieces
+    /// are skipped entirely.
+    #[arg(long = "seedSplitMin", default_value_t = 12)]
+    pub seed_split_min: usize,
+
     /// Max number of loci anchors are allowed to map to
     #[arg(long = "winAnchorMultimapNmax", default_value_t = 50)]
     pub win_anchor_multimap_nmax: usize,
