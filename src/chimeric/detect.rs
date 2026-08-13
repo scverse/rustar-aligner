@@ -548,7 +548,17 @@ pub fn detect_inter_mate_chimeric(
 
     // Convert transcripts to chimeric segments
     let donor = transcript_to_segment(t1).ok()?;
-    let acceptor = transcript_to_segment(t2).ok()?;
+    let mut acceptor = transcript_to_segment(t2).ok()?;
+
+    // STAR keys both strand columns off `trChim[i].Str`, the strand of the
+    // *window* the transcript came from, and prints them unchanged
+    // (`ReadAlign_chimericDetectionOldOutput.cpp:63-64`). Our mate2 transcripts
+    // carry `is_reverse` flipped relative to their window, because SAM needs the
+    // mate's own genomic strand for the FLAG. Undo that flip here, or every
+    // acceptor column comes out inverted against STAR. `t2` is always mate2:
+    // STAR takes this branch only when `EX_iFrag` of segment 0 is below that of
+    // segment 1, and notes "trChim[0] is always on the first mate" (`:70`).
+    acceptor.is_reverse = !acceptor.is_reverse;
 
     if !donor.meets_min_length(params.chim_segment_min)
         || !acceptor.meets_min_length(params.chim_segment_min)
@@ -556,20 +566,12 @@ pub fn detect_inter_mate_chimeric(
         return None;
     }
 
-    // Junction type: non-canonical (0) for inter-chromosomal; try motif for same-chr
-    let junction_type = if is_inter_chr {
-        0
-    } else {
-        classify_junction_type(
-            &index.genome,
-            donor.chr_idx,
-            donor.genome_end,
-            donor.is_reverse,
-            acceptor.chr_idx,
-            acceptor.genome_start,
-            acceptor.is_reverse,
-        )
-    };
+    // STAR's `chimMotif=-1`, set unconditionally in this branch
+    // (`ReadAlign_chimericDetectionOld.cpp:131`): the junction falls between the
+    // mates, not inside either, so there is no donor/acceptor dinucleotide to
+    // read and no motif to classify. The value doubles as the marker that keeps
+    // this chimera out of the junction-shift scan and the `N` filter.
+    let junction_type = -1;
 
     // Zero, as STAR sets it for mates that bracket the junction
     // (`ReadAlign_chimericDetectionOld.cpp:132`): there is no junction position
@@ -895,7 +897,12 @@ pub fn apply_chim_filter(
     let ban_genomic_n = params.chim_filter.iter().any(|f| f == "banGenomicN");
     chims
         .into_iter()
-        .filter(|c| junction_scan_is_clean(c, index, ban_genomic_n))
+        // `junction_type == -1` is STAR's `chimMotif=-1`: the mates bracket the
+        // junction, so there is no position inside a mate to scan. STAR's
+        // branch returns before the loop below is ever reached, and running the
+        // scan over a fragment-wide geometry it was never derived for would
+        // drop chimeras STAR reports.
+        .filter(|c| c.junction_type < 0 || junction_scan_is_clean(c, index, ban_genomic_n))
         .collect()
 }
 
@@ -2492,9 +2499,11 @@ mod tests {
     /// `ChimericAlign_chimericStitching.cpp:22-33`), which sets `chimMotif=-1`
     /// and returns before reading `b0`, `b1` or `bR`.
     ///
-    /// This is otherwise protected only by the *order* of two statements in
-    /// `align_paired_read` — the Tier-2 filter runs before inter-mate chimeras
-    /// are appended — so it would regress silently if they were swapped.
+    /// The exemption travels with the chimera as `junction_type == -1`, STAR's
+    /// own `chimMotif` marker, rather than depending on where the filter is
+    /// called from. That matters because every detection tier now converges on
+    /// a single filtering point, so an exemption that relied on statement order
+    /// would have been lost there.
     #[test]
     fn inter_mate_chimeras_are_not_subject_to_the_genomic_n_ban() {
         let read_len = 60usize;
@@ -2515,14 +2524,30 @@ mod tests {
             "an inter-mate chimera must not be filtered by banGenomicN"
         );
 
-        // And the exemption is a property of the path, not of the filter: the
-        // same alignment handed to apply_chim_filter directly IS banned, which
-        // is why the ordering in align_paired_read matters.
         let chim = got.unwrap();
         assert_eq!(
-            apply_chim_filter(vec![chim], &p, &index).len(),
+            chim.junction_type, -1,
+            "STAR sets chimMotif=-1 for mates that bracket the junction"
+        );
+
+        // The exemption survives the filter itself, not just the call order.
+        assert_eq!(
+            apply_chim_filter(vec![chim.clone()], &p, &index).len(),
+            1,
+            "a bracketing chimera carries its own exemption through the filter"
+        );
+
+        // And it is the marker doing the work, not a blanket hole in the
+        // filter: the same alignment with a within-mate junction type IS
+        // banned, so this cannot pass by the filter having stopped filtering.
+        let within_mate = ChimericAlignment {
+            junction_type: 0,
+            ..chim
+        };
+        assert_eq!(
+            apply_chim_filter(vec![within_mate], &p, &index).len(),
             0,
-            "the filter itself would ban it; only the inter-mate path exempts it"
+            "a within-mate junction over an all-N genome must still be banned"
         );
     }
 

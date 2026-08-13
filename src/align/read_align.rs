@@ -105,6 +105,64 @@ fn attach_multimap_context(
         .collect()
 }
 
+/// The single point every detection tier's chimeras pass through before output.
+///
+/// Detection is spread over five tiers that each append to one vector, so
+/// anything applied inside a detector is applied to that tier alone. Ordering
+/// matters: the junction has to be placed before `apply_chim_filter`, because
+/// the `N` scan reads the span between the two final segment boundaries, and
+/// `keep_best_chimera` has to run last so it chooses among survivors.
+///
+/// `read_len` and `max_non_chim_score` are only consulted under
+/// `--chimMultimapNmax > 0`, where STAR writes the wider file.
+fn converge_chimeras(
+    mut chims: Vec<crate::chimeric::ChimericAlignment>,
+    read_len: usize,
+    max_non_chim_score: i32,
+    params: &Parameters,
+    index: &GenomeIndex,
+) -> Vec<crate::chimeric::ChimericAlignment> {
+    if params.chim_segment_min == 0 {
+        return chims;
+    }
+    chims.retain(|chim| {
+        chim.meets_min_segment_length(params.chim_segment_min)
+            && chim.meets_min_score(params.chim_score_min)
+    });
+    // STAR's `chimScoreBest + scoreDropMax >= readLength[0]+readLength[1]`
+    // (`ReadAlign_chimericDetectionOld.cpp:99`): the two segments together have
+    // to come close to explaining the whole fragment.
+    //
+    // Applied only to bracketing chimeras (`junction_type == -1`). There STAR's
+    // `trChim[0]` and `trChim[1]` are one transcript per mate, which is exactly
+    // what our two segments are, so the scores are comparable. For a chimera
+    // *inside* one mate they are not: STAR's `trChim[1]` is a whole transcript
+    // and can span the rest of that mate plus the other mate, scoring ~119 on a
+    // 180-base fragment where our single-mate segment scores ~59. Applying the
+    // gate to those would reject every chimera STAR reports on such a fragment.
+    // Modelling a two-mate `trChim` is what closing that gap needs.
+    chims.retain(|chim| {
+        chim.junction_type >= 0 || chim.total_score + params.chim_score_drop_max >= read_len as i32
+    });
+    for chim in &mut chims {
+        // `junction_type == -1` marks mates that bracket the junction. STAR
+        // returns from that branch with the breakpoints already set and never
+        // reads a genomic base (`ReadAlign_chimericDetectionOld.cpp:129-142`,
+        // and `ChimericAlign_chimericStitching.cpp:22` short-circuits the same
+        // way), so shifting or re-scanning here would move breakpoints STAR
+        // considers final.
+        if chim.junction_type >= 0 {
+            crate::chimeric::place_chimeric_junction(chim, &index.genome, params);
+        }
+    }
+    chims = crate::chimeric::apply_chim_filter(chims, params, index);
+    if params.chim_multimap_nmax == 0 {
+        keep_best_chimera(chims)
+    } else {
+        attach_multimap_context(chims, read_len, max_non_chim_score)
+    }
+}
+
 /// Result of aligning a single read: (transcripts, chimeric_alignments, n_for_mapq, unmapped_reason)
 pub type AlignReadResult = (
     Vec<Transcript>,
@@ -675,33 +733,22 @@ pub fn align_read(
     // (`detect_from_chimeric_residuals`) all append to this vector, so a filter
     // living in one detector silently misses the others.
     if params.chim_segment_min > 0 {
-        chimeric_alignments.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
-        // Place the junction before filtering: the `N` scan walks the span
-        // between the two segments, so it has to see the final boundaries.
-        for chim in &mut chimeric_alignments {
-            crate::chimeric::place_chimeric_junction(chim, &index.genome, params);
-        }
-        chimeric_alignments =
-            crate::chimeric::apply_chim_filter(chimeric_alignments, params, index);
-        if params.chim_multimap_nmax == 0 {
-            chimeric_alignments = keep_best_chimera(chimeric_alignments);
-        }
-        if params.chim_multimap_nmax > 0 {
-            // STAR's `maxNonChimAlignScore` is the best *raw* linear score
-            // (`trBest`), taken before the quality filters — a chimeric read
-            // often has its linear alignment filtered away, and reporting 0
-            // there would misstate how well the read aligns unsplit.
-            let best_linear = all_raw_transcripts
-                .iter()
-                .map(|t| t.score)
-                .max()
-                .unwrap_or(0);
-            chimeric_alignments =
-                attach_multimap_context(chimeric_alignments, read_seq.len(), best_linear);
-        }
+        // STAR's `maxNonChimAlignScore` is the best *raw* linear score
+        // (`trBest`), taken before the quality filters — a chimeric read
+        // often has its linear alignment filtered away, and reporting 0
+        // there would misstate how well the read aligns unsplit.
+        let best_linear = all_raw_transcripts
+            .iter()
+            .map(|t| t.score)
+            .max()
+            .unwrap_or(0);
+        chimeric_alignments = converge_chimeras(
+            chimeric_alignments,
+            read_seq.len(),
+            best_linear,
+            params,
+            index,
+        );
     }
 
     // n_for_mapq = transcripts.len() after dedup and filtering.
@@ -904,21 +951,11 @@ pub fn align_paired_read(
                 index,
             )?);
         }
-        pe_chimeric.retain(|c| {
-            c.meets_min_segment_length(params.chim_segment_min)
-                && c.meets_min_score(params.chim_score_min)
-        });
-        // Tier 2 reaches the output (`--chimOutType WithinBAM`) without passing
-        // through any detector that filters, so the `N` check has to be applied
-        // here. Inter-mate chimeras are appended after this point and stay
-        // exempt, which is what STAR does — see `detect_inter_mate_chimeric`.
-        for chim in &mut pe_chimeric {
-            crate::chimeric::place_chimeric_junction(chim, &index.genome, params);
-        }
-        pe_chimeric = crate::chimeric::apply_chim_filter(pe_chimeric, params, index);
-    }
-    if params.chim_segment_min > 0 && params.chim_multimap_nmax == 0 {
-        pe_chimeric = keep_best_chimera(pe_chimeric);
+        // No filtering here: Tier 1 and the inter-mate detector both append
+        // after this point, so anything applied now would cover Tier 2 alone
+        // and `keep_best_chimera` would pick a winner before its competitors
+        // exist. Everything converges once in `converge_chimeras`, at each of
+        // this function's exits.
     }
 
     // Combined score threshold: use len1+len2 as denominator
@@ -1036,8 +1073,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[..len1], false)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m1_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(0, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m1_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -1059,8 +1100,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[len1 + 1..], true)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m2_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(1, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m2_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -1294,6 +1339,31 @@ pub fn align_paired_read(
     // Step 4: quality filter (mappedFilter).
     filter_paired_transcripts(&mut joint_pairs, params);
 
+    // STAR's `maxNonChimAlignScore`: the best linear score for the fragment,
+    // preferring a real pair and falling back to the better single mate when the
+    // mates never paired. Only read under `--chimMultimapNmax > 0`, but computed
+    // here because `joint_pairs` is consumed by the returns below.
+    let best_linear_pe = joint_pairs
+        .iter()
+        .map(|p| p.combined_wt_score)
+        .max()
+        .unwrap_or_else(|| {
+            let m1 = all_m1_transcripts
+                .iter()
+                .map(|t| t.score)
+                .max()
+                .unwrap_or(0);
+            let m2 = all_m2_transcripts
+                .iter()
+                .map(|t| t.score)
+                .max()
+                .unwrap_or(0);
+            m1.max(m2)
+        });
+    // Every exit below routes its chimeras through this, so no return path can
+    // skip the filters or emit more than one chimera per read at default settings.
+    let converge = |chims| converge_chimeras(chims, len1 + len2, best_linear_pe, params, index);
+
     // Step 5: too-many-loci — STAR checks `multi` AFTER mappedFilter, only when the
     // best pair passes the score/match/mismatch gates (ReadAlign_mappedFilter.cpp).
     // Pairs that survive quality but exceed outFilterMultimapNmax → too many loci;
@@ -1302,7 +1372,7 @@ pub fn align_paired_read(
         let n_loci = joint_pairs.len();
         return Ok((
             Vec::new(),
-            pe_chimeric,
+            converge(pe_chimeric),
             n_loci,
             Some(UnmappedReason::TooManyLoci),
         ));
@@ -1329,10 +1399,6 @@ pub fn align_paired_read(
         pe_chimeric.extend(chims);
         let chims = detect(&all_m2_transcripts, mate2_seq)?;
         pe_chimeric.extend(chims);
-        pe_chimeric.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
     }
 
     if !joint_pairs.is_empty() {
@@ -1341,7 +1407,7 @@ pub fn align_paired_read(
             .into_iter()
             .map(|pa| PairedAlignmentResult::BothMapped(Box::new(pa)))
             .collect();
-        return Ok((results, pe_chimeric, pe_mapq_n, None));
+        return Ok((results, converge(pe_chimeric), pe_mapq_n, None));
     }
 
     // Inter-mate chimeric detection: fires when the best single-mate transcripts are discordant
@@ -1379,7 +1445,7 @@ pub fn align_paired_read(
                 mapped_transcript: t1,
                 mate1_is_mapped: true,
             }],
-            pe_chimeric,
+            converge(pe_chimeric),
             1,
             None,
         )),
@@ -1388,7 +1454,7 @@ pub fn align_paired_read(
                 mapped_transcript: t2,
                 mate1_is_mapped: false,
             }],
-            pe_chimeric,
+            converge(pe_chimeric),
             1,
             None,
         )),
@@ -1401,7 +1467,7 @@ pub fn align_paired_read(
                         mapped_transcript: t1,
                         mate1_is_mapped: true,
                     }],
-                    pe_chimeric,
+                    converge(pe_chimeric),
                     1,
                     None,
                 ))
@@ -1411,13 +1477,18 @@ pub fn align_paired_read(
                         mapped_transcript: t2,
                         mate1_is_mapped: false,
                     }],
-                    pe_chimeric,
+                    converge(pe_chimeric),
                     1,
                     None,
                 ))
             }
         }
-        (None, None) => Ok((Vec::new(), pe_chimeric, 0, Some(UnmappedReason::TooShort))),
+        (None, None) => Ok((
+            Vec::new(),
+            converge(pe_chimeric),
+            0,
+            Some(UnmappedReason::TooShort),
+        )),
     }
 }
 
