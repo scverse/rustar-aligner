@@ -18,7 +18,7 @@ mod segment;
 
 pub use detect::{
     ChimericDetector, apply_chim_filter, detect_chimeric_mult, detect_chimeric_old,
-    detect_inter_mate_chimeric,
+    detect_inter_mate_chimeric, place_chimeric_junction,
 };
 pub use output::{ChimericJunctionWriter, build_within_bam_records};
 pub use segment::{ChimericAlignment, ChimericSegment, ExonSpan, MultimapInfo};

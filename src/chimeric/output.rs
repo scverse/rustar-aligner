@@ -540,10 +540,10 @@ mod tests {
 
         assert_eq!(fields.len(), 14);
         assert_eq!(fields[0], "chr9"); // donor chr
-        assert_eq!(fields[1], "132738363"); // donor breakpoint, per-chr
+        assert_eq!(fields[1], "132738364"); // donor breakpoint (chimJ0), per-chr
         assert_eq!(fields[2], "+"); // donor strand
         assert_eq!(fields[3], "chr22"); // acceptor chr
-        assert_eq!(fields[4], "3632601"); // acceptor breakpoint, per-chr
+        assert_eq!(fields[4], "3632600"); // acceptor breakpoint (chimJ1), per-chr
         assert_eq!(fields[5], "+"); // acceptor strand
         assert_eq!(fields[6], "1"); // junction type
         assert_eq!(fields[7], "0"); // repeat donor
@@ -745,8 +745,8 @@ mod tests {
         assert_eq!(fields[5], "-"); // acceptor strand (reverse)
         assert_eq!(fields[6], "0"); // junction type (non-canonical)
         // chrStart 500 comes off every coordinate, on both strands.
-        assert_eq!(fields[1], "550"); // donor breakpoint (forward: genome_end)
-        assert_eq!(fields[4], "1550"); // acceptor breakpoint (reverse: genome_end)
+        assert_eq!(fields[1], "551"); // donor breakpoint (forward: genome_end + 1)
+        assert_eq!(fields[4], "1551"); // acceptor breakpoint (reverse: genome_end + 1)
         assert_eq!(fields[10], "501"); // donor start
         assert_eq!(fields[12], "1501"); // acceptor start
     }

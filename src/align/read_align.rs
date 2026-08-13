@@ -679,6 +679,11 @@ pub fn align_read(
             chim.meets_min_segment_length(params.chim_segment_min)
                 && chim.meets_min_score(params.chim_score_min)
         });
+        // Place the junction before filtering: the `N` scan walks the span
+        // between the two segments, so it has to see the final boundaries.
+        for chim in &mut chimeric_alignments {
+            crate::chimeric::place_chimeric_junction(chim, &index.genome, params);
+        }
         chimeric_alignments =
             crate::chimeric::apply_chim_filter(chimeric_alignments, params, index);
         if params.chim_multimap_nmax == 0 {
@@ -907,6 +912,9 @@ pub fn align_paired_read(
         // through any detector that filters, so the `N` check has to be applied
         // here. Inter-mate chimeras are appended after this point and stay
         // exempt, which is what STAR does — see `detect_inter_mate_chimeric`.
+        for chim in &mut pe_chimeric {
+            crate::chimeric::place_chimeric_junction(chim, &index.genome, params);
+        }
         pe_chimeric = crate::chimeric::apply_chim_filter(pe_chimeric, params, index);
     }
     if params.chim_segment_min > 0 && params.chim_multimap_nmax == 0 {

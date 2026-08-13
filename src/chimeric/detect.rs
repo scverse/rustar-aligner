@@ -1259,6 +1259,304 @@ pub fn detect_chimeric_old_impl(
 /// latter is the plain sum of the two segment scores and knows nothing about
 /// the read overlap or the motif penalty.
 #[allow(clippy::too_many_arguments)]
+/// Place, type and measure a chimeric junction — for every detection tier.
+///
+/// STAR does this inside `chimericStitching`, which every chimera goes through.
+/// Ours are produced by five paths and only two reach `finalize_chimera`, so
+/// doing it there left the other three with the junction wherever seed
+/// extension stopped: breakpoints a few bases off, `junction_type` 0, and
+/// repeat lengths measured around the wrong position.
+///
+/// Also normalises the pair: STAR orders by `roStart` before anything else
+/// (`ReadAlign_chimericDetectionOld.cpp:117`), so the donor is always the
+/// segment that leads in the read. Some tiers build them the other way round,
+/// which showed up as donor and acceptor swapped against STAR's output.
+pub fn place_chimeric_junction(
+    chim: &mut ChimericAlignment,
+    genome: &crate::genome::Genome,
+    params: &Parameters,
+) {
+    let read_len = chim.read_seq.len();
+    let ro_seg = |seg: &ChimericSegment| {
+        if seg.is_reverse {
+            read_len.saturating_sub(seg.read_end)
+        } else {
+            seg.read_start
+        }
+    };
+    if ro_seg(&chim.acceptor) < ro_seg(&chim.donor) {
+        std::mem::swap(&mut chim.donor, &mut chim.acceptor);
+    }
+
+    let ex0 = chim.donor.junction_exon(true);
+    let ex1 = chim.acceptor.junction_exon(false);
+    let ro_of = |ex: &crate::chimeric::ExonSpan, rev: bool| {
+        if rev {
+            read_len.saturating_sub(ex.read_end)
+        } else {
+            ex.read_start
+        }
+    };
+    let ro_start0 = ro_of(&ex0, chim.donor.is_reverse);
+    let ro_start1 = ro_of(&ex1, chim.acceptor.is_reverse);
+
+    if let Some(j) = scan_chimeric_junction(
+        genome,
+        &chim.read_seq,
+        &chim.donor,
+        &chim.acceptor,
+        ex0,
+        ex1,
+        ro_start0,
+        ro_start1,
+        0, // chimStr: undefined unless the linear alignment is spliced
+        params.chim_score_junction_non_gtag,
+    ) {
+        shift_donor_to_junction(&mut chim.donor, j.jr_best);
+        let delta = (ro_start0 + j.jr_best + 1).saturating_sub(ro_start1);
+        shift_acceptor_to_junction(&mut chim.acceptor, delta);
+        chim.junction_type = j.motif;
+    }
+
+    // Repeats are measured around the junction, so they can only be computed
+    // once it has been placed.
+    let (r0, r1) = chim_repeat_lengths(genome, &chim.donor, &chim.acceptor);
+    chim.repeat_len_donor = r0;
+    chim.repeat_len_acceptor = r1;
+}
+
+/// Trim the leading segment to `jr_best + 1` aligned bases, keeping the end
+/// that faces the junction fixed. Mirrors STAR at `:240-248`.
+fn shift_donor_to_junction(seg: &mut ChimericSegment, jr_best: usize) {
+    let keep = jr_best as u64 + 1;
+    let len = seg.genome_end - seg.genome_start;
+    if keep >= len {
+        return;
+    }
+    let drop = len - keep;
+    if seg.is_reverse {
+        // Reverse: the junction is at the low end, so the block moves up.
+        seg.genome_start += drop;
+        seg.read_start += drop as usize;
+    } else {
+        seg.genome_end -= drop;
+        seg.read_end -= drop as usize;
+    }
+    sync_exon_spans(seg);
+    rebuild_cigar(seg);
+}
+
+/// Give up `delta` bases from the trailing segment's junction-facing end.
+/// Mirrors STAR at `:250-259`.
+fn shift_acceptor_to_junction(seg: &mut ChimericSegment, delta: usize) {
+    let delta64 = delta as u64;
+    if delta == 0 || delta64 >= seg.genome_end - seg.genome_start {
+        return;
+    }
+    if seg.is_reverse {
+        seg.genome_end -= delta64;
+        seg.read_end -= delta;
+    } else {
+        seg.genome_start += delta64;
+        seg.read_start += delta;
+    }
+    sync_exon_spans(seg);
+    rebuild_cigar(seg);
+}
+
+/// Bring the exon spans back in line after a shift.
+///
+/// `junction_exon` feeds both the `N` scan and the repeat measurement, so a
+/// stale span there silently reports the junction in its pre-shift position —
+/// which is what left the repeat columns disagreeing with STAR even once the
+/// breakpoints matched.
+///
+/// A single-block segment is the whole exon, so both spans follow it. A spliced
+/// segment is left alone: its internal boundaries are real and the shift only
+/// moved the outer edge, which `place_chimeric_junction` does not attempt for
+/// multi-exon segments.
+fn sync_exon_spans(seg: &mut ChimericSegment) {
+    let single = seg.first_exon == seg.last_exon;
+    if !single {
+        return;
+    }
+    let span = crate::chimeric::ExonSpan {
+        genome_start: seg.genome_start,
+        genome_end: seg.genome_end,
+        read_start: seg.read_start,
+        read_end: seg.read_end,
+    };
+    seg.first_exon = span;
+    seg.last_exon = span;
+}
+
+/// Rebuild a shifted segment's CIGAR as soft clip / match / soft clip.
+///
+/// Only valid for the single gapless block the junction scan applies to; a
+/// spliced segment keeps whatever it had, since its internal gaps must survive.
+fn rebuild_cigar(seg: &mut ChimericSegment) {
+    use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+    let aligned = (seg.genome_end - seg.genome_start) as usize;
+    if aligned != seg.read_end - seg.read_start {
+        return; // spliced or indel-carrying: leave it alone
+    }
+    let has_gap = seg
+        .cigar
+        .iter()
+        .any(|o| matches!(o.kind(), Kind::Deletion | Kind::Insertion | Kind::Skip));
+    if has_gap {
+        return;
+    }
+    let total: usize = seg
+        .cigar
+        .iter()
+        .filter(|o| o.kind().consumes_read())
+        .map(|o| o.len())
+        .sum();
+    let (lead, trail) = if seg.is_reverse {
+        (total.saturating_sub(seg.read_end), seg.read_start)
+    } else {
+        (seg.read_start, total.saturating_sub(seg.read_end))
+    };
+    let mut ops = Vec::new();
+    if lead > 0 {
+        ops.push(Op::new(Kind::SoftClip, lead));
+    }
+    ops.push(Op::new(Kind::Match, aligned));
+    if trail > 0 {
+        ops.push(Op::new(Kind::SoftClip, trail));
+    }
+    seg.cigar = ops;
+}
+
+/// STAR's chimeric junction scan: where within the overlap to place the join.
+///
+/// The two segments usually overlap in the read, and the junction can sit
+/// anywhere in that span. STAR walks every position
+/// (`ReadAlign_chimericDetectionOld.cpp:196-232`) and scores it by three
+/// things: whether the read base agrees with the donor or the acceptor genome,
+/// whether the flanking genomic bases spell a splice motif, and a penalty when
+/// they do not. It keeps the best, preferring a motif on ties.
+///
+/// Without this the junction stays wherever seed extension happened to stop:
+/// breakpoints land a few bases off, `junction_type` reads 0 where STAR finds
+/// GT/AG, and the repeat lengths are measured around the wrong position.
+///
+/// `chim_str` is STAR's `chimStr` — the RNA strand implied by the best linear
+/// alignment's intron motifs. It gates which motif may be accepted: 1 blocks
+/// CT/AC, 2 blocks GT/AG, 0 allows either.
+struct JunctionScan {
+    jr_best: usize,
+    motif: i32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_chimeric_junction(
+    genome: &crate::genome::Genome,
+    read_seq: &[u8],
+    seg0: &ChimericSegment,
+    seg1: &ChimericSegment,
+    ex0: crate::chimeric::ExonSpan,
+    ex1: crate::chimeric::ExonSpan,
+    ro_start0: usize,
+    ro_start1: usize,
+    chim_str: i32,
+    non_gtag_penalty: i32,
+) -> Option<JunctionScan> {
+    let jr_max = (ro_start1 + (ex1.read_end - ex1.read_start))
+        .saturating_sub(ro_start0)
+        .saturating_sub(1);
+    if jr_max == 0 {
+        return None;
+    }
+
+    // A genomic base in the segment's own orientation.
+    let base = |pos: i64, rev: bool| -> Option<u8> {
+        if pos < 0 {
+            return None;
+        }
+        let b = genome.get_base(pos as u64)?;
+        Some(if rev && b < 4 { 3 - b } else { b })
+    };
+
+    let mut j_score: i32 = 0;
+    let mut best: Option<JunctionScan> = None;
+    let mut best_score = i32::MIN;
+
+    for jr in 0..jr_max {
+        let jr_i = jr as i64;
+        let shift = ro_start0 as i64 + jr_i - ro_start1 as i64;
+
+        // The two bases the read is compared against, as in the `N` scan.
+        let b0 = if seg0.is_reverse {
+            base(ex0.genome_end as i64 - 1 - jr_i, true)
+        } else {
+            base(ex0.genome_start as i64 + jr_i, false)
+        };
+        let b1 = if seg1.is_reverse {
+            base(ex1.genome_end as i64 - 1 - shift, true)
+        } else {
+            base(ex1.genome_start as i64 + shift, false)
+        };
+
+        // The four bases spelling the motif: two past the donor, two before the
+        // acceptor.
+        let (b01, b02) = if seg0.is_reverse {
+            (
+                base(ex0.genome_end as i64 - 1 - jr_i - 1, true),
+                base(ex0.genome_end as i64 - 1 - jr_i - 2, true),
+            )
+        } else {
+            (
+                base(ex0.genome_start as i64 + jr_i + 1, false),
+                base(ex0.genome_start as i64 + jr_i + 2, false),
+            )
+        };
+        let (b11, b12) = if seg1.is_reverse {
+            (
+                base(ex1.genome_end as i64 - 1 - shift + 1, true),
+                base(ex1.genome_end as i64 - 1 - shift, true),
+            )
+        } else {
+            (
+                base(ex1.genome_start as i64 + shift - 1, false),
+                base(ex1.genome_start as i64 + shift, false),
+            )
+        };
+
+        let motif = match (b01, b02, b11, b12) {
+            // GT..AG, unless the strand says otherwise.
+            (Some(2), Some(3), Some(0), Some(2)) if chim_str != 2 => 1,
+            // CT..AC.
+            (Some(1), Some(3), Some(0), Some(1)) if chim_str != 1 => 2,
+            _ => 0,
+        };
+
+        // The read base votes for whichever side it matches.
+        if let Some(&b_r) = read_seq.get(ro_start0 + jr) {
+            match (b0, b1) {
+                (Some(x), Some(y)) if b_r == x && b_r != y => j_score += 1,
+                (Some(x), Some(y)) if b_r != x && b_r == y => j_score -= 1,
+                _ => {}
+            }
+        }
+
+        let j_score_j = if motif == 0 {
+            j_score + non_gtag_penalty
+        } else {
+            j_score
+        };
+
+        if j_score_j > best_score || (j_score_j == best_score && motif > 0) {
+            best_score = j_score_j;
+            best = Some(JunctionScan { jr_best: jr, motif });
+        }
+    }
+
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finalize_chimera(
     tr1: &Transcript,
     tr2: &Transcript,
@@ -1331,7 +1629,10 @@ fn finalize_chimera(
         return Ok(None);
     }
 
-    // Classify junction and compute repeats
+    // Junction placement and typing happen later, in
+    // `place_chimeric_junction`, so that every detection tier gets them —
+    // three of the five build their alignments without coming through here.
+    // This classification is provisional and only feeds the score check below.
     let junction_type = classify_junction_type(
         &index.genome,
         donor_seg.chr_idx,

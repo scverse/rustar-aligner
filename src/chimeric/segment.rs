@@ -162,19 +162,27 @@ impl ChimericAlignment {
 
     /// Get the breakpoint position on the donor chromosome (1-based)
     pub fn donor_breakpoint(&self) -> u64 {
+        // STAR's `chimJ0`: the first base *past* the donor's block, printed as
+        // `chimJ0 - chrStart + 1` (`ReadAlign_chimericDetectionOld.cpp:244-248`,
+        // `chimericJunctionOutput.cpp:6`). Forward that is `genome_end`;
+        // reverse it is `genome_start - 1`. The `+ 1` for 1-based output is
+        // folded in here, since the writer only subtracts `chrStart`.
         if self.donor.is_reverse {
-            self.donor.genome_start + 1
+            self.donor.genome_start
         } else {
-            self.donor.genome_end
+            self.donor.genome_end + 1
         }
     }
 
     /// Get the breakpoint position on the acceptor chromosome (1-based)
     pub fn acceptor_breakpoint(&self) -> u64 {
+        // STAR's `chimJ1`: the base *before* the acceptor's block (`:254-257`).
+        // Forward `genome_start - 1`, reverse `genome_end`, again with the
+        // 1-based `+ 1` folded in.
         if self.acceptor.is_reverse {
-            self.acceptor.genome_end
+            self.acceptor.genome_end + 1
         } else {
-            self.acceptor.genome_start + 1
+            self.acceptor.genome_start
         }
     }
 
@@ -312,8 +320,10 @@ mod tests {
             "READ_001".to_string(),
         );
 
-        assert_eq!(chim.donor_breakpoint(), 1050); // end position (1-based)
-        assert_eq!(chim.acceptor_breakpoint(), 2001); // start position + 1 (1-based)
+        // STAR's chimJ0/chimJ1 with the 1-based `+1` folded in: the first base
+        // past the donor's block, and the base before the acceptor's.
+        assert_eq!(chim.donor_breakpoint(), 1051);
+        assert_eq!(chim.acceptor_breakpoint(), 2000);
     }
 
     #[test]
