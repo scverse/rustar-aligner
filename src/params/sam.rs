@@ -10,7 +10,7 @@ bitflags::bitflags! {
     /// Each bit corresponds to one tag the writer may emit. `STANDARD` and
     /// `ALL` are convenience aliases matching STAR's preset names.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct SamAttributes: u16 {
+    pub struct SamAttributes: u32 {
         const NH = 1 << 0;
         const HI = 1 << 1;
         const AS = 1 << 2;
@@ -33,6 +33,49 @@ bitflags::bitflags! {
         const VW = 1 << 12;
         const VA = 1 << 13;
         const VG = 1 << 14;
+
+        // ---- STARsolo barcode tags (BAM output only, like STAR) ----
+        /// `CR:Z`: raw (uncorrected) cell barcode sequence.
+        const CR = 1 << 15;
+        /// `CY:Z`: quality string of the raw cell barcode.
+        const CY = 1 << 16;
+        /// `UR:Z`: raw (uncorrected) UMI sequence.
+        const UR = 1 << 17;
+        /// `UY:Z`: quality string of the raw UMI.
+        const UY = 1 << 18;
+        /// `CB:Z`: whitelist-corrected cell barcode. Filled at sorting time from
+        /// the solo read info (except `--soloType CB_samTagOut`, which corrects
+        /// the barcode as the read is processed).
+        const CB = 1 << 19;
+        /// `UB:Z`: collapsed (corrected) UMI. Only known after UMI collapsing,
+        /// so it is added when the sorted BAM is written.
+        const UB = 1 << 20;
+        /// `sM:i`: STAR's `cbMatch` code (its barcode/UMI assessment).
+        const SM = 1 << 21;
+        /// `sS:Z`: full barcode-read sequence (CB + UMI + any adapter).
+        const SS = 1 << 22;
+        /// `sQ:Z`: full barcode-read quality string.
+        const SQ = 1 << 23;
+        /// `gx:Z`: gene ids of THIS alignment, `;`-joined (multi-gene allowed,
+        /// unlike the read-level unique-gene `GX`).
+        const GXM = 1 << 24;
+        /// `gn:Z`: gene names of this alignment, `;`-joined.
+        const GNM = 1 << 25;
+        /// `sF:B:i`: `(overlap type, number of genes)` for the read.
+        const SF = 1 << 26;
+
+        /// Every STARsolo barcode/gene tag. STAR emits these in BAM output only.
+        const SOLO_TAGS =
+            Self::CR.bits() | Self::CY.bits() | Self::UR.bits() | Self::UY.bits()
+            | Self::CB.bits() | Self::UB.bits()
+            | Self::SM.bits() | Self::SS.bits() | Self::SQ.bits()
+            | Self::GX.bits() | Self::GN.bits()
+            | Self::GXM.bits() | Self::GNM.bits() | Self::SF.bits();
+
+        /// The tags derived from the gene model rather than the barcode read.
+        const SOLO_GENE_TAGS =
+            Self::GX.bits() | Self::GN.bits()
+            | Self::GXM.bits() | Self::GNM.bits() | Self::SF.bits();
 
         // STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
         const STANDARD =
@@ -69,6 +112,18 @@ impl FromStr for SamAttributes {
             "RG" => Self::RG,
             "GX" => Self::GX,
             "GN" => Self::GN,
+            "CR" => Self::CR,
+            "CY" => Self::CY,
+            "UR" => Self::UR,
+            "UY" => Self::UY,
+            "CB" => Self::CB,
+            "UB" => Self::UB,
+            "sM" => Self::SM,
+            "sS" => Self::SS,
+            "sQ" => Self::SQ,
+            "gx" => Self::GXM,
+            "gn" => Self::GNM,
+            "sF" => Self::SF,
             "vW" => Self::VW,
             "vA" => Self::VA,
             "vG" => Self::VG,
@@ -117,7 +172,8 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI XS RG vW vA vG.",
+                     NH HI AS NM nM MD jM jI XS RG vW vA vG, plus the STARsolo tags \
+                     CR CY UR UY CB UB GX GN gx gn sM sS sQ sF (BAM output only).",
                 ),
         )
     }

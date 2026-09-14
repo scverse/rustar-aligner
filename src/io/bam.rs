@@ -164,6 +164,12 @@ impl SortedBamWriter {
         Ok(())
     }
 
+    /// The buffered records, for post-processing before the sort (STARsolo's
+    /// `CB`/`UB` tags, which are only known after the counting pass).
+    pub fn records_mut(&mut self) -> &mut Vec<RecordBuf> {
+        &mut self.records
+    }
+
     /// Estimate memory used by buffered records (rough: 400 bytes/record for 150bp reads).
     fn estimated_ram(&self) -> u64 {
         self.records.len() as u64 * 400
@@ -422,6 +428,11 @@ impl SortedBamStdoutWriter {
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
         self.records.extend_from_slice(batch);
         Ok(())
+    }
+
+    /// The buffered records, for STARsolo's post-counting `CB`/`UB` pass.
+    pub fn records_mut(&mut self) -> &mut Vec<RecordBuf> {
+        &mut self.records
     }
 
     pub fn finish(&mut self) -> Result<(), Error> {

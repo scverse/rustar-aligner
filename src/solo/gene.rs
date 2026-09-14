@@ -304,6 +304,131 @@ pub fn classify_read(
     })
 }
 
+/// STAR's `ReadAnnotFeature::overlapTypes` (`ReadAnnotations.h:13`), the first
+/// value of the `sF` SAM tag. The read takes the lowest-numbered type any of its
+/// alignments reaches.
+///
+/// `ExonicSense50p` / `Exonic50pAntisense` are STAR's `GeneFull_Ex50pAS` types
+/// and never arise here, since that feature is not implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OverlapType {
+    None = 0,
+    ExonicSense = 1,
+    ExonicAntisense = 2,
+    ExonicSense50p = 3,
+    Exonic50pAntisense = 4,
+    IntronicSense = 5,
+    IntronicAntisense = 6,
+    Intergenic = 7,
+}
+
+impl OverlapType {
+    /// The sense-strand types, for which STAR reports `sF:B:i,-1,-1` on an
+    /// alignment that carries no gene of its own
+    /// (`ReadAlign_alignBAM.cpp:441-447`).
+    pub fn is_sense(self) -> bool {
+        matches!(
+            self,
+            Self::ExonicSense | Self::ExonicSense50p | Self::IntronicSense
+        )
+    }
+}
+
+/// The genes each individual alignment of a read belongs to, for the `gx`/`gn`
+/// SAM tags (STAR's `readAnnot.annotFeatures[f].fAlign`), plus the read-level
+/// gene set size and overlap type behind `sF`.
+#[derive(Debug, Clone, Default)]
+pub struct AlignGenes {
+    /// One sorted gene-index list per alignment, parallel to the transcripts.
+    pub per_align: Vec<Vec<u32>>,
+    /// Union over alignments (STAR's `fSet`).
+    pub gene_set: Vec<u32>,
+    /// STAR's `ovType`.
+    pub ov_type: i32,
+}
+
+/// Per-alignment gene assignment for `gx`/`gn`/`sF`, on the `Gene` (exon,
+/// transcript-concordant) or `GeneFull` (gene body) basis.
+///
+/// Mirrors the per-transcript half of [`classify_read`]: the same concordance
+/// and strand rules, kept per alignment instead of unioned over the read.
+pub fn align_genes(
+    transcripts: &[Transcript],
+    gene_ann: &GeneAnnotation,
+    strand: SoloStrand,
+    feature: SoloFeature,
+) -> AlignGenes {
+    let want_exon = feature == SoloFeature::Gene;
+    let mut out = AlignGenes {
+        per_align: Vec::with_capacity(transcripts.len()),
+        ..Default::default()
+    };
+    if transcripts.is_empty() {
+        out.ov_type = OverlapType::None as i32;
+        return out;
+    }
+    let (mut exon_sense, mut exon_anti) = (false, false);
+    let (mut body_sense, mut body_anti) = (false, false);
+    let mut raw: Vec<usize> = Vec::new();
+
+    for tr in transcripts {
+        let mut genes: Vec<u32> = Vec::new();
+        // Exon overlap decides the exonic/intronic half of `ovType` even for the
+        // GeneFull basis, which is what makes an intronic GeneFull read report
+        // `intronic` rather than `exonic`.
+        gene_ann.overlapping_genes_into(tr, &mut raw);
+        for &g in &raw {
+            let concordant = tr
+                .exons
+                .iter()
+                .all(|b| gene_ann.block_is_exonic(g, b.genome_start, b.genome_end));
+            if !concordant {
+                continue;
+            }
+            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                exon_sense = true;
+                if want_exon {
+                    genes.push(g as u32);
+                }
+            } else {
+                exon_anti = true;
+            }
+        }
+        gene_ann.overlapping_genes_full_into(tr, &mut raw);
+        for &g in &raw {
+            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                body_sense = true;
+                if !want_exon {
+                    genes.push(g as u32);
+                }
+            } else {
+                body_anti = true;
+            }
+        }
+        genes.sort_unstable();
+        genes.dedup();
+        out.gene_set.extend_from_slice(&genes);
+        out.per_align.push(genes);
+    }
+    out.gene_set.sort_unstable();
+    out.gene_set.dedup();
+
+    // Lower types win, as in STAR's `otFinal` scan.
+    out.ov_type = if exon_sense {
+        OverlapType::ExonicSense
+    } else if exon_anti {
+        OverlapType::ExonicAntisense
+    } else if body_sense {
+        OverlapType::IntronicSense
+    } else if body_anti {
+        OverlapType::IntronicAntisense
+    } else {
+        OverlapType::Intergenic
+    } as i32;
+    out
+}
+
 /// Assign a single-end (cDNA) read to a gene from its alignment set, using the
 /// `Gene` (exonic) or `GeneFull` (gene-body, intron-inclusive) overlap basis.
 /// Thin wrapper over [`classify_read`] for the single-feature case (and tests).
@@ -488,6 +613,63 @@ mod tests {
             GeneAssignment::Gene(gi) => assert_eq!(ann.gene_ids[gi as usize], "G3"),
             other => panic!("expected G3 under GeneFull, got {other:?}"),
         }
+    }
+
+    /// `gx`/`gn` are per alignment, so two alignments of one read report their
+    /// own genes; `sF` reports the read-level overlap type and gene count, and
+    /// falls back to `(-1, -1)` on an alignment with no gene of its own.
+    #[test]
+    fn align_genes_are_per_alignment_with_a_read_level_overlap_type() {
+        // Ga (+) exons [100,200); Gb (+) exons [400,500). Intergenic elsewhere.
+        let g = genome();
+        let exons = vec![gtf_exon(101, 200, '+', "Ga"), gtf_exon(401, 500, '+', "Gb")];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+
+        let hits = vec![read_at(110, 150, false), read_at(410, 450, false)];
+        let out = align_genes(&hits, &ann, SoloStrand::Forward, SoloFeature::Gene);
+        assert_eq!(out.per_align, vec![vec![0], vec![1]]);
+        assert_eq!(out.gene_set, vec![0, 1]);
+        assert_eq!(out.ov_type, OverlapType::ExonicSense as i32);
+
+        // Second alignment intergenic: it keeps no gene, but the read is still
+        // exonic-sense from the first.
+        let mixed = vec![read_at(110, 150, false), read_at(900, 950, false)];
+        let out = align_genes(&mixed, &ann, SoloStrand::Forward, SoloFeature::Gene);
+        assert_eq!(out.per_align, vec![vec![0], Vec::<u32>::new()]);
+        assert_eq!(out.ov_type, OverlapType::ExonicSense as i32);
+        assert!(OverlapType::ExonicSense.is_sense());
+
+        // Antisense read over the same exon: exonicAS, no gene kept.
+        let anti = vec![read_at(110, 150, true)];
+        let out = align_genes(&anti, &ann, SoloStrand::Forward, SoloFeature::Gene);
+        assert_eq!(out.per_align, vec![Vec::<u32>::new()]);
+        assert_eq!(out.ov_type, OverlapType::ExonicAntisense as i32);
+        assert!(!OverlapType::ExonicAntisense.is_sense());
+
+        // No gene anywhere near: intergenic.
+        let far = vec![read_at(900, 950, false)];
+        let out = align_genes(&far, &ann, SoloStrand::Forward, SoloFeature::Gene);
+        assert_eq!(out.ov_type, OverlapType::Intergenic as i32);
+        assert!(out.gene_set.is_empty());
+    }
+
+    /// A read inside an intron is intronic-sense, and carries the gene only on
+    /// the `GeneFull` basis.
+    #[test]
+    fn intronic_reads_report_the_intronic_overlap_type() {
+        // One gene, two exons: body [100,500), intron [200,400).
+        let g = genome();
+        let exons = vec![gtf_exon(101, 200, '+', "Ga"), gtf_exon(401, 500, '+', "Ga")];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let intronic = vec![read_at(250, 300, false)];
+
+        let full = align_genes(&intronic, &ann, SoloStrand::Forward, SoloFeature::GeneFull);
+        assert_eq!(full.per_align, vec![vec![0]]);
+        assert_eq!(full.ov_type, OverlapType::IntronicSense as i32);
+
+        let gene = align_genes(&intronic, &ann, SoloStrand::Forward, SoloFeature::Gene);
+        assert_eq!(gene.per_align, vec![Vec::<u32>::new()]);
+        assert_eq!(gene.ov_type, OverlapType::IntronicSense as i32);
     }
 
     #[test]

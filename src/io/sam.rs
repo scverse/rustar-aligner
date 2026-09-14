@@ -1112,6 +1112,179 @@ pub fn add_gene_tags(records: &mut [RecordBuf], gx: &str, gn: &str, attrs: SamAt
     }
 }
 
+/// The per-read STARsolo barcode tag values of one read
+/// (`ReadAlign_alignBAM.cpp:389-473`).
+///
+/// `CB` is filled here only when the barcode is corrected as the read is
+/// processed (`--soloType CB_samTagOut`); in a counting run it, and `UB`: are
+/// added when the sorted BAM is written, once UMI collapsing has run.
+pub struct SoloBarcodeTagValues<'a> {
+    /// `CR`: raw cell barcode.
+    pub cb_seq: &'a str,
+    /// `CY`: raw cell-barcode quality.
+    pub cb_qual: &'a str,
+    /// `UR`: raw UMI.
+    pub umi_seq: &'a str,
+    /// `UY`: raw UMI quality.
+    pub umi_qual: &'a str,
+    /// `CB`: corrected cell barcode, when known at read time.
+    pub cb_corrected: Option<&'a str>,
+    /// `sM`: STAR's `cbMatch` code.
+    pub cb_match: i32,
+    /// `sS`: whole barcode read.
+    pub barcode_seq: &'a str,
+    /// `sQ`: whole barcode-read quality.
+    pub barcode_qual: &'a str,
+}
+
+/// Add the STARsolo per-read barcode tags to every record of one read (mapped
+/// alignments and the unmapped record alike, as in STAR). `attrs` should already
+/// be narrowed to the tags this run emits, see `Parameters::solo_sam_tags`.
+pub fn add_solo_barcode_tags(
+    records: &mut [RecordBuf],
+    values: &SoloBarcodeTagValues<'_>,
+    attrs: SamAttributes,
+) {
+    if !attrs.intersects(SamAttributes::SOLO_TAGS) {
+        return;
+    }
+    let str_tags: [(SamAttributes, [u8; 2], &str); 5] = [
+        (SamAttributes::CR, *b"CR", values.cb_seq),
+        (SamAttributes::CY, *b"CY", values.cb_qual),
+        (SamAttributes::UR, *b"UR", values.umi_seq),
+        (SamAttributes::UY, *b"UY", values.umi_qual),
+        (SamAttributes::SS, *b"sS", values.barcode_seq),
+    ];
+    for rec in records.iter_mut() {
+        // An empty value means the read carries no such sequence at all (a
+        // barcode read too short to hold a CB+UMI); STAR has no empty tags, so
+        // the tag is left off rather than written blank.
+        for (flag, tag, value) in str_tags {
+            if attrs.contains(flag) && !value.is_empty() {
+                rec.data_mut().insert(
+                    Tag::new(tag[0], tag[1]),
+                    Value::String(BString::from(value)),
+                );
+            }
+        }
+        // sQ is a quality string, written verbatim like sS.
+        if attrs.contains(SamAttributes::SQ) && !values.barcode_qual.is_empty() {
+            rec.data_mut().insert(
+                Tag::new(b's', b'Q'),
+                Value::String(BString::from(values.barcode_qual)),
+            );
+        }
+        if attrs.contains(SamAttributes::SM) {
+            rec.data_mut()
+                .insert(Tag::new(b's', b'M'), Value::Int32(values.cb_match));
+        }
+        if let (true, Some(cb)) = (attrs.contains(SamAttributes::CB), values.cb_corrected) {
+            rec.data_mut()
+                .insert(Tag::new(b'C', b'B'), Value::String(BString::from(cb)));
+        }
+    }
+}
+
+/// Add the per-alignment STARsolo gene tags (`gx`, `gn`, `sF`) to a read's
+/// records.
+///
+/// `tags` is one entry per alignment; `records_per_align` is how many records
+/// each alignment produced (1 single-end, 2 for a mate pair), so both mates of a
+/// pair carry the pair's genes. Records past the end of `tags` (there are none
+/// in practice) are left alone.
+pub fn add_align_gene_tags(
+    records: &mut [RecordBuf],
+    tags: &[crate::solo::AlignGeneTag],
+    records_per_align: usize,
+    attrs: SamAttributes,
+) {
+    use noodles::sam::alignment::record_buf::data::field::value::Array;
+
+    if !attrs.intersects(SamAttributes::GXM | SamAttributes::GNM | SamAttributes::SF)
+        || records_per_align == 0
+    {
+        return;
+    }
+    for (i, rec) in records.iter_mut().enumerate() {
+        let Some(tag) = tags.get(i / records_per_align) else {
+            continue;
+        };
+        if attrs.contains(SamAttributes::GXM) {
+            rec.data_mut().insert(
+                Tag::new(b'g', b'x'),
+                Value::String(BString::from(tag.gx.as_str())),
+            );
+        }
+        if attrs.contains(SamAttributes::GNM) {
+            rec.data_mut().insert(
+                Tag::new(b'g', b'n'),
+                Value::String(BString::from(tag.gn.as_str())),
+            );
+        }
+        if attrs.contains(SamAttributes::SF) {
+            rec.data_mut().insert(
+                Tag::new(b's', b'F'),
+                Value::Array(Array::Int32(tag.sf.to_vec())),
+            );
+        }
+    }
+}
+
+/// Private aux tag carrying the input read index on a buffered record until the
+/// sorted BAM is written, where it becomes `CB`/`UB`. STAR does the same thing
+/// by encoding `iReadAll` in the record's trailing bytes
+/// (`SoloFeature_addBAMtags.cpp:8`); a local `z`-namespace tag survives sorting
+/// without a parallel array.
+const SOLO_READ_INDEX_TAG: [u8; 2] = *b"zR";
+
+/// Stamp the input read index on each of a read's records, for the CB/UB pass.
+pub fn add_solo_read_index(records: &mut [RecordBuf], read_index: u32) {
+    for rec in records.iter_mut() {
+        rec.data_mut().insert(
+            Tag::new(SOLO_READ_INDEX_TAG[0], SOLO_READ_INDEX_TAG[1]),
+            Value::UInt32(read_index),
+        );
+    }
+}
+
+/// Replace the private read-index tag with `CB`/`UB`, read out of STAR's
+/// readInfo once UMI collapsing has run.
+///
+/// Both tags are written whenever either was requested, and both fall back to
+/// `"-"`, exactly as `SoloFeature::addBAMtags` does: a read that was not counted
+/// (no whitelist cell, no valid UMI, no gene) has no cell or molecule to name.
+pub fn apply_solo_read_info(
+    records: &mut [RecordBuf],
+    read_info: &[crate::solo::ReadInfo],
+    whitelist: &crate::solo::CbWhitelist,
+    umi_len: usize,
+) {
+    let tag = Tag::new(SOLO_READ_INDEX_TAG[0], SOLO_READ_INDEX_TAG[1]);
+    for rec in records.iter_mut() {
+        let Some(Value::UInt32(read_index)) = rec.data().get(&tag).cloned() else {
+            continue;
+        };
+        rec.data_mut().remove(&tag);
+        let info = read_info
+            .get(read_index as usize)
+            .copied()
+            .unwrap_or_default();
+        let cb = (info.cb != u32::MAX)
+            .then(|| whitelist.barcode_string(info.cb))
+            .flatten()
+            .unwrap_or_else(|| "-".to_string());
+        let ub = if info.umi == u64::MAX {
+            "-".to_string()
+        } else {
+            crate::solo::whitelist::unpack_barcode(info.umi, umi_len)
+        };
+        rec.data_mut()
+            .insert(Tag::new(b'C', b'B'), Value::String(BString::from(cb)));
+        rec.data_mut()
+            .insert(Tag::new(b'U', b'B'), Value::String(BString::from(ub)));
+    }
+}
+
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
 /// `(FLAG & flagAND) | flagOR`. Matches STAR/STAR-rs, which apply this only to
 /// mapped-mate records; unmapped and transcriptome-BAM records are untouched.
@@ -1750,6 +1923,62 @@ mod tests {
             chr_length: vec![8],
             chr_start: vec![0, 8],
         }
+    }
+
+    /// The solo barcode tags land on every record of the read, and only the
+    /// requested ones are written. Values with no sequence behind them (a
+    /// barcode read too short to hold a CB+UMI) are left off entirely.
+    #[test]
+    fn solo_barcode_tags_are_added_per_requested_attribute() {
+        let values = SoloBarcodeTagValues {
+            cb_seq: "ACGTACGTACGTACGT",
+            cb_qual: "IIIIIIIIIIIIIIII",
+            umi_seq: "ACGTACGTAC",
+            umi_qual: "JJJJJJJJJJ",
+            cb_corrected: Some("ACGTACGTACGTACGA"),
+            cb_match: 1,
+            barcode_seq: "",
+            barcode_qual: "",
+        };
+        let mut records = vec![RecordBuf::default(), RecordBuf::default()];
+        let attrs = SamAttributes::CR
+            | SamAttributes::CY
+            | SamAttributes::UR
+            | SamAttributes::SM
+            | SamAttributes::SS
+            | SamAttributes::CB;
+        add_solo_barcode_tags(&mut records, &values, attrs);
+
+        for rec in &records {
+            let data = rec.data();
+            let get = |t: [u8; 2]| data.get(&Tag::new(t[0], t[1])).cloned();
+            assert_eq!(
+                get(*b"CR"),
+                Some(Value::String(BString::from("ACGTACGTACGTACGT")))
+            );
+            assert_eq!(
+                get(*b"CY"),
+                Some(Value::String(BString::from("IIIIIIIIIIIIIIII")))
+            );
+            assert_eq!(
+                get(*b"UR"),
+                Some(Value::String(BString::from("ACGTACGTAC")))
+            );
+            assert_eq!(get(*b"sM"), Some(Value::Int32(1)));
+            assert_eq!(
+                get(*b"CB"),
+                Some(Value::String(BString::from("ACGTACGTACGTACGA")))
+            );
+            // Not requested, and no value: absent.
+            assert_eq!(get(*b"UY"), None);
+            assert_eq!(get(*b"sS"), None);
+            assert_eq!(get(*b"sQ"), None);
+        }
+
+        // No solo attributes requested → untouched records.
+        let mut untouched = vec![RecordBuf::default()];
+        add_solo_barcode_tags(&mut untouched, &values, SamAttributes::STANDARD);
+        assert!(untouched[0].data().is_empty());
     }
 
     #[test]

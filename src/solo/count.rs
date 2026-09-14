@@ -246,33 +246,140 @@ fn connected_components(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
 }
 
 /// 1MM_Directional: a lower-count UMI within Hamming-1 of a hub whose count
-/// satisfies `count_hub >= 2*count_leaf + dir_count_add` is absorbed; the
-/// molecule count is the number of surviving (non-absorbed) UMIs.
+/// satisfies `count_hub >= 2*count_leaf + dir_count_add` is absorbed into that
+/// hub's own (already corrected) UMI; the molecule count is the number of
+/// distinct surviving UMIs, STAR's `umiArrayCorrect_Directional`, which counts
+/// `umiC.size()` over the corrected values.
 fn directional(umis: &HashMap<u64, u32>, umi_len: usize, dir_count_add: i64) -> u64 {
-    // Sort by count desc, then by UMI value for determinism.
-    let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let n = items.len();
-    let mut absorbed = vec![false; n];
-    for i in 0..n {
-        if absorbed[i] {
-            continue;
+    let corrections = directional_correction_map(umis, umi_len, dir_count_add);
+    umis.keys()
+        .map(|u| corrections.get(u).copied().unwrap_or(*u))
+        .collect::<std::collections::HashSet<u64>>()
+        .len() as u64
+}
+
+// ---------------------------------------------------------------------------
+// UMI correction maps (STAR's `umiCorrected`, for the readInfo / UB SAM tag)
+// ---------------------------------------------------------------------------
+
+/// Swap the low and high halves of a packed UMI, as STAR's `umiSwapHalves` does
+/// before its second 1MM scan. The half-swapped value is also the order STAR's
+/// graph collapse walks the UMIs in, and so decides ties between equal-count
+/// representatives.
+fn swap_halves(umi: u64, umi_len: usize) -> u64 {
+    let half_bits = umi_len; // umi_len bases → 2*umi_len bits, half = umi_len bits
+    let mask_low = (1u64 << half_bits) - 1;
+    let high = umi >> half_bits;
+    ((umi & mask_low) << half_bits) | high
+}
+
+/// `raw UMI -> corrected UMI` for one `(cell, gene)`, matching what STAR records
+/// in `umiCorrected` for the active dedup method
+/// (`SoloFeature_collapseUMIall.cpp`, `SoloFeature_collapseUMI_Graph.cpp`).
+/// Only UMIs that actually change are listed; `Exact`/`NoDedup` correct nothing.
+#[allow(clippy::implicit_hasher)] // always called with the default hasher
+pub fn umi_correction_map(
+    umis: &HashMap<u64, u32>,
+    method: UmiDedup,
+    umi_len: usize,
+) -> HashMap<u64, u64> {
+    let mut map = match method {
+        UmiDedup::Exact | UmiDedup::NoDedup => HashMap::default(),
+        UmiDedup::OneMmCr => cellranger_1mm_map(umis, umi_len),
+        UmiDedup::OneMmAll => graph_correction_map(umis, umi_len),
+        UmiDedup::OneMmDirectional => directional_correction_map(umis, umi_len, 0),
+        UmiDedup::OneMmDirectionalUmiTools => directional_correction_map(umis, umi_len, -1),
+    };
+    map.retain(|raw, corrected| raw != corrected);
+    map
+}
+
+/// 1MM_All: every UMI of a connected component is corrected to the component's
+/// highest-count UMI, ties going to the one STAR meets first, the smallest
+/// half-swapped value (`umiArrayCorrect_Graph`'s `umiBest` scan).
+fn graph_correction_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
+    let keys: Vec<u64> = umis.keys().copied().collect();
+    let n = keys.len();
+    let mut map = HashMap::default();
+    if n <= 1 {
+        return map;
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
         }
-        let hub_count = i64::from(items[i].1);
-        for j in 0..n {
-            if i == j || absorbed[j] {
-                continue;
-            }
-            let leaf_count = i64::from(items[j].1);
-            if leaf_count <= hub_count
-                && hub_count >= 2 * leaf_count + dir_count_add
-                && hamming1(items[i].0, items[j].0, umi_len)
-            {
-                absorbed[j] = true;
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if hamming1(keys[i], keys[j], umi_len) {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
             }
         }
     }
-    (n - absorbed.iter().filter(|&&a| a).count()) as u64
+    // Best (count, then smallest swapped value) UMI per component.
+    let mut best: HashMap<usize, (u32, u64, u64)> = HashMap::default();
+    for (i, &umi) in keys.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let count = umis[&umi];
+        let swapped = swap_halves(umi, umi_len);
+        match best.get(&root) {
+            Some(&(bc, bs, _)) if bc > count || (bc == count && bs <= swapped) => {}
+            _ => {
+                best.insert(root, (count, swapped, umi));
+            }
+        }
+    }
+    // A component of one is never coloured by STAR, so it is never recorded.
+    let mut comp_size: HashMap<usize, usize> = HashMap::default();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        *comp_size.entry(root).or_insert(0) += 1;
+    }
+    for (i, &umi) in keys.iter().enumerate() {
+        let root = find(&mut parent, i);
+        if comp_size[&root] > 1
+            && let Some(&(_, _, rep)) = best.get(&root)
+        {
+            map.insert(umi, rep);
+        }
+    }
+    map
+}
+
+/// 1MM_Directional: each UMI, scanned in descending count order, is corrected to
+/// the *corrected* value of the first earlier (higher-count) UMI within one
+/// mismatch whose count satisfies `hub >= 2*leaf + dir_count_add`, STAR's
+/// `umiArrayCorrect_Directional`, chain and all.
+fn directional_correction_map(
+    umis: &HashMap<u64, u32>,
+    umi_len: usize,
+    dir_count_add: i64,
+) -> HashMap<u64, u64> {
+    let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut corrected: Vec<u64> = items.iter().map(|&(u, _)| u).collect();
+    for iu in 1..items.len() {
+        for iuu in 0..iu {
+            if i64::from(items[iuu].1) >= 2 * i64::from(items[iu].1) + dir_count_add
+                && hamming1(items[iu].0, items[iuu].0, umi_len)
+            {
+                corrected[iu] = corrected[iuu];
+                break;
+            }
+        }
+    }
+    items
+        .iter()
+        .map(|&(u, _)| u)
+        .zip(corrected)
+        .filter(|(raw, corr)| raw != corr)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +470,7 @@ fn build_matrix_body(
     pseudocount: f64,
     dir: &Path,
     n_features: usize,
+    record_read_info: bool,
 ) -> Result<(tempfile::NamedTempFile, MatrixStats), Error> {
     let mut body_tmp = tempfile::Builder::new()
         .prefix(".matrix_body")
@@ -385,6 +493,7 @@ fn build_matrix_body(
                     cb,
                     umi: m.umi,
                     gene: m.gene,
+                    read_index: m.read_index,
                 });
             }
         }
@@ -414,6 +523,9 @@ fn build_matrix_body(
             body: Vec<u8>,
             stat: Option<CellStat>,
             genes: Vec<u32>,
+            /// `(read index, readInfo entry)` for this cell's reads, when the
+            /// `CB`/`UB` SAM tags asked for STAR's readInfo.
+            read_info: Vec<(u32, crate::solo::ReadInfo)>,
         }
         let cell_outs: Vec<CellOut> = bounds
             .par_iter()
@@ -457,6 +569,35 @@ fn build_matrix_body(
                 };
                 cell_entries.sort_unstable_by_key(|&(g, _)| g);
 
+                // STAR's readInfo: every read counted for this cell records the
+                // cell it landed in and the UMI it collapsed onto
+                // (`SoloFeature_collapseUMIall.cpp:250-265`).
+                let mut read_info: Vec<(u32, crate::solo::ReadInfo)> = Vec::new();
+                if record_read_info {
+                    let mut per_gene: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+                    for (&umi, genes) in &umi_genes {
+                        for (&gene, &rc) in genes {
+                            *per_gene.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+                        }
+                    }
+                    let corrections: HashMap<u32, HashMap<u64, u64>> = per_gene
+                        .iter()
+                        .map(|(&gene, umis)| (gene, umi_correction_map(umis, method, umi_len)))
+                        .collect();
+                    read_info.reserve(j - i);
+                    for r in &records[i..j] {
+                        if r.read_index == crate::solo::NO_READ_INDEX {
+                            continue;
+                        }
+                        let umi = corrections
+                            .get(&r.gene)
+                            .and_then(|m| m.get(&r.umi))
+                            .copied()
+                            .unwrap_or(r.umi);
+                        read_info.push((r.read_index, crate::solo::ReadInfo { cb, umi }));
+                    }
+                }
+
                 let n_reads = (j - i) as u64;
                 let n_genes = cell_entries.len() as u32;
                 let mut n_umis = 0u64;
@@ -477,11 +618,15 @@ fn build_matrix_body(
                     body: cbody,
                     stat,
                     genes,
+                    read_info,
                 }
             })
             .collect();
 
         // Sequential merge: byte order preserved (CB-ascending, gene-ascending).
+        let mut info_guard = record_read_info
+            .then(|| ctx.read_info.as_ref().map(|m| m.lock().unwrap()))
+            .flatten();
         for co in cell_outs {
             body.write_all(&co.body).map_err(|e| Error::io(e, dir))?;
             nnz += co.genes.len();
@@ -491,7 +636,15 @@ fn build_matrix_body(
             if let Some(s) = co.stat {
                 cell_stats.push(s);
             }
+            if let Some(info) = info_guard.as_mut() {
+                for (read_index, entry) in co.read_info {
+                    if let Some(slot) = info.get_mut(read_index as usize) {
+                        *slot = entry;
+                    }
+                }
+            }
         }
+        drop(info_guard);
         body.flush().map_err(|e| Error::io(e, dir))?;
     }
 
@@ -1369,7 +1522,7 @@ pub fn write_gene_matrix(
     let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
 
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
-    for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
+    for (fi, (feature, recorder)) in ctx.features.iter().zip(&ctx.recorders).enumerate() {
         let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
         let raw_dir = feature_dir.join("raw");
         std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
@@ -1385,6 +1538,9 @@ pub fn write_gene_matrix(
             pseudocount,
             &raw_dir,
             n_genes,
+            // STAR fills readInfo from one feature only: the first on the
+            // --soloFeatures list (`ParametersSolo.cpp:423-434`).
+            fi == 0 && ctx.read_info_enabled(),
         )?;
         write_features(
             &raw_dir.join(&features_name),
@@ -2471,6 +2627,48 @@ mod tests {
         let c = counts(&[("AAAA", 3), ("AAAC", 2)]);
         assert_eq!(dedup_count(&c, UmiDedup::OneMmDirectionalUmiTools, 4), 1);
         assert_eq!(dedup_count(&c, UmiDedup::OneMmDirectional, 4), 2);
+    }
+
+    /// The correction map behind the `UB` SAM tag: 1MM_All sends every UMI of a
+    /// connected component to the component's highest-count member, and leaves
+    /// UMIs that collapse with nothing untouched.
+    #[test]
+    fn graph_correction_maps_each_component_to_its_top_umi() {
+        // AAAA(5)–AAAC(1)–AACC(2) is one component (AAAC bridges); TTTT alone.
+        let c = counts(&[("AAAA", 5), ("AAAC", 1), ("AACC", 2), ("TTTT", 3)]);
+        let map = umi_correction_map(&c, UmiDedup::OneMmAll, 4);
+        assert_eq!(map.get(&umi("AAAC")), Some(&umi("AAAA")));
+        assert_eq!(map.get(&umi("AACC")), Some(&umi("AAAA")));
+        // The representative and the isolated UMI are not corrections.
+        assert_eq!(map.get(&umi("AAAA")), None);
+        assert_eq!(map.get(&umi("TTTT")), None);
+        // The molecule count agrees with the map: 2 components.
+        assert_eq!(dedup_count(&c, UmiDedup::OneMmAll, 4), 2);
+    }
+
+    /// Directional follows the chain: a leaf takes the *corrected* UMI of the
+    /// hub that absorbed it, so a two-step chain lands on the head.
+    #[test]
+    fn directional_correction_follows_the_chain() {
+        // AAAA(9) ← AAAC(4) ← AAAG(1): AAAC absorbs into AAAA (9 >= 2*4),
+        // AAAG into AAAC's corrected value (4 >= 2*1) → all three are one.
+        let c = counts(&[("AAAA", 9), ("AAAC", 4), ("AAAG", 1)]);
+        let map = umi_correction_map(&c, UmiDedup::OneMmDirectional, 4);
+        assert_eq!(map.get(&umi("AAAC")), Some(&umi("AAAA")));
+        assert_eq!(map.get(&umi("AAAG")), Some(&umi("AAAA")));
+        assert_eq!(dedup_count(&c, UmiDedup::OneMmDirectional, 4), 1);
+    }
+
+    /// Exact and NoDedup correct nothing, so `UB` is the read's own UMI.
+    #[test]
+    fn exact_dedup_corrects_nothing() {
+        let c = counts(&[("AAAA", 5), ("AAAC", 1)]);
+        assert!(umi_correction_map(&c, UmiDedup::Exact, 4).is_empty());
+        assert!(umi_correction_map(&c, UmiDedup::NoDedup, 4).is_empty());
+        // 1MM_CR does correct, and only lists UMIs that actually change.
+        let cr = umi_correction_map(&c, UmiDedup::OneMmCr, 4);
+        assert_eq!(cr.get(&umi("AAAC")), Some(&umi("AAAA")));
+        assert_eq!(cr.get(&umi("AAAA")), None);
     }
 
     #[test]
