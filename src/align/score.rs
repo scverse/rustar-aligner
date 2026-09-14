@@ -28,6 +28,12 @@ pub struct AlignmentScorer {
     /// Max mismatches for stitching SJs: [non-canonical, GT-AG, GC-AG, AT-AC]
     /// -1 means unlimited
     pub align_sj_stitch_mismatch_nmax: [i32; 4],
+    /// Whether this run is STARlong. STAR compiles the per-motif stitch
+    /// mismatch cap out of the long-read binary entirely
+    /// (`stitchAlignToTranscript.cpp:308-315`: the
+    /// `alignSJstitchMismatchNmax` term sits in the `#else` of
+    /// `COMPILE_FOR_LONG_READS`), leaving only the total mismatch budget.
+    pub long_read: bool,
     /// Max absolute number of mismatches for alignment extension (outFilterMismatchNmax)
     pub n_mm_max: u32,
     /// Max ratio of mismatches to total alignment length (outFilterMismatchNoverLmax)
@@ -69,6 +75,7 @@ impl AlignmentScorer {
             align_intron_min: 21,
             sjdb_score: 2,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
+            long_read: false,
             n_mm_max: 10,
             p_mm_max: 0.3,
             align_sj_overhang_min: 5,
@@ -102,6 +109,7 @@ impl AlignmentScorer {
                 params.align_sj_stitch_mismatch_nmax[2],
                 params.align_sj_stitch_mismatch_nmax[3],
             ],
+            long_read: params.long_read,
             n_mm_max: params.out_filter_mismatch_nmax,
             p_mm_max: params.out_filter_mismatch_nover_lmax,
             align_sj_overhang_min: params.align_sj_overhang_min,
@@ -143,6 +151,23 @@ impl AlignmentScorer {
 
     /// Check if the number of mismatches is allowed for this junction motif type
     pub fn stitch_mismatch_allowed(&self, motif: &SpliceMotif, n_mismatch: u32) -> bool {
+        // STARlong does not apply this cap. In STAR's source the condition
+        // reads
+        //
+        //     #ifdef COMPILE_FOR_LONG_READS
+        //         if ( (trA->nMM + nMM) <= outFilterMismatchNmaxTotal )
+        //     #else
+        //         if ( (trA->nMM + nMM) <= outFilterMismatchNmaxTotal
+        //              && ( jCan<0 || (jCan<7 && nMM <= P.alignSJstitchMismatchNmax[(jCan+1)/2]) ) )
+        //     #endif
+        //
+        // so the per-motif term is compiled out of STARlong and only the total
+        // mismatch budget survives. Applying it anyway kills junctions that a
+        // long read reaches with a mismatch or two nearby, which on spliced
+        // long reads means losing the read outright rather than one junction.
+        if self.long_read {
+            return true;
+        }
         let idx = match motif {
             SpliceMotif::NonCanonical => 0,
             SpliceMotif::GtAg | SpliceMotif::CtAc => 1,
@@ -771,6 +796,47 @@ mod tests {
         }
     }
 
+    /// STAR compiles the per-motif stitch mismatch cap out of STARlong:
+    /// `stitchAlignToTranscript.cpp:308-315` keeps only
+    /// `(trA->nMM + nMM) <= outFilterMismatchNmaxTotal` under
+    /// `COMPILE_FOR_LONG_READS`, and puts the `alignSJstitchMismatchNmax`
+    /// term in the `#else`.
+    ///
+    /// Applying it in the long-read path costs whole reads, not single
+    /// junctions: a spliced long read that hits one mismatch beside a
+    /// junction loses the edge, the chaining DP then splits into two chains
+    /// on either side, and neither half clears
+    /// `--outFilterScoreMinOverLread`.
+    #[test]
+    fn the_stitch_mismatch_cap_does_not_apply_to_long_reads() {
+        let mut scorer = AlignmentScorer::from_params_minimal();
+        assert_eq!(scorer.align_sj_stitch_mismatch_nmax[0], 0);
+
+        // Short reads: a non-canonical junction tolerates no mismatch, and
+        // GT/AG tolerates any number.
+        assert!(scorer.stitch_mismatch_allowed(&SpliceMotif::NonCanonical, 0));
+        assert!(!scorer.stitch_mismatch_allowed(&SpliceMotif::NonCanonical, 1));
+        assert!(scorer.stitch_mismatch_allowed(&SpliceMotif::GtAg, 50));
+
+        // STARlong: the cap is gone for every motif.
+        scorer.long_read = true;
+        assert!(scorer.stitch_mismatch_allowed(&SpliceMotif::NonCanonical, 1));
+        assert!(scorer.stitch_mismatch_allowed(&SpliceMotif::GcAg, 9));
+        assert!(scorer.stitch_mismatch_allowed(&SpliceMotif::AtAc, 1000));
+    }
+
+    /// `--soloType`-style plumbing check: the flag reaches the scorer from
+    /// the parameters rather than being set by hand at one call site.
+    #[test]
+    fn the_scorer_takes_long_read_from_the_parameters() {
+        let short = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
+        assert!(!AlignmentScorer::from_params(&short).long_read);
+
+        let mut long = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
+        long.long_read = true;
+        assert!(AlignmentScorer::from_params(&long).long_read);
+    }
+
     fn make_test_genome(seq: &[u8]) -> Genome {
         // Create simple genome with one chromosome
         let n_genome = ((seq.len() as u64 + 1) / 64 + 1) * 64; // Pad to 64-byte boundary
@@ -828,6 +894,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -873,6 +940,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -917,6 +985,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -959,6 +1028,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -994,6 +1064,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1027,6 +1098,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1068,6 +1140,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1107,6 +1180,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1147,6 +1221,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1255,6 +1330,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1335,6 +1411,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
@@ -1387,6 +1464,7 @@ mod tests {
             score_ins_base: -2,
             align_intron_min: 21,
             sjdb_score: 2,
+            long_read: false,
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,

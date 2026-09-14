@@ -100,8 +100,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "outFilterMismatchNoverReadLmax",
     "seedNoneLociPerWindow",
     "seedSplitMin",
-    // Long reads.
-    "winReadCoverageBasesMin",
     // Chimeric multimapping.
     "chimFilter",
     "chimMultimapNmax",

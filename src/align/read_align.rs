@@ -2,8 +2,8 @@
 use crate::align::score::{AlignmentScorer, SpliceMotif};
 use crate::align::seed::Seed;
 use crate::align::stitch::{
-    PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
-    stitch_seeds_with_jdb_debug,
+    PE_SPACER_BASE, SeedCluster, cluster_seeds, finalize_transcript, split_combined_wt,
+    stitch_seeds_core, stitch_seeds_with_jdb_debug,
 };
 use crate::align::transcript::{Exon, Transcript};
 use crate::error::Error;
@@ -155,6 +155,30 @@ pub enum PairedAlignmentResult {
 /// - n_for_mapq: effective alignment count for MAPQ calculation (max of transcript count
 ///   and valid cluster count, to avoid undercounting from coordinate dedup on tandem repeats)
 /// - unmapped_reason: `Some(reason)` if no alignments produced, `None` if mapped
+///
+/// STARlong-only per-window read-space seed coverage (`ReadAlign_stitchPieces.cpp`'s
+/// `WC` accumulation): the union, over the window's seeds sorted by read position, of newly
+/// covered read bases. Faithful to upstream's `rLast=0` initialization, which under-counts a
+/// seed starting at read position 0 by one base.
+fn window_read_coverage(cluster: &SeedCluster) -> u64 {
+    let mut wa: Vec<&crate::align::stitch::WindowAlignment> = cluster.alignments.iter().collect();
+    wa.sort_by_key(|a| a.read_pos);
+    let mut cov = 0u64;
+    let mut r_last = 0u64;
+    for a in &wa {
+        let (r1, l1) = (a.read_pos as u64, a.length as u64);
+        if r1 + l1 > r_last + 1 {
+            cov += if r1 > r_last {
+                l1
+            } else {
+                r1 + l1 - (r_last + 1)
+            };
+            r_last = r1 + l1 - 1;
+        }
+    }
+    cov
+}
+
 pub fn align_read(
     read_seq: &[u8],
     read_name: &str,
@@ -271,9 +295,23 @@ pub fn align_read(
     let mut clusters = clusters;
     clusters.truncate(params.align_windows_per_read_nmax);
 
-    // NOTE: STAR's winReadCoverageRelativeMin filter is long-reads-only
-    // (#ifdef COMPILE_FOR_LONG_READS in stitchPieces.cpp). Standard STAR
-    // does NOT filter clusters by seed coverage. Removed to match STAR.
+    // STARlong-only (`-DCOMPILE_FOR_LONG_READS`): drop windows whose read-space seed
+    // coverage falls below both a relative (of the best window) and an absolute floor.
+    // Inert for the short-read `rustar-aligner` binary (winReadCoverageRelativeMin's
+    // default 0.5 only applies once `params.long_read` is set).
+    if params.long_read {
+        let coverage: Vec<u64> = clusters.iter().map(window_read_coverage).collect();
+        let cov_max = coverage.iter().copied().max().unwrap_or(0);
+        let cov_min = cov_max as f64 * params.win_read_coverage_relative_min;
+        clusters = clusters
+            .into_iter()
+            .zip(coverage)
+            .filter(|(_, cov)| {
+                (*cov as f64) >= cov_min && *cov >= params.win_read_coverage_bases_min
+            })
+            .map(|(c, _)| c)
+            .collect();
+    }
 
     // Step 2b: Detect chimeric alignments from multi-cluster seeds (Tier 2)
     let mut chimeric_alignments = Vec::new();
@@ -306,6 +344,7 @@ pub fn align_read(
             &scorer,
             junction_db,
             params.align_transcripts_per_window_nmax,
+            params.long_read,
             debug_name,
         );
         if debug_read {
@@ -2281,5 +2320,59 @@ mod tests {
         let before = items.clone();
         shuffle_tied_prefix(&mut items, |t| t.0, 42);
         assert_eq!(items, before);
+    }
+
+    fn wa(read_pos: usize, length: usize) -> crate::align::stitch::WindowAlignment {
+        crate::align::stitch::WindowAlignment {
+            seed_idx: 0,
+            read_pos,
+            length,
+            genome_pos: read_pos as u64,
+            sa_pos: read_pos as u64,
+            n_rep: 1,
+            is_anchor: true,
+            mate_id: 2,
+            pre_ext_score: 0,
+        }
+    }
+
+    fn cluster_with(alignments: Vec<crate::align::stitch::WindowAlignment>) -> SeedCluster {
+        SeedCluster {
+            alignments,
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 0,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        }
+    }
+
+    #[test]
+    fn window_read_coverage_single_seed() {
+        // One seed covering read[0..10): the `rLast=0` init under-counts a seed starting
+        // at read position 0 by one base (faithful to STAR's own quirk).
+        let cluster = cluster_with(vec![wa(0, 10)]);
+        assert_eq!(window_read_coverage(&cluster), 9);
+    }
+
+    #[test]
+    fn window_read_coverage_seed_not_at_zero() {
+        // A seed starting after position 0 is not subject to the rLast=0 undercount.
+        let cluster = cluster_with(vec![wa(5, 10)]);
+        assert_eq!(window_read_coverage(&cluster), 10);
+    }
+
+    #[test]
+    fn window_read_coverage_union_of_overlapping_seeds() {
+        // Two overlapping seeds: coverage is the union of read bases, not the sum.
+        let cluster = cluster_with(vec![wa(5, 10), wa(10, 10)]);
+        assert_eq!(window_read_coverage(&cluster), 15);
+    }
+
+    #[test]
+    fn window_read_coverage_disjoint_seeds() {
+        let cluster = cluster_with(vec![wa(0, 5), wa(20, 5)]);
+        assert_eq!(window_read_coverage(&cluster), 9);
     }
 }

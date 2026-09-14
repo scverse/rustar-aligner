@@ -25,6 +25,12 @@ exclude = [
 name = "rustar-aligner"
 path = "src/main.rs"
 
+[[bin]]
+# STAR's `STARlong` (`-DCOMPILE_FOR_LONG_READS`): identical CLI, but forces the
+# chaining-DP long-read stitcher (see params::Parameters::long_read).
+name = "rustar-aligner-long"
+path = "src/bin/rustar_aligner_long.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

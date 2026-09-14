@@ -487,6 +487,12 @@ pub struct Parameters {
     #[arg(long = "tempDir")]
     pub temp_dir: Option<PathBuf>,
 
+    /// STAR's `STARlong` mode (chaining-DP stitcher for long reads): not a CLI
+    /// flag, matching native STAR (a separate binary, `-DCOMPILE_FOR_LONG_READS`);
+    /// set by the `rustar-aligner-long` binary entry point after parsing.
+    #[arg(skip)]
+    pub long_read: bool,
+
     // ── Genome ──────────────────────────────────────────────────────────
     /// Path to genome index directory
     #[arg(long = "genomeDir", default_value = "./GenomeDir")]
@@ -1056,6 +1062,10 @@ pub struct Parameters {
     /// Max number of transcripts per window
     #[arg(long = "alignTranscriptsPerWindowNmax", default_value_t = 100)]
     pub align_transcripts_per_window_nmax: usize,
+
+    /// STARlong only: min absolute covered bases per window
+    #[arg(long = "winReadCoverageBasesMin", default_value_t = 0)]
+    pub win_read_coverage_bases_min: u64,
 
     // ── Splice junction database ────────────────────────────────────────
     /// GTF file for splice junction annotations

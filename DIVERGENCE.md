@@ -81,6 +81,25 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 **Source.** See `CLAUDE.md` (PE status) and `STAR-RS-COMPARISON.md`.
 
+### 2.2 Three long reads STARlong does not map at all
+
+On 500 simulated spliced long reads (`test/simulate_long_reads.py`, mean 2.1 kb, every read multi-exon), `rustar-aligner-long` maps three that STARlong 2.7.11b leaves unmapped: `sim_371_Q0105_mRNA_6ex`, `sim_448_Q0105_mRNA_6ex` and `sim_476_Q0115_mRNA_3ex`.
+
+**What STAR does.** It reports all three as `unmapped: other`, not as filtered: `Log.final.out` shows 0 too-short, 0 too-many-mismatches, 3 other. That marker means no window produced a usable transcript, so this is a failure to find the alignment rather than a decision to reject it.
+
+**What rustar-aligner does.** It places them on the mitochondrial transcript they were drawn from, with the same exon structure STAR itself produces for other reads of that transcript:
+
+```
+STAR    sim_140_Q0105  Mito:36540  415M768N14M1404N77M1623N250M1417N46M738N356M
+rustar  sim_371_Q0105  Mito:36540  415M768N28M1404N63M1623N250M1417N50M738N352M
+```
+
+**Why.** These reads are simulated from `Q0105` and `Q0115`, so the locus and the junction set are known, and both match. The alignments are correct.
+
+**Impact.** Three reads on this tier count against raw exactness while being improvements. Not corrected: matching STAR here would mean discarding correct alignments to reproduce a failure.
+
+**Source.** `test/simulate_long_reads.py` for the fixture; STARlong `Log.final.out` for the unmapped classification.
+
 ---
 
 ## 3. Output-file metadata divergences
