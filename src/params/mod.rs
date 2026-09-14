@@ -514,6 +514,11 @@ pub struct Parameters {
     #[arg(long = "genomeSAsparseD", default_value_t = 1)]
     pub genome_sa_sparse_d: u32,
 
+    /// Genome representation to build. `Full` (the default) is an ordinary
+    /// genome; `Transcriptome` and `SuperTranscriptome` are not built here.
+    #[arg(long = "genomeType", default_value = "Full")]
+    pub genome_type: String,
+
     /// Substitute VCF alleles into the genome at genomeGenerate (`None`,
     /// `Haploid`, or `Diploid`). Requires `--genomeTransformVCF`; incompatible
     /// with `--sjdbGTFfile`. `Diploid` is genotype-aware and duplicates the
@@ -1802,6 +1807,30 @@ impl Parameters {
                 ));
             }
         }
+        // --genomeType: `Transcriptome` needs a different index layout
+        // entirely, so it is refused rather than built as something that
+        // silently is not what was asked for. `SuperTranscriptome` condenses
+        // the genome to its annotated exons and therefore needs an annotation.
+        match params.genome_type.as_str() {
+            "Full" => {}
+            "SuperTranscriptome" => {
+                if params.sjdb_gtf_file.is_none() {
+                    return Err(command.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "--genomeType SuperTranscriptome requires --sjdbGTFfile: there is \
+                         nothing to condense without an annotation",
+                    ));
+                }
+            }
+            other => {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--genomeType {other} is not supported; expected Full or SuperTranscriptome"
+                    ),
+                ));
+            }
+        }
         // --readFilesType: only Fastx is supported. Reading pre-aligned SAM
         // input is separate work; refuse rather than silently treating a SAM
         // file as FASTQ.
@@ -2997,5 +3026,24 @@ mod tests {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+    }
+
+    #[test]
+    fn genome_flags_accept_their_defaults_and_refuse_the_rest() {
+        let gg = |extra: &[&str]| {
+            let mut a = vec!["--runMode", "genomeGenerate", "--genomeFastaFiles", "g.fa"];
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+
+        // Defaults parse, and are the STAR ones.
+        let p = gg(&[]).unwrap();
+        assert_eq!(p.genome_type, "Full");
+
+        // The unimplemented genome layouts are refused rather than silently
+        // building an ordinary genome under another name.
+        // SuperTranscriptome is built, but only with an annotation to condense.
+        assert!(gg(&["--genomeType", "SuperTranscriptome"]).is_err());
+        assert!(gg(&["--genomeType", "Transcriptome"]).is_err());
     }
 }

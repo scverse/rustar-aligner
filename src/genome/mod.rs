@@ -1,4 +1,5 @@
 pub mod fasta;
+pub mod supertranscript;
 pub mod transform;
 
 use std::path::Path;
@@ -6,7 +7,7 @@ use std::path::Path;
 use crate::error::Error;
 use crate::params::Parameters;
 
-use fasta::parse_fasta_files;
+use fasta::{Chromosome, parse_fasta_files};
 
 /// STAR's genome spacing character (used for inter-chromosome padding).
 const GENOME_SPACING_CHAR: u8 = 5;
@@ -213,10 +214,25 @@ impl Genome {
             None
         };
 
+        Self::from_chromosomes(&chromosomes, bin_nbits, transform_blocks)
+    }
+
+    /// Lay out a genome from chromosome sequences already in base codes:
+    /// pad each to a `2^chr_bin_nbits` boundary, then fill the
+    /// reverse-complement half.
+    ///
+    /// [`from_fasta`](Self::from_fasta) is this plus FASTA parsing and the
+    /// VCF transform. `--genomeType SuperTranscriptome` uses it directly,
+    /// since its chromosomes are built rather than read.
+    pub fn from_chromosomes(
+        chromosomes: &[Chromosome],
+        bin_nbits: u32,
+        transform_blocks: Option<Vec<[u64; 3]>>,
+    ) -> Result<Self, Error> {
         // First pass: chromosome names/lengths, validating non-zero length.
         let mut chr_name = Vec::new();
         let mut chr_length = Vec::new();
-        for chrom in &chromosomes {
+        for chrom in chromosomes {
             let len = chrom.sequence.len() as u64;
             if len == 0 {
                 return Err(Error::Fasta(format!(

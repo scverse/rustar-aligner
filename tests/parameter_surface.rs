@@ -113,7 +113,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     // Genome index types and transforms.
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
-    "genomeType",
     "sjdbInsertSave",
     // STARsolo barcode chemistry.
     "soloAdapterMismatchesNmax",
