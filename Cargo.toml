@@ -68,6 +68,9 @@ noodles-bgzf = { version = "0.49", features = ["libdeflate"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+# Already a runtime dependency at the same version; listed here so the
+# integration tests can read the gzipped CellRanger-layout matrix files.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 predicates = "3"
 
 [build-dependencies]
