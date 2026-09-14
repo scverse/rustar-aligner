@@ -112,7 +112,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "clip5pAdapterSeq",
     // Genome index types and transforms.
     "genomeSuffixLengthMax",
-    "genomeTransformOutput",
     "genomeType",
     "sjdbInsertSave",
     // STARsolo barcode chemistry.

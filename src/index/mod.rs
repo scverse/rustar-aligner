@@ -42,6 +42,59 @@ pub struct GenomeIndex {
     /// `sjdbOverhang` recorded in `sjdbInfo.txt`. Zero when no sjdb
     /// junctions are present.
     pub sjdb_overhang: u32,
+    /// Populated only for `--genomeTransformOutput SAM`: what the output
+    /// coordinate space is, when it is not the one the search runs against.
+    pub transform_out: Option<TransformOut>,
+}
+
+/// The original genome an alignment is reported against under
+/// `--genomeTransformOutput SAM`.
+///
+/// Reads are searched against the transformed genome, since that is what the
+/// suffix array indexes, and then mapped back through `blocks`. The SAM header
+/// comes from the genome here, not from the searched one: reporting original
+/// coordinates under transformed reference lengths would produce a file no
+/// downstream tool could read correctly.
+#[derive(Clone)]
+pub struct TransformOut {
+    /// The untransformed genome, from `OriginalGenome/`.
+    pub genome: Genome,
+    /// Its annotated junctions, for the motifs recomputed after the transform.
+    pub junctions: SpliceJunctionDb,
+    /// `[transformed_start, length, original_start]`, ascending, sentinel-terminated.
+    pub blocks: Vec<[u64; 3]>,
+}
+
+impl GenomeIndex {
+    /// The genome alignments are *reported* against, which is the searched one
+    /// unless `--genomeTransformOutput SAM` moved output into the original
+    /// coordinate space.
+    pub fn output_genome(&self) -> &Genome {
+        match &self.transform_out {
+            Some(t) => &t.genome,
+            None => &self.genome,
+        }
+    }
+
+    /// Map a transcript into the output coordinate space, dropping it when it
+    /// does not convert. Without a transform this hands back what it was given.
+    pub fn to_output_space(
+        &self,
+        tr: crate::align::transcript::Transcript,
+        params: &Parameters,
+    ) -> Option<crate::align::transcript::Transcript> {
+        let Some(t) = &self.transform_out else {
+            return Some(tr);
+        };
+        crate::genome::transform_align::transform_transcript(
+            &t.genome,
+            &t.junctions,
+            &t.blocks,
+            &tr,
+            params.align_intron_min as u64,
+            params.align_intron_max as u64,
+        )
+    }
 }
 
 /// Output of [`GenomeIndex::build_prep`] — the shared setup
@@ -89,6 +142,9 @@ impl GenomeIndex {
             sa_index,
             junction_db,
             transcriptome,
+            // Built here, not loaded: the back-transform is an align-time
+            // concern and `build` has no index directory to read it from.
+            transform_out: None,
             prepared_junctions,
             sjdb_overhang,
         })

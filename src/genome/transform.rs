@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use crate::error::Error;
 use crate::io::fastq::encode_base;
 
 use super::compute_chr_starts;
@@ -328,6 +329,67 @@ pub fn blocks_to_tsv(blocks: &[[u64; 3]]) -> String {
     s
 }
 
+/// The stop entry appended to a parsed block map.
+///
+/// The back-transform walks forward over the blocks an exon reaches into and
+/// stops on the first one that starts past its end. A sentinel that no
+/// coordinate can reach makes that a plain comparison instead of a bounds test
+/// on every iteration, which is how STAR writes it (`genomeOutLoad`).
+pub const BLOCK_SENTINEL: [u64; 3] = [u64::MAX, 0, 0];
+
+/// Parse `transformGenomeBlocks.tsv` back into the conversion map used by the
+/// align-time back-transform.
+///
+/// The file is written for reverse conversion, so its columns are already
+/// `[transformed_start, length, original_start]` — the order
+/// [`crate::genome::transform_align::transform_transcript`] wants, and the
+/// reverse of the `[u64; 3]` order the build side keeps in memory. The result
+/// is sorted by transformed start and terminated by [`BLOCK_SENTINEL`].
+pub fn blocks_from_tsv(text: &str) -> Result<Vec<[u64; 3]>, Error> {
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| Error::Index("transformGenomeBlocks.tsv is empty".to_string()))?;
+    let declared: usize = header
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            Error::Index(format!(
+                "transformGenomeBlocks.tsv: bad header line {header:?}"
+            ))
+        })?;
+
+    let mut blocks = Vec::with_capacity(declared + 1);
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut f = line.split_whitespace();
+        let mut next = |what: &str| -> Result<u64, Error> {
+            f.next().and_then(|v| v.parse().ok()).ok_or_else(|| {
+                Error::Index(format!("transformGenomeBlocks.tsv: bad {what} in {line:?}"))
+            })
+        };
+        let new_start = next("new_start")?;
+        let length = next("length")?;
+        let orig_start = next("orig_start")?;
+        blocks.push([new_start, length, orig_start]);
+    }
+
+    if blocks.len() != declared {
+        return Err(Error::Index(format!(
+            "transformGenomeBlocks.tsv declares {declared} blocks but has {}",
+            blocks.len()
+        )));
+    }
+    // The map is written in chromosome order, which is already ascending by
+    // transformed start; sorting is a cheap guarantee rather than a fix.
+    blocks.sort_unstable();
+    blocks.push(BLOCK_SENTINEL);
+    Ok(blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +535,25 @@ chr1\t6\t.\tG\tA\t.\t.\t.\tGT\t1/1
         assert_eq!(t.blocks[0][0], 0); // orig_start
         assert_eq!(t.blocks[1][0], 0); // same shared orig_start, not offset
         assert_eq!(t.blocks[1][2], offset); // new_start shifted by hap0's padded genome length
+    }
+
+    #[test]
+    fn block_map_round_trips_through_the_tsv() {
+        // In-memory order is [orig_start, length, new_start]; the file stores
+        // the reverse, which is also what the back-transform reads.
+        let written = vec![[0u64, 50, 0], [55, 100, 50]];
+        let parsed = blocks_from_tsv(&blocks_to_tsv(&written)).unwrap();
+        assert_eq!(
+            parsed,
+            vec![[0, 50, 0], [50, 100, 55], BLOCK_SENTINEL],
+            "the parsed map is keyed on transformed coordinates, plus the stop entry"
+        );
+    }
+
+    #[test]
+    fn a_block_count_that_disagrees_with_the_body_is_an_error() {
+        let text = "3\t-1\n0\t50\t0\n50\t100\t55\n";
+        let err = blocks_from_tsv(text).unwrap_err().to_string();
+        assert!(err.contains("declares 3 blocks but has 2"), "{err}");
     }
 }
