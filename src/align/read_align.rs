@@ -544,15 +544,29 @@ pub fn align_read(
         && !all_raw_transcripts.is_empty()
         && let Some(tr_best) = transcripts.first()
     {
-        use crate::chimeric::detect_chimeric_old;
-        let chims = detect_chimeric_old(
-            &all_raw_transcripts,
-            tr_best,
-            read_seq,
-            read_name,
-            params,
-            index,
-        )?;
+        use crate::chimeric::{detect_chimeric_mult, detect_chimeric_old};
+        // `--chimMultimapNmax > 0` selects STAR's newer enumeration path, which
+        // reports every chimera within the score range instead of only the best.
+        let chims = if params.chim_multimap_nmax > 0 {
+            detect_chimeric_mult(
+                &all_raw_transcripts,
+                tr_best.score,
+                read_seq,
+                read_name,
+                params,
+                index,
+                None,
+            )?
+        } else {
+            detect_chimeric_old(
+                &all_raw_transcripts,
+                tr_best,
+                read_seq,
+                read_name,
+                params,
+                index,
+            )?
+        };
         chimeric_alignments.extend(chims);
     }
 
@@ -1195,29 +1209,23 @@ pub fn align_paired_read(
     // on each mate's transcript pool (joint-pair halves + single-mate WTs combined).
     // Runs before the BothMapped early return so chimeras are reported for all pair outcomes.
     if params.chim_segment_min > 0 {
-        use crate::chimeric::detect_chimeric_old;
-        if let Some(tr_best_m1) = all_m1_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m1_transcripts,
-                tr_best_m1,
-                mate1_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
-        if let Some(tr_best_m2) = all_m2_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m2_transcripts,
-                tr_best_m2,
-                mate2_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
+        use crate::chimeric::{detect_chimeric_mult, detect_chimeric_old};
+        // Same two paths as SE, run once per mate pool. Each pool is a single
+        // mate's read, so there is no mate boundary inside it.
+        let detect = |pool: &[Transcript], seq: &[u8]| -> Result<Vec<_>, Error> {
+            let Some(tr_best) = pool.iter().max_by_key(|t| t.score) else {
+                return Ok(Vec::new());
+            };
+            if params.chim_multimap_nmax > 0 {
+                detect_chimeric_mult(pool, tr_best.score, seq, read_name, params, index, None)
+            } else {
+                detect_chimeric_old(pool, tr_best, seq, read_name, params, index)
+            }
+        };
+        let chims = detect(&all_m1_transcripts, mate1_seq)?;
+        pe_chimeric.extend(chims);
+        let chims = detect(&all_m2_transcripts, mate2_seq)?;
+        pe_chimeric.extend(chims);
         pe_chimeric.retain(|chim| {
             chim.meets_min_segment_length(params.chim_segment_min)
                 && chim.meets_min_score(params.chim_score_min)

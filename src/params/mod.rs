@@ -1165,6 +1165,27 @@ pub struct Parameters {
     #[arg(long = "chimScoreSeparation", default_value_t = 10)]
     pub chim_score_separation: i32,
 
+    /// Post-detection filters for chimeric junctions. `banGenomicN` (the
+    /// default) rejects a junction whose flanking genomic bases include an `N`;
+    /// `None` disables filtering.
+    #[arg(long = "chimFilter", num_args = 1.., default_values_t = vec!["banGenomicN".to_string()])]
+    pub chim_filter: Vec<String>,
+
+    /// Report up to this many chimeric alignments per read. 0 (the default)
+    /// keeps STAR's old single-best behaviour.
+    #[arg(long = "chimMultimapNmax", default_value_t = 0)]
+    pub chim_multimap_nmax: usize,
+
+    /// Score range below the best chimeric score within which multimapping
+    /// chimeras are reported.
+    #[arg(long = "chimMultimapScoreRange", default_value_t = 1)]
+    pub chim_multimap_score_range: i32,
+
+    /// Minimum drop of the best non-chimeric alignment score below the read
+    /// length required before a chimera is considered.
+    #[arg(long = "chimNonchimScoreDropMin", default_value_t = 20)]
+    pub chim_nonchim_score_drop_min: i32,
+
     /// Max multimapping of main chimeric segment
     #[arg(long = "chimMainSegmentMultNmax", default_value_t = 10)]
     pub chim_main_segment_mult_nmax: u32,
@@ -1814,6 +1835,16 @@ impl Parameters {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     format!("--readFilesType {kind} is not supported; expected Fastx"),
+                ));
+            }
+        }
+
+        // Validate --chimFilter.
+        for f in &params.chim_filter {
+            if !matches!(f.as_str(), "banGenomicN" | "None") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("unknown --chimFilter '{f}'; expected banGenomicN or None"),
                 ));
             }
         }
