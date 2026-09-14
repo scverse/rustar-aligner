@@ -52,6 +52,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- `--soloOutRawBarcodes Observed` writes the raw matrix with one column
+  per *observed* barcode instead of one per whitelist barcode, matching
+  what CellRanger's `raw_feature_bc_matrix` contains. Counts are
+  unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
+  **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
