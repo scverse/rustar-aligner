@@ -52,6 +52,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- `--outBAMsortingBinsN` spills the coordinate sort to disk bins
+  instead of holding every record in memory, which is what finally gives
+  `--limitBAMsortRAM` something to bound. Output is unchanged: the
+  binned and in-memory sorts produce byte-identical decoded records.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and

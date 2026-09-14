@@ -658,6 +658,12 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
+    /// Number of bins the coordinate sort spills to. More bins means a smaller
+    /// peak resident set and more temporary files. 0 disables spilling and
+    /// sorts entirely in memory.
+    #[arg(long = "outBAMsortingBinsN", default_value_t = 50)]
+    pub out_bam_sorting_bins_n: usize,
+
     /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
     #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
@@ -756,10 +762,6 @@ pub struct Parameters {
     /// Keep intermediate files after the run.
     #[arg(long = "outTmpKeep", default_value = "None")]
     pub out_tmp_keep: String,
-
-    /// Number of bins used when sorting BAM by coordinate.
-    #[arg(long = "outBAMsortingBinsN", default_value_t = 50)]
-    pub out_bam_sorting_bins_n: usize,
 
     /// Threads used for BAM sorting. 0 selects `--runThreadN`.
     #[arg(long = "outBAMsortingThreadN", default_value_t = 0)]

@@ -56,10 +56,6 @@ const ACCEPTED_BUT_INERT: &[(&str, &str)] = &[
         "an allocation cap on the inserted-junction array",
     ),
     (
-        "outBAMsortingBinsN",
-        "sorting is not binned yet; output is unaffected",
-    ),
-    (
         "outBAMsortingThreadN",
         "BGZF writing is single-threaded; output is unaffected",
     ),
