@@ -595,6 +595,16 @@ pub struct Parameters {
     #[arg(long = "clipAdapterType", default_value = "Hamming")]
     pub clip_adapter_type: String,
 
+    /// 5' adapter sequence to clip, one per mate. Only used by
+    /// `--clipAdapterType CellRanger4`, where it is the 10x template switch
+    /// oligo. `-` (the default) means none.
+    #[arg(long = "clip5pAdapterSeq", default_value = "-")]
+    pub clip5p_adapter_seq: String,
+
+    /// Max mismatch fraction for the 5' adapter.
+    #[arg(long = "clip5pAdapterMMp", default_value_t = 0.1)]
+    pub clip5p_adapter_mmp: f64,
+
     /// 3' adapter sequence to clip (Hamming scan), `-` = none
     #[arg(long = "clip3pAdapterSeq", default_value = "-")]
     pub clip3p_adapter_seq: String,

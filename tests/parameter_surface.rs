@@ -107,9 +107,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "chimMultimapNmax",
     "chimMultimapScoreRange",
     "chimNonchimScoreDropMin",
-    // CellRanger4 adapter clipping.
-    "clip5pAdapterMMp",
-    "clip5pAdapterSeq",
     // Genome index types and transforms.
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
