@@ -506,6 +506,27 @@ fn build_matrix_body(
     ))
 }
 
+/// The whitelist indices that actually appear as a column in the streamed
+/// matrix body, ascending.
+///
+/// Reads the body once rather than tracking the set during counting, so the
+/// default path pays nothing for a feature it does not use.
+fn observed_barcodes(body: &tempfile::NamedTempFile) -> Result<Vec<u32>, Error> {
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        // "<gene> <cb1based> <count>", the layout `finalize_matrix` also parses.
+        if let Some(cb1) = line.split(' ').nth(1)
+            && let Ok(cb) = cb1.parse::<u32>()
+        {
+            seen.insert(cb.saturating_sub(1));
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 /// Write a final `matrix.mtx[.gz]` = MatrixMarket header + (optionally
 /// cb-remapped/filtered) body. With `remap = None` the body is copied verbatim
 /// (raw); with `Some(map)` only columns in the map survive, renumbered to the
@@ -1368,10 +1389,28 @@ pub fn write_gene_matrix(
     let n_genes = ctx.gene_ann.gene_ids.len();
     let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
 
+    // `--soloOutLayout CellRanger`: CellRanger's directory names, and a `-1`
+    // GEM-well suffix on every barcode. The counts are the same either way.
+    let cr_layout = params.solo_out_layout == "CellRanger";
+    let (raw_name, filt_name) = if cr_layout {
+        ("raw_feature_bc_matrix", "filtered_feature_bc_matrix")
+    } else {
+        ("raw", "filtered")
+    };
+    let cb_suffix = if cr_layout { "-1" } else { "" };
+    // CellRanger has no per-feature directory. Drop ours when there is exactly
+    // one feature; keep it when there are several, because collapsing them
+    // would have each feature silently overwrite the last.
+    let per_feature_dir = !cr_layout || ctx.features.len() > 1;
+
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
     for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
-        let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
-        let raw_dir = feature_dir.join("raw");
+        let feature_dir = if per_feature_dir {
+            params.output_path(&format!("{solo_dir}{}/", feature.dir_name()))
+        } else {
+            params.output_path(&solo_dir)
+        };
+        let raw_dir = feature_dir.join(raw_name);
         std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
 
         // Stream the deduplicated counts into a shared temp body, then finalize
@@ -1392,26 +1431,58 @@ pub fn write_gene_matrix(
             &ctx.gene_ann.gene_names,
             gzip,
         )?;
-        write_barcodes(
-            &raw_dir.join(&barcodes_name),
-            &ctx.whitelist,
-            sorted.len(),
-            gzip,
-        )?;
+        // `--soloOutRawBarcodes Observed` narrows the raw matrix to the
+        // barcodes that actually carry a count, which is what CellRanger's
+        // `raw_feature_bc_matrix` holds. STARsolo's raw matrix has a column per
+        // whitelist barcode, so the default keeps that.
+        let observed: Option<Vec<u32>> = if params.solo_out_raw_barcodes == "Observed" {
+            Some(observed_barcodes(&body)?)
+        } else {
+            None
+        };
+        let (raw_cols, raw_remap) = match &observed {
+            Some(cbs) => {
+                let map: HashMap<u32, u32> = cbs
+                    .iter()
+                    .enumerate()
+                    .map(|(col, &cb)| (cb, col as u32 + 1))
+                    .collect();
+                (cbs.len(), Some(map))
+            }
+            None => (sorted.len(), None),
+        };
+        match &observed {
+            Some(cbs) => {
+                write_barcodes_subset(
+                    &raw_dir.join(&barcodes_name),
+                    &ctx.whitelist,
+                    cbs,
+                    gzip,
+                    cb_suffix,
+                )?;
+            }
+            None => write_barcodes(
+                &raw_dir.join(&barcodes_name),
+                &ctx.whitelist,
+                sorted.len(),
+                gzip,
+                cb_suffix,
+            )?,
+        }
         finalize_matrix(
             &body,
             &raw_dir.join(&matrix_name),
             gzip,
             n_genes,
-            sorted.len(),
+            raw_cols,
             mstats.nnz,
-            None,
+            raw_remap.as_ref(),
         )?;
         log::info!(
-            "STARsolo: wrote {}/raw matrix ({} genes × {} barcodes, {} entries){}",
-            feature.dir_name(),
+            "STARsolo: wrote {} matrix ({} genes × {} barcodes, {} entries){}",
+            raw_dir.display(),
             n_genes,
-            sorted.len(),
+            raw_cols,
             mstats.nnz,
             if gzip { " [gzip]" } else { "" },
         );
@@ -1456,7 +1527,7 @@ pub fn write_gene_matrix(
         if let Some(cbs) = called
             && !cbs.is_empty()
         {
-            let filt_dir = feature_dir.join("filtered");
+            let filt_dir = feature_dir.join(filt_name);
             std::fs::create_dir_all(&filt_dir).map_err(|e| Error::io(e, &filt_dir))?;
             let remap: HashMap<u32, u32> = cbs
                 .iter()
@@ -1469,7 +1540,13 @@ pub fn write_gene_matrix(
                 &ctx.gene_ann.gene_names,
                 gzip,
             )?;
-            write_barcodes_subset(&filt_dir.join(&barcodes_name), &ctx.whitelist, &cbs, gzip)?;
+            write_barcodes_subset(
+                &filt_dir.join(&barcodes_name),
+                &ctx.whitelist,
+                &cbs,
+                gzip,
+                cb_suffix,
+            )?;
             let fnnz = finalize_matrix(
                 &body,
                 &filt_dir.join(&matrix_name),
@@ -1480,8 +1557,8 @@ pub fn write_gene_matrix(
                 Some(&remap),
             )?;
             log::info!(
-                "STARsolo: wrote {}/filtered matrix ({} cells, {} entries)",
-                feature.dir_name(),
+                "STARsolo: wrote {} matrix ({} cells, {} entries)",
+                filt_dir.display(),
                 cbs.len(),
                 fnnz,
             );
@@ -1593,11 +1670,14 @@ pub fn write_gene_matrix(
         write_file(&sj_dir.join(&features_name), gzip, |w| {
             sjs.write_sj_lines(w, genome, params).map(|_| ())
         })?;
+        // SJ has no CellRanger counterpart, but every barcode written by one run
+        // is spelled the same way, so the suffix applies here too.
         write_barcodes(
             &sj_dir.join(&barcodes_name),
             &ctx.whitelist,
             sorted.len(),
             gzip,
+            cb_suffix,
         )?;
         let umi_len = params.solo_umi_len as usize;
         let nnz = build_sj_matrix(
@@ -1633,6 +1713,7 @@ pub fn write_gene_matrix(
             &ctx.whitelist,
             sorted.len(),
             gzip,
+            cb_suffix,
         )?;
         let umi_len = params.solo_umi_len as usize;
         // `--soloVelocytoAmbiguous no` folds exon-only molecules into spliced and
@@ -2087,16 +2168,21 @@ fn write_features(
     Ok(())
 }
 
-/// Unpack `cb` into `line` (with trailing newline) and write it.
+/// Unpack `cb` into `line` (with `suffix` and a trailing newline) and write it.
+///
+/// `suffix` is `"-1"` under `--soloOutLayout CellRanger` (the GEM-well tag
+/// CellRanger appends to every barcode) and `""` otherwise.
 fn write_one_barcode(
     w: &mut dyn std::io::Write,
     whitelist: &CbWhitelist,
     cb: u32,
     line: &mut Vec<u8>,
     path: &Path,
+    suffix: &str,
 ) -> Result<(), Error> {
     line.clear();
     whitelist.unpack_barcode_into(cb, line);
+    line.extend_from_slice(suffix.as_bytes());
     line.push(b'\n');
     w.write_all(line).map_err(|e| Error::io(e, path))
 }
@@ -2104,12 +2190,18 @@ fn write_one_barcode(
 /// `barcodes.tsv`: full whitelist in sorted order (matches the raw matrix
 /// columns). Lists millions of lines, so the writer is buffered and the barcode
 /// is unpacked into a reused scratch buffer (no per-line allocation).
-fn write_barcodes(path: &Path, whitelist: &CbWhitelist, n: usize, gzip: bool) -> Result<(), Error> {
+fn write_barcodes(
+    path: &Path,
+    whitelist: &CbWhitelist,
+    n: usize,
+    gzip: bool,
+    suffix: &str,
+) -> Result<(), Error> {
     let len = whitelist.barcode_len();
     write_file(path, gzip, |w| {
-        let mut line: Vec<u8> = Vec::with_capacity(len + 1);
+        let mut line: Vec<u8> = Vec::with_capacity(len + suffix.len() + 1);
         for i in 0..n {
-            write_one_barcode(w, whitelist, i as u32, &mut line, path)?;
+            write_one_barcode(w, whitelist, i as u32, &mut line, path, suffix)?;
         }
         Ok(())
     })?;
@@ -2123,12 +2215,13 @@ fn write_barcodes_subset(
     whitelist: &CbWhitelist,
     cbs: &[u32],
     gzip: bool,
+    suffix: &str,
 ) -> Result<(), Error> {
     let len = whitelist.barcode_len();
     write_file(path, gzip, |w| {
-        let mut line: Vec<u8> = Vec::with_capacity(len + 1);
+        let mut line: Vec<u8> = Vec::with_capacity(len + suffix.len() + 1);
         for &cb in cbs {
-            write_one_barcode(w, whitelist, cb, &mut line, path)?;
+            write_one_barcode(w, whitelist, cb, &mut line, path, suffix)?;
         }
         Ok(())
     })?;
@@ -2331,6 +2424,30 @@ mod tests {
     use super::*;
     use crate::io::fastq::encode_base;
     use crate::solo::whitelist::pack_barcode;
+
+    /// `--soloOutLayout CellRanger` appends the `-1` GEM-well suffix that
+    /// CellRanger puts on every barcode; the default writes the bare barcode.
+    #[test]
+    fn barcodes_carry_the_gem_well_suffix_only_under_the_cellranger_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let wl_path = dir.path().join("wl.txt");
+        std::fs::write(&wl_path, "ACGT\nTGCA\n").unwrap();
+        let wl = CbWhitelist::load(&wl_path).unwrap();
+
+        let plain = dir.path().join("plain.tsv");
+        write_barcodes(&plain, &wl, wl.len(), false, "").unwrap();
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "ACGT\nTGCA\n");
+
+        let cr = dir.path().join("cr.tsv");
+        write_barcodes(&cr, &wl, wl.len(), false, "-1").unwrap();
+        assert_eq!(std::fs::read_to_string(&cr).unwrap(), "ACGT-1\nTGCA-1\n");
+
+        // The subset writer (filtered matrix, and the raw one under
+        // `--soloOutRawBarcodes Observed`) takes the same suffix.
+        let sub = dir.path().join("sub.tsv");
+        write_barcodes_subset(&sub, &wl, &[1], false, "-1").unwrap();
+        assert_eq!(std::fs::read_to_string(&sub).unwrap(), "TGCA-1\n");
+    }
 
     #[test]
     fn median_sorted_odd_even_empty() {
