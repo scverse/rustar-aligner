@@ -538,6 +538,9 @@ impl SoloRecorder {
 /// Everything the alignment loop needs to quantify a solo run, shared as an
 /// `Arc` across rayon threads. The gene model is built from `--sjdbGTFfile`;
 /// the whitelist and stats are read concurrently (interior atomics).
+// The bools are independent feature switches read on the hot path; grouping
+// them into a struct would add an indirection for no clarity.
+#[allow(clippy::struct_excessive_bools)]
 pub struct SoloContext {
     pub layout: SoloBarcodeLayout,
     pub whitelist: CbWhitelist,
@@ -580,6 +583,48 @@ pub struct SoloContext {
     /// since building the transcriptome costs a GTF pass.
     pub transcriptome: Option<crate::quant::transcriptome::TranscriptomeIndex>,
     pub transcript3p: Option<Mutex<crate::solo::transcript3p::Transcript3pAcc>>,
+    /// `--soloOutLayout CellRanger`: write `metrics_summary.csv`, which needs
+    /// the Q30 tallies and the full positional funnel.
+    pub want_metrics: bool,
+    /// Base-quality tallies for the three `Q30 Bases in ...` metrics.
+    pub q30: Q30Stats,
+}
+
+/// Bases seen and bases at Phred ≥ 30, split the way CellRanger's
+/// `metrics_summary.csv` splits them: the cell barcode, the UMI, and the cDNA
+/// read. Only populated when `--soloOutLayout CellRanger` asks for the metrics.
+#[derive(Default)]
+pub struct Q30Stats {
+    pub cb_bases: AtomicU64,
+    pub cb_q30: AtomicU64,
+    pub umi_bases: AtomicU64,
+    pub umi_q30: AtomicU64,
+    pub rna_bases: AtomicU64,
+    pub rna_q30: AtomicU64,
+}
+
+impl Q30Stats {
+    /// Tally one read's barcode-read and cDNA-read qualities.
+    ///
+    /// Qualities are raw FASTQ bytes, Phred+33, so a Phred of 30 is the byte
+    /// `'?'` (63). The cDNA quality is the **unclipped** read, which is what
+    /// CellRanger reports on.
+    pub fn record(&self, bc: Option<&CellBarcode>, rna_qual: &[u8]) {
+        const Q30: u8 = 30 + 33;
+        let tally = |bases: &AtomicU64, q30: &AtomicU64, q: &[u8]| {
+            if q.is_empty() {
+                return;
+            }
+            bases.fetch_add(q.len() as u64, Ordering::Relaxed);
+            let n = q.iter().filter(|&&b| b >= Q30).count() as u64;
+            q30.fetch_add(n, Ordering::Relaxed);
+        };
+        if let Some(bc) = bc {
+            tally(&self.cb_bases, &self.cb_q30, &bc.cb_qual);
+            tally(&self.umi_bases, &self.umi_q30, &bc.umi_qual);
+        }
+        tally(&self.rna_bases, &self.rna_q30, rna_qual);
+    }
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -695,6 +740,7 @@ impl SoloContext {
         let velocyto_enabled = params.solo_features.iter().any(|f| f == "Velocyto");
         let transcript3p = params.solo_features.iter().any(|f| f == "Transcript3p");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
+        let want_metrics = params.solo_out_layout == "CellRanger";
 
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
@@ -734,6 +780,8 @@ impl SoloContext {
                 .transpose()?,
             transcript3p: transcript3p
                 .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
+            want_metrics,
+            q30: Q30Stats::default(),
         })
     }
 
@@ -759,15 +807,26 @@ impl SoloContext {
         n_loci: usize,
         barcode: Option<&CellBarcode>,
         junctions: &[(u64, u64)],
+        rna_qual: &[u8],
     ) -> SoloReadOutcome {
         let mut out = SoloReadOutcome::default();
+
+        // Base qualities for `metrics_summary.csv`. Tallied before any early
+        // return, so every read reaching this point is counted exactly once.
+        if self.want_metrics {
+            self.q30.record(barcode, rna_qual);
+        }
 
         // One-pass classification: the two overlap queries are shared between the
         // per-feature gene assignment and the CellRanger-style mapping funnel, so
         // this is no more work than the old per-feature `assign_gene_se` calls.
-        let want_exon = self.features.contains(&SoloFeature::Gene);
+        let want_exon = self.features.contains(&SoloFeature::Gene) || self.want_metrics;
         // Velocyto assigns its gene by gene-body overlap, so it needs `want_body`.
-        let want_body = self.features.contains(&SoloFeature::GeneFull) || self.velocyto_enabled;
+        // `metrics_summary.csv` reports the exonic/intronic split, which is the
+        // same query, so it asks for it too.
+        let want_body = self.features.contains(&SoloFeature::GeneFull)
+            || self.velocyto_enabled
+            || self.want_metrics;
         let class = classify_read(
             cdna_transcripts,
             &self.gene_ann,
@@ -1002,6 +1061,7 @@ impl SoloContext {
         pairs: &[(&Transcript, &Transcript)],
         barcode: Option<&CellBarcode>,
         junctions: &[(u64, u64)],
+        rna_qual: &[u8],
     ) -> SoloReadOutcome {
         // Effective transcripts: give both mates of a pair the pair's strand
         // (mate 1's), so `classify_read`'s per-transcript strand filter treats them
@@ -1013,7 +1073,7 @@ impl SoloContext {
             eff.push((*m1).clone());
             eff.push(m2c);
         }
-        self.process_read(&eff, pairs.len(), barcode, junctions)
+        self.process_read(&eff, pairs.len(), barcode, junctions, rna_qual)
     }
 }
 
