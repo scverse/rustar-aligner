@@ -12,6 +12,81 @@ use crate::params::{IntronMotifFilter, IntronStrandFilter, MultimapperOrder, Par
 use crate::stats::UnmappedReason;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+/// Why a transcript was dropped by the quality filters.
+///
+/// A fixed set of counters rather than a `HashMap<&str, i32>`: this is built
+/// once per read and incremented per filtered transcript, so the map cost a
+/// heap allocation per read and a string hash per increment. The counts feed
+/// two debug logs and the `unmapped_reason` decision below, all of which ask
+/// only whether a count is non-zero, so nothing here can reach the output
+/// except through that decision.
+#[derive(Default, Clone, Copy)]
+struct FilterReasons {
+    counts: [u32; FilterReasons::N],
+}
+
+impl FilterReasons {
+    const N: usize = 9;
+    const NAMES: [&'static str; Self::N] = [
+        "score_min",
+        "score_min_relative",
+        "mismatch_max",
+        "mismatch_rate",
+        "match_min",
+        "match_min_relative",
+        "noncanonical_junction",
+        "noncanonical_unannotated_junction",
+        "inconsistent_strand",
+    ];
+
+    const SCORE_MIN: usize = 0;
+    const SCORE_MIN_RELATIVE: usize = 1;
+    const MISMATCH_MAX: usize = 2;
+    const MISMATCH_RATE: usize = 3;
+    const MATCH_MIN: usize = 4;
+    const MATCH_MIN_RELATIVE: usize = 5;
+    const NONCANONICAL_JUNCTION: usize = 6;
+    const NONCANONICAL_UNANNOTATED_JUNCTION: usize = 7;
+    const INCONSISTENT_STRAND: usize = 8;
+
+    #[inline]
+    fn add(&mut self, reason: usize) {
+        self.counts[reason] += 1;
+    }
+
+    #[inline]
+    fn has(&self, reason: usize) -> bool {
+        self.counts[reason] > 0
+    }
+
+    /// Any reason other than the two mismatch ones.
+    #[inline]
+    fn has_non_mismatch(&self) -> bool {
+        self.counts
+            .iter()
+            .enumerate()
+            .any(|(i, &c)| c > 0 && i != Self::MISMATCH_MAX && i != Self::MISMATCH_RATE)
+    }
+}
+
+impl std::fmt::Debug for FilterReasons {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        write!(f, "{{")?;
+        for (i, &c) in self.counts.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            if !first {
+                write!(f, ", ")?;
+            }
+            first = false;
+            write!(f, "{}: {}", Self::NAMES[i], c)?;
+        }
+        write!(f, "}}")
+    }
+}
+
 /// Derive a deterministic per-read RNG seed from `run_rng_seed` + the read name.
 ///
 /// STAR seeds `std::mt19937` once per chunk/thread (`runRNGseed*(iChunk+1)`),
@@ -408,24 +483,24 @@ pub fn align_read(
 
     // Log filtering statistics
     let pre_filter_count = transcripts.len();
-    let mut filter_reasons = std::collections::HashMap::new();
+    let mut filter_reasons = FilterReasons::default();
 
     transcripts.retain(|t| {
         // Absolute score threshold
         if t.score < params.out_filter_score_min {
-            *filter_reasons.entry("score_min").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::SCORE_MIN);
             return false;
         }
 
         // Relative score threshold: STAR casts to intScore (i32)
         if t.score < (params.out_filter_score_min_over_lread * lread_m1) as i32 {
-            *filter_reasons.entry("score_min_relative").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::SCORE_MIN_RELATIVE);
             return false;
         }
 
         // Absolute mismatch count
         if t.n_mismatch > params.out_filter_mismatch_nmax {
-            *filter_reasons.entry("mismatch_max").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::MISMATCH_MAX);
             log::debug!(
                 "Filtered {}: {} mismatches > {} max (read_len={}, score={})",
                 read_name,
@@ -440,7 +515,7 @@ pub fn align_read(
         // Relative mismatch count (mismatches / read_length)
         let mismatch_rate = t.n_mismatch as f64 / read_length;
         if mismatch_rate > params.out_filter_mismatch_nover_lmax {
-            *filter_reasons.entry("mismatch_rate").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::MISMATCH_RATE);
             log::debug!(
                 "Filtered {}: {:.1}% mismatch rate > {:.1}% max ({}/{} bases, score={})",
                 read_name,
@@ -456,13 +531,13 @@ pub fn align_read(
         // Absolute matched bases
         let n_matched = t.n_matched();
         if n_matched < params.out_filter_match_nmin as usize {
-            *filter_reasons.entry("match_min").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::MATCH_MIN);
             return false;
         }
 
         // Relative matched bases: STAR casts to uint (u32)
         if (n_matched as f64) < params.out_filter_match_nmin_over_lread * lread_m1 {
-            *filter_reasons.entry("match_min_relative").or_insert(0) += 1;
+            filter_reasons.add(FilterReasons::MATCH_MIN_RELATIVE);
             return false;
         }
 
@@ -474,7 +549,7 @@ pub fn align_read(
             IntronMotifFilter::RemoveNoncanonical => {
                 // Reject if any junction is non-canonical
                 if t.junction_motifs.contains(&SpliceMotif::NonCanonical) {
-                    *filter_reasons.entry("noncanonical_junction").or_insert(0) += 1;
+                    filter_reasons.add(FilterReasons::NONCANONICAL_JUNCTION);
                     return false;
                 }
             }
@@ -485,9 +560,7 @@ pub fn align_read(
                     .zip(t.junction_annotated.iter())
                     .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated)
                 {
-                    *filter_reasons
-                        .entry("noncanonical_unannotated_junction")
-                        .or_insert(0) += 1;
+                    filter_reasons.add(FilterReasons::NONCANONICAL_UNANNOTATED_JUNCTION);
                     return false;
                 }
             }
@@ -511,7 +584,7 @@ pub fn align_read(
                 }
             }
             if has_plus && has_minus {
-                *filter_reasons.entry("inconsistent_strand").or_insert(0) += 1;
+                filter_reasons.add(FilterReasons::INCONSISTENT_STRAND);
                 return false;
             }
         }
@@ -638,11 +711,9 @@ pub fn align_read(
     // if the quality filter emptied the set, the best transcript failed → classify
     // short/mismatch; otherwise, if too many loci survive, it's multi; else mapped.
     let unmapped_reason = if transcripts.is_empty() {
-        let has_mismatch = filter_reasons.contains_key("mismatch_max")
-            || filter_reasons.contains_key("mismatch_rate");
-        let has_other = filter_reasons
-            .keys()
-            .any(|k| *k != "mismatch_max" && *k != "mismatch_rate");
+        let has_mismatch = filter_reasons.has(FilterReasons::MISMATCH_MAX)
+            || filter_reasons.has(FilterReasons::MISMATCH_RATE);
+        let has_other = filter_reasons.has_non_mismatch();
         if has_mismatch && !has_other {
             Some(UnmappedReason::TooManyMismatches)
         } else {
@@ -1702,14 +1773,17 @@ mod tests {
     fn test_unmapped_reason_mismatch_classification() {
         // Verify the filter_reasons logic used to derive unmapped_reason.
         // mismatch-only → TooManyMismatches; anything else (or mixed) → TooShort.
-        let classify = |reasons: &[&str]| -> UnmappedReason {
-            let filter_reasons: std::collections::HashMap<&str, i32> =
-                reasons.iter().map(|k| (*k, 1)).collect();
-            let has_mismatch = filter_reasons.contains_key("mismatch_max")
-                || filter_reasons.contains_key("mismatch_rate");
-            let has_other = filter_reasons
-                .keys()
-                .any(|k| *k != "mismatch_max" && *k != "mismatch_rate");
+        // Drives `FilterReasons` itself rather than re-implementing the
+        // decision: the previous version of this test kept its own copy of the
+        // logic, so it would have passed even if the shipped code had changed.
+        let classify = |reasons: &[usize]| -> UnmappedReason {
+            let mut filter_reasons = FilterReasons::default();
+            for &r in reasons {
+                filter_reasons.add(r);
+            }
+            let has_mismatch = filter_reasons.has(FilterReasons::MISMATCH_MAX)
+                || filter_reasons.has(FilterReasons::MISMATCH_RATE);
+            let has_other = filter_reasons.has_non_mismatch();
             if has_mismatch && !has_other {
                 UnmappedReason::TooManyMismatches
             } else {
@@ -1718,25 +1792,31 @@ mod tests {
         };
 
         assert_eq!(
-            classify(&["mismatch_max"]),
+            classify(&[FilterReasons::MISMATCH_MAX]),
             UnmappedReason::TooManyMismatches
         );
         assert_eq!(
-            classify(&["mismatch_rate"]),
+            classify(&[FilterReasons::MISMATCH_RATE]),
             UnmappedReason::TooManyMismatches
         );
         assert_eq!(
-            classify(&["mismatch_max", "mismatch_rate"]),
+            classify(&[FilterReasons::MISMATCH_MAX, FilterReasons::MISMATCH_RATE]),
             UnmappedReason::TooManyMismatches
         );
         // Mixed with score filter → TooShort
         assert_eq!(
-            classify(&["mismatch_max", "score_min"]),
+            classify(&[FilterReasons::MISMATCH_MAX, FilterReasons::SCORE_MIN]),
             UnmappedReason::TooShort
         );
         // Score-only → TooShort
-        assert_eq!(classify(&["score_min"]), UnmappedReason::TooShort);
-        assert_eq!(classify(&["match_min"]), UnmappedReason::TooShort);
+        assert_eq!(
+            classify(&[FilterReasons::SCORE_MIN]),
+            UnmappedReason::TooShort
+        );
+        assert_eq!(
+            classify(&[FilterReasons::MATCH_MIN]),
+            UnmappedReason::TooShort
+        );
     }
 
     #[test]
