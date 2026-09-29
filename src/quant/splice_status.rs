@@ -1,5 +1,8 @@
 //! Bulk spliced / unspliced / ambiguous gene quantification
-//! (`--quantMode GeneVelocyto`, a rustar-aligner extension).
+//! (`--quantMode GeneSplicing`, a rustar-aligner extension).
+//!
+//! Provenance: the classification is a port of STARsolo's Velocyto feature;
+//! only the STAR source file names below still carry that name.
 //!
 //! STARsolo's `--soloFeatures Velocyto` classifies every read against every
 //! annotated transcript that contains it, then collapses those per-transcript
@@ -78,9 +81,9 @@ impl AlignVsTranscript {
     }
 }
 
-/// Velocyto category of one read for one gene.
+/// Splicing status of one read for one gene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VelocytoCategory {
+pub enum SpliceStatus {
     /// Compatible only with exonic (mature) models.
     Spliced = 0,
     /// Requires an intronic (pre-mRNA) model.
@@ -91,14 +94,14 @@ pub enum VelocytoCategory {
 
 /// Outcome of classifying one read under one strand convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadVelocyto {
+pub enum ReadSplicing {
     /// No transcript on the selected strand contains the read (or every
     /// containing transcript rejected it).
     NoFeature,
     /// Containing transcripts belong to more than one gene.
     MultiGene,
     /// One gene, one category.
-    Gene(u32, VelocytoCategory),
+    Gene(u32, SpliceStatus),
 }
 
 /// Strand conventions, in output column order (same as `ReadsPerGene.out.tab`).
@@ -136,7 +139,7 @@ impl StrandMode {
     }
 }
 
-/// A genomic alignment reduced to what the Velocyto classifier reads: its
+/// A genomic alignment reduced to what the classifier reads: its
 /// aligned blocks with indels merged (STAR expands a block across
 /// `canonSJ` -1/-2), whether it has a splice junction (`sjYes`), and the
 /// strand of read 1 (`aG.Str`).
@@ -358,7 +361,7 @@ pub fn transcript_types(align: &AlignBlocks, idx: &TranscriptomeIndex, out: &mut
 pub fn collapse_gene_category(
     types: impl IntoIterator<Item = (usize, u8)>,
     idx: &TranscriptomeIndex,
-) -> ReadVelocyto {
+) -> ReadSplicing {
     const INTRON: u8 = 1 << AlignVsTranscript::Intron as u8;
     const EXON_INTRON: u8 = 1 << AlignVsTranscript::ExonIntron as u8;
     const SPAN: u8 = 1 << AlignVsTranscript::ExonIntronSpan as u8;
@@ -373,7 +376,7 @@ pub fn collapse_gene_category(
         let g = idx.tr_gene_idx[tr];
         match gene {
             None => gene = Some(g),
-            Some(g0) if g0 != g => return ReadVelocyto::MultiGene,
+            Some(g0) if g0 != g => return ReadSplicing::MultiGene,
             Some(_) => {}
         }
         let has = |bit: u8| ty & bit != 0;
@@ -383,21 +386,21 @@ pub fn collapse_gene_category(
         intron_model |= has(INTRON) && !has(EXON_INTRON) && !has(CONCORDANT);
     }
     let Some(g) = gene else {
-        return ReadVelocyto::NoFeature;
+        return ReadSplicing::NoFeature;
     };
     let cat = if exon_model && !intron_model && !mixed_model {
-        VelocytoCategory::Spliced
+        SpliceStatus::Spliced
     } else if span_model || ((intron_model || mixed_model) && !exon_model) {
-        VelocytoCategory::Unspliced
+        SpliceStatus::Unspliced
     } else {
-        VelocytoCategory::Ambiguous
+        SpliceStatus::Ambiguous
     };
-    ReadVelocyto::Gene(g, cat)
+    ReadSplicing::Gene(g, cat)
 }
 
 /// Classify one uniquely mapped read (or pair) under the three strand
 /// conventions, in [`StrandMode::ALL`] order.
-pub fn classify_read(align: &AlignBlocks, idx: &TranscriptomeIndex) -> [ReadVelocyto; 3] {
+pub fn classify_read(align: &AlignBlocks, idx: &TranscriptomeIndex) -> [ReadSplicing; 3] {
     let mut types = Vec::new();
     transcript_types(align, idx, &mut types);
     // STAR's per-UMI intersection works on transcript-sorted lists; for a
@@ -419,8 +422,8 @@ pub fn classify_read(align: &AlignBlocks, idx: &TranscriptomeIndex) -> [ReadVelo
 // Counters + output
 // ---------------------------------------------------------------------------
 
-/// Thread-safe counters for `ReadsPerGeneVelocyto.out.tab`.
-pub struct VelocytoCounts {
+/// Thread-safe counters for `ReadsPerGeneSplicing.out.tab`.
+pub struct SplicingCounts {
     /// Per gene: `[strand mode][category]`, flattened as `mode * 3 + cat`.
     per_gene: Vec<[AtomicU64; 9]>,
     /// Reads that did not map (including too-many-loci), as in GeneCounts.
@@ -434,10 +437,10 @@ pub struct VelocytoCounts {
     pub n_multi_gene: [AtomicU64; 3],
 }
 
-impl VelocytoCounts {
+impl SplicingCounts {
     /// Zeroed counters for `n_genes` genes.
     pub fn new(n_genes: usize) -> Self {
-        VelocytoCounts {
+        SplicingCounts {
             per_gene: (0..n_genes)
                 .map(|_| std::array::from_fn(|_| AtomicU64::new(0)))
                 .collect(),
@@ -448,16 +451,16 @@ impl VelocytoCounts {
         }
     }
 
-    fn record(&self, classes: &[ReadVelocyto; 3]) {
+    fn record(&self, classes: &[ReadSplicing; 3]) {
         for (mode, class) in classes.iter().enumerate() {
             match *class {
-                ReadVelocyto::NoFeature => {
+                ReadSplicing::NoFeature => {
                     self.n_no_feature[mode].fetch_add(1, Ordering::Relaxed);
                 }
-                ReadVelocyto::MultiGene => {
+                ReadSplicing::MultiGene => {
                     self.n_multi_gene[mode].fetch_add(1, Ordering::Relaxed);
                 }
-                ReadVelocyto::Gene(g, cat) => {
+                ReadSplicing::Gene(g, cat) => {
                     self.per_gene[g as usize][mode * 3 + cat as usize]
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -516,7 +519,7 @@ impl VelocytoCounts {
         t
     }
 
-    /// Write `ReadsPerGeneVelocyto.out.tab`: a header line, then one line per
+    /// Write `ReadsPerGeneSplicing.out.tab`: a header line, then one line per
     /// gene (`geneInfo.tab` order) with spliced / unspliced / ambiguous
     /// counts for each strand convention.
     pub fn write_table(&self, path: &Path, idx: &TranscriptomeIndex) -> Result<(), Error> {
@@ -544,7 +547,7 @@ impl VelocytoCounts {
         std::fs::write(path, out).map_err(|e| Error::io(e, path))
     }
 
-    /// Write `ReadsPerGeneVelocyto.summary.tsv`: read accounting and the
+    /// Write `ReadsPerGeneSplicing.summary.tsv`: read accounting and the
     /// spliced / unspliced / ambiguous shares for each strand convention.
     pub fn write_summary(&self, path: &Path) -> Result<(), Error> {
         let mut f = std::fs::File::create(path).map_err(|e| Error::io(e, path))?;
@@ -780,7 +783,7 @@ mod tests {
         }
     }
 
-    fn classify(t: &Transcript, idx: &TranscriptomeIndex) -> [ReadVelocyto; 3] {
+    fn classify(t: &Transcript, idx: &TranscriptomeIndex) -> [ReadSplicing; 3] {
         classify_read(&AlignBlocks::from_transcript(t), idx)
     }
 
@@ -790,10 +793,10 @@ mod tests {
         let idx = index();
         let g1 = gene(&idx, "G1");
         let r = classify(&aln(&g, 0, &[(2050, 2100)], false), &idx);
-        assert_eq!(r[0], ReadVelocyto::Gene(g1, VelocytoCategory::Spliced));
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Spliced));
+        assert_eq!(r[0], ReadSplicing::Gene(g1, SpliceStatus::Spliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Spliced));
         // Reverse library: a + read is antisense to G1, no feature.
-        assert_eq!(r[2], ReadVelocyto::NoFeature);
+        assert_eq!(r[2], ReadSplicing::NoFeature);
     }
 
     #[test]
@@ -802,7 +805,7 @@ mod tests {
         let idx = index();
         let g1 = gene(&idx, "G1");
         let r = classify(&aln(&g, 0, &[(1650, 1700), (2000, 2050)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Spliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Spliced));
     }
 
     #[test]
@@ -812,7 +815,7 @@ mod tests {
         let idx = index();
         let g1 = gene(&idx, "G1");
         let r = classify(&aln(&g, 0, &[(1300, 1350)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Ambiguous));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Ambiguous));
     }
 
     #[test]
@@ -822,10 +825,10 @@ mod tests {
         let idx = index();
         let g1 = gene(&idx, "G1");
         let r = classify(&aln(&g, 0, &[(1955, 1990)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Unspliced));
         // Exon/intron boundary read of a constitutive exon: unspliced.
         let r = classify(&aln(&g, 0, &[(1680, 1730)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Unspliced));
     }
 
     #[test]
@@ -837,9 +840,9 @@ mod tests {
         let g2 = gene(&idx, "G2");
         // Read on - strand = sense for G2.
         let r = classify(&aln(&g, 0, &[(1800, 1850)], true), &idx);
-        assert_eq!(r[0], ReadVelocyto::MultiGene); // unstranded: G1 intron + G2 exon
-        assert_eq!(r[1], ReadVelocyto::Gene(g2, VelocytoCategory::Spliced));
-        assert_eq!(r[2], ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced));
+        assert_eq!(r[0], ReadSplicing::MultiGene); // unstranded: G1 intron + G2 exon
+        assert_eq!(r[1], ReadSplicing::Gene(g2, SpliceStatus::Spliced));
+        assert_eq!(r[2], ReadSplicing::Gene(g1, SpliceStatus::Unspliced));
     }
 
     #[test]
@@ -847,10 +850,10 @@ mod tests {
         let g = genome();
         let idx = index();
         let r = classify(&aln(&g, 0, &[(8000, 8050)], false), &idx);
-        assert_eq!(r, [ReadVelocyto::NoFeature; 3]);
+        assert_eq!(r, [ReadSplicing::NoFeature; 3]);
         // Protruding past a transcript end: not contained, no feature.
         let r = classify(&aln(&g, 0, &[(5280, 5330)], false), &idx);
-        assert_eq!(r, [ReadVelocyto::NoFeature; 3]);
+        assert_eq!(r, [ReadSplicing::NoFeature; 3]);
     }
 
     #[test]
@@ -860,10 +863,10 @@ mod tests {
         let g3 = gene(&idx, "G3");
         // First base of the first exon to within the exon.
         let r = classify(&aln(&g, 0, &[(5000, 5050)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g3, VelocytoCategory::Spliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g3, SpliceStatus::Spliced));
         // Last bases of the last exon.
         let r = classify(&aln(&g, 0, &[(5250, 5300)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g3, VelocytoCategory::Spliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g3, SpliceStatus::Spliced));
     }
 
     #[test]
@@ -872,7 +875,7 @@ mod tests {
         let idx = index();
         let mt = gene(&idx, "MT1");
         let r = classify(&aln(&g, 1, &[(200, 250)], false), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(mt, VelocytoCategory::Spliced));
+        assert_eq!(r[1], ReadSplicing::Gene(mt, SpliceStatus::Spliced));
     }
 
     #[test]
@@ -883,8 +886,8 @@ mod tests {
         let y = gene(&idx, "PAR1_PAR_Y");
         let rx = classify(&aln(&g, 2, &[(350, 400)], false), &idx);
         let ry = classify(&aln(&g, 3, &[(350, 400)], false), &idx);
-        assert_eq!(rx[1], ReadVelocyto::Gene(x, VelocytoCategory::Unspliced));
-        assert_eq!(ry[1], ReadVelocyto::Gene(y, VelocytoCategory::Unspliced));
+        assert_eq!(rx[1], ReadSplicing::Gene(x, SpliceStatus::Unspliced));
+        assert_eq!(ry[1], ReadSplicing::Gene(y, SpliceStatus::Unspliced));
     }
 
     #[test]
@@ -905,7 +908,7 @@ mod tests {
             combined_n_match: 85,
         };
         let r = classify_read(&AlignBlocks::from_pair(&pair), &idx);
-        assert_eq!(r[1], ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced));
+        assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Unspliced));
     }
 
     #[test]
@@ -934,34 +937,34 @@ mod tests {
         let t2 = idx.tr_ids.iter().position(|t| t == "T2").unwrap();
         let g1 = gene(&idx, "G1");
         let span = AlignVsTranscript::ExonIntronSpan.type_bits();
-        let cases: &[(&[(usize, u8)], ReadVelocyto)] = &[
-            (&[], ReadVelocyto::NoFeature),
-            (&[(t1a, V_C), (t2, V_C)], ReadVelocyto::MultiGene),
+        let cases: &[(&[(usize, u8)], ReadSplicing)] = &[
+            (&[], ReadSplicing::NoFeature),
+            (&[(t1a, V_C), (t2, V_C)], ReadSplicing::MultiGene),
             (
                 &[(t1a, V_C), (t1b, V_C)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Spliced),
+                ReadSplicing::Gene(g1, SpliceStatus::Spliced),
             ),
             (
                 &[(t1a, V_I), (t1b, V_I)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced),
+                ReadSplicing::Gene(g1, SpliceStatus::Unspliced),
             ),
             (
                 &[(t1a, V_EI)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced),
+                ReadSplicing::Gene(g1, SpliceStatus::Unspliced),
             ),
             (
                 &[(t1a, span), (t1b, span)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Unspliced),
+                ReadSplicing::Gene(g1, SpliceStatus::Unspliced),
             ),
             (
                 &[(t1a, V_I), (t1b, V_C)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Ambiguous),
+                ReadSplicing::Gene(g1, SpliceStatus::Ambiguous),
             ),
             // STAR: a span in one model plus an only-exonic model is "spliced"
             // (the span sets neither exonModel, intronModel nor mixedModel).
             (
                 &[(t1a, span), (t1b, V_C)],
-                ReadVelocyto::Gene(g1, VelocytoCategory::Spliced),
+                ReadSplicing::Gene(g1, SpliceStatus::Spliced),
             ),
         ];
         for (types, want) in cases {
@@ -977,7 +980,7 @@ mod tests {
     fn counts_table_and_summary() {
         let g = genome();
         let idx = index();
-        let counts = VelocytoCounts::new(idx.gene_ids.len());
+        let counts = SplicingCounts::new(idx.gene_ids.len());
         // spliced (constitutive exon), unspliced (intron 2), ambiguous
         // (retained intron), unmapped, multimapper, no feature.
         counts.count_se_read(&[aln(&g, 0, &[(2050, 2100)], false)], &idx);
