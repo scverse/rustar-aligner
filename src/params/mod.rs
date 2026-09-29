@@ -1352,6 +1352,12 @@ impl Parameters {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
     }
 
+    /// Whether WithinBAM supplementary records are hard-clipped (STAR's
+    /// `pCh.out.bamHardClip`): `HardClip` is the default, `SoftClip` turns it off.
+    pub fn chim_out_bam_hard_clip(&self) -> bool {
+        !self.chim_out_type.iter().any(|s| s == "SoftClip")
+    }
+
     /// True if the user provided a non-default `--outSAMattrRGline`.
     pub fn rg_line_set(&self) -> bool {
         !self.out_sam_attr_rg_line.is_empty() && self.out_sam_attr_rg_line[0] != "-"
