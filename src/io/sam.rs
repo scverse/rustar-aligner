@@ -3,6 +3,7 @@ use crate::align::read_align::PairedAlignment;
 use crate::align::transcript::{Transcript, cigar_to_string};
 use crate::error::Error;
 use crate::genome::Genome;
+use crate::io::encode::{RecordEncoder, RecordFormat};
 use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
@@ -32,6 +33,13 @@ use std::path::Path;
 #[derive(Default)]
 pub struct BufferedSamRecords {
     pub records: Vec<RecordBuf>,
+    /// `records` (plus any `--chimOutType WithinBAM` supplementary records)
+    /// already serialized for the main output on an align worker (#223).
+    /// When set, `records` has been emptied and the writer only appends these
+    /// bytes.
+    pub encoded: Option<Vec<u8>>,
+    /// Same, for this read's `--quantMode TranscriptomeSAM` records.
+    pub encoded_transcriptome: Option<Vec<u8>>,
 }
 
 impl BufferedSamRecords {
@@ -39,6 +47,8 @@ impl BufferedSamRecords {
     pub fn new() -> Self {
         Self {
             records: Vec::with_capacity(10000),
+            encoded: None,
+            encoded_transcriptome: None,
         }
     }
 
@@ -73,6 +83,31 @@ fn insert_unmapped_tags(record: &mut RecordBuf, attrs: SamAttributes, reason: Un
         UnmappedReason::TooManyLoci => b'3',
     };
     data.insert(Tag::new(b'u', b'T'), Value::Character(ut));
+}
+
+/// Debug check: panic if a record's CIGAR query length disagrees with its SEQ.
+pub(crate) fn check_cigar_seq_len(record: &RecordBuf) {
+    let cigar_ops = record.cigar().as_ref();
+    let cigar_query_len: usize = cigar_ops
+        .iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum();
+    let seq_len = record.sequence().len();
+    if cigar_query_len != seq_len && !cigar_ops.is_empty() {
+        let name = record
+            .name()
+            .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
+            .unwrap_or_default();
+        panic!(
+            "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
+            name,
+            cigar_query_len,
+            seq_len,
+            record.flags(),
+            cigar_to_string(cigar_ops)
+        );
+    }
 }
 
 /// SAM file writer
@@ -170,30 +205,20 @@ impl SamWriter {
     /// * `batch` - Slice of records to write
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
         for record in batch {
-            // Debug: validate CIGAR vs SEQ length before writing
-            let cigar_ops = record.cigar().as_ref();
-            let cigar_query_len: usize = cigar_ops
-                .iter()
-                .filter(|op| op.kind().consumes_read())
-                .map(|op| op.len())
-                .sum();
-            let seq_len = record.sequence().len();
-            if cigar_query_len != seq_len && !cigar_ops.is_empty() {
-                let name = record
-                    .name()
-                    .map(|n| String::from_utf8_lossy(n.as_ref()).to_string())
-                    .unwrap_or_default();
-                panic!(
-                    "[SAM-MISMATCH] read={} cigar_query_len={} seq_len={} flags={:?} cigar={}",
-                    name,
-                    cigar_query_len,
-                    seq_len,
-                    record.flags(),
-                    cigar_to_string(cigar_ops)
-                );
-            }
+            check_cigar_seq_len(record);
             self.writer.write_alignment_record(&self.header, record)?;
         }
+        Ok(())
+    }
+
+    /// Encoder producing exactly what [`SamWriter::write_batch`] writes.
+    pub fn encoder(&self) -> RecordEncoder {
+        RecordEncoder::new(RecordFormat::Sam, &self.header).with_cigar_check()
+    }
+
+    /// Append records serialized by [`SamWriter::encoder`].
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        std::io::Write::write_all(self.writer.get_mut(), bytes)?;
         Ok(())
     }
 
@@ -880,6 +905,17 @@ impl SamStdoutWriter {
         for record in batch {
             self.writer.write_alignment_record(&self.header, record)?;
         }
+        Ok(())
+    }
+
+    /// Encoder producing exactly what [`SamStdoutWriter::write_batch`] writes.
+    pub fn encoder(&self) -> RecordEncoder {
+        RecordEncoder::new(RecordFormat::Sam, &self.header)
+    }
+
+    /// Append records serialized by [`SamStdoutWriter::encoder`].
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        std::io::Write::write_all(self.writer.get_mut(), bytes)?;
         Ok(())
     }
 }
