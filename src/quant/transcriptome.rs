@@ -1565,31 +1565,22 @@ fn rebuild_cigar_without_softclips(
         end_idx -= 1;
     }
 
-    let body = &cigar[start_idx..end_idx];
-    for (i, op) in body.iter().enumerate() {
-        if i == 0 && left_clip > 0 {
-            // Fold left_clip into the first op if it's match-like.
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch => out.push(op.add_len(left_clip)),
-                _ => {
-                    // Extension landed on a non-match op (shouldn't normally
-                    // happen).  Emit as Match.
-                    out.push(Op::new(Kind::Match, left_clip));
-                    out.push(*op);
-                }
-            }
-        } else if i + 1 == body.len() && right_clip > 0 {
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch => {
-                    out.push(op.add_len(right_clip));
-                }
-                _ => {
-                    out.push(*op);
-                    out.push(Op::new(Kind::Match, right_clip));
-                }
-            }
-        } else {
-            out.push(*op);
+    // Fold each clip into its own end independently: with a single-op body
+    // (e.g. `1S97M2S`) both clips land on the same op.
+    out.extend_from_slice(&cigar[start_idx..end_idx]);
+    let is_match = |op: &Op| matches!(op.kind(), Kind::Match | Kind::SequenceMatch);
+    if left_clip > 0 {
+        match out.first_mut() {
+            Some(op) if is_match(op) => *op = op.add_len(left_clip),
+            // Extension landed on a non-match op (should not normally
+            // happen): emit it as Match.
+            _ => out.insert(0, Op::new(Kind::Match, left_clip)),
+        }
+    }
+    if right_clip > 0 {
+        match out.last_mut() {
+            Some(op) if is_match(op) => *op = op.add_len(right_clip),
+            _ => out.push(Op::new(Kind::Match, right_clip)),
         }
     }
     out
@@ -3070,5 +3061,38 @@ mod tests {
         // The test genome is all A; the - strand target reads as T.
         assert_eq!(lines[1..].concat(), "T".repeat(100));
         assert_eq!(lines[1].len(), 60);
+    }
+
+    #[test]
+    fn softclip_rebuild_folds_both_clips_into_a_single_op() {
+        use cigar::op::{Kind, Op};
+        let c = |v: &[(Kind, usize)]| v.iter().map(|&(k, n)| Op::new(k, n)).collect::<Vec<_>>();
+        // 1S97M2S (seen on 2x100 human reads): both clips on the one M.
+        assert_eq!(
+            rebuild_cigar_without_softclips(
+                &c(&[(Kind::SoftClip, 1), (Kind::Match, 97), (Kind::SoftClip, 2)]),
+                1,
+                2
+            ),
+            c(&[(Kind::Match, 100)])
+        );
+        assert_eq!(
+            rebuild_cigar_without_softclips(
+                &c(&[
+                    (Kind::SoftClip, 3),
+                    (Kind::Match, 40),
+                    (Kind::Skip, 500),
+                    (Kind::Match, 50),
+                    (Kind::SoftClip, 7)
+                ]),
+                3,
+                7
+            ),
+            c(&[(Kind::Match, 43), (Kind::Skip, 500), (Kind::Match, 57)])
+        );
+        assert_eq!(
+            rebuild_cigar_without_softclips(&c(&[(Kind::Match, 98), (Kind::SoftClip, 2)]), 0, 2),
+            c(&[(Kind::Match, 100)])
+        );
     }
 }
