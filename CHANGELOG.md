@@ -29,6 +29,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Bulk total RNA-seq: spliced / unspliced gene counts and pre-mRNA-aware
+  TranscriptomeSAM** (rustar-aligner extensions, opt-in, see DIVERGENCE.md
+  1.4 and the "Bulk total RNA-seq" guide).
+  - `--quantMode GeneVelocyto` writes `ReadsPerGeneVelocyto.out.tab`
+    (spliced / unspliced / ambiguous per gene for the unstranded, forward and
+    reverse strand conventions) and `ReadsPerGeneVelocyto.summary.tsv`, using
+    STARsolo's Velocyto classification on each read or pair.
+  - `--quantTranscriptomePreMRNA BanRetainedIntron` keeps unspliced reads
+    that overlap a retained intron out of that gene's transcripts in
+    `Aligned.toTranscriptome.out.bam`, so retained-intron isoforms stop
+    absorbing pre-mRNA reads. Default `Keep` is STAR's behaviour.
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 

@@ -66,6 +66,23 @@ The site that acts on those zeroed counts, however, gates on a different flag (`
 
 ---
 
+### 1.4 Bulk total-RNA options: `--quantMode GeneVelocyto` and `--quantTranscriptomePreMRNA`
+
+Both are rustar-aligner extensions with no STAR equivalent. They are opt-in; with the defaults (no `GeneVelocyto`, `--quantTranscriptomePreMRNA Keep`) no output changes, which `tests/bulk_unspliced.rs` (`new_options_leave_existing_outputs_unchanged`) checks.
+
+**What STAR does.** STAR classifies reads as spliced / unspliced / ambiguous only for single-cell runs (`--soloFeatures Velocyto`, `Transcriptome_classifyAlign.cpp` + `SoloFeature_countVelocyto.cpp`). For bulk, `--quantMode GeneCounts` counts exonic reads only. `--quantMode TranscriptomeSAM` projects every alignment onto every transcript whose exons contain it (`Transcriptome_quantAlign.cpp`), so an unspliced read inside an intron that another isoform retains is projected onto the retaining isoform only.
+
+**What rustar-aligner does.**
+
+- `--quantMode GeneVelocyto` runs a port of STARsolo's Velocyto classification (`alignToTranscriptMinOverlap` with `minOverlapMinusOne = 6` and the 1 Mb intron cap, then the per-UMI collapse of `countVelocyto`) on each uniquely mapped read or pair, one read standing for one UMI, and writes `ReadsPerGeneVelocyto.out.tab` / `.summary.tsv` for the three strand conventions of `ReadsPerGene.out.tab`. Two details differ from `classifyAlign`: the containment test uses the true leftmost / rightmost aligned base of the pair, where STAR uses the first block's start and the last block's end (a `TODO` next to that line in STAR flags the case where mate 2 ends before mate 1); and blocks are sorted by position before the scan, so STAR's early exit at the last exon also holds for overlapping mates.
+- `--quantTranscriptomePreMRNA BanRetainedIntron` drops, before projection, the transcripts of any gene whose retained-intron intervals (an intron of one isoform covered, with both flanks, by one exon of another isoform of the same gene) an unspliced read or pair overlaps.
+
+**Why.** In ribo-depleted total RNA, a large share of reads is pre-mRNA. STAR's projection gives the intronic ones to retained-intron isoforms, so isoform proportions follow the library's pre-mRNA content (see the PR for measurements, and COMBINE-lab/salmon#1229 for the same effect with Salmon decoys). Bulk users have no STAR option that reports how much of a library is unspliced.
+
+**Impact.** Only when the options are given. `BanRetainedIntron` removes records from `Aligned.toTranscriptome.out.bam` (never adds or changes one); genuinely expressed retained-intron isoforms lose their distinguishing reads, which is documented in the bulk total-RNA guide.
+
+**Source.** `src/quant/velocyto.rs`, `src/quant/transcriptome.rs` (`RetainedIntrons`, `filter_and_project`), `src/quant/mod.rs` (`QuantContext`). STAR: `Transcriptome_classifyAlign.cpp`, `SoloFeature_countVelocyto.cpp`, `Transcriptome_quantAlign.cpp`.
+
 ## 2. Cases where rustar-aligner outperforms STAR
 
 These are not chosen divergences and not bugs: rustar-aligner reports a **higher-scoring, correct** alignment that STAR misses. They are listed here so the differential benchmark's non-exact reads are fully accounted for.

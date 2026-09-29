@@ -79,6 +79,10 @@ You can request both modes in the same run:
 
 This emits `ReadsPerGene.out.tab` *and* `Aligned.toTranscriptome.out.bam` in addition to the normal alignment output.
 
+## Total RNA (ribo-depleted) libraries
+
+For libraries with a large pre-mRNA content, `--quantMode GeneVelocyto` adds spliced / unspliced / ambiguous counts per gene and `--quantTranscriptomePreMRNA BanRetainedIntron` keeps pre-mRNA reads out of retained-intron isoforms in the transcriptome BAM. Both are rustar-aligner extensions; see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
+
 ## Index-time vs alignment-time
 
 For best speed, supply `--sjdbGTFfile` at `--runMode genomeGenerate` time and the transcript-level data structures get persisted into the genome directory. Then at alignment time you only need `--quantMode TranscriptomeSAM` (or `GeneCounts`); rustar-aligner reuses the persisted annotations.

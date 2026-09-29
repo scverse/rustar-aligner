@@ -85,6 +85,10 @@ gene_id    unstranded    forward_stranded    reverse_stranded
 
 The first four rows are summary categories: `N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`. Subsequent rows are per-gene counts. Pick the column matching your library's strandedness — see the [quantification guide](/rustar-aligner/guides/quantification/).
 
+### `sample_ReadsPerGeneVelocyto.out.tab` / `sample_ReadsPerGeneVelocyto.summary.tsv`
+
+Written when `--quantMode GeneVelocyto` is set (rustar-aligner extension, not in STAR). The table has a header line and one line per gene with spliced, unspliced and ambiguous counts for the unstranded, forward and reverse strand conventions (nine count columns). The summary gives read accounting and the spliced / unspliced / ambiguous fractions per strand convention. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
+
 ## Unmapped reads
 
 ### `sample_Unmapped.out.mate1` / `sample_Unmapped.out.mate2`
