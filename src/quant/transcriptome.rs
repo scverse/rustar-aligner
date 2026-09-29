@@ -95,6 +95,54 @@ impl QuantTranscriptomeSAMoutput {
     }
 }
 
+/// `--quantTranscriptomeUnspliced` (rustar-aligner extension, not in STAR):
+/// add one unspliced target per gene to the transcriptome so that pre-mRNA
+/// reads have somewhere to go besides retained-intron isoforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuantTranscriptomeUnspliced {
+    /// STAR behaviour: annotated transcripts only.
+    #[default]
+    None,
+    /// `<gene_id>-I`: the union of the gene's annotated introns, each merged
+    /// interval extended by the flank on both sides (clipped to the gene body)
+    /// and merged again, concatenated in genome order (splici-style).
+    Intron,
+    /// `<gene_id>-I`: the whole gene body (first to last annotated base).
+    PreMRNA,
+}
+
+impl std::str::FromStr for QuantTranscriptomeUnspliced {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "None" => Ok(Self::None),
+            "Intron" => Ok(Self::Intron),
+            "PreMRNA" => Ok(Self::PreMRNA),
+            _ => Err(format!(
+                "unknown --quantTranscriptomeUnspliced '{s}'; expected 'None', 'Intron' or 'PreMRNA'"
+            )),
+        }
+    }
+}
+
+/// Unspliced intervals of one gene: `(chr, strand, merged [start, end))`.
+pub type GeneIntervals = (usize, u8, Vec<(u64, u64)>);
+
+/// Suffix of the unspliced target names (`<gene_id>-I`, as in splici).
+pub const UNSPLICED_SUFFIX: &str = "-I";
+
+/// Marks a [`TranscriptomeIndex`] extended with unspliced targets: indices
+/// `first..n_transcripts()` are the `<gene_id>-I` targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsplicedTargets {
+    /// Index of the first unspliced target (= number of annotated transcripts).
+    pub first: usize,
+    /// How the targets were built.
+    pub mode: QuantTranscriptomeUnspliced,
+    /// Flank added around each merged intron (`Intron` mode).
+    pub flank: u64,
+}
+
 /// `--quantTranscriptomePreMRNA` (rustar-aligner extension, not in STAR):
 /// what to do with alignments that are indistinguishable between pre-mRNA
 /// and a retained-intron isoform before projecting onto the transcriptome.
@@ -225,6 +273,19 @@ impl RetainedIntrons {
     }
 }
 
+/// Sort and merge overlapping or touching `[start, end)` intervals.
+fn merge_intervals(mut iv: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    iv.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(iv.len());
+    for (s, e) in iv {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
 /// Per-transcript exon in absolute genome coordinates (0-based half-open),
 /// paired with the cumulative transcript-space length of all preceding exons
 /// (STAR's `exLenCum`).
@@ -285,6 +346,9 @@ pub struct TranscriptomeIndex {
     /// Retained-intron intervals, set only under
     /// `--quantTranscriptomePreMRNA BanRetainedIntron`.
     pub retained_introns: Option<std::sync::Arc<RetainedIntrons>>,
+    /// Set when unspliced `<gene_id>-I` targets were appended
+    /// (`--quantTranscriptomeUnspliced Intron|PreMRNA`).
+    pub unspliced: Option<UnsplicedTargets>,
 }
 
 impl TranscriptomeIndex {
@@ -491,6 +555,7 @@ impl TranscriptomeIndex {
             tr_starts_sorted,
             tr_end_max_sorted,
             retained_introns: None,
+            unspliced: None,
         })
     }
 
@@ -509,6 +574,192 @@ impl TranscriptomeIndex {
     /// Number of transcripts indexed.
     pub fn n_transcripts(&self) -> usize {
         self.tr_ids.len()
+    }
+
+    /// Whether transcript `tr` is an unspliced `<gene_id>-I` target.
+    pub fn is_unspliced_target(&self, tr: usize) -> bool {
+        self.unspliced.is_some_and(|u| tr >= u.first)
+    }
+
+    /// Unspliced intervals of every gene, indexed by gene: `(chr, strand,
+    /// merged [start, end) intervals)`, or `None` for a gene with no interval
+    /// (a single-exon gene in `Intron` mode). A gene is taken on the
+    /// chromosome and strand of its first transcript; transcripts elsewhere
+    /// (e.g. pseudo-autosomal copies sharing a gene_id) are ignored here.
+    pub fn unspliced_intervals(
+        &self,
+        mode: QuantTranscriptomeUnspliced,
+        flank: u64,
+    ) -> Vec<Option<GeneIntervals>> {
+        let n_genes = self.gene_ids.len();
+        let mut home: Vec<Option<(usize, u8)>> = vec![None; n_genes];
+        let mut body: Vec<(u64, u64)> = vec![(u64::MAX, 0); n_genes];
+        let mut introns: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_genes];
+        let n_annot = self.unspliced.map_or(self.n_transcripts(), |u| u.first);
+        for tr in 0..n_annot {
+            let g = self.tr_gene_idx[tr] as usize;
+            let key = (self.tr_chr_idx[tr], self.tr_strand[tr]);
+            if *home[g].get_or_insert(key) != key {
+                continue;
+            }
+            body[g].0 = body[g].0.min(self.tr_start[tr]);
+            body[g].1 = body[g].1.max(self.tr_end[tr]);
+            for w in self.tr_exons[tr].windows(2) {
+                if w[1].genome_start > w[0].genome_end {
+                    introns[g].push((w[0].genome_end, w[1].genome_start));
+                }
+            }
+        }
+        (0..n_genes)
+            .map(|g| {
+                let (chr, strand) = home[g]?;
+                let (bs, be) = body[g];
+                let iv = match mode {
+                    QuantTranscriptomeUnspliced::None => return None,
+                    QuantTranscriptomeUnspliced::PreMRNA => vec![(bs, be)],
+                    QuantTranscriptomeUnspliced::Intron => {
+                        let merged = merge_intervals(std::mem::take(&mut introns[g]));
+                        let flanked = merged
+                            .into_iter()
+                            .map(|(s, e)| (s.saturating_sub(flank).max(bs), (e + flank).min(be)))
+                            .collect();
+                        merge_intervals(flanked)
+                    }
+                };
+                (!iv.is_empty()).then_some((chr, strand, iv))
+            })
+            .collect()
+    }
+
+    /// A copy of this index with one unspliced target per gene appended after
+    /// the annotated transcripts, in gene order, named `<gene_id>-I`. The
+    /// annotated transcripts keep their indices and relative order.
+    #[must_use]
+    pub fn with_unspliced_targets(&self, mode: QuantTranscriptomeUnspliced, flank: u64) -> Self {
+        let mut idx = self.clone();
+        let first = idx.n_transcripts();
+        for (g, iv) in self
+            .unspliced_intervals(mode, flank)
+            .into_iter()
+            .enumerate()
+        {
+            let Some((chr, strand, iv)) = iv else {
+                continue;
+            };
+            let mut cum = 0u32;
+            let exons: Vec<TrExon> = iv
+                .iter()
+                .map(|&(s, e)| {
+                    let ex = TrExon {
+                        genome_start: s,
+                        genome_end: e,
+                        ex_len_cum: cum,
+                    };
+                    cum = cum.saturating_add((e - s) as u32);
+                    ex
+                })
+                .collect();
+            idx.tr_ids
+                .push(format!("{}{UNSPLICED_SUFFIX}", self.gene_ids[g]));
+            idx.tr_chr_idx.push(chr);
+            idx.tr_strand.push(strand);
+            idx.tr_gene_idx.push(g as u32);
+            idx.tr_start.push(iv[0].0);
+            idx.tr_end.push(iv[iv.len() - 1].1);
+            idx.tr_exons.push(exons);
+            idx.tr_length.push(cum);
+            idx.tr_exi.push(0);
+        }
+        // Rebuild the sorted views. The sort is stable and annotated
+        // transcripts come first, so their relative order is unchanged.
+        let n_tr = idx.n_transcripts();
+        let mut order: Vec<usize> = (0..n_tr).collect();
+        order.sort_by(|&a, &b| {
+            idx.tr_start[a]
+                .cmp(&idx.tr_start[b])
+                .then_with(|| idx.tr_end[a].cmp(&idx.tr_end[b]))
+        });
+        let mut cum = 0u32;
+        for &i in &order {
+            idx.tr_exi[i] = cum;
+            cum = cum.saturating_add(idx.tr_exons[i].len() as u32);
+        }
+        idx.tr_starts_sorted = order.iter().map(|&i| idx.tr_start[i]).collect();
+        let mut m = 0u64;
+        idx.tr_end_max_sorted = order
+            .iter()
+            .map(|&i| {
+                m = m.max(idx.tr_end[i]);
+                m
+            })
+            .collect();
+        idx.tr_order = order;
+        idx.unspliced = Some(UnsplicedTargets { first, mode, flank });
+        idx
+    }
+
+    /// Write `target_id, gene_id, gene_name, status, length` for every target
+    /// (annotated transcripts `spliced`, `<gene_id>-I` targets `unspliced`),
+    /// in BAM `@SQ` order: a tx2gene table for tximport / summarisation.
+    pub fn write_targets_tsv(&self, path: &Path) -> Result<(), Error> {
+        use std::fmt::Write as _;
+        let mut out = String::from("target_id\tgene_id\tgene_name\tstatus\tlength\n");
+        for tr in 0..self.n_transcripts() {
+            let g = self.tr_gene_idx[tr] as usize;
+            let status = if self.is_unspliced_target(tr) {
+                "unspliced"
+            } else {
+                "spliced"
+            };
+            let _ = writeln!(
+                out,
+                "{}\t{}\t{}\t{status}\t{}",
+                self.tr_ids[tr],
+                self.gene_ids.get(g).map_or("", String::as_str),
+                self.gene_names.get(g).map_or("", String::as_str),
+                self.tr_length[tr]
+            );
+        }
+        std::fs::write(path, out).map_err(|e| Error::io(e, path))
+    }
+
+    /// Write the sequences of the unspliced targets (in transcript
+    /// orientation: reverse-complemented for `-` genes) as FASTA, 60 bases per
+    /// line. Salmon's alignment mode needs them next to the transcript FASTA.
+    pub fn write_unspliced_fasta(&self, path: &Path, genome: &Genome) -> Result<(), Error> {
+        let Some(u) = self.unspliced else {
+            return Ok(());
+        };
+        let f = std::fs::File::create(path).map_err(|e| Error::io(e, path))?;
+        let mut w = std::io::BufWriter::new(f);
+        let io = |e| Error::io(e, path);
+        const ACGTN: [u8; 5] = *b"ACGTN";
+        for tr in u.first..self.n_transcripts() {
+            let mut seq: Vec<u8> = Vec::with_capacity(self.tr_length[tr] as usize);
+            for ex in &self.tr_exons[tr] {
+                for pos in ex.genome_start..ex.genome_end {
+                    seq.push(ACGTN[(genome.sequence.base(pos as usize) as usize).min(4)]);
+                }
+            }
+            if self.tr_strand[tr] == 2 {
+                seq.reverse();
+                for b in &mut seq {
+                    *b = match *b {
+                        b'A' => b'T',
+                        b'C' => b'G',
+                        b'G' => b'C',
+                        b'T' => b'A',
+                        x => x,
+                    };
+                }
+            }
+            writeln!(w, ">{}", self.tr_ids[tr]).map_err(io)?;
+            for chunk in seq.chunks(60) {
+                w.write_all(chunk).map_err(io)?;
+                w.write_all(b"\n").map_err(io)?;
+            }
+        }
+        w.flush().map_err(io)
     }
 
     /// Load from STAR-compatible index files in `dir`.
@@ -607,6 +858,7 @@ impl TranscriptomeIndex {
             tr_starts_sorted,
             tr_end_max_sorted,
             retained_introns: None,
+            unspliced: None,
         })
     }
 
@@ -1318,6 +1570,10 @@ pub fn filter_and_project(
     };
 
     let mut projected = align_to_transcripts(&align_for_projection, idx, lread);
+    if fragment_spliced && idx.unspliced.is_some() {
+        // A fragment crossing a junction is processed RNA: spliced targets only.
+        projected.retain(|p| !idx.is_unspliced_target(p.chr_idx));
+    }
     if let Some(ri) = &idx.retained_introns
         && !fragment_spliced
     {
@@ -2882,5 +3138,194 @@ mod tests {
         let ri = ban.retained_introns.as_ref().unwrap();
         assert_eq!(ri.n_alignments_banned.load(Ordering::Relaxed), 2);
         assert_eq!(ri.n_projections_banned.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn unspliced_mode_from_str() {
+        use std::str::FromStr;
+        for (v, m) in [
+            ("None", QuantTranscriptomeUnspliced::None),
+            ("Intron", QuantTranscriptomeUnspliced::Intron),
+            ("PreMRNA", QuantTranscriptomeUnspliced::PreMRNA),
+        ] {
+            assert_eq!(QuantTranscriptomeUnspliced::from_str(v).unwrap(), m);
+        }
+        assert!(QuantTranscriptomeUnspliced::from_str("intron").is_err());
+        let p = default_params();
+        assert_eq!(
+            p.quant_transcriptome_unspliced,
+            QuantTranscriptomeUnspliced::None
+        );
+        assert_eq!(p.quant_transcriptome_unspliced_flank, -1);
+    }
+
+    #[test]
+    fn unspliced_intervals_intron_and_premrna() {
+        let idx = retained_intron_index();
+        let g1 = idx.gene_ids.iter().position(|g| g == "G1").unwrap();
+        let g2 = idx.gene_ids.iter().position(|g| g == "G2").unwrap();
+        let iv = |mode, flank| idx.unspliced_intervals(mode, flank);
+        let intron0 = iv(QuantTranscriptomeUnspliced::Intron, 0);
+        // Union of every isoform's introns (the retained intron included).
+        assert_eq!(intron0[g1], Some((0, 1, vec![(200, 300), (400, 500)])));
+        assert_eq!(intron0[g2], Some((1, 1, vec![(1200, 1300)])));
+        let intron10 = iv(QuantTranscriptomeUnspliced::Intron, 10);
+        assert_eq!(
+            intron10[g1].as_ref().unwrap().2,
+            vec![(190, 310), (390, 510)]
+        );
+        // Flanks are clipped to the gene body and merged when they meet.
+        let intron150 = iv(QuantTranscriptomeUnspliced::Intron, 150);
+        assert_eq!(intron150[g1].as_ref().unwrap().2, vec![(100, 600)]);
+        let pre = iv(QuantTranscriptomeUnspliced::PreMRNA, 0);
+        assert_eq!(pre[g1].as_ref().unwrap().2, vec![(100, 600)]);
+        assert_eq!(pre[g2].as_ref().unwrap().2, vec![(1100, 1400)]);
+    }
+
+    #[test]
+    fn single_exon_gene_has_no_intron_target() {
+        let genome = make_genome();
+        let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
+        let ext = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 10);
+        assert_eq!(ext.n_transcripts(), 1);
+        let ext = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::PreMRNA, 10);
+        assert_eq!(ext.tr_ids, ["T1", "G1-I"]);
+    }
+
+    #[test]
+    fn unspliced_targets_are_appended_in_gene_order() {
+        let idx = retained_intron_index();
+        let ext = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 10);
+        let n = idx.n_transcripts();
+        assert_eq!(ext.tr_ids[..n], idx.tr_ids[..]);
+        assert_eq!(ext.tr_ids[n..], ["G1-I", "G2-I"]);
+        assert_eq!(ext.unspliced.unwrap().first, n);
+        assert!(!ext.is_unspliced_target(n - 1) && ext.is_unspliced_target(n));
+        assert_eq!(ext.tr_length[n], 240);
+        assert!(ext.tr_starts_sorted.windows(2).all(|w| w[0] <= w[1]));
+        // Annotated transcripts keep their relative order in the sorted view.
+        let annotated: Vec<usize> = ext.tr_order.iter().copied().filter(|&t| t < n).collect();
+        assert_eq!(annotated, idx.tr_order);
+    }
+
+    fn project_se_unspliced(
+        idx: &TranscriptomeIndex,
+        chr: usize,
+        start: u64,
+        end: u64,
+        spliced: bool,
+    ) -> Vec<String> {
+        use cigar::op::{Kind, Op};
+        let genome = make_genome();
+        let len = (end - start) as usize;
+        let align = make_align(
+            chr,
+            false,
+            vec![(start, end, 0, len)],
+            vec![Op::new(Kind::Match, len)],
+        );
+        let mut names: Vec<String> = filter_and_project(
+            &align,
+            &vec![0u8; len],
+            &genome,
+            idx,
+            len as u32,
+            QuantTranscriptomeSAMoutput::BanSingleEnd,
+            &default_params(),
+            spliced,
+        )
+        .iter()
+        .map(|p| idx.tr_ids[p.chr_idx].clone())
+        .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn unspliced_target_projection() {
+        let idx = retained_intron_index();
+        let ext = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 10);
+        // Inside the retained intron: retained-intron isoform AND G1-I.
+        assert_eq!(project_se_unspliced(&idx, 0, 270, 295, false), ["T1ri"]);
+        assert_eq!(
+            project_se_unspliced(&ext, 0, 270, 295, false),
+            ["G1-I", "T1ri"]
+        );
+        // The fragment crosses a junction: spliced targets only.
+        assert_eq!(project_se_unspliced(&ext, 0, 270, 295, true), ["T1ri"]);
+        // Constitutive exon, away from the flanks: spliced targets only.
+        assert_eq!(
+            project_se_unspliced(&ext, 0, 520, 570, false),
+            ["T1", "T1alt", "T1cas", "T1ri"]
+        );
+        // Intron 2 / exon 3 boundary: only an unspliced target can hold it,
+        // provided the flank covers the exonic part.
+        assert!(project_se_unspliced(&ext, 0, 480, 530, false).is_empty());
+        let ext49 = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 49);
+        assert_eq!(project_se_unspliced(&ext49, 0, 480, 530, false), ["G1-I"]);
+        // Cassette exon of G2: its inclusion isoform and G2-I.
+        assert_eq!(
+            project_se_unspliced(&ext, 1, 1241, 1259, false),
+            ["G2-I", "T2cas"]
+        );
+    }
+
+    #[test]
+    fn unspliced_target_on_minus_strand_is_flipped() {
+        use cigar::op::{Kind, Op};
+        let genome = make_genome();
+        let gtf = vec![
+            make_exon("chr1", 101, 200, '-', "Gm", "Tm"),
+            make_exon("chr1", 301, 400, '-', "Gm", "Tm"),
+        ];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome)
+            .unwrap()
+            .with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 0);
+        let align = make_align(
+            0,
+            false,
+            vec![(210, 260, 0, 50)],
+            vec![Op::new(Kind::Match, 50)],
+        );
+        let p = align_to_transcripts(&align, &idx, 50);
+        assert_eq!(p.len(), 1);
+        assert_eq!(idx.tr_ids[p[0].chr_idx], "Gm-I");
+        // Target [200, 300) of length 100 read 3' to 5': offset 100 - 60 = 40.
+        assert_eq!(p[0].genome_start, 40);
+        assert!(p[0].is_reverse);
+    }
+
+    #[test]
+    fn targets_table_and_unspliced_fasta() {
+        let genome = make_genome();
+        let gtf = vec![
+            make_exon("chr1", 101, 200, '-', "Gm", "Tm"),
+            make_exon("chr1", 301, 400, '-', "Gm", "Tm"),
+        ];
+        let mut ann = gtf.clone();
+        for r in &mut ann {
+            r.attributes.insert("gene_name".into(), "GENEM".into());
+        }
+        let idx = TranscriptomeIndex::from_gtf_exons(&ann, &genome)
+            .unwrap()
+            .with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let tsv = dir.path().join("t.tsv");
+        idx.write_targets_tsv(&tsv).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&tsv).unwrap(),
+            "target_id\tgene_id\tgene_name\tstatus\tlength\n\
+             Tm\tGm\tGENEM\tspliced\t200\n\
+             Gm-I\tGm\tGENEM\tunspliced\t100\n"
+        );
+        let fa = dir.path().join("u.fa");
+        idx.write_unspliced_fasta(&fa, &genome).unwrap();
+        let fa = std::fs::read_to_string(&fa).unwrap();
+        let lines: Vec<&str> = fa.lines().collect();
+        assert_eq!(lines[0], ">Gm-I");
+        // The test genome is all A; the - strand target reads as T.
+        assert_eq!(lines[1..].concat(), "T".repeat(100));
+        assert_eq!(lines[1].len(), 60);
     }
 }

@@ -1136,6 +1136,36 @@ pub struct Parameters {
     #[arg(long = "quantTranscriptomePreMRNA", default_value = "Keep")]
     pub quant_transcriptome_pre_mrna: crate::quant::transcriptome::QuantTranscriptomePreMRNA,
 
+    /// rustar-aligner extension (not in STAR), for `--quantMode
+    /// TranscriptomeSAM` on total RNA-seq: add one unspliced target per gene,
+    /// named `<gene_id>-I`, after the annotated transcripts.
+    ///   * `None` (default): STAR behaviour, annotated transcripts only
+    ///   * `Intron`: the gene's merged annotated introns plus flanks
+    ///   * `PreMRNA`: the whole gene body
+    ///
+    /// Unspliced reads and pairs are projected onto every compatible target,
+    /// spliced and unspliced; fragments crossing a junction only onto
+    /// spliced ones.
+    #[arg(long = "quantTranscriptomeUnspliced", default_value = "None")]
+    pub quant_transcriptome_unspliced: crate::quant::transcriptome::QuantTranscriptomeUnspliced,
+
+    /// Flank (bases) added on each side of every merged intron for
+    /// `--quantTranscriptomeUnspliced Intron`; -1 (default) uses the index's
+    /// sjdbOverhang, i.e. read length - 1 by STAR's convention.
+    #[arg(
+        long = "quantTranscriptomeUnsplicedFlank",
+        default_value_t = -1,
+        allow_hyphen_values = true
+    )]
+    pub quant_transcriptome_unspliced_flank: i64,
+
+    /// rustar-aligner extension: `Yes` also writes the unspliced target
+    /// sequences to `Aligned.toTranscriptome.unspliced.fa` (Salmon's alignment
+    /// mode needs them next to the transcript FASTA). `No` by default, as
+    /// the file is of the order of the genome size.
+    #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
+    pub quant_transcriptome_unspliced_fasta: String,
+
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
     #[arg(long = "twopassMode", default_value = "None")]
@@ -1748,6 +1778,26 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+            ));
+        }
+
+        // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
+        if !matches!(
+            params.quant_transcriptome_unspliced_fasta.as_str(),
+            "Yes" | "No"
+        ) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--quantTranscriptomeUnsplicedFasta must be Yes or No",
+            ));
+        }
+        if params.quant_transcriptome_unspliced
+            != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None
+            && !params.quant_transcriptome_sam()
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
             ));
         }
 
