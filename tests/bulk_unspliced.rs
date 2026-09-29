@@ -11,6 +11,7 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use noodles::bam;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -250,6 +251,61 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
+/// Reads per transcript estimated from the transcriptome BAM by a minimal
+/// Salmon-like EM: a read compatible with transcripts `S` is shared in
+/// proportion to `alpha_t / efflen_t`, `efflen_t = len_t - READ_LEN + 1`.
+fn transcript_counts(path: &Path) -> HashMap<String, f64> {
+    let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+    let header = reader.read_header().unwrap();
+    let refs = header.reference_sequences();
+    let names: Vec<String> = refs
+        .keys()
+        .map(|k| String::from_utf8_lossy(k).to_string())
+        .collect();
+    let efflen: Vec<f64> = refs
+        .values()
+        .map(|r| (usize::from(r.length()) - READ_LEN + 1) as f64)
+        .collect();
+    let mut per_read: HashMap<String, Vec<usize>> = HashMap::new();
+    for rec in reader.records() {
+        let rec = rec.unwrap();
+        let q = String::from_utf8_lossy(rec.name().unwrap()).to_string();
+        let tid = rec.reference_sequence_id().unwrap().unwrap();
+        per_read.entry(q).or_default().push(tid);
+    }
+    let classes: Vec<Vec<usize>> = per_read.into_values().collect();
+    let n_tr = names.len();
+    let mut alpha = vec![1.0 / n_tr as f64; n_tr];
+    let mut counts = vec![0.0; n_tr];
+    for _ in 0..2000 {
+        counts.iter_mut().for_each(|c| *c = 0.0);
+        for tids in &classes {
+            let z: f64 = tids.iter().map(|&t| alpha[t] / efflen[t]).sum();
+            if z > 0.0 {
+                for &t in tids {
+                    counts[t] += alpha[t] / efflen[t] / z;
+                }
+            }
+        }
+        let total: f64 = counts.iter().sum();
+        for (a, c) in alpha.iter_mut().zip(&counts) {
+            *a = c / total;
+        }
+    }
+    names.into_iter().zip(counts).collect()
+}
+
+fn summary(path: &Path) -> HashMap<String, Vec<String>> {
+    read(path)
+        .lines()
+        .skip(1)
+        .map(|l| {
+            let mut it = l.split('\t').map(str::to_string);
+            (it.next().unwrap(), it.collect())
+        })
+        .collect()
+}
+
 #[test]
 fn new_options_leave_existing_outputs_unchanged() {
     let (tmp, gdir, gtf, fq, _) = setup();
@@ -319,4 +375,114 @@ fn new_options_leave_existing_outputs_unchanged() {
     assert!(velo.join("ReadsPerGeneVelocyto.out.tab").exists());
     assert!(!base.join("ReadsPerGeneVelocyto.out.tab").exists());
     assert!(!ban.join("ReadsPerGeneVelocyto.summary.tsv").exists());
+}
+
+#[test]
+fn simulated_total_rna_mixture() {
+    let (tmp, gdir, gtf, fq, pre_starts) = setup();
+    let keep = align(
+        &tmp,
+        &gdir,
+        &gtf,
+        &fq,
+        "keep",
+        &["--quantMode", "TranscriptomeSAM", "GeneVelocyto"],
+    );
+    let ban = align(
+        &tmp,
+        &gdir,
+        &gtf,
+        &fq,
+        "ban",
+        &[
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantTranscriptomePreMRNA",
+            "BanRetainedIntron",
+        ],
+    );
+
+    // --- TranscriptomeSAM: share of the gene's transcriptome reads on the
+    // retained-intron isoform, against the simulated share of mature reads.
+    let ck = transcript_counts(&keep.join("Aligned.toTranscriptome.out.bam"));
+    let cb = transcript_counts(&ban.join("Aligned.toTranscriptome.out.bam"));
+    let share = |c: &HashMap<String, f64>, g: &str| {
+        let a = c.get(&format!("{g}_A")).copied().unwrap_or(0.0);
+        let r = c.get(&format!("{g}_R")).copied().unwrap_or(0.0);
+        r / (a + r)
+    };
+    let mut err_keep = 0.0;
+    let mut err_ban = 0.0;
+    for gene in &GENES {
+        let truth = gene.n_r as f64 / (gene.n_a + gene.n_r) as f64;
+        let (k, b) = (share(&ck, gene.name), share(&cb, gene.name));
+        eprintln!(
+            "{}: truth RI share {truth:.3}, Keep {k:.3}, BanRetainedIntron {b:.3}",
+            gene.name
+        );
+        let a = |c: &HashMap<String, f64>| c.get(&format!("{}_A", gene.name)).copied();
+        eprintln!(
+            "{}: spliced isoform A reads, simulated mature {}, Keep {:.1}, BanRetainedIntron {:.1}",
+            gene.name,
+            gene.n_a,
+            a(&ck).unwrap_or(0.0),
+            a(&cb).unwrap_or(0.0)
+        );
+        err_keep += (k - truth).abs();
+        err_ban += (b - truth).abs();
+        if gene.n_r == 0 {
+            // Pure pre-mRNA contamination: STAR's projection inflates the
+            // retained-intron isoform, the filter removes the inflation.
+            assert!(
+                k > 0.3,
+                "{}: expected inflated RI share, got {k}",
+                gene.name
+            );
+            assert!(b < 0.05, "{}: RI share still {b}", gene.name);
+        }
+    }
+    assert!(
+        err_ban < err_keep / 2.0,
+        "RI share error Keep {err_keep:.3} vs Ban {err_ban:.3}"
+    );
+
+    // --- GeneVelocyto: the library is reverse-stranded, so the forward
+    // columns see nothing and the reverse columns see every gene read.
+    let s = summary(&keep.join("ReadsPerGeneVelocyto.summary.tsv"));
+    let n = |k: &str, col: usize| s[k][col].parse::<u64>().unwrap();
+    let total_reads: usize = GENES.iter().map(|g| g.n_a + g.n_r + g.n_pre).sum();
+    assert_eq!(
+        n("N_spliced", 1) + n("N_unspliced", 1) + n("N_ambiguous", 1),
+        0
+    );
+    let assigned_rev = n("N_spliced", 2) + n("N_unspliced", 2) + n("N_ambiguous", 2);
+    assert!(assigned_rev as f64 > 0.95 * total_reads as f64);
+    // A read is unspliced when some model needs pre-mRNA and none is only
+    // exonic: here, exactly the pre-mRNA reads reaching more than 6 bases
+    // (STAR's minOverlapMinusOne) into intron 2, which no isoform retains.
+    // Reads inside the retained intron 1 are ambiguous, the others spliced.
+    let (i2s, i2e) = (EXONS[1].1, EXONS[2].0);
+    let expected_unspliced = pre_starts
+        .iter()
+        .filter(|&&p| (p + READ_LEN).min(i2e).saturating_sub(p.max(i2s)) > 6)
+        .count() as u64;
+    let got = n("N_unspliced", 2);
+    eprintln!("unspliced: expected {expected_unspliced}, got {got}");
+    assert!(got.abs_diff(expected_unspliced) * 50 <= expected_unspliced);
+    assert!(n("N_ambiguous", 2) > 0);
+    let mature: usize = GENES.iter().map(|g| g.n_a).sum();
+    assert!(n("N_spliced", 2) as usize >= mature * 95 / 100);
+
+    // Per-gene table: G1 and G2 have reverse-strand counts, G3 is a - gene
+    // and is also reverse-stranded relative to its reads.
+    let tab = read(&keep.join("ReadsPerGeneVelocyto.out.tab"));
+    for line in tab.lines().skip(1) {
+        let cols: Vec<u64> = line
+            .split('\t')
+            .skip(1)
+            .map(|c| c.parse().unwrap())
+            .collect();
+        assert_eq!(cols[3..6].iter().sum::<u64>(), 0, "{line}");
+        assert!(cols[6..9].iter().sum::<u64>() > 600, "{line}");
+    }
 }
