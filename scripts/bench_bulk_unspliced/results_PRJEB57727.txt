@@ -1,0 +1,63 @@
+| library | mode | pairs | unique % | trSAM frag/pair | Salmon mapped | RI share | -I share | unspliced (GeneSplicing) | wall s | RSS GiB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ERR10501066_rep1 | star | 2000000 | 91.12% | 0.663 | 0.988 | 0.0534 | 0.0000 | 0.3334 | 35 | 28.9 |
+| ERR10501066_rep1 | intron | 2000000 | 91.12% | 0.920 | 0.984 | 0.0453 | 0.2972 | nan | 42 | 29.3 |
+| ERR10501066_rep1 | premrna | 2000000 | 91.12% | 0.927 | 0.985 | 0.0522 | 0.4136 | nan | 47 | 29.5 |
+| ERR10501066_rep2 | star | 2000000 | 91.12% | 0.661 | 0.988 | 0.0545 | 0.0000 | 0.3337 | 46 | 28.8 |
+| ERR10501066_rep2 | intron | 2000000 | 91.12% | 0.918 | 0.984 | 0.0464 | 0.2986 | nan | 54 | 29.5 |
+| ERR10501066_rep2 | premrna | 2000000 | 91.12% | 0.925 | 0.986 | 0.0534 | 0.4141 | nan | 59 | 29.4 |
+| ERR10501099_rep1 | star | 2000000 | 89.97% | 0.647 | 0.988 | 0.0456 | 0.0000 | 0.3570 | 65 | 29.0 |
+| ERR10501099_rep1 | intron | 2000000 | 89.97% | 0.917 | 0.985 | 0.0381 | 0.3131 | nan | 46 | 29.5 |
+| ERR10501099_rep1 | premrna | 2000000 | 89.97% | 0.924 | 0.986 | 0.0442 | 0.4345 | nan | 38 | 29.5 |
+| ERR10501099_rep2 | star | 2000000 | 90.06% | 0.645 | 0.988 | 0.0449 | 0.0000 | 0.3574 | 36 | 29.1 |
+| ERR10501099_rep2 | intron | 2000000 | 90.06% | 0.916 | 0.985 | 0.0377 | 0.3146 | nan | 44 | 29.4 |
+| ERR10501099_rep2 | premrna | 2000000 | 90.06% | 0.923 | 0.986 | 0.0439 | 0.4347 | nan | 60 | 29.5 |
+| ERR10501182_rep1 | star | 2000000 | 91.80% | 0.602 | 0.984 | 0.0595 | 0.0000 | 0.3990 | 52 | 29.0 |
+| ERR10501182_rep1 | intron | 2000000 | 91.80% | 0.915 | 0.980 | 0.0492 | 0.3664 | nan | 61 | 29.5 |
+| ERR10501182_rep1 | premrna | 2000000 | 91.80% | 0.921 | 0.982 | 0.0561 | 0.4704 | nan | 54 | 29.6 |
+| ERR10501182_rep2 | star | 2000000 | 91.82% | 0.600 | 0.984 | 0.0602 | 0.0000 | 0.4002 | 50 | 29.1 |
+| ERR10501182_rep2 | intron | 2000000 | 91.82% | 0.913 | 0.981 | 0.0494 | 0.3680 | nan | 47 | 29.4 |
+| ERR10501182_rep2 | premrna | 2000000 | 91.82% | 0.920 | 0.982 | 0.0565 | 0.4716 | nan | 52 | 29.5 |
+| ERR10501185_rep1 | star | 2000000 | 88.81% | 0.648 | 0.987 | 0.0480 | 0.0000 | 0.3871 | 57 | 28.7 |
+| ERR10501185_rep1 | intron | 2000000 | 88.81% | 0.922 | 0.983 | 0.0401 | 0.3172 | nan | 42 | 29.2 |
+| ERR10501185_rep1 | premrna | 2000000 | 88.81% | 0.929 | 0.984 | 0.0493 | 0.4665 | nan | 64 | 29.3 |
+| ERR10501185_rep2 | star | 2000000 | 88.91% | 0.645 | 0.987 | 0.0496 | 0.0000 | 0.3878 | 35 | 28.8 |
+| ERR10501185_rep2 | intron | 2000000 | 88.91% | 0.919 | 0.983 | 0.0416 | 0.3188 | nan | 39 | 29.2 |
+| ERR10501185_rep2 | premrna | 2000000 | 88.91% | 0.926 | 0.984 | 0.0507 | 0.4674 | nan | 62 | 29.4 |
+| ERR10501210_rep1 | star | 2000000 | 87.67% | 0.734 | 0.990 | 0.0346 | 0.0000 | 0.2939 | 39 | 28.7 |
+| ERR10501210_rep1 | intron | 2000000 | 87.67% | 0.931 | 0.987 | 0.0294 | 0.2256 | nan | 41 | 29.1 |
+| ERR10501210_rep1 | premrna | 2000000 | 87.67% | 0.936 | 0.988 | 0.0367 | 0.3960 | nan | 58 | 29.3 |
+| ERR10501210_rep2 | star | 2000000 | 87.75% | 0.732 | 0.990 | 0.0342 | 0.0000 | 0.2936 | 61 | 28.7 |
+| ERR10501210_rep2 | intron | 2000000 | 87.75% | 0.929 | 0.987 | 0.0290 | 0.2264 | nan | 52 | 29.3 |
+| ERR10501210_rep2 | premrna | 2000000 | 87.75% | 0.934 | 0.988 | 0.0359 | 0.3958 | nan | 77 | 29.3 |
+| ERR10501288_rep1 | star | 2000000 | 93.08% | 0.519 | 0.981 | 0.0713 | 0.0000 | 0.4772 | 61 | 28.9 |
+| ERR10501288_rep1 | intron | 2000000 | 93.08% | 0.910 | 0.981 | 0.0565 | 0.4598 | nan | 42 | 29.3 |
+| ERR10501288_rep1 | premrna | 2000000 | 93.08% | 0.917 | 0.983 | 0.0625 | 0.5397 | nan | 62 | 29.5 |
+| ERR10501288_rep2 | star | 2000000 | 92.48% | 0.513 | 0.981 | 0.0717 | 0.0000 | 0.4773 | 63 | 29.2 |
+| ERR10501288_rep2 | intron | 2000000 | 92.48% | 0.900 | 0.981 | 0.0573 | 0.4607 | nan | 78 | 29.5 |
+| ERR10501288_rep2 | premrna | 2000000 | 92.48% | 0.908 | 0.983 | 0.0637 | 0.5402 | nan | 54 | 29.5 |
+| ERR10501299_rep1 | star | 2000000 | 89.87% | 0.694 | 0.990 | 0.0386 | 0.0000 | 0.3196 | 54 | 28.8 |
+| ERR10501299_rep1 | intron | 2000000 | 89.87% | 0.926 | 0.987 | 0.0325 | 0.2670 | nan | 50 | 29.4 |
+| ERR10501299_rep1 | premrna | 2000000 | 89.87% | 0.933 | 0.988 | 0.0385 | 0.4088 | nan | 80 | 29.3 |
+| ERR10501299_rep2 | star | 2000000 | 89.98% | 0.692 | 0.990 | 0.0385 | 0.0000 | 0.3199 | 55 | 28.9 |
+| ERR10501299_rep2 | intron | 2000000 | 89.98% | 0.925 | 0.986 | 0.0325 | 0.2684 | nan | 42 | 29.2 |
+| ERR10501299_rep2 | premrna | 2000000 | 89.98% | 0.932 | 0.988 | 0.0387 | 0.4091 | nan | 42 | 29.4 |
+| ERR10501321_rep1 | star | 2000000 | 93.09% | 0.440 | 0.977 | 0.0775 | 0.0000 | 0.5750 | 38 | 28.8 |
+| ERR10501321_rep1 | intron | 2000000 | 93.09% | 0.911 | 0.980 | 0.0605 | 0.5516 | nan | 45 | 29.3 |
+| ERR10501321_rep1 | premrna | 2000000 | 93.09% | 0.918 | 0.982 | 0.0693 | 0.6298 | nan | 39 | 29.1 |
+| ERR10501321_rep2 | star | 2000000 | 92.47% | 0.434 | 0.977 | 0.0763 | 0.0000 | 0.5752 | 33 | 28.8 |
+| ERR10501321_rep2 | intron | 2000000 | 92.47% | 0.901 | 0.980 | 0.0593 | 0.5525 | nan | 40 | 29.2 |
+| ERR10501321_rep2 | premrna | 2000000 | 92.47% | 0.909 | 0.982 | 0.0675 | 0.6303 | nan | 35 | 29.2 |
+
+GeneSplicing strand column: ['reverse']
+all libraries (n=16), unspliced fraction mean 0.3930: star: RI share mean 0.0537, rho vs unspliced 0.92, slope 0.151; intron: RI share mean 0.0440, rho vs unspliced 0.92, slope 0.107; premrna: RI share mean 0.0512, rho vs unspliced 0.92, slope 0.111
+rep1 only (n=8), unspliced fraction mean 0.3928: star: RI share mean 0.0536, rho vs unspliced 0.93, slope 0.152; intron: RI share mean 0.0439, rho vs unspliced 0.93, slope 0.108; premrna: RI share mean 0.0511, rho vs unspliced 0.93, slope 0.113
+star: mean trSAM frag/pair 0.617, Salmon mapped 0.986, -I share 0.0000, wall 49 s, peak RSS 29.2 GiB
+intron: mean trSAM frag/pair 0.917, Salmon mapped 0.983, -I share 0.3504, wall 48 s, peak RSS 29.5 GiB
+premrna: mean trSAM frag/pair 0.924, Salmon mapped 0.985, -I share 0.4702, wall 55 s, peak RSS 29.6 GiB
+
+pseudo-replicates, star: isoform-proportion r median 0.817 (range 0.786-0.827); log avgTxLength r median 0.975 (range 0.967-0.978); multi-isoform genes with >= 100 fragments: median 1616
+pseudo-replicates, intron: isoform-proportion r median 0.819 (range 0.790-0.833); log avgTxLength r median 0.974 (range 0.963-0.976); multi-isoform genes with >= 100 fragments: median 1525
+pseudo-replicates, premrna: isoform-proportion r median 0.828 (range 0.803-0.840); log avgTxLength r median 0.972 (range 0.963-0.976); multi-isoform genes with >= 100 fragments: median 1462
+
+genomeGenerate: wall 926 s, peak RSS 20.7 GiB
