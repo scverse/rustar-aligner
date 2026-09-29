@@ -1137,8 +1137,8 @@ pub struct Parameters {
 
     /// rustar-aligner extension (not in STAR), for `--quantMode
     /// TranscriptomeSAM` on total RNA-seq:
-    ///   * `Keep` (default) — STAR behaviour, every alignment is projected
-    ///   * `BanRetainedIntron` — do not project an unspliced read or pair onto
+    ///   * `Keep` (default): STAR behaviour, every alignment is projected
+    ///   * `BanRetainedIntron`: do not project an unspliced read or pair onto
     ///     the transcripts of a gene when it overlaps an intron of that gene
     ///     that another isoform retains (pre-mRNA and retained-intron isoform
     ///     cannot be told apart)
