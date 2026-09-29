@@ -153,7 +153,9 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 |-----------|---------|-------------|
 | `--quantMode` | — | `GeneCounts` and/or `TranscriptomeSAM`, space-separated. rustar-aligner extension: `GeneSplicing` (bulk spliced / unspliced / ambiguous gene counts, see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/)). |
 | `--quantTranscriptomeSAMoutput` | `BanSingleEnd_BanIndels_ExtendSoftclip` | Variant for transcriptome BAM: `BanSingleEnd`, `BanSingleEnd_ExtendSoftclip`, or the default RSEM-compatible form. |
-| `--quantTranscriptomePreMRNA` | `Keep` | rustar-aligner extension. `BanRetainedIntron`: do not project unspliced reads that overlap a retained intron of a gene onto that gene's transcripts. `Keep` is STAR's behaviour. |
+| `--quantTranscriptomeUnspliced` | `None` | rustar-aligner extension. `Intron` / `PreMRNA`: add one unspliced target per gene (`<gene_id>-I`: merged introns plus flanks, or the gene body) to the transcriptome BAM. `None` is STAR's behaviour. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/). |
+| `--quantTranscriptomeUnsplicedFlank` | `-1` | rustar-aligner extension. Flank around each merged intron for `Intron`; `-1` uses the index's `sjdbOverhang`. |
+| `--quantTranscriptomeUnsplicedFasta` | `No` | rustar-aligner extension. `Yes` writes the unspliced target sequences to `Aligned.toTranscriptome.unspliced.fa`. |
 
 ## Two-pass mode
 

@@ -81,7 +81,7 @@ This emits `ReadsPerGene.out.tab` *and* `Aligned.toTranscriptome.out.bam` in add
 
 ## Total RNA (ribo-depleted) libraries
 
-For libraries with a large pre-mRNA content, `--quantMode GeneSplicing` adds spliced / unspliced / ambiguous counts per gene and `--quantTranscriptomePreMRNA BanRetainedIntron` keeps pre-mRNA reads out of retained-intron isoforms in the transcriptome BAM. Both are rustar-aligner extensions; see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
+For libraries with a large pre-mRNA content, `--quantTranscriptomeUnspliced` adds one unspliced `<gene_id>-I` target per gene to the transcriptome BAM (so pre-mRNA reads stop landing on retained-intron isoforms), `--outSAMattributes sp` tags genomic alignments with their splicing status, and `--quantMode GeneSplicing` counts spliced / unspliced / ambiguous reads per gene. All three are rustar-aligner extensions; see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Index-time vs alignment-time
 
