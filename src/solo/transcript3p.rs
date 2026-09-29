@@ -595,7 +595,6 @@ mod tests {
             tr_order: vec![0, 1, 2],
             tr_starts_sorted: vec![0; 3],
             tr_end_max_sorted: vec![1000; 3],
-            retained_introns: None,
             unspliced: None,
         }
     }
