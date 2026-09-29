@@ -53,6 +53,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
 
+- STARsolo cell-barcode correction now applies STAR's `cbMinP` posterior
+  threshold (0.975, single precision), caps the mismatch quality at `QSmax`
+  (33), and enforces `oneExact`: under every `--soloCBmatchWLtype` except the
+  pseudocount ones, a barcode corrected to a single whitelist entry counts
+  only if some read matched that entry exactly. Without these,
+  `1MM_multi_Nbase_pseudocounts` produced the same matrix as the default
+  `1MM_multi` (#172).
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).
