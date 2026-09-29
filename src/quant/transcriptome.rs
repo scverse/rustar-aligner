@@ -143,136 +143,6 @@ pub struct UnsplicedTargets {
     pub flank: u64,
 }
 
-/// `--quantTranscriptomePreMRNA` (rustar-aligner extension, not in STAR):
-/// what to do with alignments that are indistinguishable between pre-mRNA
-/// and a retained-intron isoform before projecting onto the transcriptome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QuantTranscriptomePreMRNA {
-    /// STAR behaviour: project every alignment.
-    #[default]
-    Keep,
-    /// Do not project an unspliced fragment onto the transcripts of gene G
-    /// when one of its (soft-clip-extended) aligned blocks overlaps a
-    /// retained-intron interval of G, see [`RetainedIntrons`].
-    BanRetainedIntron,
-}
-
-impl std::str::FromStr for QuantTranscriptomePreMRNA {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "Keep" => Ok(Self::Keep),
-            "BanRetainedIntron" => Ok(Self::BanRetainedIntron),
-            _ => Err(format!(
-                "unknown --quantTranscriptomePreMRNA '{s}'; expected 'Keep' or 'BanRetainedIntron'"
-            )),
-        }
-    }
-}
-
-/// Retained-intron intervals per gene, for
-/// `--quantTranscriptomePreMRNA BanRetainedIntron`.
-///
-/// An intron `[a, b)` of transcript S (the gap between two consecutive exons)
-/// is *retained* when another transcript of the same gene has an exon that
-/// covers it together with at least one base of each flanking exon
-/// (`exon.start < a` and `exon.end > b`). The intervals are merged per gene.
-///
-/// An unspliced read inside such an interval is compatible with both the
-/// retaining isoform and the unspliced pre-mRNA of the gene; STAR projects it
-/// onto the retaining isoform only, which in total RNA-seq inflates
-/// retained-intron isoforms in proportion to the pre-mRNA content.
-/// Cassette exons and alternative 5'/3' splice sites do not create intervals
-/// (their exons do not reach across a whole intron), so their reads are kept.
-#[derive(Debug, Default)]
-pub struct RetainedIntrons {
-    /// Merged, sorted `[start, end)` absolute intervals, indexed by gene.
-    pub per_gene: Vec<Vec<(u64, u64)>>,
-    /// Alignments (SE reads or single mates) that lost at least one
-    /// projection to the filter.
-    pub n_alignments_banned: std::sync::atomic::AtomicU64,
-    /// Transcript projections removed by the filter.
-    pub n_projections_banned: std::sync::atomic::AtomicU64,
-}
-
-impl RetainedIntrons {
-    /// Compute the retained-intron intervals of every gene of `idx`.
-    pub fn build(idx: &TranscriptomeIndex) -> Self {
-        let n_genes = idx.gene_ids.len();
-        let mut tr_by_gene: Vec<Vec<usize>> = vec![Vec::new(); n_genes];
-        for (tr, &g) in idx.tr_gene_idx.iter().enumerate() {
-            if let Some(v) = tr_by_gene.get_mut(g as usize) {
-                v.push(tr);
-            }
-        }
-        let mut per_gene: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_genes];
-        for (g, trs) in tr_by_gene.iter().enumerate() {
-            if trs.len() < 2 {
-                continue;
-            }
-            // All exons of the gene, sorted by start, with a running max end.
-            let mut exons: Vec<(u64, u64)> = trs
-                .iter()
-                .flat_map(|&t| {
-                    idx.tr_exons[t]
-                        .iter()
-                        .map(|e| (e.genome_start, e.genome_end))
-                })
-                .collect();
-            exons.sort_unstable();
-            let mut max_end = Vec::with_capacity(exons.len());
-            let mut m = 0u64;
-            for &(_, e) in &exons {
-                m = m.max(e);
-                max_end.push(m);
-            }
-            let mut ri: Vec<(u64, u64)> = Vec::new();
-            for &t in trs {
-                for w in idx.tr_exons[t].windows(2) {
-                    let (a, b) = (w[0].genome_end, w[1].genome_start);
-                    if b <= a {
-                        continue;
-                    }
-                    let k = exons.partition_point(|&(s, _)| s < a);
-                    if k > 0 && max_end[k - 1] > b {
-                        ri.push((a, b));
-                    }
-                }
-            }
-            ri.sort_unstable();
-            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ri.len());
-            for (a, b) in ri {
-                match merged.last_mut() {
-                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
-                    _ => merged.push((a, b)),
-                }
-            }
-            per_gene[g] = merged;
-        }
-        RetainedIntrons {
-            per_gene,
-            ..Default::default()
-        }
-    }
-
-    /// Whether any aligned block of `align` overlaps a retained-intron
-    /// interval of gene `gene`.
-    pub fn overlaps(&self, gene: u32, align: &Transcript) -> bool {
-        let Some(iv) = self.per_gene.get(gene as usize) else {
-            return false;
-        };
-        if iv.is_empty() {
-            return false;
-        }
-        align.exons.iter().any(|b| {
-            // First interval ending after the block start; overlap if it
-            // starts before the block end.
-            let k = iv.partition_point(|&(_, e)| e <= b.genome_start);
-            k < iv.len() && iv[k].0 < b.genome_end
-        })
-    }
-}
-
 /// Sort and merge overlapping or touching `[start, end)` intervals.
 fn merge_intervals(mut iv: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     iv.sort_unstable();
@@ -343,9 +213,6 @@ pub struct TranscriptomeIndex {
     pub tr_starts_sorted: Vec<u64>,
     /// Running max of `tr_end` along `tr_order` (STAR's `trEmax`).
     pub tr_end_max_sorted: Vec<u64>,
-    /// Retained-intron intervals, set only under
-    /// `--quantTranscriptomePreMRNA BanRetainedIntron`.
-    pub retained_introns: Option<std::sync::Arc<RetainedIntrons>>,
     /// Set when unspliced `<gene_id>-I` targets were appended
     /// (`--quantTranscriptomeUnspliced Intron|PreMRNA`).
     pub unspliced: Option<UnsplicedTargets>,
@@ -554,7 +421,6 @@ impl TranscriptomeIndex {
             tr_order,
             tr_starts_sorted,
             tr_end_max_sorted,
-            retained_introns: None,
             unspliced: None,
         })
     }
@@ -857,7 +723,6 @@ impl TranscriptomeIndex {
             tr_order,
             tr_starts_sorted,
             tr_end_max_sorted,
-            retained_introns: None,
             unspliced: None,
         })
     }
@@ -1539,12 +1404,9 @@ fn align_to_one_transcript(
 /// on the reverse strand — STAR's `Read1[roStr==0 ? 0 : 2]`.
 ///
 /// `fragment_spliced` tells whether the read (SE) or either mate (PE) crosses
-/// a splice junction; it is only read when `idx.retained_introns` is set
-/// (`--quantTranscriptomePreMRNA BanRetainedIntron`), in which case the
-/// projections of an unspliced fragment onto the transcripts of a gene whose
-/// retained-intron intervals it overlaps are dropped. Applying the rule per
-/// mate with the fragment-level flag drops the pair on those transcripts as
-/// soon as one mate overlaps, since a pair needs both mates projected.
+/// a splice junction. It is only read when `idx.unspliced` is set
+/// (`--quantTranscriptomeUnspliced Intron|PreMRNA`): a spliced fragment is
+/// processed RNA, so its projections onto `<gene_id>-I` targets are dropped.
 #[allow(clippy::too_many_arguments)]
 pub fn filter_and_project(
     align: &Transcript,
@@ -1574,31 +1436,7 @@ pub fn filter_and_project(
         // A fragment crossing a junction is processed RNA: spliced targets only.
         projected.retain(|p| !idx.is_unspliced_target(p.chr_idx));
     }
-    if let Some(ri) = &idx.retained_introns
-        && !fragment_spliced
-    {
-        ban_retained_intron(&mut projected, &align_for_projection, idx, ri);
-    }
     projected
-}
-
-/// Drop the projections onto transcripts of genes whose retained-intron
-/// intervals `align` overlaps, and count them.
-fn ban_retained_intron(
-    projected: &mut Vec<Transcript>,
-    align: &Transcript,
-    idx: &TranscriptomeIndex,
-    ri: &RetainedIntrons,
-) {
-    use std::sync::atomic::Ordering;
-    let before = projected.len();
-    projected.retain(|p| !ri.overlaps(idx.tr_gene_idx[p.chr_idx], align));
-    let removed = (before - projected.len()) as u64;
-    if removed > 0 {
-        ri.n_alignments_banned.fetch_add(1, Ordering::Relaxed);
-        ri.n_projections_banned
-            .fetch_add(removed, Ordering::Relaxed);
-    }
 }
 
 fn has_soft_clip(align: &Transcript) -> bool {
@@ -3067,101 +2905,6 @@ mod tests {
             }
         }
         TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap()
-    }
-
-    #[test]
-    fn pre_mrna_mode_from_str() {
-        use std::str::FromStr;
-        assert_eq!(
-            QuantTranscriptomePreMRNA::from_str("Keep").unwrap(),
-            QuantTranscriptomePreMRNA::Keep
-        );
-        assert_eq!(
-            QuantTranscriptomePreMRNA::from_str("BanRetainedIntron").unwrap(),
-            QuantTranscriptomePreMRNA::BanRetainedIntron
-        );
-        assert!(QuantTranscriptomePreMRNA::from_str("Ban").is_err());
-        assert_eq!(
-            default_params().quant_transcriptome_pre_mrna,
-            QuantTranscriptomePreMRNA::Keep
-        );
-    }
-
-    #[test]
-    fn retained_intron_intervals() {
-        let idx = retained_intron_index();
-        let ri = RetainedIntrons::build(&idx);
-        let g1 = idx.gene_ids.iter().position(|g| g == "G1").unwrap();
-        let g2 = idx.gene_ids.iter().position(|g| g == "G2").unwrap();
-        // T1ri's exon [100, 400) covers intron 1 of T1 and the shorter
-        // introns of T1cas / T1alt; intron 2 is never retained.
-        assert_eq!(ri.per_gene[g1], vec![(200, 300)]);
-        // A cassette exon or a longer exon end alone is not a retained intron.
-        assert!(ri.per_gene[g2].is_empty());
-    }
-
-    fn project_se(
-        idx: &TranscriptomeIndex,
-        chr: usize,
-        start: u64,
-        end: u64,
-        spliced: bool,
-    ) -> Vec<String> {
-        use cigar::op::{Kind, Op};
-        let genome = make_genome();
-        let len = (end - start) as usize;
-        let align = make_align(
-            chr,
-            false,
-            vec![(start, end, 0, len)],
-            vec![Op::new(Kind::Match, len)],
-        );
-        let mut names: Vec<String> = filter_and_project(
-            &align,
-            &vec![0u8; len],
-            &genome,
-            idx,
-            len as u32,
-            QuantTranscriptomeSAMoutput::BanSingleEnd,
-            &default_params(),
-            spliced,
-        )
-        .iter()
-        .map(|p| idx.tr_ids[p.chr_idx].clone())
-        .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn ban_retained_intron_projection() {
-        use std::sync::atomic::Ordering;
-        let keep = retained_intron_index();
-        let mut ban = keep.clone();
-        ban.retained_introns = Some(std::sync::Arc::new(RetainedIntrons::build(&ban)));
-
-        // Unspliced read inside the retained intron: STAR projects it onto
-        // the retaining isoform only; the filter drops it.
-        assert_eq!(project_se(&keep, 0, 270, 295, false), ["T1ri"]);
-        assert!(project_se(&ban, 0, 270, 295, false).is_empty());
-        // Straddling the intron / exon 2 boundary: same.
-        assert_eq!(project_se(&keep, 0, 280, 330, false), ["T1ri"]);
-        assert!(project_se(&ban, 0, 280, 330, false).is_empty());
-        // The fragment crosses a junction elsewhere: kept (processed RNA).
-        assert_eq!(project_se(&ban, 0, 270, 295, true), ["T1ri"]);
-        // Constitutive exon: untouched.
-        assert_eq!(
-            project_se(&ban, 0, 520, 570, false),
-            ["T1", "T1alt", "T1cas", "T1ri"]
-        );
-        // Cassette exon and alternative 5' extension of a gene with no
-        // retained intron: untouched.
-        assert_eq!(project_se(&ban, 1, 1241, 1259, false), ["T2cas"]);
-        assert_eq!(project_se(&ban, 1, 1195, 1219, false), ["T2alt"]);
-
-        let ri = ban.retained_introns.as_ref().unwrap();
-        assert_eq!(ri.n_alignments_banned.load(Ordering::Relaxed), 2);
-        assert_eq!(ri.n_projections_banned.load(Ordering::Relaxed), 2);
     }
 
     #[test]

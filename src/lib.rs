@@ -346,23 +346,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let tr_idx = tr_idx_all
         .as_ref()
         .filter(|_| params.quant_transcriptome_sam())
-        .map(|tr| {
-            if params.quant_transcriptome_pre_mrna
-                == crate::quant::transcriptome::QuantTranscriptomePreMRNA::BanRetainedIntron
-            {
-                let mut tr = (**tr).clone();
-                let ri = crate::quant::transcriptome::RetainedIntrons::build(&tr);
-                info!(
-                    "quantTranscriptomePreMRNA BanRetainedIntron: {} retained-intron intervals in {} genes",
-                    ri.per_gene.iter().map(Vec::len).sum::<usize>(),
-                    ri.per_gene.iter().filter(|v| !v.is_empty()).count()
-                );
-                tr.retained_introns = Some(std::sync::Arc::new(ri));
-                std::sync::Arc::new(tr)
-            } else {
-                std::sync::Arc::clone(tr)
-            }
-        });
+        .map(std::sync::Arc::clone);
 
     // --quantTranscriptomeUnspliced: append one `<gene_id>-I` target per gene
     // to the TranscriptomeSAM index (the GeneSplicing classifier keeps using
@@ -508,15 +492,6 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let log_progress_path = params.output_path("Log.progress.out");
     crate::io::log::write_log_progress_out(&log_progress_path, &stats, time_start, time_finish)?;
     info!("Wrote {}", log_progress_path.display());
-
-    if let Some(ri) = tr_idx.as_ref().and_then(|t| t.retained_introns.as_ref()) {
-        use std::sync::atomic::Ordering;
-        info!(
-            "quantTranscriptomePreMRNA BanRetainedIntron: {} alignments lost {} transcriptome projections",
-            ri.n_alignments_banned.load(Ordering::Relaxed),
-            ri.n_projections_banned.load(Ordering::Relaxed)
-        );
-    }
 
     // Write ReadsPerGene.out.tab / ReadsPerGeneSplicing.* for the requested
     // --quantMode values.
