@@ -69,9 +69,187 @@ pub struct PairedRead {
     pub mate2: EncodedRead,
 }
 
+/// Record parser used underneath [`FastqReader`].
+///
+/// Both backends read the same decompressed byte stream (plain file, gzip via
+/// `flate2`, or `--readFilesCommand` output) and hand their records to the same
+/// post-processing ([`encode_record`]), so the reads they produce are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FastqBackend {
+    /// `noodles` FASTQ parser, one record at a time (the default).
+    #[default]
+    Noodles,
+    /// `paraseq` minimal-copy batch parser (issue #95). Needs the `paraseq`
+    /// Cargo feature.
+    #[cfg(feature = "paraseq")]
+    Paraseq,
+}
+
+/// Environment variable that selects the FASTQ parser at run time.
+pub const FASTQ_BACKEND_ENV: &str = "RUSTAR_FASTQ_BACKEND";
+
+impl FastqBackend {
+    /// Backend requested through `RUSTAR_FASTQ_BACKEND` (`noodles` or
+    /// `paraseq`). Unset, empty or unknown values fall back to
+    /// [`FastqBackend::Noodles`], with a warning for values this build cannot
+    /// honour.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let Ok(value) = std::env::var(FASTQ_BACKEND_ENV) else {
+            return Self::Noodles;
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "noodles" => Self::Noodles,
+            #[cfg(feature = "paraseq")]
+            "paraseq" => Self::Paraseq,
+            #[cfg(not(feature = "paraseq"))]
+            "paraseq" => {
+                warn_once(&format!(
+                    "{FASTQ_BACKEND_ENV}=paraseq ignored: this build lacks the `paraseq` feature; using noodles"
+                ));
+                Self::Noodles
+            }
+            other => {
+                warn_once(&format!(
+                    "{FASTQ_BACKEND_ENV}={other} not recognised (expected noodles or paraseq); using noodles"
+                ));
+                Self::Noodles
+            }
+        }
+    }
+}
+
+fn warn_once(msg: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| log::warn!("{msg}"));
+}
+
+enum RecordSource {
+    Noodles(fastq::io::Reader<Box<dyn BufRead + Send>>),
+    #[cfg(feature = "paraseq")]
+    Paraseq(Box<ParaseqSource>),
+}
+
+/// Records parsed per `paraseq` fill; converted reads wait in `pending`.
+#[cfg(feature = "paraseq")]
+const PARASEQ_BATCH: usize = 4096;
+
+#[cfg(feature = "paraseq")]
+struct ParaseqSource {
+    reader: paraseq::fastq::Reader<Box<dyn BufRead + Send>>,
+    record_set: paraseq::fastq::RecordSet,
+    pending: std::collections::VecDeque<EncodedRead>,
+    done: bool,
+}
+
+#[cfg(feature = "paraseq")]
+impl ParaseqSource {
+    fn new(reader: Box<dyn BufRead + Send>) -> Self {
+        Self {
+            reader: paraseq::fastq::Reader::new(reader),
+            record_set: paraseq::fastq::RecordSet::new(PARASEQ_BATCH),
+            pending: std::collections::VecDeque::with_capacity(PARASEQ_BATCH),
+            done: false,
+        }
+    }
+
+    /// Make sure `pending` holds at least one read. Returns `false` once the
+    /// input is exhausted.
+    fn refill(&mut self, qual_shift: i32, name_separators: &[u8]) -> Result<bool, Error> {
+        use paraseq::Record as _;
+
+        if !self.pending.is_empty() {
+            return Ok(true);
+        }
+        if self.done {
+            return Ok(false);
+        }
+        let parse_err = |e: paraseq::Error| {
+            Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("FASTQ parse error (paraseq): {e}"),
+            ))
+        };
+        if !self.record_set.fill(&mut self.reader).map_err(parse_err)? {
+            self.done = true;
+            // paraseq leaves an incomplete trailing record in its overflow
+            // buffer and reports a clean end of input; noodles errors on it.
+            if !self.reader.exhausted() {
+                return Err(Error::from(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete FASTQ record at end of input",
+                )));
+            }
+            return Ok(false);
+        }
+        for record in self.record_set.iter() {
+            let record = record.map_err(parse_err)?;
+            // paraseq's id is the whole header line; noodles' name stops at
+            // the first space or tab.
+            let id = record.id();
+            let name_end = id
+                .iter()
+                .position(|&b| b == b' ' || b == b'\t')
+                .unwrap_or(id.len());
+            let read = encode_record(
+                qual_shift,
+                name_separators,
+                &id[..name_end],
+                record.seq_raw(),
+                record.qual().unwrap_or_default(),
+            )?;
+            self.pending.push_back(read);
+        }
+        Ok(true)
+    }
+}
+
+/// Build an [`EncodedRead`] from one parsed record. Shared by every backend
+/// so their output cannot drift apart. `name` is the header up to (not
+/// including) the first space or tab.
+fn encode_record(
+    qual_shift: i32,
+    name_separators: &[u8],
+    name: &[u8],
+    seq: &[u8],
+    qual: &[u8],
+) -> Result<EncodedRead, Error> {
+    let name = std::str::from_utf8(name).map_err(|e| {
+        Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid UTF-8 in read name: {e}"),
+        ))
+    })?;
+
+    let sequence = seq.iter().map(|&b| encode_base(b)).collect();
+
+    let name = match name_separators
+        .iter()
+        .filter_map(|&sep| name.as_bytes().iter().position(|&b| b == sep))
+        .min()
+    {
+        Some(cut) => name[..cut].to_string(),
+        None => name.to_string(),
+    };
+
+    let quality = if qual_shift == 0 {
+        qual.to_vec()
+    } else {
+        qual.iter()
+            .map(|&b| (i32::from(b) + qual_shift).clamp(33, 126) as u8)
+            .collect()
+    };
+
+    Ok(EncodedRead {
+        name,
+        sequence,
+        quality,
+    })
+}
+
 /// FASTQ reader that handles decompression and base encoding
 pub struct FastqReader {
-    inner: fastq::io::Reader<Box<dyn BufRead + Send>>,
+    inner: RecordSource,
     /// Signed shift applied to every input quality byte so the rest of the
     /// pipeline always sees Phred+33.
     ///
@@ -97,6 +275,17 @@ impl FastqReader {
     /// # Returns
     /// A FastqReader that iterates over encoded reads
     pub fn open(path: &Path, decompress_cmd: Option<&str>) -> Result<Self, Error> {
+        Self::open_with_backend(path, decompress_cmd, FastqBackend::from_env())
+    }
+
+    /// Like [`FastqReader::open`], with an explicit record parser instead of
+    /// the one chosen by `RUSTAR_FASTQ_BACKEND`. Decompression is the same for
+    /// every backend.
+    pub fn open_with_backend(
+        path: &Path,
+        decompress_cmd: Option<&str>,
+        backend: FastqBackend,
+    ) -> Result<Self, Error> {
         let reader: Box<dyn BufRead + Send> = if let Some(cmd) = decompress_cmd {
             // Use external decompression command
             Self::open_with_command(path, cmd)?
@@ -124,10 +313,14 @@ impl FastqReader {
             }
         };
 
-        let fastq_reader = fastq::io::Reader::new(reader);
+        let inner = match backend {
+            FastqBackend::Noodles => RecordSource::Noodles(fastq::io::Reader::new(reader)),
+            #[cfg(feature = "paraseq")]
+            FastqBackend::Paraseq => RecordSource::Paraseq(Box::new(ParaseqSource::new(reader))),
+        };
 
         Ok(Self {
-            inner: fastq_reader,
+            inner,
             qual_shift: 0,
             name_separators: vec![b'/'],
         })
@@ -171,47 +364,27 @@ impl FastqReader {
 
     /// Get next read with encoded bases
     pub fn next_encoded(&mut self) -> Result<Option<EncodedRead>, Error> {
-        match self.inner.records().next() {
-            Some(Ok(record)) => {
-                let name = std::str::from_utf8(record.name())
-                    .map_err(|e| {
-                        Error::from(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("invalid UTF-8 in read name: {e}"),
-                        ))
-                    })?
-                    .to_string();
-
-                let sequence = record.sequence().iter().map(|&b| encode_base(b)).collect();
-
-                let name = match self
-                    .name_separators
-                    .iter()
-                    .filter_map(|&sep| name.as_bytes().iter().position(|&b| b == sep))
-                    .min()
-                {
-                    Some(cut) => name[..cut].to_string(),
-                    None => name,
-                };
-
-                let quality = if self.qual_shift == 0 {
-                    record.quality_scores().to_vec()
+        match &mut self.inner {
+            RecordSource::Noodles(reader) => match reader.records().next() {
+                Some(Ok(record)) => encode_record(
+                    self.qual_shift,
+                    &self.name_separators,
+                    record.name(),
+                    record.sequence(),
+                    record.quality_scores(),
+                )
+                .map(Some),
+                Some(Err(e)) => Err(Error::from(e)),
+                None => Ok(None),
+            },
+            #[cfg(feature = "paraseq")]
+            RecordSource::Paraseq(src) => {
+                if src.refill(self.qual_shift, &self.name_separators)? {
+                    Ok(src.pending.pop_front())
                 } else {
-                    record
-                        .quality_scores()
-                        .iter()
-                        .map(|&b| (b as i32 + self.qual_shift).clamp(33, 126) as u8)
-                        .collect()
-                };
-
-                Ok(Some(EncodedRead {
-                    name,
-                    sequence,
-                    quality,
-                }))
+                    Ok(None)
+                }
             }
-            Some(Err(e)) => Err(Error::from(e)),
-            None => Ok(None),
         }
     }
 
@@ -224,6 +397,14 @@ impl FastqReader {
     /// Vector of encoded reads (may be shorter than batch_size at end of file)
     pub fn read_batch(&mut self, batch_size: usize) -> Result<Vec<EncodedRead>, Error> {
         let mut batch = Vec::with_capacity(batch_size);
+        #[cfg(feature = "paraseq")]
+        if let RecordSource::Paraseq(src) = &mut self.inner {
+            while batch.len() < batch_size && src.refill(self.qual_shift, &self.name_separators)? {
+                let take = (batch_size - batch.len()).min(src.pending.len());
+                batch.extend(src.pending.drain(..take));
+            }
+            return Ok(batch);
+        }
         for _ in 0..batch_size {
             match self.next_encoded()? {
                 Some(read) => batch.push(read),
@@ -251,8 +432,19 @@ impl PairedFastqReader {
     /// # Returns
     /// A PairedFastqReader that iterates over paired reads with name validation
     pub fn open(path1: &Path, path2: &Path, decompress_cmd: Option<&str>) -> Result<Self, Error> {
-        let reader1 = FastqReader::open(path1, decompress_cmd)?;
-        let reader2 = FastqReader::open(path2, decompress_cmd)?;
+        Self::open_with_backend(path1, path2, decompress_cmd, FastqBackend::from_env())
+    }
+
+    /// Like [`PairedFastqReader::open`], with an explicit record parser for
+    /// both mates.
+    pub fn open_with_backend(
+        path1: &Path,
+        path2: &Path,
+        decompress_cmd: Option<&str>,
+        backend: FastqBackend,
+    ) -> Result<Self, Error> {
+        let reader1 = FastqReader::open_with_backend(path1, decompress_cmd, backend)?;
+        let reader2 = FastqReader::open_with_backend(path2, decompress_cmd, backend)?;
 
         Ok(Self { reader1, reader2 })
     }
@@ -777,5 +969,211 @@ mod tests {
         // EOF batch
         let batch3 = reader.read_paired_batch(3).unwrap();
         assert_eq!(batch3.len(), 0);
+    }
+}
+
+/// Equivalence of the `paraseq` backend against the default `noodles` one:
+/// same names, sequences, qualities and PE pairing on identical input.
+#[cfg(all(test, feature = "paraseq"))]
+mod paraseq_equivalence {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    type Flat = (String, Vec<u8>, Vec<u8>);
+
+    fn flat(r: &EncodedRead) -> Flat {
+        (r.name.clone(), r.sequence.clone(), r.quality.clone())
+    }
+
+    /// Deterministic FASTQ text with awkward but valid headers: descriptions
+    /// after a space or tab, `/1` suffixes, Illumina comments, lowercase and
+    /// IUPAC bases, variable lengths, and a `+` line that repeats the name.
+    fn fastq_text(n: usize, mate: u8, crlf: bool, trailing_newline: bool) -> String {
+        let eol = if crlf { "\r\n" } else { "\n" };
+        let mut s = String::new();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15 ^ u64::from(mate);
+        let bases = b"ACGTNacgtnRYK";
+        for i in 0..n {
+            let len = 20 + (i * 7) % 131;
+            let mut seq = String::with_capacity(len);
+            let mut qual = String::with_capacity(len);
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                seq.push(bases[(state % bases.len() as u64) as usize] as char);
+                qual.push((b'!' + ((state >> 8) % 42) as u8) as char);
+            }
+            let header = match i % 4 {
+                0 => format!("@r{i}/{mate}"),
+                1 => format!("@r{i} {mate}:N:0:ACGT"),
+                2 => format!("@r{i}\tdesc with spaces"),
+                _ => format!("@r{i}"),
+            };
+            let plus = if i % 3 == 0 {
+                format!("+{}", &header[1..])
+            } else {
+                "+".to_string()
+            };
+            s.push_str(&header);
+            s.push_str(eol);
+            s.push_str(&seq);
+            s.push_str(eol);
+            s.push_str(&plus);
+            s.push_str(eol);
+            s.push_str(&qual);
+            if trailing_newline || i + 1 < n {
+                s.push_str(eol);
+            }
+        }
+        s
+    }
+
+    fn write_plain(text: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn write_gz(text: &str) -> NamedTempFile {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let f = tempfile::Builder::new()
+            .suffix(".fq.gz")
+            .tempfile()
+            .unwrap();
+        let mut enc = GzEncoder::new(f.reopen().unwrap(), Compression::default());
+        enc.write_all(text.as_bytes()).unwrap();
+        enc.finish().unwrap();
+        f
+    }
+
+    fn read_all_se(path: &Path, backend: FastqBackend, batch: usize) -> Vec<Flat> {
+        let mut reader = FastqReader::open_with_backend(path, None, backend).unwrap();
+        let mut out = Vec::new();
+        loop {
+            let b = reader.read_batch(batch).unwrap();
+            if b.is_empty() {
+                break;
+            }
+            out.extend(b.iter().map(flat));
+        }
+        out
+    }
+
+    fn read_all_pe(p1: &Path, p2: &Path, backend: FastqBackend) -> Vec<(String, Flat, Flat)> {
+        let mut reader = PairedFastqReader::open_with_backend(p1, p2, None, backend).unwrap();
+        let mut out = Vec::new();
+        loop {
+            let b = reader.read_paired_batch(1000).unwrap();
+            if b.is_empty() {
+                break;
+            }
+            out.extend(
+                b.iter()
+                    .map(|p| (p.name.clone(), flat(&p.mate1), flat(&p.mate2))),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn se_plain_gzip_crlf_and_batch_boundaries() {
+        // 10_007 records crosses several paraseq fills (4096) and read_batch
+        // sizes that do not divide it.
+        for (crlf, trailing) in [(false, true), (true, true), (false, false)] {
+            let text = fastq_text(10_007, 1, crlf, trailing);
+            for file in [write_plain(&text), write_gz(&text)] {
+                let expected = read_all_se(file.path(), FastqBackend::Noodles, 10_000);
+                assert_eq!(expected.len(), 10_007);
+                for batch in [1, 999, 10_000] {
+                    let got = read_all_se(file.path(), FastqBackend::Paraseq, batch);
+                    assert_eq!(
+                        got, expected,
+                        "crlf={crlf} trailing={trailing} batch={batch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn se_next_encoded_matches() {
+        let text = fastq_text(5000, 1, false, true);
+        let file = write_plain(&text);
+        let mut a =
+            FastqReader::open_with_backend(file.path(), None, FastqBackend::Noodles).unwrap();
+        let mut b =
+            FastqReader::open_with_backend(file.path(), None, FastqBackend::Paraseq).unwrap();
+        loop {
+            let (x, y) = (a.next_encoded().unwrap(), b.next_encoded().unwrap());
+            assert_eq!(x.as_ref().map(flat), y.as_ref().map(flat));
+            if x.is_none() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn se_with_params_matches() {
+        let text = fastq_text(3000, 1, false, true);
+        let file = write_plain(&text);
+        let mut params =
+            crate::params::Parameters::parse_from(["rustar-aligner", "--readFilesIn", "x.fq"]);
+        params.read_quality_score_base = 64;
+        params.out_qs_conversion_add = 2;
+        params.read_name_separator = vec!["_".to_string(), "/".to_string()];
+        let collect = |backend| {
+            let mut r = FastqReader::open_with_backend(file.path(), None, backend)
+                .unwrap()
+                .with_params(&params);
+            r.read_batch(10_000)
+                .unwrap()
+                .iter()
+                .map(flat)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            collect(FastqBackend::Paraseq),
+            collect(FastqBackend::Noodles)
+        );
+    }
+
+    #[test]
+    fn pe_plain_and_gzip_match() {
+        let t1 = fastq_text(6001, 1, false, true);
+        let t2 = fastq_text(6001, 2, false, true);
+        let plain = (write_plain(&t1), write_plain(&t2));
+        let gz = (write_gz(&t1), write_gz(&t2));
+        for (f1, f2) in [&plain, &gz] {
+            let expected = read_all_pe(f1.path(), f2.path(), FastqBackend::Noodles);
+            assert_eq!(expected.len(), 6001);
+            let got = read_all_pe(f1.path(), f2.path(), FastqBackend::Paraseq);
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn pe_length_mismatch_errors_on_both() {
+        let f1 = write_plain(&fastq_text(10, 1, false, true));
+        let f2 = write_plain(&fastq_text(9, 2, false, true));
+        for backend in [FastqBackend::Noodles, FastqBackend::Paraseq] {
+            let mut r =
+                PairedFastqReader::open_with_backend(f1.path(), f2.path(), None, backend).unwrap();
+            assert!(r.read_paired_batch(100).is_err(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_record_errors_on_both() {
+        let mut text = fastq_text(10, 1, false, true);
+        text.push_str("@cut\nACGT");
+        let file = write_plain(&text);
+        for backend in [FastqBackend::Noodles, FastqBackend::Paraseq] {
+            let mut r = FastqReader::open_with_backend(file.path(), None, backend).unwrap();
+            assert!(r.read_batch(100).is_err(), "{backend:?}");
+        }
     }
 }
