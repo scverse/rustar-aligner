@@ -972,4 +972,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn counts_table_and_summary() {
+        let g = genome();
+        let idx = index();
+        let counts = VelocytoCounts::new(idx.gene_ids.len());
+        // spliced (constitutive exon), unspliced (intron 2), ambiguous
+        // (retained intron), unmapped, multimapper, no feature.
+        counts.count_se_read(&[aln(&g, 0, &[(2050, 2100)], false)], &idx);
+        counts.count_se_read(&[aln(&g, 0, &[(1955, 1990)], false)], &idx);
+        counts.count_se_read(&[aln(&g, 0, &[(1300, 1350)], false)], &idx);
+        counts.count_se_read(&[], &idx);
+        let t = aln(&g, 0, &[(2050, 2100)], false);
+        counts.count_se_read(&[t.clone(), t], &idx);
+        counts.count_se_read(&[aln(&g, 0, &[(8000, 8050)], false)], &idx);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tab = dir.path().join("t.tab");
+        counts.write_table(&tab, &idx).unwrap();
+        let tab = std::fs::read_to_string(tab).unwrap();
+        let mut lines = tab.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "gene_id\tunstranded_spliced\tunstranded_unspliced\tunstranded_ambiguous\t\
+             forward_spliced\tforward_unspliced\tforward_ambiguous\t\
+             reverse_spliced\treverse_unspliced\treverse_ambiguous"
+        );
+        assert_eq!(lines.next().unwrap(), "G1\t1\t1\t1\t1\t1\t1\t0\t0\t0");
+        assert_eq!(lines.count(), idx.gene_ids.len() - 1);
+
+        let sum = dir.path().join("s.tsv");
+        counts.write_summary(&sum).unwrap();
+        let sum = std::fs::read_to_string(sum).unwrap();
+        let get = |k: &str| {
+            sum.lines()
+                .find(|l| l.split('\t').next() == Some(k))
+                .unwrap()
+                .split('\t')
+                .skip(1)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("N_unmapped"), ["1", "1", "1"]);
+        assert_eq!(get("N_multimapping"), ["1", "1", "1"]);
+        assert_eq!(get("N_noFeature"), ["1", "1", "4"]);
+        assert_eq!(get("N_unspliced"), ["1", "1", "0"]);
+        assert_eq!(get("fraction_unspliced"), ["0.3333", "0.3333", "NA"]);
+    }
 }

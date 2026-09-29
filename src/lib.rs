@@ -322,45 +322,61 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let mut params = params.clone();
     params.redefine_window_params(index.genome.n_genome);
 
-    // Build gene-count context if --quantMode GeneCounts was requested.
-    // GTF requirement is already validated in params.validate().
-    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
-        if params.quant_gene_counts() {
-            let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
-            info!(
-                "quantMode GeneCounts: building gene annotation from {}",
-                gtf_path.display()
-            );
-            let ctx = crate::quant::QuantContext::build(
-                gtf_path,
-                &index.genome,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-            )?;
-            Some(std::sync::Arc::new(ctx))
-        } else {
-            None
-        };
-
     // Use the transcriptome index loaded alongside the genome (populated
     // from transcriptInfo.tab / exonInfo.tab / geneInfo.tab at load time
     // — see GenomeIndex::load). Only wire it through to the pipeline when
-    // `--quantMode TranscriptomeSAM` is requested.
-    let tr_idx: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
-        if params.quant_transcriptome_sam() {
+    // `--quantMode TranscriptomeSAM` or `GeneVelocyto` is requested.
+    let tr_idx_all: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
+        if params.quant_transcriptome_sam() || params.quant_gene_velocyto() {
             let tr = index.transcriptome.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--quantMode TranscriptomeSAM requires a GTF-aware index; \
+                    "--quantMode TranscriptomeSAM / GeneVelocyto require a GTF-aware index; \
                      re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
                      at alignReads so transcriptInfo.tab can be (re)built"
                 )
             })?;
             info!(
-                "quantMode TranscriptomeSAM: using {} transcripts from genome index",
+                "quantMode TranscriptomeSAM/GeneVelocyto: using {} transcripts from genome index",
                 tr.n_transcripts()
             );
             Some(std::sync::Arc::new(tr.clone()))
+        } else {
+            None
+        };
+    let tr_idx = tr_idx_all
+        .as_ref()
+        .filter(|_| params.quant_transcriptome_sam())
+        .map(std::sync::Arc::clone);
+
+    // Build the per-read quantification context if --quantMode GeneCounts
+    // and/or GeneVelocyto was requested. GeneCounts' GTF requirement is
+    // already validated in params.validate().
+    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
+        if params.quant_gene_counts() || params.quant_gene_velocyto() {
+            let gene = if params.quant_gene_counts() {
+                let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
+                info!(
+                    "quantMode GeneCounts: building gene annotation from {}",
+                    gtf_path.display()
+                );
+                Some(crate::quant::GeneQuant::build(
+                    gtf_path,
+                    &index.genome,
+                    &params.sjdb_gtf_feature_exon,
+                    &params.sjdb_gtf_chr_prefix,
+                    &params.sjdb_gtf_tag_exon_parent_gene,
+                )?)
+            } else {
+                None
+            };
+            let velocyto = tr_idx_all
+                .as_ref()
+                .filter(|_| params.quant_gene_velocyto())
+                .map(|tr| crate::quant::VelocytoQuant::new(std::sync::Arc::clone(tr)));
+            Some(std::sync::Arc::new(crate::quant::QuantContext {
+                gene,
+                velocyto,
+            }))
         } else {
             None
         };
@@ -448,11 +464,12 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     crate::io::log::write_log_progress_out(&log_progress_path, &stats, time_start, time_finish)?;
     info!("Wrote {}", log_progress_path.display());
 
-    // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
+    // Write ReadsPerGene.out.tab / ReadsPerGeneVelocyto.* for the requested
+    // --quantMode values.
     if let Some(ref ctx) = quant_ctx {
-        let quant_path = params.output_path("ReadsPerGene.out.tab");
-        ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
-        info!("Wrote {}", quant_path.display());
+        for path in ctx.write_outputs(|name| params.output_path(name))? {
+            info!("Wrote {}", path.display());
+        }
     }
 
     info!("Alignment complete!");
@@ -1838,7 +1855,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             stats.record_alignment(0, max_multimaps);
                             stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                             if let Some(ref q) = quant {
-                                q.counts.count_se_read(&[], 0, &q.gene_ann);
+                                q.count_se_read(&[], 0);
                             }
                             if output_unmapped {
                                 // Unmapped reads keep the full original read (STAR: clipped
@@ -1904,8 +1921,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
                         // Gene-level quantification (lock-free atomic counts)
                         if let Some(ref q) = quant {
-                            q.counts
-                                .count_se_read(&transcripts, n_for_mapq, &q.gene_ann);
+                            q.count_se_read(&transcripts, n_for_mapq);
                         }
 
                         // Record junction statistics (per-read dedup, fix A)
@@ -3180,7 +3196,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             stats.record_alignment(0, max_multimaps);
                             stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                             if let Some(ref q) = quant {
-                                q.counts.count_pe_read(&[], true, false, &q.gene_ann);
+                                q.count_pe_read(&[], true, false);
                             }
                             if output_unmapped {
                                 // Full original mates for unmapped pairs (STAR convention).
@@ -3281,12 +3297,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
                             let bm_deref: Vec<&crate::align::read_align::PairedAlignment> =
                                 both_mapped.iter().map(AsRef::as_ref).collect();
-                            q.counts.count_pe_read(
-                                &bm_deref,
-                                results.is_empty(),
-                                has_half_mapped,
-                                &q.gene_ann,
-                            );
+                            q.count_pe_read(&bm_deref, results.is_empty(), has_half_mapped);
                         }
 
                         // Record junction statistics
