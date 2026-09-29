@@ -28,18 +28,21 @@ use std::io::BufWriter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-/// Buffer for SAM records built by parallel threads
+/// Per-read buffer of SAM records built by the parallel alignment workers.
+///
+/// One buffer is created for every read (or read pair), and it usually holds
+/// only 1 to a few records (primary plus any secondaries), so it starts empty
+/// and grows on demand. There is no batch-level merge: the writer consumes
+/// each read's buffer in order.
 #[derive(Default)]
 pub struct BufferedSamRecords {
     pub records: Vec<RecordBuf>,
 }
 
 impl BufferedSamRecords {
-    /// Create new buffer with capacity
+    /// Create an empty per-read buffer (no up-front allocation).
     pub fn new() -> Self {
-        Self {
-            records: Vec::with_capacity(10000),
-        }
+        Self::default()
     }
 
     /// Add a record to the buffer
