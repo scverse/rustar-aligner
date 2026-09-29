@@ -2209,3 +2209,127 @@ fn test_read_name_separator_cuts_the_qname_and_is_configurable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #279: single-end `--chimOutType WithinBAM` must write well-formed
+// records (CIGAR query length == SEQ length). As in STAR
+// (ChimericAlign_chimericBAMoutput.cpp + ReadAlign_alignBAM.cpp), the
+// non-representative segment is a supplementary record (0x800) hard-clipped
+// on its junction side, and both records carry an SA tag.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_se_chim_within_bam_records_well_formed() {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // 100 bp chimeric reads: 60 bp forward from one locus fused to the reverse
+    // complement of 40 bp from a distant locus (strand switch => chimeric),
+    // in both orders.
+    let read_len = 100usize;
+    let fastq_path = tmpdir.path().join("chim.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for i in 0..20usize {
+            let a = 1000 + i * 150;
+            let b = 14000 + i * 150;
+            let mut first = genome[a..a + 60].to_vec();
+            first.extend_from_slice(&rc(&genome[b..b + 40]));
+            let mut second = rc(&genome[b..b + 40]);
+            second.extend_from_slice(&genome[a..a + 60]);
+            for (tag, s) in [("a", &first), ("b", &second)] {
+                writeln!(f, "@chim{i}{tag}").unwrap();
+                f.write_all(s).unwrap();
+                writeln!(f, "\n+\n{}", "I".repeat(s.len())).unwrap();
+            }
+        }
+    }
+
+    let run = |name: &str, extra: &[&str]| -> Vec<noodles::sam::alignment::RecordBuf> {
+        let out = tmpdir.path().join(name);
+        fs::create_dir_all(&out).unwrap();
+        let prefix = format!("{}/", out.display());
+        let mut args: Vec<String> = [
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--chimSegmentMin",
+            "20",
+            "--outFileNamePrefix",
+            &prefix,
+            "--chimOutType",
+            "WithinBAM",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        cargo_bin_cmd!("rustar-aligner")
+            .args(&args)
+            .assert()
+            .success();
+        let mut reader = bam::io::Reader::new(fs::File::open(out.join("Aligned.out.bam")).unwrap());
+        let header = reader.read_header().expect("BAM header readable");
+        reader
+            .record_bufs(&header)
+            .map(|r| r.expect("valid BAM record"))
+            .collect()
+    };
+
+    let query_len = |rec: &noodles::sam::alignment::RecordBuf, kinds: &[Kind]| -> usize {
+        rec.cigar()
+            .as_ref()
+            .iter()
+            .filter(|op| kinds.contains(&op.kind()))
+            .map(|op| op.len())
+            .sum()
+    };
+    let consumes = [
+        Kind::Match,
+        Kind::Insertion,
+        Kind::SoftClip,
+        Kind::SequenceMatch,
+        Kind::SequenceMismatch,
+    ];
+
+    for (name, extra, hard) in [
+        ("out_hard", &[][..], true),
+        ("out_soft", &["SoftClip"][..], false),
+    ] {
+        let records = run(name, extra);
+        let mut n_suppl = 0usize;
+        for rec in &records {
+            let qlen = query_len(rec, &consumes);
+            let hclip = query_len(rec, &[Kind::HardClip]);
+            assert_eq!(
+                qlen,
+                rec.sequence().len(),
+                "{name}: CIGAR query length != SEQ length for {:?}",
+                rec.name()
+            );
+            assert_eq!(qlen + hclip, read_len, "{name}: {:?}", rec.name());
+            if rec.flags().is_supplementary() {
+                n_suppl += 1;
+                assert_eq!(hclip > 0, hard, "{name}: supplementary clip type");
+                assert!(rec.data().get(b"SA").is_some(), "suppl must carry SA");
+            } else {
+                assert_eq!(hclip, 0, "{name}: only supplementary is hard-clipped");
+            }
+        }
+        assert!(
+            n_suppl > 0,
+            "{name}: expected supplementary chimeric records"
+        );
+    }
+}

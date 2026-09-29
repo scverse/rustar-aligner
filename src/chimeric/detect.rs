@@ -43,7 +43,16 @@ impl<'a> ChimericDetector<'a> {
         }
 
         let read_len = read_seq.len();
-        let [left_clip, right_clip] = transcript.count_soft_clips();
+        // Soft clips in read (5'->3') orientation: a reverse-strand CIGAR is laid out on the
+        // reverse-complemented read, so its left clip is the read's 3' end.
+        let [left_clip, right_clip] = {
+            let [l, r] = transcript.count_soft_clips();
+            if transcript.is_reverse {
+                [r, l]
+            } else {
+                [l, r]
+            }
+        };
         let score_min = params.chim_score_min;
         let score_drop_max = params.chim_score_drop_max;
         let non_gtag_penalty = params.chim_score_junction_non_gtag;
@@ -98,16 +107,12 @@ impl<'a> ChimericDetector<'a> {
                 continue;
             }
 
-            // Shift sub-seq read coords into full-read space for right clips
-            let clip_tr = if is_right {
-                adjust_read_positions(clip_tr_raw, clip_start)
-            } else {
-                clip_tr_raw
-            };
+            // Lift sub-seq read coords and CIGAR into full-read space
+            let clip_tr = lift_clip_transcript(clip_tr_raw, clip_start, clip_len, read_len);
 
-            // Determine donor / acceptor by read order
-            let primary_rs = transcript.exons[0].read_start;
-            let clip_rs = clip_tr.exons[0].read_start;
+            // Determine donor / acceptor by read order (5'->3' of the original read)
+            let primary_rs = ro_coords(transcript, read_len).0;
+            let clip_rs = ro_coords(&clip_tr, read_len).0;
             let (tr_donor, tr_acceptor): (&Transcript, &Transcript) = if primary_rs <= clip_rs {
                 (transcript, &clip_tr)
             } else {
@@ -221,17 +226,19 @@ impl<'a> ChimericDetector<'a> {
         let intron_max = params.align_intron_max as u64;
         let overhang_min = params.chim_junction_overhang_min as usize;
 
-        // Outer boundaries of the existing chimeric pair in read space
-        let left_covered = chim.donor.read_start.min(chim.acceptor.read_start);
-        let right_covered = chim.donor.read_end.max(chim.acceptor.read_end);
+        // Outer boundaries of the existing chimeric pair in read (5'->3') space
+        let (donor_ro_start, donor_ro_end) = segment_ro_span(&chim.donor, read_len);
+        let (acceptor_ro_start, acceptor_ro_end) = segment_ro_span(&chim.acceptor, read_len);
+        let left_covered = donor_ro_start.min(acceptor_ro_start);
+        let right_covered = donor_ro_end.max(acceptor_ro_end).min(read_len);
 
         // Which segment is at the left / right boundary
-        let left_partner = if chim.donor.read_start <= chim.acceptor.read_start {
+        let left_partner = if donor_ro_start <= acceptor_ro_start {
             &chim.donor
         } else {
             &chim.acceptor
         };
-        let right_partner = if chim.donor.read_end >= chim.acceptor.read_end {
+        let right_partner = if donor_ro_end >= acceptor_ro_end {
             &chim.donor
         } else {
             &chim.acceptor
@@ -246,7 +253,7 @@ impl<'a> ChimericDetector<'a> {
         let mut results = Vec::new();
 
         for (clip_start, clip_end, partner_seg) in candidates {
-            let clip_len = clip_end - clip_start;
+            let clip_len = clip_end.saturating_sub(clip_start);
             if clip_len < min_seg {
                 continue;
             }
@@ -284,19 +291,16 @@ impl<'a> ChimericDetector<'a> {
                 continue;
             }
 
-            // Shift sub-seq read coords into full-read space
-            let clip_tr = if clip_start > 0 {
-                adjust_read_positions(clip_tr_raw, clip_start)
-            } else {
-                clip_tr_raw
-            };
+            // Lift sub-seq read coords and CIGAR into full-read space
+            let clip_tr = lift_clip_transcript(clip_tr_raw, clip_start, clip_len, read_len);
 
             let new_seg = transcript_to_segment(&clip_tr)
                 .map_err(|e| Error::Chimeric(format!("tier3 segment: {e}")))?;
 
             // Donor / acceptor ordered by read position
             let (donor_seg, acceptor_seg): (&ChimericSegment, &ChimericSegment) =
-                if new_seg.read_start <= partner_seg.read_start {
+                if segment_ro_span(&new_seg, read_len).0 <= segment_ro_span(partner_seg, read_len).0
+                {
                     (&new_seg, partner_seg)
                 } else {
                     (partner_seg, &new_seg)
@@ -441,8 +445,9 @@ impl<'a> ChimericDetector<'a> {
             return Ok(None);
         }
 
-        // Determine donor/acceptor based on read position
-        let (donor_t, acceptor_t) = if t1.exons[0].read_start < t2.exons[0].read_start {
+        // Determine donor/acceptor based on read position (5'->3' of the original read)
+        let read_len = read_seq.len();
+        let (donor_t, acceptor_t) = if ro_coords(t1, read_len).0 < ro_coords(t2, read_len).0 {
             (t1, t2)
         } else {
             (t2, t1)
@@ -611,16 +616,60 @@ pub fn detect_inter_mate_chimeric(
     Some(chim)
 }
 
-/// Shift all exon read_start/read_end values in a transcript by `offset`.
+/// Lift a transcript stitched against a sub-sequence of the read into full-read space.
 ///
-/// Used when a transcript was stitched against a sub-slice of the read (e.g. a right soft-clip
-/// at position `offset`) so that its read coordinates become relative to the full read.
-fn adjust_read_positions(mut tr: Transcript, offset: usize) -> Transcript {
+/// `clip_start`/`clip_len` locate the sub-sequence on the original (forward) read. Read
+/// coordinates of a transcript follow its CIGAR orientation (reverse-strand transcripts are
+/// laid out on the reverse-complemented read), so the sub-sequence starts at `clip_start` for a
+/// forward transcript and at `read_len - clip_start - clip_len` for a reverse one. The CIGAR is
+/// padded with soft clips so that it spans the whole read, like transcripts from the main path.
+fn lift_clip_transcript(
+    mut tr: Transcript,
+    clip_start: usize,
+    clip_len: usize,
+    read_len: usize,
+) -> Transcript {
+    use noodles::sam::alignment::record::cigar::op::{Kind, Op};
+
+    let after = read_len.saturating_sub(clip_start + clip_len);
+    let (left_pad, right_pad) = if tr.is_reverse {
+        (after, clip_start)
+    } else {
+        (clip_start, after)
+    };
     for exon in &mut tr.exons {
-        exon.read_start += offset;
-        exon.read_end += offset;
+        exon.read_start += left_pad;
+        exon.read_end += left_pad;
+    }
+    if left_pad > 0 {
+        match tr.cigar.first_mut() {
+            Some(op) if op.kind() == Kind::SoftClip => {
+                *op = Op::new(Kind::SoftClip, op.len() + left_pad);
+            }
+            _ => tr.cigar.insert(0, Op::new(Kind::SoftClip, left_pad)),
+        }
+    }
+    if right_pad > 0 {
+        match tr.cigar.last_mut() {
+            Some(op) if op.kind() == Kind::SoftClip => {
+                *op = Op::new(Kind::SoftClip, op.len() + right_pad);
+            }
+            _ => tr.cigar.push(Op::new(Kind::SoftClip, right_pad)),
+        }
     }
     tr
+}
+
+/// Read-orientation (5'->3' of the original read) half-open span `[start, end)` of a segment.
+fn segment_ro_span(seg: &ChimericSegment, read_len: usize) -> (usize, usize) {
+    if seg.is_reverse {
+        (
+            read_len.saturating_sub(seg.read_end),
+            read_len.saturating_sub(seg.read_start),
+        )
+    } else {
+        (seg.read_start, seg.read_end)
+    }
 }
 
 /// Compute read-orientation (5'→3' of original read) start/end for a transcript.
@@ -1488,5 +1537,32 @@ mod tests {
                 .unwrap();
         assert_eq!(with.len(), 1, "diffMates should waive the inter-mate gap");
         assert_ne!(with[0].donor.chr_idx, with[0].acceptor.chr_idx);
+    }
+
+    /// Sub-sequence transcripts (soft-clip / residual re-seeding) are lifted into
+    /// full-read CIGAR orientation with a CIGAR spanning the whole read (#279).
+    #[test]
+    fn test_lift_clip_transcript_forward_and_reverse() {
+        use crate::align::transcript::cigar_to_string;
+
+        // Forward: sub-sequence read[60..100) of a 100 bp read.
+        let fwd = lift_clip_transcript(make_transcript(0, 10, 50, false), 60, 40, 100);
+        assert_eq!(fwd.exons[0].read_start, 60);
+        assert_eq!(fwd.exons[0].read_end, 100);
+        assert_eq!(cigar_to_string(&fwd.cigar), "60S40M");
+        assert_eq!(ro_coords(&fwd, 100), (60, 99));
+
+        // Reverse: same sub-sequence; on the reverse-complemented read it is the
+        // first 40 bases, so the padding goes to the right.
+        let rev = lift_clip_transcript(make_transcript(0, 10, 50, true), 60, 40, 100);
+        assert_eq!(rev.exons[0].read_start, 0);
+        assert_eq!(rev.exons[0].read_end, 40);
+        assert_eq!(cigar_to_string(&rev.cigar), "40M60S");
+        assert_eq!(ro_coords(&rev, 100), (60, 99));
+
+        // Left sub-sequence read[0..30) on the reverse strand.
+        let rev_left = lift_clip_transcript(make_transcript(0, 10, 40, true), 0, 30, 100);
+        assert_eq!(cigar_to_string(&rev_left.cigar), "70S30M");
+        assert_eq!(ro_coords(&rev_left, 100), (0, 29));
     }
 }
