@@ -144,8 +144,13 @@ fn dedup_pair_subsets(pairs: &mut Vec<PairedAlignment>) {
             .map(|e| (e.read_end - e.read_start) as u32)
             .sum()
     };
+    // STAR compares transcripts within one window, so both share chromosome
+    // and strand; require the same here so a diagonal coincidence across
+    // strands or chromosomes can never count as overlap.
     let subset_of = |a: &Transcript, b: &Transcript| -> bool {
-        mapped(a).saturating_sub(blocks_overlap_transcripts(a, b)) == 0
+        a.chr_idx == b.chr_idx
+            && a.is_reverse == b.is_reverse
+            && mapped(a).saturating_sub(blocks_overlap_transcripts(a, b)) == 0
     };
 
     let mut kept: Vec<PairedAlignment> = Vec::with_capacity(pairs.len());
@@ -1671,6 +1676,29 @@ mod tests {
         let mut pairs = vec![full, clipped];
         dedup_pair_subsets(&mut pairs);
         assert_eq!(pairs.len(), 2);
+    }
+
+    /// A mate on the opposite strand is never a subset, even when its blocks
+    /// sit on the same read-to-genome diagonal.
+    #[test]
+    fn a_lower_scoring_pair_on_the_other_strand_is_kept() {
+        let full = pair_for_dedup(0, 1_000, 0, 100, 5_000, 174);
+        let mut clipped = pair_for_dedup(0, 1_009, 9, 100, 5_000, 173);
+        clipped.mate1_transcript.is_reverse = true;
+        let mut pairs = vec![full, clipped];
+        dedup_pair_subsets(&mut pairs);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    /// STAR's `blocksOverlap`: only bases on the same diagonal count.
+    #[test]
+    fn blocks_overlap_counts_only_the_shared_diagonal() {
+        let a = pair_for_dedup(0, 1_000, 0, 100, 5_000, 0).mate1_transcript;
+        let b = pair_for_dedup(0, 1_009, 9, 100, 5_000, 0).mate1_transcript;
+        let c = pair_for_dedup(0, 1_010, 9, 100, 5_000, 0).mate1_transcript;
+        assert_eq!(blocks_overlap_transcripts(&a, &b), 91);
+        assert_eq!(blocks_overlap_transcripts(&b, &a), 91);
+        assert_eq!(blocks_overlap_transcripts(&a, &c), 0);
     }
 
     fn pair_for_dedup(
