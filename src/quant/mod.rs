@@ -549,6 +549,9 @@ pub struct QuantContext {
     pub gene: Option<GeneQuant>,
     /// `--quantMode GeneSplicing`: spliced / unspliced / ambiguous per gene.
     pub splicing: Option<SplicingQuant>,
+    /// `--outSAMattributes sp`: annotated transcripts for the per-alignment
+    /// splicing-status tag.
+    pub splice_tag: Option<std::sync::Arc<transcriptome::TranscriptomeIndex>>,
 }
 
 /// GeneAnnotation + GeneCounts (`ReadsPerGene.out.tab`).

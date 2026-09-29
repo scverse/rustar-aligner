@@ -2900,6 +2900,22 @@ mod tests {
     }
 
     #[test]
+    fn sp_attribute_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        assert!(!p.out_sam_attributes.contains(SamAttributes::SP));
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "Standard",
+            "sp",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::SP));
+        assert!(p.out_sam_attributes.contains(SamAttributes::NH));
+    }
+
+    #[test]
     fn quant_gene_splicing_is_opt_in() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
         assert!(!p.quant_gene_splicing());

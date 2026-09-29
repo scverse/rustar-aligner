@@ -327,10 +327,16 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // — see GenomeIndex::load). Only wire it through to the pipeline when
     // `--quantMode TranscriptomeSAM` or `GeneSplicing` is requested.
     let tr_idx_all: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
-        if params.quant_transcriptome_sam() || params.quant_gene_splicing() {
+        if params.quant_transcriptome_sam()
+            || params.quant_gene_splicing()
+            || params
+                .out_sam_attributes
+                .contains(crate::params::SamAttributes::SP)
+        {
             let tr = index.transcriptome.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--quantMode TranscriptomeSAM / GeneSplicing require a GTF-aware index; \
+                    "--quantMode TranscriptomeSAM / GeneSplicing and --outSAMattributes sp \
+                     require a GTF-aware index; \
                      re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
                      at alignReads so transcriptInfo.tab can be (re)built"
                 )
@@ -380,35 +386,49 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // Build the per-read quantification context if --quantMode GeneCounts
     // and/or GeneSplicing was requested. GeneCounts' GTF requirement is
     // already validated in params.validate().
-    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
-        if params.quant_gene_counts() || params.quant_gene_splicing() {
-            let gene = if params.quant_gene_counts() {
-                let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
-                info!(
-                    "quantMode GeneCounts: building gene annotation from {}",
-                    gtf_path.display()
-                );
-                Some(crate::quant::GeneQuant::build(
-                    gtf_path,
-                    &index.genome,
-                    &params.sjdb_gtf_feature_exon,
-                    &params.sjdb_gtf_chr_prefix,
-                    &params.sjdb_gtf_tag_exon_parent_gene,
-                )?)
-            } else {
-                None
-            };
-            let splicing = tr_idx_all
-                .as_ref()
-                .filter(|_| params.quant_gene_splicing())
-                .map(|tr| crate::quant::SplicingQuant::new(std::sync::Arc::clone(tr)));
-            Some(std::sync::Arc::new(crate::quant::QuantContext {
-                gene,
-                splicing,
-            }))
+    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> = if params
+        .quant_gene_counts()
+        || params.quant_gene_splicing()
+        || params
+            .out_sam_attributes
+            .contains(crate::params::SamAttributes::SP)
+    {
+        let gene = if params.quant_gene_counts() {
+            let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
+            info!(
+                "quantMode GeneCounts: building gene annotation from {}",
+                gtf_path.display()
+            );
+            Some(crate::quant::GeneQuant::build(
+                gtf_path,
+                &index.genome,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+                &params.sjdb_gtf_tag_exon_parent_gene,
+            )?)
         } else {
             None
         };
+        let splicing = tr_idx_all
+            .as_ref()
+            .filter(|_| params.quant_gene_splicing())
+            .map(|tr| crate::quant::SplicingQuant::new(std::sync::Arc::clone(tr)));
+        let splice_tag = tr_idx_all
+            .as_ref()
+            .filter(|_| {
+                params
+                    .out_sam_attributes
+                    .contains(crate::params::SamAttributes::SP)
+            })
+            .map(std::sync::Arc::clone);
+        Some(std::sync::Arc::new(crate::quant::QuantContext {
+            gene,
+            splicing,
+            splice_tag,
+        }))
+    } else {
+        None
+    };
 
     // SmartSeq has no barcodes/UMIs — a dedicated manifest-driven path.
     if params.solo_type == params::SoloType::SmartSeq {
@@ -2068,6 +2088,15 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                         params.out_sam_attributes,
                                     )?;
                                 }
+                                // --outSAMattributes sp: splicing status tag.
+                                if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref())
+                                {
+                                    crate::quant::splice_status::tag_records_se(
+                                        &mut records,
+                                        &transcripts,
+                                        tx,
+                                    );
+                                }
                                 for record in records {
                                     buffer.push(record);
                                 }
@@ -3560,6 +3589,14 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                     ctx,
                                     params.out_sam_attributes,
                                 )?;
+                            }
+                            // --outSAMattributes sp: splicing status tag.
+                            if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref()) {
+                                crate::quant::splice_status::tag_records_pe(
+                                    &mut records,
+                                    &paired_alns,
+                                    tx,
+                                );
                             }
                             for record in records {
                                 buffer.push(record);
