@@ -1,6 +1,5 @@
 /// FASTQ reader with base encoding and decompression support
 use crate::error::Error;
-use flate2::read::GzDecoder;
 use noodles::fastq;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -88,7 +87,7 @@ pub struct FastqReader {
 }
 
 impl FastqReader {
-    /// Open a FASTQ file (plain or gzip compressed)
+    /// Open a FASTQ file, plain or compressed (format detected by magic bytes)
     ///
     /// # Arguments
     /// * `path` - Path to FASTQ file
@@ -101,27 +100,14 @@ impl FastqReader {
             // Use external decompression command
             Self::open_with_command(path, cmd)?
         } else {
-            // Auto-detect compression by file extension
-            let path_str = path.to_string_lossy();
-            let is_gzipped = path_str.ends_with(".gz") || path_str.ends_with(".gzip");
-
+            // Detect compression from the magic bytes, not the file name, and
+            // stack the matching decoder (gzip always; bzip2/zstd/xz when their
+            // Cargo feature is on). See `io::compression`.
             let file = File::open(path).map_err(|e| Error::io(e, path))?;
-
-            // Larger-than-default (8 KiB) buffers cut read syscalls on the decode
-            // hot path. Feed the inflater from a big buffered file, and hand the
-            // decoded stream to noodles through a big BufReader.
-            const DECODE_BUF: usize = 1 << 19; // 512 KiB
-            if is_gzipped {
-                // Gzipped file
-                let buffered = BufReader::with_capacity(DECODE_BUF, file);
-                Box::new(BufReader::with_capacity(
-                    DECODE_BUF,
-                    GzDecoder::new(buffered),
-                ))
-            } else {
-                // Plain text FASTQ
-                Box::new(BufReader::with_capacity(DECODE_BUF, file))
-            }
+            let (reader, format) =
+                crate::io::compression::open_decoded(file).map_err(|e| Error::io(e, path))?;
+            log::debug!("reading {} as {format} input", path.display());
+            reader
         };
 
         let fastq_reader = fastq::io::Reader::new(reader);
@@ -567,6 +553,75 @@ mod tests {
         assert_eq!(read1.name, "read1");
         assert_eq!(read1.sequence, vec![0, 1, 2, 3]); // ACGT
         assert_eq!(read1.quality.len(), 4);
+    }
+
+    /// Write `bytes` to a temp file named `name_suffix`, open it with
+    /// `FastqReader`, and return every read name.
+    fn read_names_from(bytes: &[u8], name_suffix: &str) -> Vec<String> {
+        let mut tmpfile = tempfile::Builder::new()
+            .suffix(name_suffix)
+            .tempfile()
+            .unwrap();
+        tmpfile.write_all(bytes).unwrap();
+        tmpfile.flush().unwrap();
+        let mut reader = FastqReader::open(tmpfile.path(), None).unwrap();
+        let mut names = Vec::new();
+        while let Some(r) = reader.next_encoded().unwrap() {
+            names.push(r.name);
+        }
+        names
+    }
+
+    const TWO_READS: &[u8] = b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nHHHH\n";
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Compression is detected by content: the file name is irrelevant, and a
+    /// `.gz` made of several members (bcl2fastq, `cat a.gz b.gz`) is read whole.
+    #[test]
+    fn test_fastq_reader_detects_by_content_and_reads_all_gzip_members() {
+        let (a, b) = TWO_READS.split_at(19);
+        let mut multi = gzip_bytes(a);
+        multi.extend(gzip_bytes(b));
+        assert_eq!(read_names_from(&multi, ".fastq"), ["read1", "read2"]);
+        assert_eq!(read_names_from(&multi, ".fq.gz"), ["read1", "read2"]);
+        // A plain file with a misleading extension is still plain.
+        assert_eq!(read_names_from(TWO_READS, ".fq.gz"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "bz2")]
+    #[test]
+    fn test_fastq_reader_bzip2() {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(TWO_READS).unwrap();
+        let bytes = e.finish().unwrap();
+        assert_eq!(read_names_from(&bytes, ".fq.bz2"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_fastq_reader_zstd() {
+        let bytes = ruzstd::encoding::compress_to_vec(
+            TWO_READS,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(read_names_from(&bytes, ".fq.zst"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn test_fastq_reader_xz() {
+        let mut w =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
+        w.write_all(TWO_READS).unwrap();
+        let bytes = w.finish().unwrap();
+        assert_eq!(read_names_from(&bytes, ".fq.xz"), ["read1", "read2"]);
     }
 
     #[test]

@@ -65,10 +65,34 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.49", features = ["libdeflate"] }
+# Optional FASTQ input decoders beyond gzip (#218). The format is detected by
+# magic bytes in `src/io/fastq.rs`. Every backend below is pure Rust, so turning
+# them on adds no C toolchain requirement. `niffler` was evaluated and not used:
+# it cannot offer a pure-Rust zstd backend, its xz backend is C-only
+# (`liblzma-sys`), and its `bgz` backend duplicates `noodles-bgzf`.
+# `bzip2` 0.6 defaults to `libbz2-rs-sys` (pure Rust), not the C `bzip2-sys`.
+bzip2 = { version = "0.6", optional = true }
+# Decode-only pure-Rust Zstandard.
+ruzstd = { version = "0.9", optional = true }
+# Pure-Rust XZ decoder; encoder and lzip support left out.
+lzma-rust2 = { version = "0.21", optional = true, default-features = false, features = ["std", "xz", "optimization"] }
+
+[features]
+default = []
+# FASTQ input compressed with bzip2 (magic `42 5a 68`).
+bz2 = ["dep:bzip2"]
+# FASTQ input compressed with Zstandard (magic `28 b5 2f fd`).
+zstd = ["dep:ruzstd"]
+# FASTQ input compressed with XZ (magic `fd 37 7a 58 5a 00`).
+xz = ["dep:lzma-rust2"]
+# All compressed input formats beyond gzip.
+compressed-input = ["bz2", "zstd", "xz"]
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# XZ encoder, used only to build `.xz` test fixtures at runtime.
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "encoder"] }
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
