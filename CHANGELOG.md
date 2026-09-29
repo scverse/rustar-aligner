@@ -29,6 +29,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **FASTQ compression is detected by content, and bzip2 / zstd / xz input is
+  available behind features** (#218). `--readFilesIn` is sniffed by magic bytes
+  instead of by the `.gz` / `.gzip` extension, so a gzip file with any name is
+  decoded and a plain file named `*.gz` is read as plain. gzip decoding is
+  multi-member aware. New optional Cargo features, all pure Rust, none in the
+  default build: `bz2` (`bzip2` with its `libbz2-rs-sys` backend), `zstd`
+  (`ruzstd`, multi-frame and skippable-frame aware), `xz` (`lzma-rust2`,
+  multi-stream), and `compressed-input` for all three. A build without the
+  matching feature stops with an error naming the feature and the
+  `--readFilesCommand` alternative. `--readFilesCommand` still takes
+  precedence.
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
