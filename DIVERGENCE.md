@@ -66,6 +66,23 @@ The site that acts on those zeroed counts, however, gates on a different flag (`
 
 ---
 
+### 1.4 Bulk total-RNA options: unspliced transcriptome targets, `sp` tag, `--quantMode GeneSplicing`
+
+All three are rustar-aligner extensions with no STAR equivalent, and all are opt-in. With the defaults (`--quantTranscriptomeUnspliced None`, no `sp` attribute, no `GeneSplicing`) no output changes, which `tests/bulk_unspliced.rs` (`new_options_leave_existing_outputs_unchanged`) checks.
+
+**What STAR does.** `--quantMode TranscriptomeSAM` projects every alignment onto every annotated transcript whose exons contain it (`Transcriptome_quantAlign.cpp`); there are no unspliced targets, so an unspliced read inside an intron that another isoform retains is projected onto the retaining isoform only, and a read in a constitutive intron is not projected at all. STAR classifies reads as spliced / unspliced / ambiguous only for single-cell runs (STARsolo, `Transcriptome_classifyAlign.cpp` + `SoloFeature_countVelocyto.cpp`), and has no per-alignment splicing tag.
+
+**What rustar-aligner does.**
+
+- `--quantTranscriptomeUnspliced Intron|PreMRNA` appends one `<gene_id>-I` target per gene (merged introns of all isoforms plus `--quantTranscriptomeUnsplicedFlank`, or the gene body) after the annotated transcripts, and projects alignments onto them with the unchanged STAR projection, except that fragments crossing a splice junction are kept off the unspliced targets. It also writes `Aligned.toTranscriptome.targets.tsv` and, on request, the unspliced sequences.
+- `--outSAMattributes sp` and `--quantMode GeneSplicing` run a port of STARsolo's spliced / unspliced classification (`alignToTranscriptMinOverlap` with `minOverlapMinusOne = 6` and the 1 Mb intron cap, then the per-UMI collapse of `countVelocyto`), one read or pair standing for one UMI. Two details differ from `classifyAlign`: the containment test uses the true leftmost / rightmost aligned base of the pair, where STAR uses the first block's start and the last block's end (a `TODO` next to that line in STAR flags the case where mate 2 ends before mate 1); and blocks are sorted by position before the scan, so STAR's early exit at the last exon also holds for overlapping mates. The `sp` tag collapses over all containing transcripts regardless of gene and strand.
+
+**Why.** In ribo-depleted total RNA a large share of reads is pre-mRNA. Without unspliced targets STAR's projection gives the intronic ones to retained-intron isoforms, so isoform proportions follow the library's pre-mRNA content (see the PR for measurements, and COMBINE-lab/salmon#1229 for the same effect with Salmon decoys). Unspliced targets let the downstream EM share such reads, as splici does for single-cell data. Bulk users have no STAR option that reports how much of a library is unspliced.
+
+**Impact.** Only when the options are given. Unspliced targets add `@SQ` lines and records to `Aligned.toTranscriptome.out.bam` and change `NH` / `HI` / `MAPQ` of the reads they receive; `sp` adds one tag per record.
+
+**Source.** `src/quant/transcriptome.rs` (`with_unspliced_targets`, `unspliced_intervals`, `filter_and_project`), `src/quant/splice_status.rs`, `src/quant/mod.rs` (`QuantContext`), `src/params/sam.rs` (`SP`). STAR: `Transcriptome_quantAlign.cpp`, `Transcriptome_classifyAlign.cpp`, `SoloFeature_countVelocyto.cpp`.
+
 ## 2. Cases where rustar-aligner outperforms STAR
 
 These are not chosen divergences and not bugs: rustar-aligner reports a **higher-scoring, correct** alignment that STAR misses. They are listed here so the differential benchmark's non-exact reads are fully accounted for.

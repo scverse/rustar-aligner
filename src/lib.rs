@@ -322,48 +322,113 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let mut params = params.clone();
     params.redefine_window_params(index.genome.n_genome);
 
-    // Build gene-count context if --quantMode GeneCounts was requested.
-    // GTF requirement is already validated in params.validate().
-    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
-        if params.quant_gene_counts() {
-            let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
-            info!(
-                "quantMode GeneCounts: building gene annotation from {}",
-                gtf_path.display()
-            );
-            let ctx = crate::quant::QuantContext::build(
-                gtf_path,
-                &index.genome,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-            )?;
-            Some(std::sync::Arc::new(ctx))
-        } else {
-            None
-        };
-
     // Use the transcriptome index loaded alongside the genome (populated
     // from transcriptInfo.tab / exonInfo.tab / geneInfo.tab at load time
     // — see GenomeIndex::load). Only wire it through to the pipeline when
-    // `--quantMode TranscriptomeSAM` is requested.
-    let tr_idx: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
-        if params.quant_transcriptome_sam() {
+    // `--quantMode TranscriptomeSAM` or `GeneSplicing` is requested.
+    let tr_idx_all: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
+        if params.quant_transcriptome_sam()
+            || params.quant_gene_splicing()
+            || params
+                .out_sam_attributes
+                .contains(crate::params::SamAttributes::SP)
+        {
             let tr = index.transcriptome.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--quantMode TranscriptomeSAM requires a GTF-aware index; \
+                    "--quantMode TranscriptomeSAM / GeneSplicing and --outSAMattributes sp \
+                     require a GTF-aware index; \
                      re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
                      at alignReads so transcriptInfo.tab can be (re)built"
                 )
             })?;
             info!(
-                "quantMode TranscriptomeSAM: using {} transcripts from genome index",
+                "quantMode TranscriptomeSAM/GeneSplicing: using {} transcripts from genome index",
                 tr.n_transcripts()
             );
             Some(std::sync::Arc::new(tr.clone()))
         } else {
             None
         };
+    let tr_idx = tr_idx_all
+        .as_ref()
+        .filter(|_| params.quant_transcriptome_sam())
+        .map(std::sync::Arc::clone);
+
+    // --quantTranscriptomeUnspliced: append one `<gene_id>-I` target per gene
+    // to the TranscriptomeSAM index (the GeneSplicing classifier keeps using
+    // the annotated transcripts only), and describe every target.
+    let tr_idx = match tr_idx {
+        Some(tr)
+            if params.quant_transcriptome_unspliced
+                != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None =>
+        {
+            let flank = u64::try_from(params.quant_transcriptome_unspliced_flank)
+                .unwrap_or(u64::from(index.sjdb_overhang));
+            let ext = tr.with_unspliced_targets(params.quant_transcriptome_unspliced, flank);
+            info!(
+                "quantTranscriptomeUnspliced {:?}: {} unspliced targets (flank {flank})",
+                params.quant_transcriptome_unspliced,
+                ext.n_transcripts() - tr.n_transcripts()
+            );
+            let path = params.output_path("Aligned.toTranscriptome.targets.tsv");
+            ext.write_targets_tsv(&path)?;
+            info!("Wrote {}", path.display());
+            if params.quant_transcriptome_unspliced_fasta == "Yes" {
+                let path = params.output_path("Aligned.toTranscriptome.unspliced.fa");
+                ext.write_unspliced_fasta(&path, &index.genome)?;
+                info!("Wrote {}", path.display());
+            }
+            Some(std::sync::Arc::new(ext))
+        }
+        other => other,
+    };
+
+    // Build the per-read quantification context if --quantMode GeneCounts
+    // and/or GeneSplicing was requested. GeneCounts' GTF requirement is
+    // already validated in params.validate().
+    let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> = if params
+        .quant_gene_counts()
+        || params.quant_gene_splicing()
+        || params
+            .out_sam_attributes
+            .contains(crate::params::SamAttributes::SP)
+    {
+        let gene = if params.quant_gene_counts() {
+            let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
+            info!(
+                "quantMode GeneCounts: building gene annotation from {}",
+                gtf_path.display()
+            );
+            Some(crate::quant::GeneQuant::build(
+                gtf_path,
+                &index.genome,
+                &params.sjdb_gtf_feature_exon,
+                &params.sjdb_gtf_chr_prefix,
+                &params.sjdb_gtf_tag_exon_parent_gene,
+            )?)
+        } else {
+            None
+        };
+        let splicing = tr_idx_all
+            .as_ref()
+            .filter(|_| params.quant_gene_splicing())
+            .map(|tr| crate::quant::SplicingQuant::new(std::sync::Arc::clone(tr)));
+        let splice_tag = tr_idx_all
+            .as_ref()
+            .filter(|_| {
+                params
+                    .out_sam_attributes
+                    .contains(crate::params::SamAttributes::SP)
+            })
+            .map(std::sync::Arc::clone);
+        Some(std::sync::Arc::new(crate::quant::QuantContext {
+            gene,
+            splicing,
+            splice_tag,
+        }))
+    } else {
+        None
+    };
 
     // SmartSeq has no barcodes/UMIs — a dedicated manifest-driven path.
     if params.solo_type == params::SoloType::SmartSeq {
@@ -448,11 +513,12 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     crate::io::log::write_log_progress_out(&log_progress_path, &stats, time_start, time_finish)?;
     info!("Wrote {}", log_progress_path.display());
 
-    // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
+    // Write ReadsPerGene.out.tab / ReadsPerGeneSplicing.* for the requested
+    // --quantMode values.
     if let Some(ref ctx) = quant_ctx {
-        let quant_path = params.output_path("ReadsPerGene.out.tab");
-        ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
-        info!("Wrote {}", quant_path.display());
+        for path in ctx.write_outputs(|name| params.output_path(name))? {
+            info!("Wrote {}", path.display());
+        }
     }
 
     info!("Alignment complete!");
@@ -1183,7 +1249,14 @@ fn build_transcriptome_records_se(
     for aln in transcripts {
         let bases: &[u8] = if aln.is_reverse { &rc } else { read_seq };
         projected_all.extend(filter_and_project(
-            aln, bases, genome, tr_idx, lread, mode, params,
+            aln,
+            bases,
+            genome,
+            tr_idx,
+            lread,
+            mode,
+            params,
+            aln.n_junction > 0,
         ));
     }
 
@@ -1252,8 +1325,11 @@ where
         let m2 = &pair.mate2_transcript;
         let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
         let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
-        let proj_m1 = filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params);
-        let proj_m2 = filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params);
+        let spliced = m1.n_junction + m2.n_junction > 0;
+        let proj_m1 =
+            filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params, spliced);
+        let proj_m2 =
+            filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params, spliced);
 
         let mut by_tr1: HashMap<usize, Vec<&crate::align::transcript::Transcript>> = HashMap::new();
         for p in &proj_m1 {
@@ -1838,7 +1914,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             stats.record_alignment(0, max_multimaps);
                             stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                             if let Some(ref q) = quant {
-                                q.counts.count_se_read(&[], 0, &q.gene_ann);
+                                q.count_se_read(&[], 0);
                             }
                             if output_unmapped {
                                 // Unmapped reads keep the full original read (STAR: clipped
@@ -1904,8 +1980,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
                         // Gene-level quantification (lock-free atomic counts)
                         if let Some(ref q) = quant {
-                            q.counts
-                                .count_se_read(&transcripts, n_for_mapq, &q.gene_ann);
+                            q.count_se_read(&transcripts, n_for_mapq);
                         }
 
                         // Record junction statistics (per-read dedup, fix A)
@@ -1978,6 +2053,15 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                         ctx,
                                         params.out_sam_attributes,
                                     )?;
+                                }
+                                // --outSAMattributes sp: splicing status tag.
+                                if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref())
+                                {
+                                    crate::quant::splice_status::tag_records_se(
+                                        &mut records,
+                                        &transcripts,
+                                        tx,
+                                    );
                                 }
                                 for record in records {
                                     buffer.push(record);
@@ -3180,7 +3264,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             stats.record_alignment(0, max_multimaps);
                             stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                             if let Some(ref q) = quant {
-                                q.counts.count_pe_read(&[], true, false, &q.gene_ann);
+                                q.count_pe_read(&[], true, false);
                             }
                             if output_unmapped {
                                 // Full original mates for unmapped pairs (STAR convention).
@@ -3281,12 +3365,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
                             let bm_deref: Vec<&crate::align::read_align::PairedAlignment> =
                                 both_mapped.iter().map(AsRef::as_ref).collect();
-                            q.counts.count_pe_read(
-                                &bm_deref,
-                                results.is_empty(),
-                                has_half_mapped,
-                                &q.gene_ann,
-                            );
+                            q.count_pe_read(&bm_deref, results.is_empty(), has_half_mapped);
                         }
 
                         // Record junction statistics
@@ -3449,6 +3528,14 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                     ctx,
                                     params.out_sam_attributes,
                                 )?;
+                            }
+                            // --outSAMattributes sp: splicing status tag.
+                            if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref()) {
+                                crate::quant::splice_status::tag_records_pe(
+                                    &mut records,
+                                    &paired_alns,
+                                    tx,
+                                );
                             }
                             for record in records {
                                 buffer.push(record);

@@ -1110,7 +1110,9 @@ pub struct Parameters {
 
     // ── Quantification ──────────────────────────────────────────────────
     /// Quantification mode(s): GeneCounts, TranscriptomeSAM, or empty for none.
-    /// Space-separated, e.g. `--quantMode GeneCounts`.
+    /// Space-separated, e.g. `--quantMode GeneCounts`. rustar-aligner also
+    /// accepts `GeneSplicing` (not in STAR): per-gene spliced / unspliced /
+    /// ambiguous counts for bulk data, using STARsolo's spliced / unspliced rules.
     #[arg(long = "quantMode", num_args = 0..)]
     pub quant_mode: Vec<String>,
 
@@ -1123,6 +1125,36 @@ pub struct Parameters {
         default_value = "BanSingleEnd_BanIndels_ExtendSoftclip"
     )]
     pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
+
+    /// rustar-aligner extension (not in STAR), for `--quantMode
+    /// TranscriptomeSAM` on total RNA-seq: add one unspliced target per gene,
+    /// named `<gene_id>-I`, after the annotated transcripts.
+    ///   * `None` (default): STAR behaviour, annotated transcripts only
+    ///   * `Intron`: the gene's merged annotated introns plus flanks
+    ///   * `PreMRNA`: the whole gene body
+    ///
+    /// Unspliced reads and pairs are projected onto every compatible target,
+    /// spliced and unspliced; fragments crossing a junction only onto
+    /// spliced ones.
+    #[arg(long = "quantTranscriptomeUnspliced", default_value = "None")]
+    pub quant_transcriptome_unspliced: crate::quant::transcriptome::QuantTranscriptomeUnspliced,
+
+    /// Flank (bases) added on each side of every merged intron for
+    /// `--quantTranscriptomeUnspliced Intron`; -1 (default) uses the index's
+    /// sjdbOverhang, i.e. read length - 1 by STAR's convention.
+    #[arg(
+        long = "quantTranscriptomeUnsplicedFlank",
+        default_value_t = -1,
+        allow_hyphen_values = true
+    )]
+    pub quant_transcriptome_unspliced_flank: i64,
+
+    /// rustar-aligner extension: `Yes` also writes the unspliced target
+    /// sequences to `Aligned.toTranscriptome.unspliced.fa` (Salmon's alignment
+    /// mode needs them next to the transcript FASTA). `No` by default, as
+    /// the file is of the order of the genome size.
+    #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
+    pub quant_transcriptome_unspliced_fasta: String,
 
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
@@ -1669,6 +1701,26 @@ impl Parameters {
             }
         }
 
+        // Unknown --quantMode values are fatal, as in STAR
+        // (Parameters.cpp: "unrecognized option in --quantMode"); a leading
+        // "-" means none. GeneSplicing is a rustar-aligner extension.
+        if params.quant_mode.first().is_some_and(|m| m != "-")
+            && let Some(bad) = params.quant_mode.iter().find(|m| {
+                !matches!(
+                    m.as_str(),
+                    "TranscriptomeSAM" | "GeneCounts" | "GeneSplicing"
+                )
+            })
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
+                     GeneCounts, GeneSplicing, or -"
+                ),
+            ));
+        }
+
         // quantMode GeneCounts requires a GTF file
         if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
             return Err(command.error(
@@ -1730,12 +1782,32 @@ impl Parameters {
         // for alignReads, GenomeIndex::load checks for the on-disk files
         // and surfaces a clear error if neither source is available.
         if params.run_mode() == RunMode::GenomeGenerate
-            && params.quant_transcriptome_sam()
+            && (params.quant_transcriptome_sam() || params.quant_gene_splicing())
             && params.sjdb_gtf_file.is_none()
         {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+            ));
+        }
+
+        // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
+        if !matches!(
+            params.quant_transcriptome_unspliced_fasta.as_str(),
+            "Yes" | "No"
+        ) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--quantTranscriptomeUnsplicedFasta must be Yes or No",
+            ));
+        }
+        if params.quant_transcriptome_unspliced
+            != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None
+            && !params.quant_transcriptome_sam()
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
             ));
         }
 
@@ -2077,6 +2149,12 @@ impl Parameters {
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// Returns true if `--quantMode GeneSplicing` (rustar-aligner extension:
+    /// bulk spliced / unspliced / ambiguous gene counts) was requested.
+    pub fn quant_gene_splicing(&self) -> bool {
+        self.quant_mode.iter().any(|m| m == "GeneSplicing")
     }
 
     /// True when a single-cell run is requested (`--soloType` != None).
@@ -2685,6 +2763,54 @@ mod tests {
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip
         );
+    }
+
+    #[test]
+    fn unknown_quant_mode_is_rejected() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneVelocyto"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantMode",
+                "TranscriptomeSAM",
+                "Genecounts"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
+    }
+
+    #[test]
+    fn sp_attribute_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        assert!(!p.out_sam_attributes.contains(SamAttributes::SP));
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "Standard",
+            "sp",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::SP));
+        assert!(p.out_sam_attributes.contains(SamAttributes::NH));
+    }
+
+    #[test]
+    fn quant_gene_splicing_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
+        assert!(!p.quant_gene_splicing());
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "GeneSplicing",
+        ])
+        .unwrap();
+        assert!(p.quant_gene_splicing());
+        assert!(p.quant_transcriptome_sam());
     }
 
     #[test]

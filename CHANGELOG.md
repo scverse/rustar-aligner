@@ -29,6 +29,28 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Bulk total RNA-seq: unspliced targets, splicing-status tag and
+  spliced / unspliced gene counts** (rustar-aligner extensions, opt-in, see
+  DIVERGENCE.md 1.4 and the "Bulk total RNA-seq" guide).
+  - `--quantTranscriptomeUnspliced Intron|PreMRNA` adds one `<gene_id>-I`
+    target per gene (merged introns plus `--quantTranscriptomeUnsplicedFlank`,
+    or the gene body) after the transcripts of
+    `Aligned.toTranscriptome.out.bam`; unspliced reads are projected onto
+    every compatible target, spliced and unspliced, so a read in a retained
+    intron is no longer forced onto the retained-intron isoform. Writes
+    `Aligned.toTranscriptome.targets.tsv` and, on request, the unspliced
+    sequences (`--quantTranscriptomeUnsplicedFasta Yes`).
+  - `--outSAMattributes sp` tags genomic alignments `sp:A:S|U|A`
+    (spliced / unspliced / ambiguous).
+  - `--quantMode GeneSplicing` writes `ReadsPerGeneSplicing.out.tab` and
+    `ReadsPerGeneSplicing.summary.tsv`, using STARsolo's spliced / unspliced
+    classification on each read or pair.
+
+### Bug fixes
+
+- Unknown `--quantMode` values are now rejected, as in STAR, instead of
+  being silently ignored.
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
