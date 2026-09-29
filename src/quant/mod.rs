@@ -9,6 +9,7 @@
 /// - `transcriptome` — transcript-level alignment projection for
 ///   `--quantMode TranscriptomeSAM` (Salmon / RSEM input).
 pub mod transcriptome;
+pub mod velocyto;
 
 use std::io::Write as _;
 use std::path::Path;
