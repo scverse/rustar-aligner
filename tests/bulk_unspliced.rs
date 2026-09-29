@@ -1,7 +1,7 @@
 //! Integration tests for the bulk total-RNA options (rustar-aligner
 //! extensions, not in STAR):
 //!
-//! - `--quantMode GeneVelocyto` (per-gene spliced / unspliced / ambiguous);
+//! - `--quantMode GeneSplicing` (per-gene spliced / unspliced / ambiguous);
 //! - `--quantTranscriptomePreMRNA BanRetainedIntron` (TranscriptomeSAM).
 //!
 //! A synthetic genome carries three genes, each with a fully spliced isoform
@@ -317,17 +317,17 @@ fn new_options_leave_existing_outputs_unchanged() {
         "base",
         &["--quantMode", "GeneCounts", "TranscriptomeSAM"],
     );
-    let velo = align(
+    let splicing = align(
         &tmp,
         &gdir,
         &gtf,
         &fq,
-        "velo",
+        "splicing",
         &[
             "--quantMode",
             "GeneCounts",
             "TranscriptomeSAM",
-            "GeneVelocyto",
+            "GeneSplicing",
             "--quantTranscriptomePreMRNA",
             "Keep",
         ],
@@ -349,7 +349,7 @@ fn new_options_leave_existing_outputs_unchanged() {
 
     let base_sam = sam_without_command_line(&base.join("Aligned.out.sam"));
     assert!(base_sam.lines().count() > 2000, "too few alignments");
-    for other in [&velo, &ban] {
+    for other in [&splicing, &ban] {
         assert_eq!(
             base_sam,
             sam_without_command_line(&other.join("Aligned.out.sam"))
@@ -362,19 +362,19 @@ fn new_options_leave_existing_outputs_unchanged() {
             log_final_without_times(&other.join("Log.final.out"))
         );
     }
-    // GeneVelocyto and PreMRNA Keep do not touch the transcriptome BAM ...
+    // GeneSplicing and PreMRNA Keep do not touch the transcriptome BAM ...
     let base_tr = bam_records(&base.join("Aligned.toTranscriptome.out.bam"));
     assert_eq!(
         base_tr,
-        bam_records(&velo.join("Aligned.toTranscriptome.out.bam"))
+        bam_records(&splicing.join("Aligned.toTranscriptome.out.bam"))
     );
     // ... BanRetainedIntron removes records and adds none.
     let ban_tr = bam_records(&ban.join("Aligned.toTranscriptome.out.bam"));
     assert!(ban_tr.len() < base_tr.len());
     // The new output files exist only when requested.
-    assert!(velo.join("ReadsPerGeneVelocyto.out.tab").exists());
-    assert!(!base.join("ReadsPerGeneVelocyto.out.tab").exists());
-    assert!(!ban.join("ReadsPerGeneVelocyto.summary.tsv").exists());
+    assert!(splicing.join("ReadsPerGeneSplicing.out.tab").exists());
+    assert!(!base.join("ReadsPerGeneSplicing.out.tab").exists());
+    assert!(!ban.join("ReadsPerGeneSplicing.summary.tsv").exists());
 }
 
 #[test]
@@ -386,7 +386,7 @@ fn simulated_total_rna_mixture() {
         &gtf,
         &fq,
         "keep",
-        &["--quantMode", "TranscriptomeSAM", "GeneVelocyto"],
+        &["--quantMode", "TranscriptomeSAM", "GeneSplicing"],
     );
     let ban = align(
         &tmp,
@@ -446,9 +446,9 @@ fn simulated_total_rna_mixture() {
         "RI share error Keep {err_keep:.3} vs Ban {err_ban:.3}"
     );
 
-    // --- GeneVelocyto: the library is reverse-stranded, so the forward
+    // --- GeneSplicing: the library is reverse-stranded, so the forward
     // columns see nothing and the reverse columns see every gene read.
-    let s = summary(&keep.join("ReadsPerGeneVelocyto.summary.tsv"));
+    let s = summary(&keep.join("ReadsPerGeneSplicing.summary.tsv"));
     let n = |k: &str, col: usize| s[k][col].parse::<u64>().unwrap();
     let total_reads: usize = GENES.iter().map(|g| g.n_a + g.n_r + g.n_pre).sum();
     assert_eq!(
@@ -475,7 +475,7 @@ fn simulated_total_rna_mixture() {
 
     // Per-gene table: G1 and G2 have reverse-strand counts, G3 is a - gene
     // and is also reverse-stranded relative to its reads.
-    let tab = read(&keep.join("ReadsPerGeneVelocyto.out.tab"));
+    let tab = read(&keep.join("ReadsPerGeneSplicing.out.tab"));
     for line in tab.lines().skip(1) {
         let cols: Vec<u64> = line
             .split('\t')

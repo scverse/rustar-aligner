@@ -151,7 +151,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--quantMode` | — | `GeneCounts` and/or `TranscriptomeSAM`, space-separated. rustar-aligner extension: `GeneVelocyto` (bulk spliced / unspliced / ambiguous gene counts, see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/)). |
+| `--quantMode` | — | `GeneCounts` and/or `TranscriptomeSAM`, space-separated. rustar-aligner extension: `GeneSplicing` (bulk spliced / unspliced / ambiguous gene counts, see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/)). |
 | `--quantTranscriptomeSAMoutput` | `BanSingleEnd_BanIndels_ExtendSoftclip` | Variant for transcriptome BAM: `BanSingleEnd`, `BanSingleEnd_ExtendSoftclip`, or the default RSEM-compatible form. |
 | `--quantTranscriptomePreMRNA` | `Keep` | rustar-aligner extension. `BanRetainedIntron`: do not project unspliced reads that overlap a retained intron of a gene onto that gene's transcripts. `Keep` is STAR's behaviour. |
 

@@ -1,3 +1,4 @@
+pub mod splice_status;
 /// Gene-level read quantification (`--quantMode GeneCounts`).
 ///
 /// Implements HTSeq-style "union" counting: a read counts toward a gene if any
@@ -9,7 +10,6 @@
 /// - `transcriptome` — transcript-level alignment projection for
 ///   `--quantMode TranscriptomeSAM` (Salmon / RSEM input).
 pub mod transcriptome;
-pub mod velocyto;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -543,12 +543,12 @@ impl GeneCounts {
 // ---------------------------------------------------------------------------
 
 /// Bundles the per-read quantifications requested by `--quantMode`
-/// (`GeneCounts`, `GeneVelocyto`) for cheap Arc sharing across threads.
+/// (`GeneCounts`, `GeneSplicing`) for cheap Arc sharing across threads.
 pub struct QuantContext {
     /// `--quantMode GeneCounts`: exon-union gene counts.
     pub gene: Option<GeneQuant>,
-    /// `--quantMode GeneVelocyto`: spliced / unspliced / ambiguous per gene.
-    pub velocyto: Option<VelocytoQuant>,
+    /// `--quantMode GeneSplicing`: spliced / unspliced / ambiguous per gene.
+    pub splicing: Option<SplicingQuant>,
 }
 
 /// GeneAnnotation + GeneCounts (`ReadsPerGene.out.tab`).
@@ -557,10 +557,10 @@ pub struct GeneQuant {
     pub counts: GeneCounts,
 }
 
-/// Transcript models + counters for `ReadsPerGeneVelocyto.out.tab`.
-pub struct VelocytoQuant {
+/// Transcript models + counters for `ReadsPerGeneSplicing.out.tab`.
+pub struct SplicingQuant {
     pub transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>,
-    pub counts: velocyto::VelocytoCounts,
+    pub counts: splice_status::SplicingCounts,
 }
 
 impl GeneQuant {
@@ -581,11 +581,11 @@ impl GeneQuant {
     }
 }
 
-impl VelocytoQuant {
+impl SplicingQuant {
     /// Counters over the genes of an already-loaded transcriptome index.
     pub fn new(transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>) -> Self {
-        let counts = velocyto::VelocytoCounts::new(transcriptome.gene_ids.len());
-        VelocytoQuant {
+        let counts = splice_status::SplicingCounts::new(transcriptome.gene_ids.len());
+        SplicingQuant {
             transcriptome,
             counts,
         }
@@ -598,7 +598,7 @@ impl QuantContext {
         if let Some(g) = &self.gene {
             g.counts.count_se_read(transcripts, n_for_mapq, &g.gene_ann);
         }
-        if let Some(v) = &self.velocyto {
+        if let Some(v) = &self.splicing {
             v.counts.count_se_read(transcripts, &v.transcriptome);
         }
     }
@@ -614,7 +614,7 @@ impl QuantContext {
             g.counts
                 .count_pe_read(both_mapped, unmapped, half_mapped, &g.gene_ann);
         }
-        if let Some(v) = &self.velocyto {
+        if let Some(v) = &self.splicing {
             v.counts
                 .count_pe_read(both_mapped, unmapped, &v.transcriptome);
         }
@@ -632,11 +632,11 @@ impl QuantContext {
             g.counts.write_output(&path, &g.gene_ann)?;
             written.push(path);
         }
-        if let Some(v) = &self.velocyto {
-            let path = output_path("ReadsPerGeneVelocyto.out.tab");
+        if let Some(v) = &self.splicing {
+            let path = output_path("ReadsPerGeneSplicing.out.tab");
             v.counts.write_table(&path, &v.transcriptome)?;
             written.push(path);
-            let path = output_path("ReadsPerGeneVelocyto.summary.tsv");
+            let path = output_path("ReadsPerGeneSplicing.summary.tsv");
             v.counts.write_summary(&path)?;
             written.push(path);
         }

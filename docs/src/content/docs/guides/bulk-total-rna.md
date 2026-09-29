@@ -8,8 +8,8 @@ pre-mRNA: intronic reads routinely make up a third to more than half of the
 fragments. Two rustar-aligner options, both **opt-in and not part of STAR**,
 target this kind of data:
 
-- `--quantMode GeneVelocyto` counts every uniquely mapped read or pair as
-  spliced, unspliced or ambiguous per gene, with STARsolo's Velocyto rules;
+- `--quantMode GeneSplicing` counts every uniquely mapped read or pair as
+  spliced, unspliced or ambiguous per gene, with STARsolo's rules;
 - `--quantTranscriptomePreMRNA BanRetainedIntron` stops
   `--quantMode TranscriptomeSAM` from handing unspliced pre-mRNA reads to
   retained-intron isoforms.
@@ -29,13 +29,13 @@ isoform proportions (and tximport's `avgTxLength` offsets) track library
 quality rather than biology. The same effect is reported for Salmon with
 genome decoys ([COMBINE-lab/salmon#1229](https://github.com/COMBINE-lab/salmon/issues/1229)).
 
-## Spliced / unspliced / ambiguous gene counts (`GeneVelocyto`)
+## Spliced / unspliced / ambiguous gene counts (`GeneSplicing`)
 
 ```bash
 rustar-aligner \
   --genomeDir /path/to/genome_index \
   --readFilesIn reads_1.fq.gz reads_2.fq.gz --readFilesCommand zcat \
-  --quantMode GeneCounts GeneVelocyto \
+  --quantMode GeneCounts GeneSplicing \
   --sjdbGTFfile gencode.v50.annotation.gtf \
   --outFileNamePrefix sample_
 ```
@@ -46,14 +46,13 @@ It needs the same GTF-aware index as `TranscriptomeSAM` (built with
 
 ### Classification
 
-The rules are those of STARsolo's `--soloFeatures Velocyto`
-(`Transcriptome_classifyAlign.cpp` and `SoloFeature_countVelocyto.cpp` in
-STAR), applied to each read (single-end) or read pair (paired-end) as if it
+The rules are those STARsolo uses for its single-cell spliced / unspliced
+matrices, applied to each read (single-end) or read pair (paired-end) as if it
 were one UMI:
 
 1. Every annotated transcript that fully contains the alignment is tested.
    Each aligned block is called exonic, intronic or exon/intron-spanning,
-   with velocyto's 6-base tolerance at exon boundaries. A spliced alignment
+   with a 6-base tolerance at exon boundaries. A spliced alignment
    that touches an intron is incompatible with that transcript, and a block in
    an intron longer than 1 Mb is not called intronic.
 2. If the compatible transcripts belong to more than one gene, the read is
@@ -69,7 +68,7 @@ Unmapped, too-many-loci and multimapping reads are accounted as in
 
 ### Output
 
-`sample_ReadsPerGeneVelocyto.out.tab`: a header line, then one line per gene
+`sample_ReadsPerGeneSplicing.out.tab`: a header line, then one line per gene
 (in `geneInfo.tab` order) with nine counts: spliced, unspliced and ambiguous
 for each strand convention.
 
@@ -82,7 +81,7 @@ STARsolo `--soloStrand Forward`); `reverse` keeps transcripts on the opposite
 strand (dUTP / TruSeq Stranded, `-s reverse`). Pick the columns matching the
 library, as with `ReadsPerGene.out.tab`.
 
-`sample_ReadsPerGeneVelocyto.summary.tsv`: read accounting per strand
+`sample_ReadsPerGeneSplicing.summary.tsv`: read accounting per strand
 convention (`N_unmapped`, `N_multimapping`, `N_noFeature`, `N_multiGene`,
 `N_spliced`, `N_unspliced`, `N_ambiguous`) and the three fractions of the
 assigned reads (`fraction_spliced`, `fraction_unspliced`,
@@ -124,7 +123,7 @@ projections removed is written to the log.
   isoforms of the gene, as they do for genes with no retained-intron isoform.
   If retained introns are the object of study, keep the default and model
   intron retention explicitly.
-- Fewer fragments reach Salmon / RSEM; use `ReadsPerGeneVelocyto.summary.tsv`
+- Fewer fragments reach Salmon / RSEM; use `ReadsPerGeneSplicing.summary.tsv`
   to report how much of the library is pre-mRNA.
 
 The benchmark behind these statements (public whole-blood total RNA, GRCh38 +

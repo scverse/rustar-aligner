@@ -32,10 +32,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - **Bulk total RNA-seq: spliced / unspliced gene counts and pre-mRNA-aware
   TranscriptomeSAM** (rustar-aligner extensions, opt-in, see DIVERGENCE.md
   1.4 and the "Bulk total RNA-seq" guide).
-  - `--quantMode GeneVelocyto` writes `ReadsPerGeneVelocyto.out.tab`
+  - `--quantMode GeneSplicing` writes `ReadsPerGeneSplicing.out.tab`
     (spliced / unspliced / ambiguous per gene for the unstranded, forward and
-    reverse strand conventions) and `ReadsPerGeneVelocyto.summary.tsv`, using
-    STARsolo's Velocyto classification on each read or pair.
+    reverse strand conventions) and `ReadsPerGeneSplicing.summary.tsv`, using
+    STARsolo's spliced / unspliced classification on each read or pair.
   - `--quantTranscriptomePreMRNA BanRetainedIntron` keeps unspliced reads
     that overlap a retained intron out of that gene's transcripts in
     `Aligned.toTranscriptome.out.bam`, so retained-intron isoforms stop

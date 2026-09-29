@@ -1111,8 +1111,8 @@ pub struct Parameters {
     // ── Quantification ──────────────────────────────────────────────────
     /// Quantification mode(s): GeneCounts, TranscriptomeSAM, or empty for none.
     /// Space-separated, e.g. `--quantMode GeneCounts`. rustar-aligner also
-    /// accepts `GeneVelocyto` (not in STAR): per-gene spliced / unspliced /
-    /// ambiguous counts for bulk data, using STARsolo's Velocyto rules.
+    /// accepts `GeneSplicing` (not in STAR): per-gene spliced / unspliced /
+    /// ambiguous counts for bulk data, using STARsolo's spliced / unspliced rules.
     #[arg(long = "quantMode", num_args = 0..)]
     pub quant_mode: Vec<String>,
 
@@ -1742,7 +1742,7 @@ impl Parameters {
         // for alignReads, GenomeIndex::load checks for the on-disk files
         // and surfaces a clear error if neither source is available.
         if params.run_mode() == RunMode::GenomeGenerate
-            && (params.quant_transcriptome_sam() || params.quant_gene_velocyto())
+            && (params.quant_transcriptome_sam() || params.quant_gene_splicing())
             && params.sjdb_gtf_file.is_none()
         {
             return Err(command.error(
@@ -2091,10 +2091,10 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
     }
 
-    /// Returns true if `--quantMode GeneVelocyto` (rustar-aligner extension:
+    /// Returns true if `--quantMode GeneSplicing` (rustar-aligner extension:
     /// bulk spliced / unspliced / ambiguous gene counts) was requested.
-    pub fn quant_gene_velocyto(&self) -> bool {
-        self.quant_mode.iter().any(|m| m == "GeneVelocyto")
+    pub fn quant_gene_splicing(&self) -> bool {
+        self.quant_mode.iter().any(|m| m == "GeneSplicing")
     }
 
     /// True when a single-cell run is requested (`--soloType` != None).
@@ -2706,18 +2706,18 @@ mod tests {
     }
 
     #[test]
-    fn quant_gene_velocyto_is_opt_in() {
+    fn quant_gene_splicing_is_opt_in() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
-        assert!(!p.quant_gene_velocyto());
+        assert!(!p.quant_gene_splicing());
         let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
             "--quantMode",
             "TranscriptomeSAM",
-            "GeneVelocyto",
+            "GeneSplicing",
         ])
         .unwrap();
-        assert!(p.quant_gene_velocyto());
+        assert!(p.quant_gene_splicing());
         assert!(p.quant_transcriptome_sam());
     }
 
