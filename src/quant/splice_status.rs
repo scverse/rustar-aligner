@@ -362,16 +362,8 @@ pub fn collapse_gene_category(
     types: impl IntoIterator<Item = (usize, u8)>,
     idx: &TranscriptomeIndex,
 ) -> ReadSplicing {
-    const INTRON: u8 = 1 << AlignVsTranscript::Intron as u8;
-    const EXON_INTRON: u8 = 1 << AlignVsTranscript::ExonIntron as u8;
-    const SPAN: u8 = 1 << AlignVsTranscript::ExonIntronSpan as u8;
-    const CONCORDANT: u8 = 1 << AlignVsTranscript::Concordant as u8;
-
     let mut gene: Option<u32> = None;
-    let mut exon_model = false;
-    let mut intron_model = false;
-    let mut span_model = true;
-    let mut mixed_model = false;
+    let mut models = Models::default();
     for (tr, ty) in types {
         let g = idx.tr_gene_idx[tr];
         match gene {
@@ -379,23 +371,124 @@ pub fn collapse_gene_category(
             Some(g0) if g0 != g => return ReadSplicing::MultiGene,
             Some(_) => {}
         }
-        let has = |bit: u8| ty & bit != 0;
-        mixed_model |= ((has(INTRON) && has(CONCORDANT)) || has(EXON_INTRON)) && !has(SPAN);
-        span_model &= has(SPAN);
-        exon_model |= has(CONCORDANT) && !has(INTRON) && !has(EXON_INTRON);
-        intron_model |= has(INTRON) && !has(EXON_INTRON) && !has(CONCORDANT);
+        models.add(ty);
     }
-    let Some(g) = gene else {
-        return ReadSplicing::NoFeature;
-    };
-    let cat = if exon_model && !intron_model && !mixed_model {
-        SpliceStatus::Spliced
-    } else if span_model || ((intron_model || mixed_model) && !exon_model) {
-        SpliceStatus::Unspliced
-    } else {
-        SpliceStatus::Ambiguous
-    };
-    ReadSplicing::Gene(g, cat)
+    match gene {
+        None => ReadSplicing::NoFeature,
+        Some(g) => ReadSplicing::Gene(g, models.status()),
+    }
+}
+
+/// The model flags of STAR's `countVelocyto` collapse.
+#[allow(clippy::struct_excessive_bools)] // mirrors STAR's four flags
+struct Models {
+    exon: bool,
+    intron: bool,
+    span: bool,
+    mixed: bool,
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        // `spanModel` starts true and is and-ed over the transcripts.
+        Models {
+            exon: false,
+            intron: false,
+            span: true,
+            mixed: false,
+        }
+    }
+}
+
+impl Models {
+    fn add(&mut self, ty: u8) {
+        const INTRON: u8 = 1 << AlignVsTranscript::Intron as u8;
+        const EXON_INTRON: u8 = 1 << AlignVsTranscript::ExonIntron as u8;
+        const SPAN: u8 = 1 << AlignVsTranscript::ExonIntronSpan as u8;
+        const CONCORDANT: u8 = 1 << AlignVsTranscript::Concordant as u8;
+        let has = |bit: u8| ty & bit != 0;
+        self.mixed |= ((has(INTRON) && has(CONCORDANT)) || has(EXON_INTRON)) && !has(SPAN);
+        self.span &= has(SPAN);
+        self.exon |= has(CONCORDANT) && !has(INTRON) && !has(EXON_INTRON);
+        self.intron |= has(INTRON) && !has(EXON_INTRON) && !has(CONCORDANT);
+    }
+
+    fn status(&self) -> SpliceStatus {
+        if self.exon && !self.intron && !self.mixed {
+            SpliceStatus::Spliced
+        } else if self.span || ((self.intron || self.mixed) && !self.exon) {
+            SpliceStatus::Unspliced
+        } else {
+            SpliceStatus::Ambiguous
+        }
+    }
+}
+
+/// Read-level splicing status for the `sp` SAM tag: the same collapse as
+/// [`collapse_gene_category`], but over every annotated transcript that
+/// contains the alignment on either strand, whatever its gene (a tag
+/// describes the read, not a gene assignment). `None` when no transcript
+/// contains it.
+pub fn read_status(align: &AlignBlocks, idx: &TranscriptomeIndex) -> Option<SpliceStatus> {
+    let mut types = Vec::new();
+    transcript_types(align, idx, &mut types);
+    if types.is_empty() {
+        return None;
+    }
+    let mut models = Models::default();
+    for (_, ty) in types {
+        models.add(ty);
+    }
+    Some(models.status())
+}
+
+impl SpliceStatus {
+    /// Value of the `sp:A` SAM tag.
+    pub fn tag_char(self) -> u8 {
+        match self {
+            SpliceStatus::Spliced => b'S',
+            SpliceStatus::Unspliced => b'U',
+            SpliceStatus::Ambiguous => b'A',
+        }
+    }
+}
+
+/// Add `sp:A:{S,U,A}` to single-end records (one record per alignment, in
+/// `transcripts` order, as built by `SamWriter::build_alignment_records`).
+pub fn tag_records_se(
+    records: &mut [noodles::sam::alignment::RecordBuf],
+    transcripts: &[Transcript],
+    idx: &TranscriptomeIndex,
+) {
+    for (rec, t) in records.iter_mut().zip(transcripts) {
+        if let Some(st) = read_status(&AlignBlocks::from_transcript(t), idx) {
+            insert_sp(rec, st);
+        }
+    }
+}
+
+/// Add `sp:A:{S,U,A}` to paired-end records (mate 1 and mate 2 records per
+/// pair, in `pairs` order, as built by `SamWriter::build_paired_records`);
+/// both mates carry the fragment's status.
+pub fn tag_records_pe(
+    records: &mut [noodles::sam::alignment::RecordBuf],
+    pairs: &[PairedAlignment],
+    idx: &TranscriptomeIndex,
+) {
+    for (recs, pair) in records.chunks_mut(2).zip(pairs) {
+        if let Some(st) = read_status(&AlignBlocks::from_pair(pair), idx) {
+            for rec in recs {
+                insert_sp(rec, st);
+            }
+        }
+    }
+}
+
+fn insert_sp(rec: &mut noodles::sam::alignment::RecordBuf, st: SpliceStatus) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    rec.data_mut()
+        .insert(Tag::new(b's', b'p'), Value::Character(st.tag_char()));
 }
 
 /// Classify one uniquely mapped read (or pair) under the three strand
@@ -1022,5 +1115,67 @@ mod tests {
         assert_eq!(get("N_noFeature"), ["1", "1", "4"]);
         assert_eq!(get("N_unspliced"), ["1", "1", "0"]);
         assert_eq!(get("fraction_unspliced"), ["0.3333", "0.3333", "NA"]);
+    }
+
+    #[test]
+    fn read_status_ignores_gene_boundaries() {
+        let g = genome();
+        let idx = index();
+        let st = |t: &Transcript| read_status(&AlignBlocks::from_transcript(t), &idx);
+        assert_eq!(
+            st(&aln(&g, 0, &[(2050, 2100)], false)),
+            Some(SpliceStatus::Spliced)
+        );
+        assert_eq!(
+            st(&aln(&g, 0, &[(1955, 1990)], false)),
+            Some(SpliceStatus::Unspliced)
+        );
+        assert_eq!(
+            st(&aln(&g, 0, &[(1300, 1350)], false)),
+            Some(SpliceStatus::Ambiguous)
+        );
+        // Exonic in G2, intronic in G1 (other strand): both models count.
+        assert_eq!(
+            st(&aln(&g, 0, &[(1800, 1850)], true)),
+            Some(SpliceStatus::Ambiguous)
+        );
+        assert_eq!(st(&aln(&g, 0, &[(8000, 8050)], false)), None);
+    }
+
+    #[test]
+    fn sp_tag_on_records() {
+        use noodles::sam::alignment::record::data::field::Tag;
+        use noodles::sam::alignment::record_buf::data::field::Value;
+        let g = genome();
+        let idx = index();
+        let trs = vec![
+            aln(&g, 0, &[(1955, 1990)], false),
+            aln(&g, 0, &[(8000, 8050)], false),
+        ];
+        let mut recs = vec![noodles::sam::alignment::RecordBuf::default(); 2];
+        tag_records_se(&mut recs, &trs, &idx);
+        assert_eq!(
+            recs[0].data().get(&Tag::new(b's', b'p')),
+            Some(&Value::Character(b'U'))
+        );
+        assert_eq!(recs[1].data().get(&Tag::new(b's', b'p')), None);
+        let pair = PairedAlignment {
+            mate1_transcript: aln(&g, 0, &[(1550, 1600)], false),
+            mate2_transcript: aln(&g, 0, &[(2050, 2100)], true),
+            mate1_region: (0, 50),
+            mate2_region: (0, 50),
+            is_proper_pair: true,
+            insert_size: 550,
+            combined_wt_score: 0,
+            combined_n_match: 100,
+        };
+        let mut recs = vec![noodles::sam::alignment::RecordBuf::default(); 2];
+        tag_records_pe(&mut recs, &[pair], &idx);
+        for r in &recs {
+            assert_eq!(
+                r.data().get(&Tag::new(b's', b'p')),
+                Some(&Value::Character(b'S'))
+            );
+        }
     }
 }

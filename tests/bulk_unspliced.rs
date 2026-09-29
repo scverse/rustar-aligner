@@ -555,3 +555,62 @@ fn simulated_total_rna_mixture() {
     let mature: usize = GENES.iter().map(|g| g.n_a).sum();
     assert!(n("N_spliced", 2) as usize >= mature * 95 / 100);
 }
+
+#[test]
+fn splicing_status_tag_in_genomic_sam() {
+    let (tmp, gdir, gtf, fq, pre_starts) = setup();
+    let out = align(
+        &tmp,
+        &gdir,
+        &gtf,
+        &fq,
+        "sp",
+        &["--outSAMattributes", "Standard", "sp"],
+    );
+    let base = align(&tmp, &gdir, &gtf, &fq, "nosp", &[]);
+    let sam = read(&out.join("Aligned.out.sam"));
+    let mut tag: HashMap<String, String> = HashMap::new();
+    let mut stripped = Vec::new();
+    for line in sam.lines().filter(|l| !l.starts_with('@')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if let Some(t) = f.iter().find(|x| x.starts_with("sp:A:")) {
+            tag.insert(f[0].to_string(), t[5..].to_string());
+        }
+        stripped.push(
+            f.iter()
+                .filter(|x| !x.starts_with("sp:A:"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+    }
+    // Minus the tag, the records are the default ones.
+    let base_sam = read(&base.join("Aligned.out.sam"));
+    let base_records: Vec<&str> = base_sam.lines().filter(|l| !l.starts_with('@')).collect();
+    assert_eq!(stripped, base_records);
+    // Pre-mRNA reads: inside exon 1 -> S, well inside the constitutive
+    // intron 2 -> U, well inside the retained intron 1 -> A.
+    let (i1s, i1e) = (EXONS[0].1, EXONS[1].0);
+    let (i2s, i2e) = (EXONS[1].1, EXONS[2].0);
+    let mut idx = 0;
+    let mut checked = 0;
+    for gene in &GENES {
+        for i in 0..gene.n_pre {
+            let p = pre_starts[idx];
+            idx += 1;
+            let name = format!("{}_P_{i}", gene.name);
+            let want = if p >= i2s + 7 && p + READ_LEN + 7 <= i2e {
+                "U"
+            } else if p >= i1s + 7 && p + READ_LEN + 7 <= i1e {
+                "A"
+            } else if p + READ_LEN <= i1s {
+                "S"
+            } else {
+                continue;
+            };
+            assert_eq!(tag[&name], want, "{name} at {p}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 500, "{checked}");
+}
