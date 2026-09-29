@@ -364,6 +364,35 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             }
         });
 
+    // --quantTranscriptomeUnspliced: append one `<gene_id>-I` target per gene
+    // to the TranscriptomeSAM index (the GeneSplicing classifier keeps using
+    // the annotated transcripts only), and describe every target.
+    let tr_idx = match tr_idx {
+        Some(tr)
+            if params.quant_transcriptome_unspliced
+                != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None =>
+        {
+            let flank = u64::try_from(params.quant_transcriptome_unspliced_flank)
+                .unwrap_or(u64::from(index.sjdb_overhang));
+            let ext = tr.with_unspliced_targets(params.quant_transcriptome_unspliced, flank);
+            info!(
+                "quantTranscriptomeUnspliced {:?}: {} unspliced targets (flank {flank})",
+                params.quant_transcriptome_unspliced,
+                ext.n_transcripts() - tr.n_transcripts()
+            );
+            let path = params.output_path("Aligned.toTranscriptome.targets.tsv");
+            ext.write_targets_tsv(&path)?;
+            info!("Wrote {}", path.display());
+            if params.quant_transcriptome_unspliced_fasta == "Yes" {
+                let path = params.output_path("Aligned.toTranscriptome.unspliced.fa");
+                ext.write_unspliced_fasta(&path, &index.genome)?;
+                info!("Wrote {}", path.display());
+            }
+            Some(std::sync::Arc::new(ext))
+        }
+        other => other,
+    };
+
     // Build the per-read quantification context if --quantMode GeneCounts
     // and/or GeneSplicing was requested. GeneCounts' GTF requirement is
     // already validated in params.validate().
