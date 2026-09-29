@@ -1,20 +1,18 @@
 ---
 title: Bulk total RNA-seq
-description: Spliced / unspliced gene counts and pre-mRNA-aware transcriptome projection for ribo-depleted bulk libraries.
+description: Unspliced targets in the transcriptome BAM, a splicing-status tag and spliced / unspliced gene counts for ribo-depleted bulk libraries.
 ---
 
 Ribo-depleted ("total") RNA-seq libraries contain a large share of unspliced
 pre-mRNA: intronic reads routinely make up a third to more than half of the
-fragments. Two rustar-aligner options, both **opt-in and not part of STAR**,
-target this kind of data:
+fragments. rustar-aligner has three **opt-in** options for this kind of data.
+None of them exists in STAR; without them every output is the same as STAR's.
 
-- `--quantMode GeneSplicing` counts every uniquely mapped read or pair as
-  spliced, unspliced or ambiguous per gene, with STARsolo's rules;
-- `--quantTranscriptomePreMRNA BanRetainedIntron` stops
-  `--quantMode TranscriptomeSAM` from handing unspliced pre-mRNA reads to
-  retained-intron isoforms.
-
-Without these options every output is the same as STAR's.
+| Option | What it adds |
+|---|---|
+| `--quantTranscriptomeUnspliced Intron` or `PreMRNA` | one unspliced target per gene, `<gene_id>-I`, in `Aligned.toTranscriptome.out.bam` |
+| `--outSAMattributes ... sp` | an `sp:A` splicing-status tag on every genomic alignment |
+| `--quantMode GeneSplicing` | spliced / unspliced / ambiguous read counts per gene |
 
 ## Why pre-mRNA matters for transcript quantification
 
@@ -29,103 +27,135 @@ isoform proportions (and tximport's `avgTxLength` offsets) track library
 quality rather than biology. The same effect is reported for Salmon with
 genome decoys ([COMBINE-lab/salmon#1229](https://github.com/COMBINE-lab/salmon/issues/1229)).
 
-## Spliced / unspliced / ambiguous gene counts (`GeneSplicing`)
+The fix used for single-cell data by
+[splici / alevin-fry](https://doi.org/10.1038/s41592-022-01408-3) is to give
+the quantifier unspliced targets next to the spliced transcripts, so that a
+read compatible with both is shared by the EM instead of being forced onto the
+retained-intron isoform. `--quantTranscriptomeUnspliced` does this for the
+transcriptome BAM.
+
+## Unspliced targets in the transcriptome BAM
 
 ```bash
 rustar-aligner \
   --genomeDir /path/to/genome_index \
-  --readFilesIn reads_1.fq.gz reads_2.fq.gz --readFilesCommand zcat \
-  --quantMode GeneCounts GeneSplicing \
-  --sjdbGTFfile gencode.v50.annotation.gtf \
+  --readFilesIn reads_1.fq.gz reads_2.fq.gz \
+  --quantMode TranscriptomeSAM \
+  --quantTranscriptomeUnspliced PreMRNA \
+  --quantTranscriptomeUnsplicedFasta Yes \
   --outFileNamePrefix sample_
 ```
 
-It needs the same GTF-aware index as `TranscriptomeSAM` (built with
-`--sjdbGTFfile` at `genomeGenerate`) and can be combined with any other
-`--quantMode` value.
+### Targets
 
-### Classification
+One target per gene, named `<gene_id>-I`, is added after the annotated
+transcripts (`@SQ` lines in gene order):
 
-The rules are those STARsolo uses for its single-cell spliced / unspliced
-matrices, applied to each read (single-end) or read pair (paired-end) as if it
-were one UMI:
+- `Intron` (splici-style): the union of the introns of all the gene's
+  isoforms, merged, extended on each side by
+  `--quantTranscriptomeUnsplicedFlank` bases (default `-1` = the index's
+  `sjdbOverhang`, i.e. read length - 1 by STAR's convention), clipped to the
+  gene body, merged again and concatenated in genome order. Introns retained
+  by an isoform and introns skipped by a cassette exon are included.
+- `PreMRNA`: the whole gene body, from the first to the last annotated base.
 
-1. Every annotated transcript that fully contains the alignment is tested.
-   Each aligned block is called exonic, intronic or exon/intron-spanning,
-   with a 6-base tolerance at exon boundaries. A spliced alignment
-   that touches an intron is incompatible with that transcript, and a block in
-   an intron longer than 1 Mb is not called intronic.
-2. If the compatible transcripts belong to more than one gene, the read is
-   `N_multiGene` and not counted.
-3. Otherwise, per gene: only-exonic models give **spliced** (mature mRNA; the
-   read need not cross a junction), intronic or spanning models with no
-   only-exonic model give **unspliced** (pre-mRNA), and a mix gives
-   **ambiguous**. A read inside an intron that another isoform of the same gene
-   retains is ambiguous.
+A gene is taken on the chromosome and strand of its first transcript. In
+`Intron` mode a single-exon gene has no target. Targets are built at
+alignment time from the transcript tables of the index, so any GTF-aware
+index works and the flank can change between runs.
 
-Unmapped, too-many-loci and multimapping reads are accounted as in
-`GeneCounts`; paired-end reads with a single mapped mate count as unmapped.
+### Projection
 
-### Output
+Nothing changes in how an alignment is projected: it goes to every target that
+contains all its aligned blocks, spliced and unspliced alike. So:
 
-`sample_ReadsPerGeneSplicing.out.tab`: a header line, then one line per gene
-(in `geneInfo.tab` order) with nine counts: spliced, unspliced and ambiguous
-for each strand convention.
+- a read inside a retained intron is written both to the retained-intron
+  isoform and to `<gene_id>-I`; `NH`, `HI` and `MAPQ` count all targets, and
+  Salmon or RSEM decide;
+- a read inside a constitutive intron is written to `<gene_id>-I` only
+  (it used to be dropped);
+- a read or pair that **crosses a splice junction** is processed RNA and goes
+  to spliced targets only;
+- `--quantTranscriptomeSAMoutput` rules (indels, soft-clip extension,
+  single-end) apply to every target.
 
-```
-gene_id  unstranded_spliced  unstranded_unspliced  unstranded_ambiguous  forward_spliced  ...  reverse_ambiguous
-```
+`Intron` or `PreMRNA`? `PreMRNA` also offers a home to the exonic part of
+pre-mRNA and keeps pairs with one mate in an exon and one in an intron (in
+`Intron` mode such a pair fits no target unless an isoform retains that
+intron). `Intron` matches splici and keeps exon-only reads away from the
+unspliced targets, at the cost of counting the exonic part of pre-mRNA as
+mature.
 
-`forward` keeps transcripts on the strand of read 1 (`htseq-count -s yes`,
-STARsolo `--soloStrand Forward`); `reverse` keeps transcripts on the opposite
-strand (dUTP / TruSeq Stranded, `-s reverse`). Pick the columns matching the
-library, as with `ReadsPerGene.out.tab`.
+### Files
 
-`sample_ReadsPerGeneSplicing.summary.tsv`: read accounting per strand
-convention (`N_unmapped`, `N_multimapping`, `N_noFeature`, `N_multiGene`,
-`N_spliced`, `N_unspliced`, `N_ambiguous`) and the three fractions of the
-assigned reads (`fraction_spliced`, `fraction_unspliced`,
-`fraction_ambiguous`). The unspliced fraction is a direct per-library measure
-of pre-mRNA content, usable as a QC metric or covariate.
+- `sample_Aligned.toTranscriptome.targets.tsv`: `target_id`, `gene_id`,
+  `gene_name`, `status` (`spliced` / `unspliced`), `length`, in `@SQ` order;
+  a ready-made tx2gene table (sum by `gene_id` and `status` for spliced and
+  unspliced gene counts).
+- `sample_Aligned.toTranscriptome.unspliced.fa` (with
+  `--quantTranscriptomeUnsplicedFasta Yes`): the `<gene_id>-I` sequences, in
+  transcript orientation. It is of the order of the genome size and depends
+  only on the index and the flank, so write it once.
 
-## Pre-mRNA-aware transcriptome projection
+### Salmon
+
+Salmon's alignment mode needs every `@SQ` target in its FASTA, with the same
+names. With GENCODE:
 
 ```bash
-rustar-aligner ... \
-  --quantMode TranscriptomeSAM \
-  --quantTranscriptomePreMRNA BanRetainedIntron
+gzip -dc gencode.v50.transcripts.fa.gz | sed 's/|.*//' > transcripts.fa
+cat transcripts.fa sample_Aligned.toTranscriptome.unspliced.fa > targets.fa
+salmon quant -a sample_Aligned.toTranscriptome.out.bam -t targets.fa -l A -o salmon_out
 ```
 
-A **retained-intron interval** is an intron of one isoform that another
-isoform of the same gene covers with a single exon reaching into both
-flanking exons. With `BanRetainedIntron`, an alignment is not projected onto
-the transcripts of a gene when:
+Keep the `-I` targets out of isoform-level analyses, and out of tximport's
+`avgTxLength` if a spliced-only gene length is wanted.
 
-- no mate crosses a splice junction, and
-- one of its aligned blocks (after the soft-clip extension of
-  `--quantTranscriptomeSAMoutput`) overlaps a retained-intron interval of that
-  gene.
+## Splicing-status tag (`sp`)
 
-For paired-end data the rule applies to the fragment: the pair is dropped from
-the gene as soon as one mate overlaps and neither mate is spliced. Cassette
-exons and alternative 5'/3' splice sites do not create intervals, so their
-reads are projected as before; so are reads that cross a junction. Other
-alignments and other genes are untouched. The number of alignments and
-projections removed is written to the log.
+`--outSAMattributes Standard sp` adds `sp:A:S` (spliced: compatible only with
+mature mRNA, the read need not cross a junction), `sp:A:U` (unspliced: needs
+pre-mRNA) or `sp:A:A` (ambiguous: both) to every genomic alignment record,
+from the rules below applied to every annotated transcript that contains the
+alignment, on either strand and whatever its gene. There is no tag when no
+transcript contains the alignment. Both mates of a pair carry the fragment
+status. `sp` is in no preset and is not used by STAR or STARsolo.
 
-### What to expect
+## Spliced / unspliced gene counts (`GeneSplicing`)
 
-- Retained-intron isoforms no longer absorb pre-mRNA reads; their estimated
-  share drops and stops following the library's unspliced fraction.
-- The flip side: a retained-intron isoform that is genuinely expressed loses
-  the reads that distinguish it (they are indistinguishable from pre-mRNA),
-  and exonic pre-mRNA reads that it used to share now go to the other
-  isoforms of the gene, as they do for genes with no retained-intron isoform.
-  If retained introns are the object of study, keep the default and model
-  intron retention explicitly.
-- Fewer fragments reach Salmon / RSEM; use `ReadsPerGeneSplicing.summary.tsv`
-  to report how much of the library is pre-mRNA.
+```bash
+rustar-aligner ... --quantMode GeneCounts GeneSplicing
+```
 
-The benchmark behind these statements (public whole-blood total RNA, GRCh38 +
+A cheap per-library measure of pre-mRNA content, and a gene-level table. Each
+uniquely mapped read or pair is classified with the rules STARsolo uses for its
+single-cell spliced / unspliced matrices, one read standing for one molecule:
+
+1. Every annotated transcript that fully contains the alignment is tested.
+   Each aligned block is called exonic, intronic or exon/intron-spanning, with
+   a 6-base tolerance at exon boundaries. A spliced alignment that touches an
+   intron is incompatible with that transcript, and a block in an intron longer
+   than 1 Mb is not called intronic.
+2. If the compatible transcripts belong to more than one gene, the read is
+   `N_multiGene` and not counted.
+3. Otherwise: only-exonic models give **spliced**, intronic or spanning models
+   with no only-exonic model give **unspliced**, and a mix gives
+   **ambiguous** (for example a read inside an intron that another isoform
+   retains).
+
+Unmapped, too-many-loci and multimapping reads are accounted as in
+`GeneCounts`; pairs with a single mapped mate count as unmapped.
+
+- `sample_ReadsPerGeneSplicing.out.tab`: a header line, then one line per gene
+  (in `geneInfo.tab` order) with spliced, unspliced and ambiguous counts for
+  each strand convention (`unstranded_*`, `forward_*`, `reverse_*`).
+  `forward` keeps transcripts on the strand of read 1 (`htseq-count -s yes`);
+  `reverse` keeps the opposite strand (dUTP / TruSeq Stranded,
+  `-s reverse`).
+- `sample_ReadsPerGeneSplicing.summary.tsv`: `N_unmapped`, `N_multimapping`,
+  `N_noFeature`, `N_multiGene`, `N_spliced`, `N_unspliced`, `N_ambiguous` and
+  the three fractions of the assigned reads, per strand convention.
+
+The benchmark behind these options (public whole-blood total RNA, GRCh38 +
 GENCODE v50) can be reproduced with the scripts in
 `scripts/bench_bulk_unspliced/`.

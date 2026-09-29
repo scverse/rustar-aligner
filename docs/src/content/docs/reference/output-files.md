@@ -23,7 +23,7 @@ Coordinate-sorted BAM. Written when `--outSAMtype BAM SortedByCoordinate`. The s
 
 ### `sample_Aligned.toTranscriptome.out.bam`
 
-Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within.
+Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within. With `--quantTranscriptomeUnspliced Intron|PreMRNA` (rustar-aligner extension) the references also include one `<gene_id>-I` unspliced target per gene, and `sample_Aligned.toTranscriptome.targets.tsv` (target, gene, `spliced`/`unspliced` status, length) is written next to it, plus `sample_Aligned.toTranscriptome.unspliced.fa` with `--quantTranscriptomeUnsplicedFasta Yes`. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Log files
 
