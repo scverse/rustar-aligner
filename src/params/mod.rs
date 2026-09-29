@@ -1126,6 +1126,16 @@ pub struct Parameters {
     )]
     pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
 
+    /// rustar-aligner extension (not in STAR), for `--quantMode
+    /// TranscriptomeSAM` on total RNA-seq:
+    ///   * `Keep` (default) — STAR behaviour, every alignment is projected
+    ///   * `BanRetainedIntron` — do not project an unspliced read or pair onto
+    ///     the transcripts of a gene when it overlaps an intron of that gene
+    ///     that another isoform retains (pre-mRNA and retained-intron isoform
+    ///     cannot be told apart)
+    #[arg(long = "quantTranscriptomePreMRNA", default_value = "Keep")]
+    pub quant_transcriptome_pre_mrna: crate::quant::transcriptome::QuantTranscriptomePreMRNA,
+
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
     #[arg(long = "twopassMode", default_value = "None")]

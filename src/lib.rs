@@ -346,7 +346,23 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let tr_idx = tr_idx_all
         .as_ref()
         .filter(|_| params.quant_transcriptome_sam())
-        .map(std::sync::Arc::clone);
+        .map(|tr| {
+            if params.quant_transcriptome_pre_mrna
+                == crate::quant::transcriptome::QuantTranscriptomePreMRNA::BanRetainedIntron
+            {
+                let mut tr = (**tr).clone();
+                let ri = crate::quant::transcriptome::RetainedIntrons::build(&tr);
+                info!(
+                    "quantTranscriptomePreMRNA BanRetainedIntron: {} retained-intron intervals in {} genes",
+                    ri.per_gene.iter().map(Vec::len).sum::<usize>(),
+                    ri.per_gene.iter().filter(|v| !v.is_empty()).count()
+                );
+                tr.retained_introns = Some(std::sync::Arc::new(ri));
+                std::sync::Arc::new(tr)
+            } else {
+                std::sync::Arc::clone(tr)
+            }
+        });
 
     // Build the per-read quantification context if --quantMode GeneCounts
     // and/or GeneVelocyto was requested. GeneCounts' GTF requirement is
@@ -463,6 +479,15 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     let log_progress_path = params.output_path("Log.progress.out");
     crate::io::log::write_log_progress_out(&log_progress_path, &stats, time_start, time_finish)?;
     info!("Wrote {}", log_progress_path.display());
+
+    if let Some(ri) = tr_idx.as_ref().and_then(|t| t.retained_introns.as_ref()) {
+        use std::sync::atomic::Ordering;
+        info!(
+            "quantTranscriptomePreMRNA BanRetainedIntron: {} alignments lost {} transcriptome projections",
+            ri.n_alignments_banned.load(Ordering::Relaxed),
+            ri.n_projections_banned.load(Ordering::Relaxed)
+        );
+    }
 
     // Write ReadsPerGene.out.tab / ReadsPerGeneVelocyto.* for the requested
     // --quantMode values.
@@ -1200,7 +1225,14 @@ fn build_transcriptome_records_se(
     for aln in transcripts {
         let bases: &[u8] = if aln.is_reverse { &rc } else { read_seq };
         projected_all.extend(filter_and_project(
-            aln, bases, genome, tr_idx, lread, mode, params,
+            aln,
+            bases,
+            genome,
+            tr_idx,
+            lread,
+            mode,
+            params,
+            aln.n_junction > 0,
         ));
     }
 
@@ -1269,8 +1301,11 @@ where
         let m2 = &pair.mate2_transcript;
         let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
         let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
-        let proj_m1 = filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params);
-        let proj_m2 = filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params);
+        let spliced = m1.n_junction + m2.n_junction > 0;
+        let proj_m1 =
+            filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params, spliced);
+        let proj_m2 =
+            filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params, spliced);
 
         let mut by_tr1: HashMap<usize, Vec<&crate::align::transcript::Transcript>> = HashMap::new();
         for p in &proj_m1 {
