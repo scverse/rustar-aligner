@@ -1057,6 +1057,35 @@ struct AlignmentBatchResults {
     signal_n_tr: usize,
 }
 
+/// Reads per alignment batch, chosen so a batch's result vector stays an
+/// ordinary-sized allocation.
+///
+/// [`run_batch_pipeline`] allocates a fresh `Vec<Result<T, Error>>` for every
+/// batch and drops it once consumed. mimalloc serves anything past its
+/// large-object threshold from the arena path rather than a thread-local page,
+/// so once that vector crosses roughly 512 KB each batch pays a fresh mapping
+/// and — with `arena_eager_commit` off, which `main` sets deliberately to keep
+/// RSS down — faults every page back in. At the previous fixed 10,000 reads the
+/// vector was 1.7 MB and that path accounted for ~38% of the samples in a solo
+/// run.
+///
+/// The ceiling is the measured one. Sweeping batch size on a 2M-read solo run
+/// (8 threads) put the optimum on a plateau from roughly 1000 to 2000 reads:
+/// 10,000 took 3.46s, 3000 2.29s, 2000 2.15s, 1500 2.13s, 1000 2.17s, 250 2.58s.
+/// Below the plateau per-batch dispatch starts to dominate, which is what the
+/// floor guards. Some of the per-batch cost tracks the read count rather than
+/// the result vector — sizing purely by bytes picked 4096 for the solo product
+/// and left time on the table — so the count is capped as well.
+///
+/// The byte rule still earns its place as the other half: it keeps the
+/// allocation under the threshold if the result struct grows later, rather than
+/// leaving a tuned constant to rot.
+fn batch_size_for<T>() -> usize {
+    const TARGET_BYTES: usize = 384 * 1024;
+    const MAX_READS: usize = 2048;
+    (TARGET_BYTES / std::mem::size_of::<Result<T, error::Error>>().max(1)).clamp(512, MAX_READS)
+}
+
 /// One `Result` per read/pair in an aligned batch.
 type BatchOut<T> = Vec<Result<T, error::Error>>;
 
@@ -1465,7 +1494,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();
@@ -2099,7 +2128,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     let clip5p = params.clip5p(0);
     let clip3p = params.clip3p(0);
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
@@ -2414,7 +2443,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     // Per-mate clip: mate 1 (--clip5pNbases[0], e.g. 39 to strip the 5' barcode
     // region) and mate 2 ([1], e.g. 0). CellRanger4 adapter clipping is not used
     // by the cellgeni 5' path (it uses clip5pNbases instead), so it is not applied.
@@ -2810,7 +2839,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();

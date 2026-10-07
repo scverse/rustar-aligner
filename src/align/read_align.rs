@@ -1257,7 +1257,20 @@ pub fn align_paired_read(
                 ))
             }
         }
-        (None, None) => Ok((Vec::new(), pe_chimeric, 0, Some(UnmappedReason::TooShort))),
+        // STAR splits this case in two (`ReadAlign_mappedFilter.cpp`): a read
+        // with no good window at all is `unmappedOther` ("other"), and only a
+        // read that *had* a window whose best transcript failed the score or
+        // length thresholds is `unmappedShort` ("too short"). Reporting every
+        // unmapped pair as too short empties the "other" bucket, which is what
+        // #48 measured on paired-end data.
+        (None, None) => {
+            let reason = if clusters.is_empty() {
+                UnmappedReason::Other
+            } else {
+                UnmappedReason::TooShort
+            };
+            Ok((Vec::new(), pe_chimeric, 0, Some(reason)))
+        }
     }
 }
 

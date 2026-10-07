@@ -1909,6 +1909,22 @@ impl Parameters {
                             "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
                         ));
                     }
+                    // The barcode region of that mate is not cDNA, and nothing
+                    // else says how many bases it spans, so STAR refuses the
+                    // run unless the mate is clipped
+                    // (`ParametersSolo.cpp:145-150`). Without this the CB+UMI
+                    // prefix is aligned as if it were sequence: 28 bases of it
+                    // for 10x v3, with no error anywhere in the run.
+                    let mate = 0; // --soloBarcodeMate 1 is mate 1
+                    if params.clip5p(mate) == 0 && params.clip3p(mate) == 0 {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--soloBarcodeMate 1 puts the barcode inside mate 1, which requires \
+                             clipping the barcode off that mate\n\
+                             SOLUTION: clip it from 5' and/or 3' with --clip5pNbases and/or \
+                             --clip3pNbases; give a value per mate, using 0 for no clipping",
+                        ));
+                    }
                 }
                 other => {
                     return Err(command.error(
@@ -2404,8 +2420,8 @@ mod tests {
 
     #[test]
     fn solo_barcode_mate_validation() {
-        let with_mate = |mate: &str| {
-            try_parse(&[
+        let with_mate_and_clip = |mate: &str, clip: Option<(&str, &str)>| {
+            let mut args = vec![
                 "--readFilesIn",
                 "R1.fq",
                 "R2.fq",
@@ -2421,16 +2437,77 @@ mod tests {
                 "Gene",
                 "--soloBarcodeMate",
                 mate,
-            ])
+            ];
+            if let Some((flag, value)) = clip {
+                args.push(flag);
+                args.push(value);
+                args.push("0");
+            }
+            try_parse(&args)
         };
-        // Mate 1 (5' paired-end) is accepted; the helper reports it.
+        let with_mate = |mate: &str| with_mate_and_clip(mate, Some(("--clip5pNbases", "28")));
+
+        // Mate 1 (5' paired-end) with the barcode clipped off: accepted, and
+        // the helper reports it.
         let p = with_mate("1").unwrap();
         assert!(p.solo_barcode_on_mate1());
-        // Mate 0 (default) is the standard SE-solo path.
-        assert!(!with_mate("0").unwrap().solo_barcode_on_mate1());
+        // Mate 0 (default) is the standard SE-solo path; no clip is needed
+        // because the barcode has its own read.
+        assert!(
+            !with_mate_and_clip("0", None)
+                .unwrap()
+                .solo_barcode_on_mate1()
+        );
         // Mate 2 is rejected with a clear message.
         let err = with_mate("2").unwrap_err().to_string();
         assert!(err.contains("soloBarcodeMate"), "unexpected error: {err}");
+    }
+
+    /// STAR refuses `--soloBarcodeMate 1` unless the barcode is clipped off
+    /// that mate (`ParametersSolo.cpp:145-150`): the barcode region is not
+    /// cDNA, and nothing else says how long it is. Without the check the CB+UMI
+    /// prefix is aligned as sequence and the run reports nothing.
+    #[test]
+    fn solo_barcode_mate_1_requires_clipping_that_mate() {
+        let with_clip = |extra: &[&str]| {
+            let mut args = vec![
+                "--readFilesIn",
+                "R1.fq",
+                "R2.fq",
+                "--soloType",
+                "CB_UMI_Simple",
+                "--soloCBwhitelist",
+                "None",
+                "--soloCBmatchWLtype",
+                "Exact",
+                "--sjdbGTFfile",
+                "g.gtf",
+                "--soloFeatures",
+                "Gene",
+                "--soloBarcodeMate",
+                "1",
+            ];
+            args.extend_from_slice(extra);
+            try_parse(&args)
+        };
+
+        // No clip at all: refused, and the message says what to do.
+        let err = with_clip(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("clip5pNbases"),
+            "the error should name the fix: {err}"
+        );
+
+        // A clip on mate 2 only leaves mate 1's barcode in place, so it is
+        // still refused.
+        assert!(with_clip(&["--clip5pNbases", "0", "28"]).is_err());
+
+        // 5' clip on mate 1: accepted.
+        assert!(with_clip(&["--clip5pNbases", "28", "0"]).is_ok());
+        // 3' clip on mate 1: also accepted, for a barcode at the other end.
+        assert!(with_clip(&["--clip3pNbases", "28", "0"]).is_ok());
+        // A single value applies to both mates, which covers mate 1.
+        assert!(with_clip(&["--clip5pNbases", "28"]).is_ok());
     }
 
     #[test]
