@@ -5,20 +5,17 @@
 // - Intra-chromosomal strand breaks
 // - Circular RNAs (back-splices)
 //
-// Detection strategy:
-// - Tier 1: chimericDetectionOld (post-stitching, transcript-pair search — detect_chimeric_old)
-// - Tier 2: Multi-cluster chimeric stitching (during clustering)
-// - Tier 1b: detect_from_soft_clips (re-seed primary soft-clips when Tier 1 finds nothing)
-// - Tier 3: detect_from_chimeric_residuals (re-seed outer uncovered regions of Tier 1/2 pairs)
+// Detection (`detect.rs`) is STAR's: `chimericDetectionOld` by default, or
+// `chimericDetectionMult` under `--chimMultimapNmax`, both over the read's
+// window transcripts — combined two-mate transcripts for a pair.
 
 mod detect;
 mod output;
-mod score;
 mod segment;
 
-pub use detect::{ChimericDetector, detect_chimeric_old, detect_inter_mate_chimeric};
+pub use detect::{ChimRead, WinTr, chimeric_detection};
 pub use output::{ChimericJunctionWriter, build_within_bam_records};
-pub use segment::{ChimericAlignment, ChimericSegment};
+pub use segment::{ChimericAlignment, ChimericSegment, ExonSpan, JunctionLine, MultimapInfo};
 
 #[cfg(test)]
 mod tests {

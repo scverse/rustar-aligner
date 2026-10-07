@@ -275,20 +275,12 @@ pub fn align_read(
     // (#ifdef COMPILE_FOR_LONG_READS in stitchPieces.cpp). Standard STAR
     // does NOT filter clusters by seed coverage. Removed to match STAR.
 
-    // Step 2b: Detect chimeric alignments from multi-cluster seeds (Tier 2)
-    let mut chimeric_alignments = Vec::new();
-    if params.chim_segment_min > 0 && clusters.len() > 1 {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        chimeric_alignments
-            .extend(detector.detect_from_multi_clusters(&clusters, read_seq, read_name, index)?);
-    }
-
     // Step 3: Stitch seeds within each cluster
     let scorer = AlignmentScorer::from_params(params);
     let mut transcripts = Vec::new();
-    // Collect all raw (pre-dedup) transcripts for chimericDetectionOld (Tier 1).
-    let mut all_raw_transcripts: Vec<crate::align::transcript::Transcript> = Vec::new();
+    // STAR's `trAll`: every window's transcripts, before any cross-window
+    // dedup or filtering, which is what its chimeric detection reads.
+    let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
 
     // Use junction DB for annotation-aware scoring if available
     let junction_db = if index.junction_db.is_empty() {
@@ -336,7 +328,20 @@ pub fn align_read(
             }
         }
         if params.chim_segment_min > 0 {
-            all_raw_transcripts.extend(cluster_transcripts.iter().cloned());
+            chim_windows.push(
+                cluster_transcripts
+                    .iter()
+                    .filter_map(|t| {
+                        crate::chimeric::WinTr::single(
+                            t,
+                            u8::from(t.is_reverse),
+                            0,
+                            0,
+                            read_seq.len(),
+                        )
+                    })
+                    .collect(),
+            );
         }
         transcripts.extend(cluster_transcripts);
     }
@@ -537,66 +542,25 @@ pub fn align_read(
         );
     }
 
-    // Step 3b: chimericDetectionOld (Tier 1) — STAR-faithful post-stitching transcript-pair search.
-    // Uses the best post-dedup transcript as the primary segment and searches all raw transcripts
-    // (pre-dedup, from all clusters) for the best complementary partner.
-    if params.chim_segment_min > 0
-        && !all_raw_transcripts.is_empty()
-        && let Some(tr_best) = transcripts.first()
-    {
-        use crate::chimeric::detect_chimeric_old;
-        let chims = detect_chimeric_old(
-            &all_raw_transcripts,
-            tr_best,
-            read_seq,
-            read_name,
-            params,
-            index,
-        )?;
-        chimeric_alignments.extend(chims);
-    }
-
-    // Step 3c: Soft-clip re-mapping (Phase 12.2) — try to align soft-clipped bases when
-    // detect_chimeric_old found no chimeric partner in the existing transcript pool.
-    if params.chim_segment_min > 0
-        && chimeric_alignments.is_empty()
-        && let Some(tr_best) = transcripts.first()
-    {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        if let Some(chim) = detector.detect_from_soft_clips(tr_best, read_seq, read_name, index)? {
-            chimeric_alignments.push(chim);
-        }
-    }
-
-    // Step 3d: Tier 3 — re-seed outer uncovered read regions of each chimeric pair (Phase 17.10).
-    // Extends 2-segment chimeras toward multi-junction fusions by seeding the read bases
-    // that lie outside both chimeric segments.
-    if params.chim_segment_min > 0 && !chimeric_alignments.is_empty() {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        let mut tier3 = Vec::new();
-        for chim in &chimeric_alignments {
-            let extras =
-                detector.detect_from_chimeric_residuals(chim, read_seq, read_name, index)?;
-            tier3.extend(extras);
-        }
-        chimeric_alignments.extend(tier3);
-    }
-
     // Note: STAR sometimes finds 2 equivalent indel placements in homopolymer runs
     // via its recursive stitcher's seed exploration (NH=2 instead of NH=1 for ~5 reads).
     // Generating equivalents post-hoc causes more harm than good (41 false NH=2 vs 5 fixed).
     // The root cause is jR scanning placing insertions at different positions — fixing that
     // would be a better approach than post-hoc enumeration.
 
-    // Step 6: Filter chimeric alignments
-    if params.chim_segment_min > 0 {
-        chimeric_alignments.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
-    }
+    // STAR's chimericDetection, which runs after multMapSelect/mappedFilter
+    // whatever their outcome, over the window transcripts.
+    let chimeric_alignments = if params.chim_segment_min > 0 {
+        let read = crate::chimeric::ChimRead::new(
+            read_seq,
+            [read_seq.len(), 0],
+            read_name,
+            [read_seq, &[]],
+        );
+        crate::chimeric::chimeric_detection(chim_windows, &read, &index.genome, &scorer, params)
+    } else {
+        Vec::new()
+    };
 
     // n_for_mapq = transcripts.len() after dedup and filtering.
     // Multi-transcript DP (Phase 16.10) produces multiple transcripts per window
@@ -756,54 +720,6 @@ pub fn align_paired_read(
     // Cluster combined seeds using the combined read length
     let clusters = cluster_seeds(&combined_seeds, index, params, combined_len, debug_pe);
 
-    // PE chimeric pre-pass: intra-mate multi-cluster detection (Tier 2).
-    // Split clusters by mate_id and run per-mate chimeric detection, mirroring SE behavior.
-    let mut pe_chimeric: Vec<crate::chimeric::ChimericAlignment> = Vec::new();
-    if params.chim_segment_min > 0 && clusters.len() >= 2 {
-        use crate::chimeric::ChimericDetector;
-
-        let mate1_clusters: Vec<_> = clusters
-            .iter()
-            .filter(|c| c.alignments.iter().all(|wa| wa.mate_id == 0))
-            .cloned()
-            .collect();
-
-        // Mate2 clusters: adjust read_pos to be relative to mate2_seq (subtract len1+1)
-        let mate2_clusters: Vec<_> = clusters
-            .iter()
-            .filter(|c| c.alignments.iter().all(|wa| wa.mate_id == 1))
-            .map(|c| {
-                let mut c2 = c.clone();
-                for wa in &mut c2.alignments {
-                    wa.read_pos -= len1 + 1;
-                }
-                c2
-            })
-            .collect();
-
-        let detector = ChimericDetector::new(params);
-        if mate1_clusters.len() >= 2 {
-            pe_chimeric.extend(detector.detect_from_multi_clusters(
-                &mate1_clusters,
-                mate1_seq,
-                read_name,
-                index,
-            )?);
-        }
-        if mate2_clusters.len() >= 2 {
-            pe_chimeric.extend(detector.detect_from_multi_clusters(
-                &mate2_clusters,
-                mate2_seq,
-                read_name,
-                index,
-            )?);
-        }
-        pe_chimeric.retain(|c| {
-            c.meets_min_segment_length(params.chim_segment_min)
-                && c.meets_min_score(params.chim_score_min)
-        });
-    }
-
     // Combined score threshold: use len1+len2 as denominator
     let combined_score_threshold =
         (params.out_filter_score_min_over_lread * (len1 + len2) as f64) as i32;
@@ -811,10 +727,10 @@ pub fn align_paired_read(
     let mut joint_pairs: Vec<PairedAlignment> = Vec::new();
     let mut single_mate1_transcripts: Vec<Transcript> = Vec::new();
     let mut single_mate2_transcripts: Vec<Transcript> = Vec::new();
-    // All finalized mate transcripts (from both joint pairs and single-mate WTs) used
-    // as the search pool for chimericDetectionOld (Tier 1) on each mate independently.
-    let mut all_m1_transcripts: Vec<Transcript> = Vec::new();
-    let mut all_m2_transcripts: Vec<Transcript> = Vec::new();
+    // STAR's `trAll` for chimeric detection: per window, the combined-read
+    // transcripts — whole pairs and single mates alike.
+    let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
+    let chim_on = params.chim_segment_min > 0;
 
     // Stitch combined clusters, split WTs by mate_id, finalize each half
     for cluster in clusters.iter().take(params.align_windows_per_read_nmax) {
@@ -828,6 +744,8 @@ pub fn align_paired_read(
             params.align_mates_gap_max.into(),
             debug_name,
         );
+        let mut chim_window: Vec<crate::chimeric::WinTr> = Vec::new();
+        let str_ = u8::from(stitch_is_reverse);
 
         for wt in &wts {
             let split_result =
@@ -889,16 +807,11 @@ pub fn align_paired_read(
                     t2.is_reverse = true;
                 }
 
-                if params.chim_segment_min > 0 {
-                    all_m1_transcripts.push(t1.clone());
-                    all_m2_transcripts.push(t2.clone());
-                }
-
                 let combined_span =
                     t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
                 let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
 
-                if let Some(pair) = try_pair_transcripts(
+                let pair = try_pair_transcripts(
                     &t1,
                     &t2,
                     len1,
@@ -906,7 +819,44 @@ pub fn align_paired_read(
                     params,
                     combined_score_threshold,
                     combined_wt_score,
-                ) {
+                );
+                // STAR's `trAll` holds every pair stitching kept. The absolute
+                // score floor in `try_pair_transcripts` is an early `mappedFilter`,
+                // not a stitching rule, so chimeric detection must still see a
+                // pair that only fails that floor — it is often `trBest`.
+                if chim_on
+                    && (pair.is_some()
+                        || try_pair_transcripts(
+                            &t1,
+                            &t2,
+                            len1,
+                            len2,
+                            params,
+                            i32::MIN,
+                            combined_wt_score,
+                        )
+                        .is_some())
+                {
+                    // The strand frame starts with mate1 forward, mate2
+                    // reversed: `[mate1 | spacer | RC(mate2)]` and its reverse
+                    // complement.
+                    let (first, ff, second, sf, off) = if stitch_is_reverse {
+                        (&t2, 1, &t1, 0, len2 + 1)
+                    } else {
+                        (&t1, 0, &t2, 1, len1 + 1)
+                    };
+                    chim_window.extend(crate::chimeric::WinTr::pair(
+                        first,
+                        ff,
+                        second,
+                        sf,
+                        off,
+                        str_,
+                        combined_wt_score,
+                        combined_len,
+                    ));
+                }
+                if let Some(pair) = pair {
                     joint_pairs.push(pair);
                 }
             } else {
@@ -919,8 +869,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[..len1], false)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m1_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(0, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m1_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -931,8 +885,19 @@ pub fn align_paired_read(
                         0, // mate1
                     ) {
                         t.is_reverse = stitch_is_reverse;
-                        if params.chim_segment_min > 0 {
-                            all_m1_transcripts.push(t.clone());
+                        if chim_on {
+                            chim_window.extend(crate::chimeric::WinTr::single(
+                                &t,
+                                str_,
+                                crate::align::stitch::mate_read_offset(
+                                    0,
+                                    len1,
+                                    len2,
+                                    stitch_is_reverse,
+                                ),
+                                0,
+                                combined_len,
+                            ));
                         }
                         single_mate1_transcripts.push(t);
                     }
@@ -942,8 +907,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[len1 + 1..], true)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m2_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(1, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m2_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -954,15 +923,45 @@ pub fn align_paired_read(
                         1, // mate2
                     ) {
                         t.is_reverse = !stitch_is_reverse;
-                        if params.chim_segment_min > 0 {
-                            all_m2_transcripts.push(t.clone());
+                        if chim_on {
+                            chim_window.extend(crate::chimeric::WinTr::single(
+                                &t,
+                                str_,
+                                crate::align::stitch::mate_read_offset(
+                                    1,
+                                    len1,
+                                    len2,
+                                    stitch_is_reverse,
+                                ),
+                                1,
+                                combined_len,
+                            ));
                         }
                         single_mate2_transcripts.push(t);
                     }
                 }
             }
         }
+        if chim_on {
+            chim_windows.push(chim_window);
+        }
     }
+
+    // STAR's chimericDetection over the combined-read window transcripts. It
+    // runs after multMapSelect/mappedFilter whatever their outcome, and reads
+    // nothing they decide, so it is done here, before the decision tree
+    // consumes the pairs.
+    let pe_chimeric = if chim_on {
+        let read = crate::chimeric::ChimRead::new(
+            &combined_read,
+            [len1, len2],
+            read_name,
+            [mate1_seq, mate2_seq],
+        );
+        crate::chimeric::chimeric_detection(chim_windows, &read, &index.genome, &scorer, params)
+    } else {
+        Vec::new()
+    };
 
     // --peOverlapNbasesMin: if the mates overlap in genome space, merge them into one
     // single-end read, align that merged read through the same SE pipeline (`align_read`,
@@ -1191,39 +1190,6 @@ pub fn align_paired_read(
         ));
     }
 
-    // PE Tier 1: chimericDetectionOld per-mate — mirrors SE behavior but run independently
-    // on each mate's transcript pool (joint-pair halves + single-mate WTs combined).
-    // Runs before the BothMapped early return so chimeras are reported for all pair outcomes.
-    if params.chim_segment_min > 0 {
-        use crate::chimeric::detect_chimeric_old;
-        if let Some(tr_best_m1) = all_m1_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m1_transcripts,
-                tr_best_m1,
-                mate1_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
-        if let Some(tr_best_m2) = all_m2_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m2_transcripts,
-                tr_best_m2,
-                mate2_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
-        pe_chimeric.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
-    }
-
     if !joint_pairs.is_empty() {
         let pe_mapq_n = joint_pairs.len().max(1);
         let results = joint_pairs
@@ -1231,21 +1197,6 @@ pub fn align_paired_read(
             .map(|pa| PairedAlignmentResult::BothMapped(Box::new(pa)))
             .collect();
         return Ok((results, pe_chimeric, pe_mapq_n, None));
-    }
-
-    // Inter-mate chimeric detection: fires when the best single-mate transcripts are discordant
-    // (different chr, same strand, or >1Mb apart). Runs before half-mapped fallback consumes
-    // the transcript vecs.
-    if params.chim_segment_min > 0 {
-        use crate::chimeric::detect_inter_mate_chimeric;
-        let best_m1_chim = single_mate1_transcripts.iter().max_by_key(|t| t.score);
-        let best_m2_chim = single_mate2_transcripts.iter().max_by_key(|t| t.score);
-        if let (Some(t1), Some(t2)) = (best_m1_chim, best_m2_chim)
-            && let Some(chim) =
-                detect_inter_mate_chimeric(t1, t2, mate1_seq, read_name, params, index)
-        {
-            pe_chimeric.push(chim);
-        }
     }
 
     // Half-mapped fallback: report the best-scoring single-mate transcript.
@@ -1550,6 +1501,7 @@ pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::genome::Genome;
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;

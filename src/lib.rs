@@ -1449,7 +1449,10 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -1632,6 +1635,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 chim_writer.write_alignment(
                                     chim_aln,
                                     &index.genome.chr_name,
+                                    &index.genome.chr_start,
                                     &chim_aln.read_name,
                                 )?;
                             }
@@ -1698,6 +1702,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     chim_writer.write_alignment(
                                         chim_aln,
                                         &index.genome.chr_name,
+                                        &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
                                 }
@@ -2789,7 +2794,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -2959,6 +2967,20 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         if let Some(ref mut tw) = tr_writer {
                             tw.write_batch(&batch.transcriptome_records)?;
                         }
+                        // Chimeric.out.junction. The writer was created and
+                        // flushed here but never written to, so a PE run reported
+                        // chimeric reads in Log.final.out and left the junction
+                        // file empty.
+                        if let Some(ref mut chim_writer) = chimeric_writer {
+                            for chim_aln in &batch.chimeric_alns {
+                                chim_writer.write_alignment(
+                                    chim_aln,
+                                    &index.genome.chr_name,
+                                    &index.genome.chr_start,
+                                    &chim_aln.read_name,
+                                )?;
+                            }
+                        }
                         if params.chim_out_within_bam() {
                             use crate::chimeric::build_within_bam_records;
                             for chim_aln in &batch.chimeric_alns {
@@ -3018,6 +3040,16 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             writer.write_batch(&records)?;
                             if let Some(ref mut tw) = tr_writer {
                                 tw.write_batch(&meta.transcriptome_records)?;
+                            }
+                            if let Some(ref mut chim_writer) = chimeric_writer {
+                                for chim_aln in &meta.chimeric_alns {
+                                    chim_writer.write_alignment(
+                                        chim_aln,
+                                        &index.genome.chr_name,
+                                        &index.genome.chr_start,
+                                        &chim_aln.read_name,
+                                    )?;
+                                }
                             }
                             if params.chim_out_within_bam() {
                                 use crate::chimeric::build_within_bam_records;
