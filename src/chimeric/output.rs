@@ -81,41 +81,57 @@ impl ChimericJunctionWriter {
         chr_starts: &[u64],
         read_name: &str,
     ) -> Result<(), Error> {
-        // Get chromosome names
-        let donor_chr = &chr_names[alignment.donor.chr_idx];
-        let acceptor_chr = &chr_names[alignment.acceptor.chr_idx];
-
-        // Every coordinate in this file is per-chromosome, as STAR's is. The
-        // segments carry genome-absolute positions, so the chromosome's padded
-        // start has to come off all four of them -- the two breakpoints and the
-        // two segment starts. `format_sa_entry` and the WithinBAM records below
-        // already did this; this writer did not, so columns 2, 5, 11 and 13
-        // were offset by chrStart.
-        let donor_offset = chr_starts[alignment.donor.chr_idx];
-        let acceptor_offset = chr_starts[alignment.acceptor.chr_idx];
-
-        // Get breakpoints (1-based, per-chromosome)
-        let donor_bp = alignment.donor_breakpoint() - donor_offset;
-        let acceptor_bp = alignment.acceptor_breakpoint() - acceptor_offset;
-
-        // Get strand symbols
-        let donor_strand = alignment.donor_strand();
-        let acceptor_strand = alignment.acceptor_strand();
-
-        // Get junction type
+        // The STAR detector records the line as STAR writes it, including
+        // two-mate segments whose start and CIGAR no single-mate segment holds.
+        // Every coordinate in this file is per-chromosome, as STAR's is, so the
+        // chromosome's padded start comes off all four positions.
+        let (
+            donor_chr_idx,
+            donor_bp,
+            donor_strand,
+            acceptor_chr_idx,
+            acceptor_bp,
+            acceptor_strand,
+            donor_start,
+            donor_cigar,
+            acceptor_start,
+            acceptor_cigar,
+        ) = if let Some(j) = &alignment.junction_line {
+            let (dc, ac) = (chr_starts[j.donor_chr], chr_starts[j.acceptor_chr]);
+            let strand = |rev: bool| if rev { '-' } else { '+' };
+            (
+                j.donor_chr,
+                j.donor_break.wrapping_sub(dc).wrapping_add(1),
+                strand(j.donor_reverse),
+                j.acceptor_chr,
+                j.acceptor_break.wrapping_sub(ac).wrapping_add(1),
+                strand(j.acceptor_reverse),
+                j.donor_start - dc + 1,
+                j.donor_cigar.clone(),
+                j.acceptor_start - ac + 1,
+                j.acceptor_cigar.clone(),
+            )
+        } else {
+            let (d, a) = (&alignment.donor, &alignment.acceptor);
+            let (dc, ac) = (chr_starts[d.chr_idx], chr_starts[a.chr_idx]);
+            (
+                d.chr_idx,
+                alignment.donor_breakpoint() - dc,
+                alignment.donor_strand(),
+                a.chr_idx,
+                alignment.acceptor_breakpoint() - ac,
+                alignment.acceptor_strand(),
+                d.genome_start - dc + 1,
+                d.cigar_string(),
+                a.genome_start - ac + 1,
+                a.cigar_string(),
+            )
+        };
+        let donor_chr = &chr_names[donor_chr_idx];
+        let acceptor_chr = &chr_names[acceptor_chr_idx];
         let junction_type = alignment.junction_type;
-
-        // Get repeat lengths
         let repeat_donor = alignment.repeat_len_donor;
         let repeat_acceptor = alignment.repeat_len_acceptor;
-
-        // Get segment start positions (1-based, per-chromosome)
-        let donor_start = alignment.donor.genome_start - donor_offset + 1;
-        let acceptor_start = alignment.acceptor.genome_start - acceptor_offset + 1;
-
-        // Convert CIGAR to string
-        let donor_cigar = alignment.donor.cigar_string();
-        let acceptor_cigar = alignment.acceptor.cigar_string();
 
         // Write line. Under `--chimMultimapNmax` STAR appends six run-level
         // columns (`ChimericAlign_chimericJunctionOutput.cpp:14-19`); without it

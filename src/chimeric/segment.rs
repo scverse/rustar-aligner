@@ -102,6 +102,31 @@ impl ChimericSegment {
     }
 }
 
+/// A chimera's junction line exactly as STAR writes it.
+///
+/// STAR's segments are whole window transcripts, and for a paired read one of
+/// them often covers both mates, so its start and CIGAR (with the `p` gap
+/// between mates) are not those of any single-mate segment. The detector fills
+/// this in and the junction writer prints it as it stands. Positions are
+/// genome-absolute and 0-based; the writer makes them per-chromosome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JunctionLine {
+    pub donor_chr: usize,
+    /// STAR's `chimJ0`.
+    pub donor_break: u64,
+    pub donor_reverse: bool,
+    pub acceptor_chr: usize,
+    /// STAR's `chimJ1`.
+    pub acceptor_break: u64,
+    pub acceptor_reverse: bool,
+    /// `trChim[0].exons[0][EX_G]`.
+    pub donor_start: u64,
+    pub donor_cigar: String,
+    /// `trChim[1].exons[0][EX_G]`.
+    pub acceptor_start: u64,
+    pub acceptor_cigar: String,
+}
+
 /// A chimeric alignment consisting of two segments
 #[derive(Debug, Clone)]
 pub struct ChimericAlignment {
@@ -116,6 +141,8 @@ pub struct ChimericAlignment {
     /// Present only for chimeras from the `--chimMultimapNmax` path, which
     /// writes a wider file. `None` selects the 14-column format.
     pub multimap: Option<MultimapInfo>,
+    /// The junction line, set by the STAR detector; see [`JunctionLine`].
+    pub junction_line: Option<JunctionLine>,
 }
 
 impl ChimericAlignment {
@@ -140,6 +167,7 @@ impl ChimericAlignment {
             read_seq,
             read_name,
             multimap: None,
+            junction_line: None,
         }
     }
 
