@@ -1093,7 +1093,7 @@ mod tests {
     fn decode_gsj_hit_outside_buffer_returns_empty() {
         let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
         // Hit in the real genome: caller should bypass this function.
-        assert!(decode_gsj_hit(500, 50, 5000, 100, &junctions).is_empty());
+        assert_eq!(decode_gsj_hit(500, 50, 5000, 100, &junctions), []);
     }
 
     #[test]
@@ -1107,10 +1107,16 @@ mod tests {
         let n_genome_real = 5000;
         let overhang = 100u32;
         let hit_pos = n_genome_real + 5;
-        assert!(decode_gsj_hit(hit_pos, 20, n_genome_real, overhang, &junctions).is_empty());
+        assert_eq!(
+            decode_gsj_hit(hit_pos, 20, n_genome_real, overhang, &junctions),
+            []
+        );
         // Acceptor-only hit (slot_offset >= overhang) is also dropped.
         let hit_pos2 = n_genome_real + 120;
-        assert!(decode_gsj_hit(hit_pos2, 20, n_genome_real, overhang, &junctions).is_empty());
+        assert_eq!(
+            decode_gsj_hit(hit_pos2, 20, n_genome_real, overhang, &junctions),
+            []
+        );
     }
 
     #[test]
@@ -1172,16 +1178,19 @@ mod tests {
         let n_genome_real = 5000;
         let overhang = 10u32;
         // Past last junction.
-        assert!(
-            decode_gsj_hit(n_genome_real + 21, 5, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 21, 5, n_genome_real, overhang, &junctions),
+            []
         );
         // On the trailing spacer byte (slot_offset == 2*overhang).
-        assert!(
-            decode_gsj_hit(n_genome_real + 20, 1, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 20, 1, n_genome_real, overhang, &junctions),
+            []
         );
         // Hit extends past the spacer.
-        assert!(
-            decode_gsj_hit(n_genome_real + 19, 3, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 19, 3, n_genome_real, overhang, &junctions),
+            []
         );
     }
 
