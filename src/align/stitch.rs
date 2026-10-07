@@ -2529,6 +2529,57 @@ fn stitch_recurse(
 ///
 /// # Returns
 /// `Some((m1_wt, m2_wt))` if both mates are present; `None` for single-mate WTs.
+/// Read-position offset of a mate's bases within the combined stitch read.
+///
+/// The combined read is laid out `[mate1 | SPACER | RC(mate2)]` forward and
+/// `[mate2 | SPACER | RC(mate1)]` reversed, so exactly one mate starts at 0 and
+/// the other starts past the spacer. Subtracting this offset from an exon's
+/// read coordinates rebases them into that mate's own slice.
+pub(crate) fn mate_read_offset(
+    mate_id: u8,
+    len1: usize,
+    len2: usize,
+    stitch_is_reverse: bool,
+) -> usize {
+    match (mate_id, stitch_is_reverse) {
+        (0, false) | (1, true) => 0,
+        (0, true) => len2 + 1,
+        _ => len1 + 1,
+    }
+}
+
+/// Rebase a single-mate transcript's read coordinates into that mate's slice.
+///
+/// `split_combined_wt` does this for two-mate transcripts, but it returns
+/// `None` when only one mate is present, so single-mate windows need the same
+/// shift applied on their own. Without it, the mate sitting *after* the spacer
+/// keeps read coordinates in combined-read space: `finalize_transcript` then
+/// compares `read_end` against the length of the one-mate slice, finds it past
+/// the end, and drops the transcript. The effect was strand-shaped rather than
+/// obviously positional — mate1 survived only in forward windows and mate2 only
+/// in reverse ones, because those are the two cases where the mate starts at 0.
+///
+/// The WT-level `read_start`/`read_end` are recomputed from the shifted exons,
+/// not shifted directly: those are the fields `finalize_transcript` bounds-checks.
+pub(crate) fn rebase_single_mate_wt(wt: &WorkingTranscript, offset: usize) -> WorkingTranscript {
+    let mut out = wt.clone();
+    if offset == 0 {
+        return out;
+    }
+    for ex in &mut out.exons {
+        ex.read_start = ex.read_start.saturating_sub(offset);
+        ex.read_end = ex.read_end.saturating_sub(offset);
+    }
+    if let (Some(start), Some(end)) = (
+        out.exons.iter().map(|e| e.read_start).min(),
+        out.exons.iter().map(|e| e.read_end).max(),
+    ) {
+        out.read_start = start;
+        out.read_end = end;
+    }
+    out
+}
+
 pub(crate) fn split_combined_wt(
     wt: &WorkingTranscript,
     len1: usize,
@@ -3161,6 +3212,87 @@ mod tests {
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
     use crate::index::suffix_array::SuffixArray;
+
+    /// A single-mate window's read coordinates must land inside that mate's own
+    /// slice, WT-level fields included.
+    ///
+    /// The combined read is `[mate1 | SPACER | RC(mate2)]`, so one mate always
+    /// starts past the spacer. `finalize_transcript` bounds-checks `wt.read_end`
+    /// against the length of the one-mate slice it is given, so leaving the
+    /// WT-level fields in combined-read space drops that mate silently — and
+    /// only that mate, which made the loss look strand-shaped: mate1 survived in
+    /// forward windows and mate2 in reverse ones, those being the two cases
+    /// where the mate starts at 0.
+    #[test]
+    fn rebase_single_mate_wt_moves_wt_level_bounds_not_just_exons() {
+        let len1 = 60usize;
+        let mut wt = WorkingTranscript::new();
+        // A mate2-only window in a forward combined read: mate2's bases occupy
+        // [len1+1 .. len1+1+60) = [61, 121).
+        wt.exons.push(ExonBlock {
+            read_start: 61,
+            read_end: 121,
+            genome_start: 1_000,
+            genome_end: 1_060,
+            mate_id: 1,
+        });
+        wt.read_start = 61;
+        wt.read_end = 121;
+
+        let offset = mate_read_offset(1, len1, 60, false);
+        assert_eq!(offset, len1 + 1);
+
+        let out = rebase_single_mate_wt(&wt, offset);
+        assert_eq!(out.exons[0].read_start, 0);
+        assert_eq!(out.exons[0].read_end, 60);
+        // The WT-level bounds are what get bounds-checked; if only the exons
+        // move, read_end stays at 121 and the mate is thrown away.
+        assert_eq!(out.read_start, 0);
+        assert_eq!(
+            out.read_end, 60,
+            "read_end must be rebased into the mate slice, not left at 121"
+        );
+        // Genome coordinates are untouched: only read space is being rebased.
+        assert_eq!(out.exons[0].genome_start, 1_000);
+        assert_eq!(out.exons[0].genome_end, 1_060);
+    }
+
+    /// The mate that already starts at 0 must come through byte-identical.
+    #[test]
+    fn rebase_single_mate_wt_is_identity_at_offset_zero() {
+        let mut wt = WorkingTranscript::new();
+        wt.exons.push(ExonBlock {
+            read_start: 0,
+            read_end: 60,
+            genome_start: 500,
+            genome_end: 560,
+            mate_id: 0,
+        });
+        wt.read_start = 0;
+        wt.read_end = 60;
+
+        assert_eq!(mate_read_offset(0, 60, 60, false), 0);
+        assert_eq!(mate_read_offset(1, 60, 60, true), 0);
+
+        let out = rebase_single_mate_wt(&wt, 0);
+        assert_eq!(out.read_start, 0);
+        assert_eq!(out.read_end, 60);
+        assert_eq!(out.exons[0].read_start, 0);
+        assert_eq!(out.exons[0].read_end, 60);
+    }
+
+    /// Reversed windows put mate1 after the spacer, mate2 at 0 — the mirror of
+    /// the forward layout, and the case that leaves mate1 unreachable if missed.
+    #[test]
+    fn mate_read_offset_mirrors_the_layout_when_the_window_is_reversed() {
+        let (len1, len2) = (75usize, 60usize);
+        // Forward: [mate1 | SPACER | RC(mate2)]
+        assert_eq!(mate_read_offset(0, len1, len2, false), 0);
+        assert_eq!(mate_read_offset(1, len1, len2, false), len1 + 1);
+        // Reversed: [mate2 | SPACER | RC(mate1)]
+        assert_eq!(mate_read_offset(0, len1, len2, true), len2 + 1);
+        assert_eq!(mate_read_offset(1, len1, len2, true), 0);
+    }
 
     fn make_simple_index() -> GenomeIndex {
         // Simple genome: ACGTACGTNN (10 bases)

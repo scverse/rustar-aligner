@@ -1,1492 +1,1580 @@
-// Chimeric alignment detection algorithms
+//! STAR's chimeric detection, ported as written.
+//!
+//! STAR has exactly two chimeric detectors, and both work on the same input:
+//! the window transcripts `trAll[iW][iTr]` that stitching produced. With
+//! `--chimMultimapNmax 0` it runs `ReadAlign::chimericDetectionOld`, which pins
+//! the best transcript and looks for one partner; otherwise
+//! `ChimericDetection::chimericDetectionMult`, which tries every pair and
+//! re-stitches each candidate (`ChimericAlign::chimericStitching`).
+//!
+//! For a paired read those window transcripts are *combined-read* transcripts:
+//! the read is `mate1 | spacer | RC(mate2)`, a transcript may cover both mates,
+//! and its exons carry the mate they came from (`EX_iFrag`). Everything below
+//! works in that frame, so a chimeric segment can be a whole stitched pair and
+//! its CIGAR carries the second mate after a `p` operation, as STAR's does.
+//!
+//! [`WinTr`] is STAR's `Transcript` reduced to the fields these functions read.
 
-use crate::align::SeedCluster;
-use crate::align::score::AlignmentScorer;
-use crate::align::seed::Seed;
-use crate::align::stitch::{cluster_seeds, stitch_seeds, stitch_seeds_with_jdb};
+use crate::align::score::{AlignmentScorer, SpliceMotif};
 use crate::align::transcript::Transcript;
-use crate::chimeric::score::{calculate_repeat_length, classify_junction_type};
-use crate::chimeric::segment::{ChimericAlignment, ChimericSegment};
-use crate::error::Error;
-use crate::index::GenomeIndex;
+use crate::chimeric::segment::{
+    ChimericAlignment, ChimericSegment, ExonSpan, JunctionLine, MultimapInfo,
+};
+use crate::genome::Genome;
 use crate::params::Parameters;
+use noodles::sam::alignment::record::cigar::{Op, op::Kind};
 
-/// Chimeric alignment detector
-pub struct ChimericDetector<'a> {
-    params: &'a Parameters,
+/// One row of STAR's `exons[][]`: genome start (`EX_G`), read start in the
+/// transcript's own strand frame (`EX_R`), length (`EX_L`) and mate (`EX_iFrag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChimExon {
+    pub g: u64,
+    pub r: usize,
+    pub l: usize,
+    pub frag: u8,
 }
 
-impl<'a> ChimericDetector<'a> {
-    /// Create a new chimeric detector
-    pub fn new(params: &'a Parameters) -> Self {
-        Self { params }
+/// STAR's `canonSJ` value for the gap between two consecutive mates.
+const SJ_MATE_GAP: i32 = -3;
+const SJ_INSERTION: i32 = -2;
+const SJ_DELETION: i32 = -1;
+
+/// The parts of STAR's `Transcript` that chimeric detection reads.
+#[derive(Debug, Clone)]
+pub struct WinTr {
+    pub chr: usize,
+    /// `Str`: 0 forward, 1 reverse. Read coordinates index `Read1[0]` for 0 and
+    /// its reverse complement `Read1[2]` for 1.
+    pub str_: u8,
+    pub exons: Vec<ChimExon>,
+    /// `canonSJ` per gap: -3 between mates, -2 insertion, -1 deletion, 0..6 a
+    /// junction motif (0 non-canonical, odd `+`, even `-`).
+    pub canon_sj: Vec<i32>,
+    pub sj_annot: Vec<bool>,
+    pub max_score: i32,
+    /// `intronMotifs[sjStr]` counts: unstranded, `+`, `-` junctions.
+    pub intron_motifs: [u32; 3],
+    /// Sum of exon lengths, as STAR's `rLength` (not the read span).
+    pub r_length: usize,
+    pub ro_start: usize,
+}
+
+/// STAR's `canonSJ` code for a junction motif.
+fn motif_code(m: SpliceMotif) -> i32 {
+    match m {
+        SpliceMotif::NonCanonical => 0,
+        SpliceMotif::GtAg => 1,
+        SpliceMotif::CtAc => 2,
+        SpliceMotif::GcAg => 3,
+        SpliceMotif::CtGc => 4,
+        SpliceMotif::AtAc => 5,
+        SpliceMotif::GtAt => 6,
+    }
+}
+
+/// Exons and gap codes of one mate's alignment, read from its CIGAR.
+///
+/// STAR ends an exon at every junction, insertion and deletion, which is
+/// exactly where a CIGAR switches away from `M`. `r_offset` places the mate in
+/// the combined read; the leading soft clip places the first exon within it.
+fn mate_blocks(t: &Transcript, r_offset: usize, frag: u8) -> (Vec<ChimExon>, Vec<i32>, Vec<bool>) {
+    let mut exons = Vec::new();
+    let mut gaps = Vec::new();
+    let mut annot = Vec::new();
+    let (mut gpos, mut rpos) = (t.genome_start, r_offset);
+    let mut junction_idx = 0usize;
+    // Pending gap kind since the last exon: junction beats deletion beats
+    // insertion, as one STAR gap holds one `canonSJ`.
+    let mut pending: Option<(i32, bool)> = None;
+    for op in &t.cigar {
+        let len = op.len();
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                if !exons.is_empty() {
+                    let (code, ann) = pending.take().unwrap_or((SJ_DELETION, false));
+                    gaps.push(code);
+                    annot.push(ann);
+                }
+                exons.push(ChimExon {
+                    g: gpos,
+                    r: rpos,
+                    l: len,
+                    frag,
+                });
+                gpos += len as u64;
+                rpos += len;
+            }
+            Kind::SoftClip => {
+                if exons.is_empty() {
+                    rpos += len;
+                }
+            }
+            Kind::Insertion => {
+                rpos += len;
+                if pending.is_none() {
+                    pending = Some((SJ_INSERTION, false));
+                }
+            }
+            Kind::Deletion => {
+                gpos += len as u64;
+                if !matches!(pending, Some((c, _)) if c >= 0) {
+                    pending = Some((SJ_DELETION, false));
+                }
+            }
+            Kind::Skip => {
+                gpos += len as u64;
+                let m = t
+                    .junction_motifs
+                    .get(junction_idx)
+                    .copied()
+                    .unwrap_or(SpliceMotif::NonCanonical);
+                let ann = t
+                    .junction_annotated
+                    .get(junction_idx)
+                    .copied()
+                    .unwrap_or(false);
+                junction_idx += 1;
+                pending = Some((motif_code(m), ann));
+            }
+            _ => {}
+        }
+    }
+    (exons, gaps, annot)
+}
+
+impl WinTr {
+    /// A transcript covering one mate (or a single-end read).
+    pub fn single(
+        t: &Transcript,
+        str_: u8,
+        r_offset: usize,
+        frag: u8,
+        lread: usize,
+    ) -> Option<Self> {
+        let (exons, canon_sj, sj_annot) = mate_blocks(t, r_offset, frag);
+        Self::build(t.chr_idx, str_, exons, canon_sj, sj_annot, t.score, lread)
     }
 
-    /// Detect chimeric alignments by re-seeding soft-clipped bases (Tier 1 soft-clip re-mapping).
-    ///
-    /// When the primary alignment has a large soft-clip (>= chimSegmentMin), extract that
-    /// clipped sequence and run a new seed search.  If a valid alignment is found it is paired
-    /// with the primary transcript to form a chimeric alignment.  Right clips are tried first,
-    /// then left clips.  This complements `detect_chimeric_old`, which only searches transcripts
-    /// already found during normal seeding.
-    pub fn detect_from_soft_clips(
-        &self,
-        transcript: &Transcript,
-        read_seq: &[u8],
-        read_name: &str,
-        index: &GenomeIndex,
-    ) -> Result<Option<ChimericAlignment>, Error> {
-        let params = self.params;
-        let min_seg = params.chim_segment_min as usize;
-        if min_seg == 0 || transcript.exons.is_empty() {
-            return Ok(None);
+    /// A combined-read transcript covering both mates: `first` occupies the
+    /// start of the strand frame, `second` follows the spacer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pair(
+        first: &Transcript,
+        first_frag: u8,
+        second: &Transcript,
+        second_frag: u8,
+        second_offset: usize,
+        str_: u8,
+        score: i32,
+        lread: usize,
+    ) -> Option<Self> {
+        let (mut exons, mut canon_sj, mut sj_annot) = mate_blocks(first, 0, first_frag);
+        let (e2, c2, a2) = mate_blocks(second, second_offset, second_frag);
+        if exons.is_empty() || e2.is_empty() {
+            return None;
         }
-
-        let read_len = read_seq.len();
-        let [left_clip, right_clip] = transcript.count_soft_clips();
-        let score_min = params.chim_score_min;
-        let score_drop_max = params.chim_score_drop_max;
-        let non_gtag_penalty = params.chim_score_junction_non_gtag;
-        let intron_max = params.align_intron_max as u64;
-        let overhang_min = params.chim_junction_overhang_min as usize;
-
-        // Try right clip first, then left (match STAR's ordering)
-        let candidates = [(right_clip, true), (left_clip, false)];
-
-        for (clip_len, is_right) in candidates {
-            if clip_len < min_seg {
-                continue;
-            }
-
-            let clip_start = if is_right { read_len - clip_len } else { 0 };
-            let clip_seq = if is_right {
-                &read_seq[clip_start..]
-            } else {
-                &read_seq[..clip_len]
-            };
-
-            // Re-seed the soft-clipped sub-sequence
-            let seeds = Seed::find_seeds(clip_seq, index, params.seed_map_min, params, "")?;
-            if seeds.is_empty() {
-                continue;
-            }
-
-            let clusters = cluster_seeds(&seeds, index, params, clip_seq.len(), false);
-            if clusters.is_empty() {
-                continue;
-            }
-
-            let scorer = AlignmentScorer::from_params(params);
-            let jdb = if index.junction_db.is_empty() {
-                None
-            } else {
-                Some(&index.junction_db)
-            };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
-
-            let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
-                continue;
-            };
-
-            if clip_tr_raw.exons.is_empty() {
-                continue;
-            }
-
-            let clip_aligned =
-                clip_tr_raw.exons.last().unwrap().read_end - clip_tr_raw.exons[0].read_start;
-            if clip_aligned < min_seg {
-                continue;
-            }
-
-            // Shift sub-seq read coords into full-read space for right clips
-            let clip_tr = if is_right {
-                adjust_read_positions(clip_tr_raw, clip_start)
-            } else {
-                clip_tr_raw
-            };
-
-            // Determine donor / acceptor by read order
-            let primary_rs = transcript.exons[0].read_start;
-            let clip_rs = clip_tr.exons[0].read_start;
-            let (tr_donor, tr_acceptor): (&Transcript, &Transcript) = if primary_rs <= clip_rs {
-                (transcript, &clip_tr)
-            } else {
-                (&clip_tr, transcript)
-            };
-
-            // Overhang: each segment must cover >= chimJunctionOverhangMin at junction boundary
-            let donor_overhang =
-                tr_donor.exons.last().unwrap().read_end - tr_donor.exons[0].read_start;
-            let acceptor_overhang =
-                tr_acceptor.exons.last().unwrap().read_end - tr_acceptor.exons[0].read_start;
-            if donor_overhang < overhang_min || acceptor_overhang < overhang_min {
-                continue;
-            }
-
-            // Classify junction for score adjustment
-            let junction_type = classify_junction_type(
-                &index.genome,
-                tr_donor.chr_idx,
-                tr_donor.genome_end,
-                tr_donor.is_reverse,
-                tr_acceptor.chr_idx,
-                tr_acceptor.genome_start,
-                tr_acceptor.is_reverse,
-            );
-
-            let combined_score = tr_donor.score + tr_acceptor.score;
-            let effective_score = if junction_type == 0 {
-                combined_score + non_gtag_penalty
-            } else {
-                combined_score
-            };
-
-            if effective_score < score_min {
-                continue;
-            }
-            if effective_score + score_drop_max < read_len as i32 {
-                continue;
-            }
-
-            // Must be geometrically chimeric (different chr/strand, or span > alignIntronMax)
-            let is_chimeric = tr_donor.chr_idx != tr_acceptor.chr_idx
-                || tr_donor.is_reverse != tr_acceptor.is_reverse
-                || {
-                    let span = if tr_donor.genome_end <= tr_acceptor.genome_start {
-                        tr_acceptor.genome_start - tr_donor.genome_end
-                    } else {
-                        tr_donor.genome_start.saturating_sub(tr_acceptor.genome_end)
-                    };
-                    intron_max > 0 && span > intron_max
-                };
-
-            if !is_chimeric {
-                continue;
-            }
-
-            let donor_seg = transcript_to_segment(tr_donor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip donor: {e}")))?;
-            let acceptor_seg = transcript_to_segment(tr_acceptor)
-                .map_err(|e| Error::Chimeric(format!("soft-clip acceptor: {e}")))?;
-
-            let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-                &index.genome,
-                donor_seg.chr_idx,
-                donor_seg.genome_end,
-                acceptor_seg.chr_idx,
-                acceptor_seg.genome_start,
-                20,
-            );
-
-            let chim = ChimericAlignment::new(
-                donor_seg,
-                acceptor_seg,
-                junction_type,
-                repeat_len_donor,
-                repeat_len_acceptor,
-                read_seq.to_vec(),
-                read_name.to_string(),
-            );
-
-            return Ok(Some(chim));
-        }
-
-        Ok(None)
+        canon_sj.push(SJ_MATE_GAP);
+        sj_annot.push(false);
+        exons.extend(e2);
+        canon_sj.extend(c2);
+        sj_annot.extend(a2);
+        Self::build(first.chr_idx, str_, exons, canon_sj, sj_annot, score, lread)
     }
 
-    /// Re-seed the outer uncovered read regions of an existing chimeric pair (Tier 3).
-    ///
-    /// After Tiers 1 and 2 find a donor+acceptor chimeric alignment, the read may still
-    /// have uncovered bases at the left of the donor or the right of the acceptor.  If
-    /// either uncovered span is >= chimSegmentMin, re-seed it and attempt to form an
-    /// additional chimeric alignment with the adjacent segment.  This enables detection
-    /// of multi-junction chimeric reads (3-way gene fusions).
-    pub fn detect_from_chimeric_residuals(
-        &self,
-        chim: &ChimericAlignment,
-        read_seq: &[u8],
-        read_name: &str,
-        index: &GenomeIndex,
-    ) -> Result<Vec<ChimericAlignment>, Error> {
-        let params = self.params;
-        let min_seg = params.chim_segment_min as usize;
-        if min_seg == 0 {
-            return Ok(vec![]);
+    fn build(
+        chr: usize,
+        str_: u8,
+        exons: Vec<ChimExon>,
+        canon_sj: Vec<i32>,
+        sj_annot: Vec<bool>,
+        max_score: i32,
+        lread: usize,
+    ) -> Option<Self> {
+        if exons.is_empty() {
+            return None;
         }
-
-        let read_len = read_seq.len();
-        let score_min = params.chim_score_min;
-        let score_drop_max = params.chim_score_drop_max;
-        let non_gtag_penalty = params.chim_score_junction_non_gtag;
-        let intron_max = params.align_intron_max as u64;
-        let overhang_min = params.chim_junction_overhang_min as usize;
-
-        // Outer boundaries of the existing chimeric pair in read space
-        let left_covered = chim.donor.read_start.min(chim.acceptor.read_start);
-        let right_covered = chim.donor.read_end.max(chim.acceptor.read_end);
-
-        // Which segment is at the left / right boundary
-        let left_partner = if chim.donor.read_start <= chim.acceptor.read_start {
-            &chim.donor
+        // `intronMotifs[trA.sjStr[iex]]++` over junctions (`canonSJ >= 0`). An
+        // unannotated junction's `sjStr` follows its motif; an annotated one
+        // takes the annotation's strand, which for a canonical motif agrees.
+        // An annotated non-canonical junction's strand is not carried here, so
+        // it is left uncounted rather than miscounted as unstranded.
+        let mut intron_motifs = [0u32; 3];
+        for (&c, &a) in canon_sj.iter().zip(&sj_annot) {
+            if c < 0 {
+                continue;
+            }
+            let s = if c == 0 {
+                if a {
+                    continue;
+                }
+                0
+            } else if c % 2 == 1 {
+                1
+            } else {
+                2
+            };
+            intron_motifs[s] += 1;
+        }
+        let r_length = exons.iter().map(|e| e.l).sum();
+        let r_start = exons[0].r;
+        // `stitchWindowAligns.cpp:299`.
+        let ro_start = if str_ == 0 {
+            r_start
         } else {
-            &chim.acceptor
+            lread.wrapping_sub(r_start).wrapping_sub(r_length)
         };
-        let right_partner = if chim.donor.read_end >= chim.acceptor.read_end {
-            &chim.donor
-        } else {
-            &chim.acceptor
-        };
-
-        // [clip_start, clip_end) → partner it would be paired with
-        let candidates = [
-            (0usize, left_covered, left_partner),
-            (right_covered, read_len, right_partner),
-        ];
-
-        let mut results = Vec::new();
-
-        for (clip_start, clip_end, partner_seg) in candidates {
-            let clip_len = clip_end - clip_start;
-            if clip_len < min_seg {
-                continue;
-            }
-
-            let clip_seq = &read_seq[clip_start..clip_end];
-
-            let seeds = Seed::find_seeds(clip_seq, index, params.seed_map_min, params, "")?;
-            if seeds.is_empty() {
-                continue;
-            }
-
-            let clusters = cluster_seeds(&seeds, index, params, clip_seq.len(), false);
-            if clusters.is_empty() {
-                continue;
-            }
-
-            let scorer = AlignmentScorer::from_params(params);
-            let jdb = if index.junction_db.is_empty() {
-                None
-            } else {
-                Some(&index.junction_db)
-            };
-            let clip_trs = stitch_seeds_with_jdb(&clusters[0], clip_seq, index, &scorer, jdb, 1);
-
-            let Some(clip_tr_raw) = clip_trs.into_iter().next() else {
-                continue;
-            };
-            if clip_tr_raw.exons.is_empty() {
-                continue;
-            }
-
-            let clip_aligned =
-                clip_tr_raw.exons.last().unwrap().read_end - clip_tr_raw.exons[0].read_start;
-            if clip_aligned < min_seg {
-                continue;
-            }
-
-            // Shift sub-seq read coords into full-read space
-            let clip_tr = if clip_start > 0 {
-                adjust_read_positions(clip_tr_raw, clip_start)
-            } else {
-                clip_tr_raw
-            };
-
-            let new_seg = transcript_to_segment(&clip_tr)
-                .map_err(|e| Error::Chimeric(format!("tier3 segment: {e}")))?;
-
-            // Donor / acceptor ordered by read position
-            let (donor_seg, acceptor_seg): (&ChimericSegment, &ChimericSegment) =
-                if new_seg.read_start <= partner_seg.read_start {
-                    (&new_seg, partner_seg)
-                } else {
-                    (partner_seg, &new_seg)
-                };
-
-            // Overhang check
-            let donor_overhang = donor_seg.read_end - donor_seg.read_start;
-            let acceptor_overhang = acceptor_seg.read_end - acceptor_seg.read_start;
-            if donor_overhang < overhang_min || acceptor_overhang < overhang_min {
-                continue;
-            }
-
-            // Junction classification and score
-            let junction_type = classify_junction_type(
-                &index.genome,
-                donor_seg.chr_idx,
-                donor_seg.genome_end,
-                donor_seg.is_reverse,
-                acceptor_seg.chr_idx,
-                acceptor_seg.genome_start,
-                acceptor_seg.is_reverse,
-            );
-
-            let combined_score = donor_seg.score + acceptor_seg.score;
-            let effective_score = if junction_type == 0 {
-                combined_score + non_gtag_penalty
-            } else {
-                combined_score
-            };
-
-            if effective_score < score_min || effective_score + score_drop_max < read_len as i32 {
-                continue;
-            }
-
-            // Geometry check: must be genuinely chimeric
-            let is_chimeric = donor_seg.chr_idx != acceptor_seg.chr_idx
-                || donor_seg.is_reverse != acceptor_seg.is_reverse
-                || {
-                    let span = if donor_seg.genome_end <= acceptor_seg.genome_start {
-                        acceptor_seg.genome_start - donor_seg.genome_end
-                    } else {
-                        donor_seg
-                            .genome_start
-                            .saturating_sub(acceptor_seg.genome_end)
-                    };
-                    intron_max > 0 && span > intron_max
-                };
-
-            if !is_chimeric {
-                continue;
-            }
-
-            let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-                &index.genome,
-                donor_seg.chr_idx,
-                donor_seg.genome_end,
-                acceptor_seg.chr_idx,
-                acceptor_seg.genome_start,
-                20,
-            );
-
-            results.push(ChimericAlignment::new(
-                donor_seg.clone(),
-                acceptor_seg.clone(),
-                junction_type,
-                repeat_len_donor,
-                repeat_len_acceptor,
-                read_seq.to_vec(),
-                read_name.to_string(),
-            ));
-        }
-
-        Ok(results)
+        Some(Self {
+            chr,
+            str_,
+            exons,
+            canon_sj,
+            sj_annot,
+            max_score: max_score.max(0),
+            intron_motifs,
+            r_length,
+            ro_start,
+        })
     }
 
-    /// Detect chimeric alignments from multi-cluster seeds (Tier 2)
-    ///
-    /// Triggers when:
-    /// - Seeds cluster on different chromosomes
-    /// - Seeds cluster on different strands (same chromosome)
-    /// - Seeds cluster with large genomic distance (>1Mb, same chr/strand)
-    pub fn detect_from_multi_clusters(
-        &self,
-        clusters: &[SeedCluster],
-        read_seq: &[u8],
-        read_name: &str,
-        index: &GenomeIndex,
-    ) -> Result<Vec<ChimericAlignment>, Error> {
-        let mut chimeras = Vec::new();
+    /// `gLength`: genomic span of the whole transcript.
+    pub fn g_length(&self) -> u64 {
+        let last = self.exons[self.exons.len() - 1];
+        last.g + last.l as u64 - self.exons[0].g
+    }
 
-        // Find cluster pairs with chimeric signatures
-        for i in 0..clusters.len() {
-            for j in (i + 1)..clusters.len() {
-                if is_chimeric_signature(&clusters[i], &clusters[j]) {
-                    // Try to build chimeric alignment from these clusters
-                    if let Some(chim) = self.build_chimeric_from_clusters(
-                        &clusters[i],
-                        &clusters[j],
-                        read_seq,
-                        read_name,
-                        index,
-                    )? {
-                        chimeras.push(chim);
+    fn last(&self) -> ChimExon {
+        self.exons[self.exons.len() - 1]
+    }
+}
+
+/// The read as chimeric detection sees it.
+pub struct ChimRead<'a> {
+    /// `Read1[0]`: the read, or `mate1 | spacer | RC(mate2)` for a pair.
+    pub fwd: &'a [u8],
+    /// `Read1[2]`: reverse complement of `fwd`.
+    pub rev: Vec<u8>,
+    /// `readLength[0..2]`; the second is 0 for single-end.
+    pub read_length: [usize; 2],
+    pub paired: bool,
+    pub name: &'a str,
+    /// The mates as sequenced, for the per-mate segments WithinBAM writes.
+    pub mates: [&'a [u8]; 2],
+}
+
+impl<'a> ChimRead<'a> {
+    pub fn new(
+        fwd: &'a [u8],
+        read_length: [usize; 2],
+        name: &'a str,
+        mates: [&'a [u8]; 2],
+    ) -> Self {
+        let rev = fwd
+            .iter()
+            .rev()
+            .map(|&b| if b < 4 { 3 - b } else { b })
+            .collect();
+        Self {
+            fwd,
+            rev,
+            read_length,
+            paired: read_length[1] > 0,
+            name,
+            mates,
+        }
+    }
+
+    /// `Lread`.
+    pub fn lread(&self) -> usize {
+        self.fwd.len()
+    }
+
+    /// `readLengthPairOriginal`.
+    fn pair_len(&self) -> usize {
+        if self.paired {
+            self.read_length[0] + self.read_length[1] + 1
+        } else {
+            self.read_length[0]
+        }
+    }
+}
+
+/// STAR's `trAll`, plus what `multMapSelect` derived from it.
+pub struct Windows {
+    pub tr: Vec<Vec<WinTr>>,
+}
+
+impl Windows {
+    /// Build each window the way `stitchWindowAligns` records into `wTr`
+    /// (`stitchWindowAligns.cpp:337-381`), taking transcripts in discovery
+    /// order: a transcript whose blocks another already covers is dropped if it
+    /// scores lower, one that covers an earlier transcript evicts it, and the
+    /// rest are inserted by score, shorter genomic span first on ties.
+    ///
+    /// With chimeric detection on STAR records every transcript regardless of
+    /// score (`|| P.pCh.segmentMin>0`), so there is no score gate here.
+    pub fn new(tr: Vec<Vec<WinTr>>, max_per_window: usize) -> Self {
+        let tr = tr
+            .into_iter()
+            .map(|win| {
+                let mut w: Vec<WinTr> = Vec::new();
+                for t in win {
+                    let mapped = t.r_length;
+                    let mut i = 0;
+                    let mut dropped = false;
+                    while i < w.len() {
+                        let n = blocks_overlap(&t, &w[i]);
+                        let (u_new, u_old) = (mapped - n, w[i].r_length - n);
+                        if u_new == 0 && t.max_score < w[i].max_score {
+                            dropped = true;
+                            break;
+                        } else if u_old == 0 {
+                            w.remove(i);
+                        } else {
+                            // `uOld>0 && (uNew>0 || Score>=old)` always holds here.
+                            i += 1;
+                        }
+                    }
+                    if dropped {
+                        continue;
+                    }
+                    let at = w
+                        .iter()
+                        .position(|o| {
+                            t.max_score > o.max_score
+                                || (t.max_score == o.max_score && t.g_length() < o.g_length())
+                        })
+                        .unwrap_or(w.len());
+                    w.insert(at, t);
+                    // STAR overwrites the slot past the cap rather than growing.
+                    w.truncate(max_per_window.max(1));
+                }
+                w
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        Self { tr }
+    }
+
+    /// `trBest` (`ReadAlign_stitchPieces.cpp:358`): the best window's top
+    /// transcript, a later window winning only on a higher score or an equal
+    /// score with a shorter span.
+    fn best(&self) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (iw, w) in self.tr.iter().enumerate() {
+            match best {
+                None => best = Some(iw),
+                Some(b) => {
+                    let (cur, top) = (&w[0], &self.tr[b][0]);
+                    if cur.max_score > top.max_score
+                        || (cur.max_score == top.max_score && cur.g_length() < top.g_length())
+                    {
+                        best = Some(iw);
                     }
                 }
             }
         }
-
-        Ok(chimeras)
+        best
     }
 
-    /// Build chimeric alignment from two clusters
-    fn build_chimeric_from_clusters(
-        &self,
-        cluster1: &SeedCluster,
-        cluster2: &SeedCluster,
-        read_seq: &[u8],
-        read_name: &str,
-        index: &GenomeIndex,
-    ) -> Result<Option<ChimericAlignment>, Error> {
-        if cluster1.alignments.is_empty() || cluster2.alignments.is_empty() {
-            return Ok(None);
+    /// `multMapSelect`: `nTr` and the first two `trMult` entries, as
+    /// (window, transcript) indices.
+    fn mult(&self, score_range: i32) -> (usize, [Option<(usize, usize)>; 2]) {
+        let max_score = self.tr.iter().map(|w| w[0].max_score).max().unwrap_or(0);
+        let mut n = 0;
+        let mut first = [None, None];
+        for (iw, w) in self.tr.iter().enumerate() {
+            for (it, t) in w.iter().enumerate() {
+                if t.max_score + score_range >= max_score {
+                    if n < 2 {
+                        first[n] = Some((iw, it));
+                    }
+                    n += 1;
+                }
+            }
         }
+        (n, first)
+    }
+}
 
-        // Stitch each cluster independently using existing stitch_seeds
-        use crate::align::score::AlignmentScorer;
-        let scorer = AlignmentScorer::from_params(self.params);
+/// A genomic base as STAR's `G[]` holds it; positions outside the array read
+/// as padding, which like `N` is `> 3`.
+fn gbase(genome: &Genome, pos: i64) -> u8 {
+    if pos < 0 {
+        return 5;
+    }
+    genome.get_base(pos as u64).unwrap_or(5)
+}
 
-        let transcripts1 = stitch_seeds(cluster1, read_seq, index, &scorer);
-        let transcripts2 = stitch_seeds(cluster2, read_seq, index, &scorer);
+fn comp(b: u8) -> u8 {
+    if b < 4 { 3 - b } else { b }
+}
 
-        if transcripts1.is_empty() || transcripts2.is_empty() {
-            return Ok(None);
+/// `Transcript::alignScore` (`Transcript_alignScore.cpp`): re-score a
+/// transcript from its exons.
+fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentScorer) -> i32 {
+    let r: &[u8] = if tr.str_ == 0 { read.fwd } else { &read.rev };
+    let mut score = 0i32;
+    for e in &tr.exons {
+        for ii in 0..e.l {
+            let r1 = r.get(e.r + ii).copied().unwrap_or(5);
+            let g1 = gbase(genome, (e.g + ii as u64) as i64);
+            if r1 > 3 || g1 > 3 {
+            } else if r1 == g1 {
+                score += 1;
+            } else {
+                score -= 1;
+            }
         }
-
-        // Take best transcript from each cluster
-        let t1 = &transcripts1[0];
-        let t2 = &transcripts2[0];
-
-        // Check that both transcripts have exons
-        if t1.exons.is_empty() || t2.exons.is_empty() {
-            return Ok(None);
+    }
+    for iex in 0..tr.exons.len().saturating_sub(1) {
+        let (a, b) = (tr.exons[iex], tr.exons[iex + 1]);
+        if tr.sj_annot[iex] {
+            score += scorer.sjdb_score;
+            continue;
         }
-
-        // Determine donor/acceptor based on read position
-        let (donor_t, acceptor_t) = if t1.exons[0].read_start < t2.exons[0].read_start {
-            (t1, t2)
-        } else {
-            (t2, t1)
+        score += match tr.canon_sj[iex] {
+            SJ_MATE_GAP => 0,
+            SJ_INSERTION => {
+                (b.r - a.r - a.l) as i32 * scorer.score_ins_base + scorer.score_ins_open
+            }
+            SJ_DELETION => {
+                (b.g - a.g - a.l as u64) as i32 * scorer.score_del_base + scorer.score_del_open
+            }
+            0 => scorer.score_gap_noncan + scorer.score_gap,
+            1 | 2 => scorer.score_gap,
+            3 | 4 => scorer.score_gap_gcag + scorer.score_gap,
+            5 | 6 => scorer.score_gap_atac + scorer.score_gap,
+            _ => 0,
         };
+    }
+    if scorer.score_genomic_length_log2_scale != 0.0 {
+        let span = tr.g_length().max(1) as f64;
+        score += (span.log2() * scorer.score_genomic_length_log2_scale - 0.5).ceil() as i32;
+    }
+    score
+}
 
-        // Convert transcripts to chimeric segments
-        let donor = transcript_to_segment(donor_t)?;
-        let acceptor = transcript_to_segment(acceptor_t)?;
-
-        // Check minimum segment lengths
-        if !donor.meets_min_length(self.params.chim_segment_min)
-            || !acceptor.meets_min_length(self.params.chim_segment_min)
-        {
-            return Ok(None);
+/// `Transcript::generateCigarP` / `ReadAlign::outputTranscriptCIGARp`: the
+/// CIGAR with a `p` operation for the gap between mates, negative when the
+/// mates overlap.
+fn cigar_p(tr: &WinTr, read: &ChimRead) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let left = if read.paired { tr.str_ as usize } else { 0 };
+    let rl = read.read_length[left];
+    let e0 = tr.exons[0];
+    let trim_l = e0.r - if e0.r < rl { 0 } else { rl + 1 };
+    if trim_l > 0 {
+        let _ = write!(s, "{trim_l}S");
+    }
+    for ii in 0..tr.exons.len() {
+        if ii > 0 {
+            let (p, c) = (tr.exons[ii - 1], tr.exons[ii]);
+            let p_end = p.g + p.l as u64;
+            if c.g >= p_end {
+                let gap_g = c.g - p_end;
+                if tr.canon_sj[ii - 1] == SJ_MATE_GAP {
+                    let s1 = rl - (p.r + p.l);
+                    let s2 = c.r - (rl + 1);
+                    if s1 > 0 {
+                        let _ = write!(s, "{s1}S");
+                    }
+                    let _ = write!(s, "{gap_g}p");
+                    if s2 > 0 {
+                        let _ = write!(s, "{s2}S");
+                    }
+                } else {
+                    let gap_r = c.r - p.r - p.l;
+                    if gap_r > 0 {
+                        let _ = write!(s, "{gap_r}I");
+                    }
+                    if tr.canon_sj[ii - 1] >= 0 || tr.sj_annot[ii - 1] {
+                        let _ = write!(s, "{gap_g}N");
+                    } else if gap_g > 0 {
+                        let _ = write!(s, "{gap_g}D");
+                    }
+                }
+            } else {
+                // Overlapping mates: STAR writes only the overlap, no clips.
+                let _ = write!(s, "-{}p", p_end - c.g);
+            }
         }
-
-        // Classify junction type
-        let junction_type = classify_junction_type(
-            &index.genome,
-            donor.chr_idx,
-            donor.genome_end,
-            donor.is_reverse,
-            acceptor.chr_idx,
-            acceptor.genome_start,
-            acceptor.is_reverse,
-        );
-
-        // Calculate repeat lengths
-        let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-            &index.genome,
-            donor.chr_idx,
-            donor.genome_end,
-            acceptor.chr_idx,
-            acceptor.genome_start,
-            20, // max check distance
-        );
-
-        // Create chimeric alignment
-        let chim = ChimericAlignment::new(
-            donor,
-            acceptor,
-            junction_type,
-            repeat_len_donor,
-            repeat_len_acceptor,
-            read_seq.to_vec(),
-            read_name.to_string(),
-        );
-
-        Ok(Some(chim))
+        let _ = write!(s, "{}M", tr.exons[ii].l);
     }
+    let last = tr.last();
+    let end = if last.r < rl { rl } else { read.pair_len() };
+    let trim_r = end as i64 - (last.r + last.l) as i64;
+    if trim_r > 0 {
+        let _ = write!(s, "{trim_r}S");
+    }
+    s
 }
 
-/// Calculate genomic distance between two clusters
-fn genomic_distance(c1: &SeedCluster, c2: &SeedCluster) -> u64 {
-    if c1.chr_idx != c2.chr_idx {
-        return u64::MAX;
-    }
-
-    if c1.genome_end < c2.genome_start {
-        c2.genome_start - c1.genome_end
-    } else {
-        c1.genome_start.saturating_sub(c2.genome_end)
-    }
-}
-
-/// Check if two clusters represent a chimeric signature
-fn is_chimeric_signature(c1: &SeedCluster, c2: &SeedCluster) -> bool {
-    // Different chromosomes
-    if c1.chr_idx != c2.chr_idx {
-        return true;
-    }
-
-    // Different strands (same chromosome)
-    if c1.is_reverse != c2.is_reverse {
-        return true;
-    }
-
-    // Large genomic distance (same chr/strand)
-    let distance = genomic_distance(c1, c2);
-    if distance > 1_000_000 {
-        return true;
-    }
-
-    false
-}
-
-/// Detect inter-mate chimeric alignment from two single-mate transcripts.
-///
-/// Fires when mate1 and mate2 map to different chromosomes, opposite-orientation
-/// same-chromosome positions, or positions too far apart to be a normal PE pair.
-/// This is the primary PE-specific chimeric case (gene-fusion detection).
-pub fn detect_inter_mate_chimeric(
-    t1: &Transcript,
-    t2: &Transcript,
-    mate1_seq: &[u8],
-    read_name: &str,
-    params: &Parameters,
-    index: &GenomeIndex,
-) -> Option<ChimericAlignment> {
-    // Only fire if the pair is discordant (different chr, same strand (both FW or both RC =
-    // not FR orientation), or too far apart).
-    let is_inter_chr = t1.chr_idx != t2.chr_idx;
-    // FR pair expects t1.is_reverse=false (mate1 FW) and t2.is_reverse=true (mate2 RC).
-    // Chimeric if both same strand.
-    let same_strand = t1.is_reverse == t2.is_reverse;
-    let too_far = if t1.chr_idx == t2.chr_idx {
-        let left_end = t1.genome_end.min(t2.genome_end);
-        let right_start = t1.genome_start.max(t2.genome_start);
-        right_start > left_end && right_start - left_end > 1_000_000
-    } else {
-        false
-    };
-
-    if !is_inter_chr && !same_strand && !too_far {
-        return None;
-    }
-
-    if t1.exons.is_empty() || t2.exons.is_empty() {
-        return None;
-    }
-
-    // Convert transcripts to chimeric segments
-    let donor = transcript_to_segment(t1).ok()?;
-    let acceptor = transcript_to_segment(t2).ok()?;
-
-    if !donor.meets_min_length(params.chim_segment_min)
-        || !acceptor.meets_min_length(params.chim_segment_min)
-    {
-        return None;
-    }
-
-    // Junction type: non-canonical (0) for inter-chromosomal; try motif for same-chr
-    let junction_type = if is_inter_chr {
+/// STAR's chimeric strand code for a transcript in `chimericDetectionOld`:
+/// 0 undefined, 1 same as the RNA, 2 opposite.
+fn chim_str_old(t: &WinTr) -> u8 {
+    if t.intron_motifs[1] == 0 && t.intron_motifs[2] == 0 {
         0
-    } else {
-        classify_junction_type(
-            &index.genome,
-            donor.chr_idx,
-            donor.genome_end,
-            donor.is_reverse,
-            acceptor.chr_idx,
-            acceptor.genome_start,
-            acceptor.is_reverse,
-        )
-    };
-
-    let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-        &index.genome,
-        donor.chr_idx,
-        donor.genome_end,
-        acceptor.chr_idx,
-        acceptor.genome_start,
-        20,
-    );
-
-    let chim = ChimericAlignment::new(
-        donor,
-        acceptor,
-        junction_type,
-        repeat_len_donor,
-        repeat_len_acceptor,
-        mate1_seq.to_vec(),
-        read_name.to_string(),
-    );
-
-    Some(chim)
-}
-
-/// Shift all exon read_start/read_end values in a transcript by `offset`.
-///
-/// Used when a transcript was stitched against a sub-slice of the read (e.g. a right soft-clip
-/// at position `offset`) so that its read coordinates become relative to the full read.
-fn adjust_read_positions(mut tr: Transcript, offset: usize) -> Transcript {
-    for exon in &mut tr.exons {
-        exon.read_start += offset;
-        exon.read_end += offset;
-    }
-    tr
-}
-
-/// Compute read-orientation (5'→3' of original read) start/end for a transcript.
-///
-/// STAR uses "ro" coords so that clipping amounts are always measured from the 5' end of the
-/// original read regardless of mapping strand.  For the SAM CIGAR convention used internally:
-/// - Forward: ro_start = exons.first().read_start, ro_end = exons.last().read_end − 1
-/// - Reverse:  ro_start = Lread − exons.last().read_end, ro_end = Lread − exons.first().read_start − 1
-fn ro_coords(transcript: &Transcript, read_len: usize) -> (usize, usize) {
-    if transcript.exons.is_empty() {
-        return (0, 0);
-    }
-    let first = transcript.exons.first().unwrap();
-    let last = transcript.exons.last().unwrap();
-    if !transcript.is_reverse {
-        (first.read_start, last.read_end.saturating_sub(1))
-    } else {
-        (
-            read_len.saturating_sub(last.read_end),
-            read_len.saturating_sub(first.read_start + 1),
-        )
-    }
-}
-
-/// Implement STAR's `chimericDetectionOld()`: find the best chimeric pair from all
-/// post-stitching transcripts.
-///
-/// Algorithm: use the best transcript (`tr_best`) as the primary segment and search
-/// every other transcript for a complementary segment that covers a different part of
-/// the read at a different genomic location.  Applies STAR's score-drop, uniqueness,
-/// segment-length, and read-gap filters, then emits at most one `ChimericAlignment`.
-///
-/// Called after stitching + dedup for SE reads, and per-mate after split+finalize for PE.
-pub fn detect_chimeric_old(
-    all_transcripts: &[Transcript],
-    tr_best: &Transcript,
-    read_seq: &[u8],
-    read_name: &str,
-    params: &Parameters,
-    index: &GenomeIndex,
-) -> Result<Vec<ChimericAlignment>, Error> {
-    // SE / per-mate PE pool: no combined-read mate boundary, so diffMates never applies.
-    detect_chimeric_old_impl(
-        all_transcripts,
-        tr_best,
-        read_seq,
-        read_name,
-        params,
-        index,
-        None,
-    )
-}
-
-/// `detect_chimeric_old` with an optional combined-read mate boundary (`read_length[0]`
-/// in ro-space). When a candidate segment lies in a different mate than the primary
-/// segment (STAR's `diffMates`), the read-gap check is waived — matching
-/// `ReadAlign_chimericDetectionOld.cpp` lines 67-71.
-#[allow(clippy::too_many_arguments)]
-pub fn detect_chimeric_old_impl(
-    all_transcripts: &[Transcript],
-    tr_best: &Transcript,
-    read_seq: &[u8],
-    read_name: &str,
-    params: &Parameters,
-    index: &GenomeIndex,
-    mate_boundary: Option<usize>,
-) -> Result<Vec<ChimericAlignment>, Error> {
-    let read_len = read_seq.len();
-    let min_seg = params.chim_segment_min as usize;
-    let score_min = params.chim_score_min;
-    let score_drop_max = params.chim_score_drop_max;
-    let score_separation = params.chim_score_separation;
-    let gap_max = params.chim_segment_read_gap_max as usize;
-    let overhang_min = params.chim_junction_overhang_min as usize;
-    let non_gtag_penalty = params.chim_score_junction_non_gtag;
-    let main_mult_max = params.chim_main_segment_mult_nmax as usize;
-
-    // STAR: reject if main segment is too multimapping (nTr > mainSegmentMultNmax && nTr!=2)
-    let n_total = all_transcripts.len();
-    if n_total > main_mult_max && n_total != 2 {
-        return Ok(vec![]);
-    }
-
-    // ro coords for the best transcript
-    if tr_best.exons.is_empty() {
-        return Ok(vec![]);
-    }
-    let (ro_start1, ro_end1) = ro_coords(tr_best, read_len);
-    let r_length1 = ro_end1 + 1 - ro_start1; // aligned read bases in primary
-
-    // Main segment must be long enough
-    if r_length1 < min_seg {
-        return Ok(vec![]);
-    }
-
-    // There must be space for a partner segment at one end of the read
-    let has_right_space = ro_end1 + min_seg < read_len;
-    let has_left_space = ro_start1 >= min_seg;
-    if !has_right_space && !has_left_space {
-        return Ok(vec![]);
-    }
-
-    // Main segment must have no non-canonical junctions and a consistent motif strand
-    use crate::align::score::SpliceMotif;
-    if tr_best.junction_motifs.contains(&SpliceMotif::NonCanonical) {
-        return Ok(vec![]);
-    }
-    let has_plus = tr_best
-        .junction_motifs
-        .iter()
-        .any(|m| matches!(m, SpliceMotif::GtAg | SpliceMotif::GcAg | SpliceMotif::AtAc));
-    let has_minus = tr_best
-        .junction_motifs
-        .iter()
-        .any(|m| matches!(m, SpliceMotif::CtAc | SpliceMotif::CtGc | SpliceMotif::GtAt));
-    if has_plus && has_minus {
-        return Ok(vec![]);
-    }
-    // 0=undefined, 1=same as RNA (+ strand), 2=opposite to RNA (- strand)
-    let chim_str1: u8 = if !has_plus && !has_minus {
-        0
-    } else if tr_best.is_reverse != has_plus {
+    } else if (t.str_ == 0) == (t.intron_motifs[1] > 0) {
         1
     } else {
         2
-    };
-
-    let score1 = tr_best.score;
-
-    let mut chim_score_best: i32 = i32::MIN;
-    let mut chim_score_next: i32 = i32::MIN;
-    let mut best_tr2: Option<&Transcript> = None;
-    let mut best_overlap: usize = 0;
-
-    for tr2 in all_transcripts {
-        if std::ptr::eq(tr2, tr_best) {
-            continue;
-        }
-        if tr2.exons.is_empty() {
-            continue;
-        }
-
-        // Partner must not have non-canonical junctions
-        if tr2.junction_motifs.contains(&SpliceMotif::NonCanonical) {
-            continue;
-        }
-
-        // Partner motif strand
-        let has_plus2 = tr2
-            .junction_motifs
-            .iter()
-            .any(|m| matches!(m, SpliceMotif::GtAg | SpliceMotif::GcAg | SpliceMotif::AtAc));
-        let has_minus2 = tr2
-            .junction_motifs
-            .iter()
-            .any(|m| matches!(m, SpliceMotif::CtAc | SpliceMotif::CtGc | SpliceMotif::GtAt));
-        let chim_str2: u8 = if !has_plus2 && !has_minus2 {
-            0
-        } else if tr2.is_reverse != has_plus2 {
-            1
-        } else {
-            2
-        };
-
-        // Strands must be consistent (STAR: if both defined they must match)
-        if chim_str1 != 0 && chim_str2 != 0 && chim_str1 != chim_str2 {
-            continue;
-        }
-
-        let (ro_start2, ro_end2) = ro_coords(tr2, read_len);
-
-        // Overlap in read orientation coordinates
-        let overlap = if ro_start2 > ro_start1 {
-            if ro_start2 > ro_end1 {
-                0
-            } else {
-                ro_end1 - ro_start2 + 1
-            }
-        } else if ro_end2 < ro_start1 {
-            0
-        } else {
-            ro_end2 - ro_start1 + 1
-        };
-
-        let r_length2 = ro_end2 + 1 - ro_start2;
-
-        // Both segments must be long enough (after subtracting overlap)
-        if r_length1 <= min_seg + overlap || r_length2 <= min_seg + overlap {
-            continue;
-        }
-
-        // Read gap check: the two segments must be close enough in read space —
-        // UNLESS they come from different mates (STAR's `diffMates`), in which case
-        // the inter-mate fragment gap is expected and the check is waived
-        // (ReadAlign_chimericDetectionOld.cpp:67-71). `diffMates` requires a combined
-        // read with a known mate boundary; it is always false for SE / per-mate pools.
-        let diff_mates = mate_boundary
-            .is_some_and(|b| (ro_end1 < b && ro_start2 >= b) || (ro_end2 < b && ro_start1 >= b));
-        let gap_ok = diff_mates
-            || ((ro_end1 + gap_max + 1 >= ro_start2) && (ro_end2 + gap_max + 1 >= ro_start1));
-        if !gap_ok {
-            continue;
-        }
-
-        let score2 = tr2.score;
-        let chim_score = score1 + score2 - overlap as i32;
-
-        // Track overlap of partner vs best partner (same-window case)
-        let overlap_with_best: usize = if chim_score_best > i32::MIN {
-            if let Some(prev) = best_tr2 {
-                let (prev_s, prev_e) = ro_coords(prev, read_len);
-                if ro_start2 > prev_s {
-                    if ro_start2 > prev_e {
-                        0
-                    } else {
-                        prev_e - ro_start2 + 1
-                    }
-                } else if ro_end2 < prev_s {
-                    0
-                } else {
-                    ro_end2 - prev_s + 1
-                }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        if chim_score > chim_score_best {
-            best_tr2 = Some(tr2);
-            if overlap_with_best == 0 {
-                chim_score_next = chim_score_best;
-            }
-            chim_score_best = chim_score;
-            best_overlap = overlap;
-            let _ = chim_str2; // strand info tracked for extension later
-        } else if chim_score > chim_score_next && overlap_with_best == 0 {
-            chim_score_next = chim_score;
-        }
     }
-
-    // No chimeric partner found
-    let Some(tr2) = best_tr2 else {
-        return Ok(vec![]);
-    };
-
-    // Score filters
-    if chim_score_best < score_min {
-        return Ok(vec![]);
-    }
-    // Score-drop gate (STAR chimericDetectionOld.cpp:99, `readLength[0]+readLength[1]`).
-    // `read_len` is the length of the read passed in, so this scales correctly for both
-    // modes: per-mate length for the per-mate PE pools (an intra-mate chimera spans one
-    // mate), and the combined length when a combined read is supplied via `mate_boundary`.
-    if chim_score_best + score_drop_max < read_len as i32 {
-        return Ok(vec![]);
-    }
-    // Uniqueness: next-best must be clearly worse
-    if chim_score_next + score_separation >= chim_score_best {
-        return Ok(vec![]);
-    }
-
-    // Determine donor / acceptor by read position
-    let (ro_start2, ro_end2) = ro_coords(tr2, read_len);
-    let (tr_donor, tr_acceptor) = if ro_start1 <= ro_start2 {
-        (tr_best, tr2)
-    } else {
-        (tr2, tr_best)
-    };
-    let (ro_donor_end, ro_acceptor_start) = if ro_start1 <= ro_start2 {
-        (ro_end1, ro_start2)
-    } else {
-        (ro_end2, ro_start1)
-    };
-
-    // Junction overhang check (when segments don't overlap)
-    if best_overlap == 0 {
-        // Non-overlapping case: overhang = segment length at the boundary
-        let donor_overhang = ro_donor_end + 1 - ro_coords(tr_donor, read_len).0;
-        let acceptor_overhang = ro_coords(tr_acceptor, read_len).1 + 1 - ro_acceptor_start;
-        if donor_overhang < overhang_min || acceptor_overhang < overhang_min {
-            return Ok(vec![]);
-        }
-    }
-
-    // Final geometry check: must be truly chimeric (different chr/strand or far apart).
-    // STAR: chimeric if chr/strand differ, OR if same-chr same-strand span > alignIntronMax.
-    // (For PE inter-mate: > alignMatesGapMax; for SE we use alignIntronMax as the limit.)
-    let intron_max = params.align_intron_max as u64;
-    let is_chimeric = tr_donor.chr_idx != tr_acceptor.chr_idx
-        || tr_donor.is_reverse != tr_acceptor.is_reverse
-        || {
-            let span = if tr_donor.genome_end <= tr_acceptor.genome_start {
-                tr_acceptor.genome_start - tr_donor.genome_end
-            } else {
-                tr_donor.genome_start.saturating_sub(tr_acceptor.genome_end)
-            };
-            intron_max > 0 && span > intron_max
-        };
-
-    if !is_chimeric {
-        return Ok(vec![]);
-    }
-
-    // Build chimeric segments
-    let donor_seg = transcript_to_segment(tr_donor)
-        .map_err(|e| Error::Chimeric(format!("chimeric donor segment: {e}")))?;
-    let acceptor_seg = transcript_to_segment(tr_acceptor)
-        .map_err(|e| Error::Chimeric(format!("chimeric acceptor segment: {e}")))?;
-
-    // Minimum segment length check
-    if !donor_seg.meets_min_length(params.chim_segment_min)
-        || !acceptor_seg.meets_min_length(params.chim_segment_min)
-    {
-        return Ok(vec![]);
-    }
-
-    // Classify junction and compute repeats
-    let junction_type = classify_junction_type(
-        &index.genome,
-        donor_seg.chr_idx,
-        donor_seg.genome_end,
-        donor_seg.is_reverse,
-        acceptor_seg.chr_idx,
-        acceptor_seg.genome_start,
-        acceptor_seg.is_reverse,
-    );
-
-    // Apply non-GTAG score penalty and re-check score min
-    let effective_score = if junction_type == 0 {
-        chim_score_best + 1 + non_gtag_penalty
-    } else {
-        chim_score_best
-    };
-    if effective_score < score_min || effective_score + score_drop_max < read_len as i32 {
-        return Ok(vec![]);
-    }
-
-    let (repeat_len_donor, repeat_len_acceptor) = calculate_repeat_length(
-        &index.genome,
-        donor_seg.chr_idx,
-        donor_seg.genome_end,
-        acceptor_seg.chr_idx,
-        acceptor_seg.genome_start,
-        20,
-    );
-
-    let chim = ChimericAlignment::new(
-        donor_seg,
-        acceptor_seg,
-        junction_type,
-        repeat_len_donor,
-        repeat_len_acceptor,
-        read_seq.to_vec(),
-        read_name.to_string(),
-    );
-
-    Ok(vec![chim])
 }
 
-/// Convert a transcript to a chimeric segment
-pub(crate) fn transcript_to_segment(transcript: &Transcript) -> Result<ChimericSegment, Error> {
-    if transcript.exons.is_empty() {
-        return Err(Error::Alignment(
-            "Cannot convert empty transcript to segment".to_string(),
-        ));
+/// `ChimericSegment::str`, which also calls a transcript with both motif
+/// strands undefined.
+fn chim_str_seg(t: &WinTr) -> u8 {
+    let (p, m) = (t.intron_motifs[1], t.intron_motifs[2]);
+    if (p == 0 && m == 0) || (p > 0 && m > 0) {
+        0
+    } else if (t.str_ == 0) == (p > 0) {
+        1
+    } else {
+        2
+    }
+}
+
+/// `roS`/`roE` of a segment, with the spacer removed for the second mate.
+fn ro_se(t: &WinTr, read: &ChimRead) -> (usize, usize) {
+    let lread = read.lread();
+    let (first, last) = (t.exons[0], t.last());
+    let mut start = if t.str_ == 0 {
+        first.r
+    } else {
+        lread - last.r - last.l
+    };
+    let mut end = if t.str_ == 0 {
+        last.r + last.l - 1
+    } else {
+        lread - first.r - 1
+    };
+    if start > read.read_length[0] {
+        start -= 1;
+    }
+    if end > read.read_length[0] {
+        end -= 1;
+    }
+    (start, end)
+}
+
+fn overlap_ro(s1: usize, e1: usize, s2: usize, e2: usize) -> usize {
+    if s2 > s1 {
+        if s2 > e1 { 0 } else { e1 - s2 + 1 }
+    } else if e2 < s1 {
+        0
+    } else {
+        e2 - s1 + 1
+    }
+}
+
+/// `blocksOverlap` (`blocksOverlap.cpp`): read bases two transcripts place on
+/// the same diagonal. Like STAR's, it does not look at chromosome or strand.
+fn blocks_overlap(t1: &WinTr, t2: &WinTr) -> usize {
+    let (mut i1, mut i2, mut n_overlap) = (0usize, 0usize, 0usize);
+    while i1 < t1.exons.len() && i2 < t2.exons.len() {
+        let (x, y) = (t1.exons[i1], t2.exons[i2]);
+        let (rs1, rs2) = (x.r, y.r);
+        let (re1, re2) = (x.r + x.l, y.r + y.l);
+        if rs1 >= re2 {
+            i2 += 1;
+        } else if rs2 >= re1 {
+            i1 += 1;
+        } else {
+            if x.g.wrapping_sub(rs1 as u64) == y.g.wrapping_sub(rs2 as u64) {
+                n_overlap += re1.min(re2) - rs1.max(rs2);
+            }
+            if re1 >= re2 {
+                i2 += 1;
+            }
+            if re2 >= re1 {
+                i1 += 1;
+            }
+        }
+    }
+    n_overlap
+}
+
+/// A placed chimeric junction: STAR's `trChim[0..2]` (or `al1`/`al2`) after
+/// the junction shift, with `chimJ*`, `chimMotif` and `chimRepeat*`.
+struct Placed {
+    t0: WinTr,
+    t1: WinTr,
+    j0: u64,
+    j1: u64,
+    motif: i32,
+    rep0: u32,
+    rep1: u32,
+}
+
+/// Junction placement shared by both detectors: the bracketing branch, or the
+/// scan for the best junction position within a mate followed by the shift
+/// and the repeat measurement (`ReadAlign_chimericDetectionOld.cpp:121-307`,
+/// `ChimericAlign_chimericStitching.cpp:21-168`). The two copies in STAR
+/// differ only in how they report failure, which the caller handles.
+///
+/// Returns `None` when an `N` in the read, or in the genome under
+/// `banGenomicN`, falls inside the scanned span.
+fn place(
+    mut t0: WinTr,
+    mut t1: WinTr,
+    chim_str: u8,
+    read: &ChimRead,
+    genome: &Genome,
+    params: &Parameters,
+) -> Option<Placed> {
+    let e0 = if t0.str_ == 1 { 0 } else { t0.exons.len() - 1 };
+    let e1 = if t1.str_ == 0 { 0 } else { t1.exons.len() - 1 };
+    if t0.exons[e0].frag < t1.exons[e1].frag {
+        // Mates bracket the junction.
+        let x0 = t0.exons[e0];
+        let x1 = t1.exons[e1];
+        let j0 = if t0.str_ == 1 {
+            x0.g.wrapping_sub(1)
+        } else {
+            x0.g + x0.l as u64
+        };
+        let j1 = if t1.str_ == 0 {
+            x1.g.wrapping_sub(1)
+        } else {
+            x1.g + x1.l as u64
+        };
+        return Some(Placed {
+            t0,
+            t1,
+            j0,
+            j1,
+            motif: -1,
+            rep0: 0,
+            rep1: 0,
+        });
     }
 
-    // Get overall bounds
-    let read_start = transcript.exons[0].read_start;
-    let read_end = transcript.exons.last().unwrap().read_end;
+    let ban_n = params.chim_filter.iter().any(|f| f == "banGenomicN");
+    let lread = read.lread() as i64;
+    let x0 = t0.exons[e0];
+    let x1 = t1.exons[e1];
+    let ro_start0 = if t0.str_ == 0 {
+        x0.r as i64
+    } else {
+        lread - x0.r as i64 - x0.l as i64
+    };
+    let ro_start1 = if t1.str_ == 0 {
+        x1.r as i64
+    } else {
+        lread - x1.r as i64 - x1.l as i64
+    };
+    let (g0, l0) = (x0.g as i64, x0.l as i64);
+    let (g1, l1) = (x1.g as i64, x1.l as i64);
+    let base0 = |off: i64| -> u8 {
+        if t0.str_ == 0 {
+            gbase(genome, g0 + off)
+        } else {
+            comp(gbase(genome, g0 + l0 - 1 - off))
+        }
+    };
+    // `off` is the position in the leading segment's read frame; the trailing
+    // segment is read in that same frame, shifted by `roStart0 - roStart1`.
+    let base1 = |off: i64| -> u8 {
+        if t1.str_ == 0 {
+            gbase(genome, g1 - ro_start1 + ro_start0 + off)
+        } else {
+            comp(gbase(genome, g1 + l1 - 1 + ro_start1 - ro_start0 - off))
+        }
+    };
 
-    Ok(ChimericSegment {
-        chr_idx: transcript.chr_idx,
-        genome_start: transcript.genome_start,
-        genome_end: transcript.genome_end,
-        is_reverse: transcript.is_reverse,
-        read_start,
-        read_end,
-        cigar: transcript.cigar.clone(),
-        score: transcript.score,
-        n_mismatch: transcript.n_mismatch,
+    let jr_max = {
+        let m = ro_start1 + l1;
+        if m > ro_start0 { m - ro_start0 - 1 } else { 0 }
+    };
+    let (mut motif, mut jr_best) = (0i32, 0i64);
+    let (mut j_score, mut j_score_best) = (0i32, -999_999i32);
+    let mut jr = 0i64;
+    while jr < jr_max {
+        // STAR compares the scan offset, not the read position, with the mate
+        // boundary when it skips the spacer. Kept as written.
+        if jr == read.read_length[0] as i64 {
+            jr += 1;
+        }
+        let br = read
+            .fwd
+            .get((ro_start0 + jr) as usize)
+            .copied()
+            .unwrap_or(5);
+        let b0 = base0(jr);
+        let b1 = base1(jr);
+        if (ban_n && (b0 > 3 || b1 > 3)) || br > 3 {
+            return None;
+        }
+        let (b01, b02) = (base0(jr + 1), base0(jr + 2));
+        let (b11, b12) = (base1(jr - 1), base1(jr));
+        let mut j_motif = 0;
+        if b01 == 2 && b02 == 3 && b11 == 0 && b12 == 2 {
+            if chim_str != 2 {
+                j_motif = 1;
+            }
+        } else if b01 == 1 && b02 == 3 && b11 == 0 && b12 == 1 && chim_str != 1 {
+            j_motif = 2;
+        }
+        if br == b0 && br != b1 {
+            j_score += 1;
+        } else if br != b0 && br == b1 {
+            j_score -= 1;
+        }
+        let j_score_j = if j_motif == 0 {
+            j_score + params.chim_score_junction_non_gtag
+        } else {
+            j_score
+        };
+        if j_score_j > j_score_best || (j_score_j == j_score_best && j_motif > 0) {
+            motif = j_motif;
+            jr_best = jr;
+            j_score_best = j_score_j;
+        }
+        jr += 1;
+    }
+
+    // Shift the junction.
+    let jr_best = jr_best as usize;
+    let (j0, j1);
+    {
+        let x = &mut t0.exons[e0];
+        if t0.str_ == 1 {
+            let d = x.l - jr_best - 1;
+            x.r += d;
+            x.g += d as u64;
+            x.l = jr_best + 1;
+            j0 = x.g.wrapping_sub(1);
+        } else {
+            x.l = jr_best + 1;
+            j0 = x.g + x.l as u64;
+        }
+    }
+    {
+        let x = &mut t1.exons[e1];
+        let new_l = (ro_start1 + x.l as i64 - ro_start0 - jr_best as i64 - 1) as usize;
+        if t1.str_ == 0 {
+            let d = (ro_start0 + jr_best as i64 + 1 - ro_start1) as usize;
+            x.r += d;
+            x.g += d as u64;
+            x.l = new_l;
+            j1 = x.g.wrapping_sub(1);
+        } else {
+            x.l = new_l;
+            j1 = x.g + x.l as u64;
+        }
+    }
+
+    // Repeats around the junction.
+    let side0 = |off: i64| -> u8 {
+        if t0.str_ == 0 {
+            gbase(genome, j0 as i64 + off)
+        } else {
+            comp(gbase(genome, j0 as i64 - off))
+        }
+    };
+    let side1 = |off: i64| -> u8 {
+        if t1.str_ == 0 {
+            gbase(genome, j1 as i64 + off)
+        } else {
+            comp(gbase(genome, j1 as i64 - off))
+        }
+    };
+    let mut rep1 = 0u32;
+    while rep1 < 100 && side0(rep1 as i64) == side1(rep1 as i64 + 1) {
+        rep1 += 1;
+    }
+    let mut rep0 = 0u32;
+    while rep0 < 100 && side0(-1 - rep0 as i64) == side1(-(rep0 as i64)) {
+        rep0 += 1;
+    }
+
+    Some(Placed {
+        t0,
+        t1,
+        j0,
+        j1,
+        motif,
+        rep0,
+        rep1,
     })
+}
+
+/// `ReadAlign::chimericDetectionOld`.
+fn detect_old(
+    w: &Windows,
+    read: &ChimRead,
+    genome: &Genome,
+    params: &Parameters,
+) -> Option<Placed> {
+    let lread = read.lread();
+    let seg_min = params.chim_segment_min as usize;
+    let ib = w.best()?;
+    let tr_best = &w.tr[ib][0];
+    let (n_tr, tr_mult) = w.mult(params.out_filter_multimap_score_range);
+    let main_mult = params.chim_main_segment_mult_nmax as usize;
+
+    if n_tr > main_mult && n_tr != 2 {
+        return None;
+    }
+    let lb = tr_best.last();
+    if !(seg_min > 0
+        && tr_best.r_length >= seg_min
+        && (lb.r + lb.l + seg_min <= lread || tr_best.exons[0].r >= seg_min)
+        && tr_best.intron_motifs[0] == 0
+        && (tr_best.intron_motifs[1] == 0 || tr_best.intron_motifs[2] == 0))
+    {
+        return None;
+    }
+
+    let (mut chim_score_best, mut chim_score_next) = (0i32, 0i32);
+    let mut tr_chim1: Option<(usize, usize)> = None;
+    let (ro_start1, ro_end1) = ro_se(tr_best, read);
+    let mut chim_str = chim_str_old(tr_best);
+    let mut chim_str_best = 0u8;
+    let gap_max = params.chim_segment_read_gap_max as usize;
+
+    for (iw, win) in w.tr.iter().enumerate() {
+        for (iwt, t) in win.iter().enumerate() {
+            if iw != ib && iwt > 0 {
+                break;
+            }
+            if iw == ib && iwt == 0 {
+                continue;
+            }
+            if t.intron_motifs[0] > 0 {
+                continue;
+            }
+            let chim_str1 = chim_str_old(t);
+            if chim_str != 0 && chim_str1 != 0 && chim_str != chim_str1 {
+                continue;
+            }
+            let (ro_start2, ro_end2) = ro_se(t, read);
+            let overlap = overlap_ro(ro_start1, ro_end1, ro_start2, ro_end2);
+            let rl0 = read.read_length[0];
+            let diff_mates =
+                (ro_end1 < rl0 && ro_start2 >= rl0) || (ro_end2 < rl0 && ro_start1 >= rl0);
+            if ro_end1 > seg_min + ro_start1 + overlap
+                && ro_end2 > seg_min + ro_start2 + overlap
+                && (diff_mates
+                    || (ro_end1 + gap_max + 1 >= ro_start2 && ro_end2 + gap_max + 1 >= ro_start1))
+            {
+                let chim_score = tr_best.max_score + t.max_score - overlap as i32;
+                let mut overlap1 = 0;
+                if iwt > 0
+                    && chim_score_best > 0
+                    && let Some((a, b)) = tr_chim1
+                {
+                    overlap1 = blocks_overlap(&w.tr[a][b], t);
+                }
+                if chim_score > chim_score_best {
+                    tr_chim1 = Some((iw, iwt));
+                    if overlap1 == 0 {
+                        chim_score_next = chim_score_best;
+                    }
+                    chim_score_best = chim_score;
+                    chim_str_best = chim_str1;
+                } else if chim_score > chim_score_next && overlap1 == 0 {
+                    chim_score_next = chim_score;
+                }
+            }
+        }
+    }
+
+    let frag_len = (read.read_length[0] + read.read_length[1]) as i32;
+    if !(chim_score_best >= params.chim_score_min
+        && chim_score_best + params.chim_score_drop_max >= frag_len)
+    {
+        return None;
+    }
+    let tc1 = tr_chim1?;
+    if n_tr > main_mult && Some(tc1) != tr_mult[0] && Some(tc1) != tr_mult[1] {
+        return None;
+    }
+    if chim_str == 0 {
+        chim_str = chim_str_best;
+    }
+    if chim_score_next + params.chim_score_separation >= chim_score_best {
+        return None;
+    }
+
+    let (mut c0, mut c1) = (tr_best.clone(), w.tr[tc1.0][tc1.1].clone());
+    if c0.ro_start > c1.ro_start {
+        std::mem::swap(&mut c0, &mut c1);
+    }
+    let e0 = if c0.str_ == 1 { 0 } else { c0.exons.len() - 1 };
+    let e1 = if c1.str_ == 0 { 0 } else { c1.exons.len() - 1 };
+    if c0.exons[e0].frag > c1.exons[e1].frag {
+        return None;
+    }
+    let overhang_min = params.chim_junction_overhang_min as usize;
+    if c0.exons[e0].frag == c1.exons[e1].frag
+        && !(c0.exons[e0].l >= overhang_min && c1.exons[e1].l >= overhang_min)
+    {
+        return None;
+    }
+
+    let p = place(c0, c1, chim_str, read, genome, params)?;
+    if p.motif == 0 {
+        chim_score_best += 1 + params.chim_score_junction_non_gtag;
+        if !(chim_score_best >= params.chim_score_min
+            && chim_score_best + params.chim_score_drop_max >= frag_len)
+        {
+            return None;
+        }
+    }
+
+    // Final check: different chromosome or strand, or farther apart than a
+    // linear alignment may reach. STAR's distance is unsigned and wraps when
+    // the junction runs backwards, which then always counts as far.
+    let dist = if p.t0.str_ == 0 {
+        p.j1.wrapping_sub(p.j0).wrapping_add(1)
+    } else {
+        p.j0.wrapping_sub(p.j1).wrapping_add(1)
+    };
+    let limit = if p.motif >= 0 {
+        params.align_intron_max as u64
+    } else {
+        params.align_mates_gap_max as u64
+    };
+    if p.t0.str_ != p.t1.str_ || p.t0.chr != p.t1.chr || dist > limit {
+        let (x0, x1) = (p.t0.exons[e0], p.t1.exons[e1]);
+        if p.motif >= 0
+            && (x0.l < overhang_min + p.rep0 as usize || x1.l < overhang_min + p.rep1 as usize)
+        {
+            return None;
+        }
+        return Some(p);
+    }
+    None
+}
+
+/// A chimera from `chimericDetectionMult`, with its re-stitched score.
+struct MultChim {
+    p: Placed,
+    score: i32,
+}
+
+/// `ChimericDetection::chimericDetectionMult` with `ChimericAlign`'s checks
+/// and stitching.
+fn detect_mult(
+    w: &Windows,
+    max_non_chim: i32,
+    read: &ChimRead,
+    genome: &Genome,
+    scorer: &AlignmentScorer,
+    params: &Parameters,
+) -> (Vec<MultChim>, i32, i32) {
+    let seg_min = params.chim_segment_min as usize;
+    let gap_max = params.chim_segment_read_gap_max as usize;
+    let overhang_min = params.chim_junction_overhang_min as usize;
+    let max_possible = (read.read_length[0] + read.read_length[1]) as i32;
+    let mut min_score = params.chim_score_min;
+    if max_non_chim >= min_score {
+        min_score = max_non_chim + 1;
+    }
+    if max_possible - params.chim_score_drop_max > min_score {
+        min_score = max_possible - params.chim_score_drop_max;
+    }
+    let rl0 = read.read_length[0];
+    let seg_ok = |t: &WinTr| t.r_length >= seg_min && t.intron_motifs[0] == 0;
+
+    let mut out: Vec<MultChim> = Vec::new();
+    let mut best = 0i32;
+    let flat: Vec<(usize, usize)> =
+        w.tr.iter()
+            .enumerate()
+            .flat_map(|(iw, win)| (0..win.len()).map(move |it| (iw, it)))
+            .collect();
+    for (i, &(iw1, ia1)) in flat.iter().enumerate() {
+        let s1 = &w.tr[iw1][ia1];
+        if !seg_ok(s1) {
+            continue;
+        }
+        let (ros1, roe1) = ro_se(s1, read);
+        let str1 = chim_str_seg(s1);
+        // Same order as STAR's nested window/align loops, with the second
+        // segment always after the first.
+        for &(iw2, ia2) in &flat[i + 1..] {
+            let s2 = &w.tr[iw2][ia2];
+            if !seg_ok(s2) {
+                continue;
+            }
+            let str2 = chim_str_seg(s2);
+            if str1 != 0 && str2 != 0 && str2 != str1 {
+                continue;
+            }
+            // `chimericAlignScore`.
+            let (ros2, roe2) = ro_se(s2, read);
+            let overlap = if ros2 > ros1 {
+                if ros2 > roe1 { 0 } else { roe1 - ros2 + 1 }
+            } else if roe2 < ros1 {
+                0
+            } else {
+                roe2 - ros1 + 1
+            };
+            let diff_mates = (roe1 < rl0 && ros2 >= rl0) || (roe2 < rl0 && ros1 >= rl0);
+            let mut chim_score = 0;
+            if roe1 > seg_min + ros1 + overlap
+                && roe2 > seg_min + ros2 + overlap
+                && (diff_mates || (roe1 + gap_max + 1 >= ros2 && roe2 + gap_max + 1 >= ros1))
+            {
+                chim_score = s1.max_score + s2.max_score - overlap as i32;
+            }
+            if chim_score < min_score {
+                continue;
+            }
+            // `ChimericAlign` orders its pair by `roStart`.
+            let (a1, a2) = if s1.ro_start > s2.ro_start {
+                (s2, s1)
+            } else {
+                (s1, s2)
+            };
+            let ex1 = if a1.str_ == 1 { 0 } else { a1.exons.len() - 1 };
+            let ex2 = if a2.str_ == 0 { 0 } else { a2.exons.len() - 1 };
+            // `chimericCheck`.
+            let (f1, f2) = (a1.exons[ex1].frag, a2.exons[ex2].frag);
+            if f1 > f2
+                || !(f1 < f2
+                    || (a1.exons[ex1].l >= overhang_min && a2.exons[ex2].l >= overhang_min))
+            {
+                continue;
+            }
+            // `chimericStitching`.
+            let chim_str = str1.max(str2);
+            let Some(p) = place(a1.clone(), a2.clone(), chim_str, read, genome, params) else {
+                continue;
+            };
+            // Unlike the old path, the repeat lengths are not added here
+            // (`ChimericAlign_chimericStitching.cpp:172`).
+            let score = if p.motif >= 0
+                && (p.t0.exons[ex1].l < overhang_min || p.t1.exons[ex2].l < overhang_min)
+            {
+                0
+            } else {
+                align_score(&p.t0, read, genome, scorer)
+                    + align_score(&p.t1, read, genome, scorer)
+                    + if p.motif == 0 {
+                        params.chim_score_junction_non_gtag
+                    } else {
+                        0
+                    }
+            };
+            if score >= min_score {
+                if score > best {
+                    best = score;
+                    if best - params.chim_multimap_score_range > min_score {
+                        min_score = best - params.chim_multimap_score_range;
+                    }
+                }
+                out.push(MultChim { p, score });
+            }
+        }
+    }
+    (out, best, min_score)
+}
+
+/// The per-mate view of a chimeric transcript that WithinBAM records use: the
+/// exons of the mate holding the junction, rebased into that mate's own read.
+fn mate_segment(tr: &WinTr, junction_exon: usize, read: &ChimRead, score: i32) -> ChimericSegment {
+    let frag = tr.exons[junction_exon].frag;
+    let ex: Vec<ChimExon> = tr
+        .exons
+        .iter()
+        .copied()
+        .filter(|e| e.frag == frag)
+        .collect();
+    // The mate at the start of the strand frame begins at 0, the other after
+    // the spacer. Forward frames hold mate1 first, reverse frames mate2.
+    let first_frag = if read.paired { tr.str_ } else { 0 };
+    let mate_len = read.read_length[frag as usize];
+    let offset = if frag == first_frag {
+        0
+    } else {
+        read.read_length[first_frag as usize] + 1
+    };
+    // A mate's own orientation: mate1 is reversed in a reverse transcript,
+    // mate2 in a forward one (it enters the combined read complemented).
+    let is_reverse = if frag == 0 {
+        tr.str_ == 1
+    } else {
+        tr.str_ == 0
+    };
+    let span = |e: &ChimExon| ExonSpan {
+        genome_start: e.g,
+        genome_end: e.g + e.l as u64,
+        read_start: e.r - offset,
+        read_end: e.r - offset + e.l,
+    };
+    let mut cigar = Vec::new();
+    let lead = ex[0].r - offset;
+    if lead > 0 {
+        cigar.push(Op::new(Kind::SoftClip, lead));
+    }
+    for (i, e) in ex.iter().enumerate() {
+        if i > 0 {
+            let p = ex[i - 1];
+            let gap_r = e.r - p.r - p.l;
+            let gap_g = e.g.saturating_sub(p.g + p.l as u64) as usize;
+            if gap_r > 0 {
+                cigar.push(Op::new(Kind::Insertion, gap_r));
+            }
+            if gap_g > 0 {
+                let idx = tr.exons.iter().position(|x| *x == p).unwrap_or(0);
+                let kind = if tr.canon_sj.get(idx).is_some_and(|&c| c >= 0)
+                    || tr.sj_annot.get(idx).copied().unwrap_or(false)
+                {
+                    Kind::Skip
+                } else {
+                    Kind::Deletion
+                };
+                cigar.push(Op::new(kind, gap_g));
+            }
+        }
+        cigar.push(Op::new(Kind::Match, e.l));
+    }
+    let last = ex[ex.len() - 1];
+    let trail = mate_len.saturating_sub(last.r - offset + last.l);
+    if trail > 0 {
+        cigar.push(Op::new(Kind::SoftClip, trail));
+    }
+    ChimericSegment {
+        chr_idx: tr.chr,
+        genome_start: ex[0].g,
+        genome_end: last.g + last.l as u64,
+        is_reverse,
+        read_start: ex[0].r - offset,
+        read_end: last.r - offset + last.l,
+        cigar,
+        score,
+        n_mismatch: 0,
+        first_exon: span(&ex[0]),
+        last_exon: span(&last),
+    }
+}
+
+fn to_alignment(
+    p: &Placed,
+    score: i32,
+    read: &ChimRead,
+    genome: &Genome,
+    scorer: &AlignmentScorer,
+) -> ChimericAlignment {
+    let e0 = if p.t0.str_ == 1 {
+        0
+    } else {
+        p.t0.exons.len() - 1
+    };
+    let e1 = if p.t1.str_ == 0 {
+        0
+    } else {
+        p.t1.exons.len() - 1
+    };
+    let donor = mate_segment(&p.t0, e0, read, align_score(&p.t0, read, genome, scorer));
+    let acceptor = mate_segment(&p.t1, e1, read, align_score(&p.t1, read, genome, scorer));
+    let mate = p.t0.exons[e0].frag as usize;
+    let mut chim = ChimericAlignment::new(
+        donor,
+        acceptor,
+        p.motif,
+        p.rep0,
+        p.rep1,
+        read.mates[mate].to_vec(),
+        read.name.to_string(),
+    );
+    chim.total_score = score;
+    chim.junction_line = Some(JunctionLine {
+        donor_chr: p.t0.chr,
+        donor_break: p.j0,
+        donor_reverse: p.t0.str_ == 1,
+        acceptor_chr: p.t1.chr,
+        acceptor_break: p.j1,
+        acceptor_reverse: p.t1.str_ == 1,
+        donor_start: p.t0.exons[0].g,
+        donor_cigar: cigar_p(&p.t0, read),
+        acceptor_start: p.t1.exons[0].g,
+        acceptor_cigar: cigar_p(&p.t1, read),
+    });
+    chim
+}
+
+/// `ReadAlign::chimericDetection`: run whichever STAR detector the parameters
+/// select over a read's window transcripts.
+pub fn chimeric_detection(
+    windows: Vec<Vec<WinTr>>,
+    read: &ChimRead,
+    genome: &Genome,
+    scorer: &AlignmentScorer,
+    params: &Parameters,
+) -> Vec<ChimericAlignment> {
+    if params.chim_segment_min == 0 {
+        return Vec::new();
+    }
+    let w = Windows::new(windows, params.align_transcripts_per_window_nmax);
+    if params.chim_multimap_nmax == 0 {
+        let Some(p) = detect_old(&w, read, genome, params) else {
+            return Vec::new();
+        };
+        // The old path's score is not written anywhere; WithinBAM and the
+        // single-best bookkeeping use the re-scored segments.
+        let score =
+            align_score(&p.t0, read, genome, scorer) + align_score(&p.t1, read, genome, scorer);
+        return vec![to_alignment(&p, score, read, genome, scorer)];
+    }
+    let Some(ib) = w.best() else {
+        return Vec::new();
+    };
+    let max_non_chim = w.tr[ib][0].max_score;
+    let frag_len = (read.read_length[0] + read.read_length[1]) as i32;
+    if max_non_chim > frag_len - params.chim_nonchim_score_drop_min {
+        return Vec::new();
+    }
+    let (chims, best, min_score) = detect_mult(&w, max_non_chim, read, genome, scorer, params);
+    if best == 0 {
+        return Vec::new();
+    }
+    let kept: Vec<&MultChim> = chims.iter().filter(|c| c.score >= min_score).collect();
+    if kept.len() > params.chim_multimap_nmax {
+        return Vec::new();
+    }
+    let chim_n = kept.len();
+    kept.into_iter()
+        .map(|c| {
+            to_alignment(&c.p, c.score, read, genome, scorer).with_multimap(MultimapInfo {
+                chim_n,
+                max_possible_score: frag_len,
+                max_non_chim_score: max_non_chim,
+                chim_score: c.score,
+                best_chim_score: best,
+                pe_merged: false,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::WindowAlignment;
-    use crate::align::transcript::{Exon, Transcript};
+    use crate::align::transcript::Exon;
     use crate::genome::Genome;
-    use crate::index::GenomeIndex;
-    use crate::index::packed_array::PackedArray;
-    use crate::index::sa_index::SaIndex;
-    use crate::index::suffix_array::SuffixArray;
-    use crate::junction::SpliceJunctionDb;
-    use noodles::sam::alignment::record::cigar;
 
-    /// Minimal two-chromosome genome for chimeric tests.
-    /// Each chromosome has 200 bases of A (=0), padded to 256-byte bins.
-    fn make_test_genome() -> Genome {
-        let chr_len = 200u64;
-        let chr_pad = 256u64;
-        let n_genome = chr_pad * 2;
-        let sequence = vec![0u8; 2 * n_genome as usize];
+    const CHR_PAD: u64 = 1024;
+
+    /// Two 1000-base chromosomes of pseudo-random sequence, so that a read
+    /// taken from one place matches nowhere else by accident.
+    fn genome() -> Genome {
+        let n_genome = CHR_PAD * 2;
+        let mut seq = vec![5u8; 2 * n_genome as usize];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for chr in 0..2u64 {
+            for i in 0..1000u64 {
+                x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                seq[(chr * CHR_PAD + i) as usize] = ((x >> 33) % 4) as u8;
+            }
+        }
         Genome {
             transform_blocks: None,
-            sequence: sequence.into(),
+            sequence: seq.into(),
             n_genome,
             n_genome_real: n_genome,
             n_chr_real: 2,
-            chr_name: vec!["chr0".to_string(), "chr1".to_string()],
-            chr_length: vec![chr_len, chr_len],
-            chr_start: vec![0, chr_pad, n_genome],
+            chr_name: vec!["chr0".into(), "chr1".into()],
+            chr_length: vec![1000, 1000],
+            chr_start: vec![0, CHR_PAD, n_genome],
         }
     }
 
-    fn make_test_index() -> GenomeIndex {
-        let genome = make_test_genome();
-        let gstrand_bit = 32u32;
-        GenomeIndex {
-            genome,
-            suffix_array: SuffixArray {
-                data: PackedArray::new(33, 0),
-                gstrand_bit,
-                gstrand_mask: (1u64 << gstrand_bit) - 1,
-            },
-            sa_index: SaIndex {
-                nbases: 0,
-                genome_sa_index_start: vec![0],
-                data: PackedArray::new(35, 0),
-                word_length: 35,
-                gstrand_bit,
-            },
-            junction_db: SpliceJunctionDb::empty(),
-            transcriptome: None,
-            prepared_junctions: Vec::new(),
-            sjdb_overhang: 0,
-        }
+    fn slice(gn: &Genome, start: u64, len: usize) -> Vec<u8> {
+        (0..len as u64)
+            .map(|i| gn.get_base(start + i).unwrap())
+            .collect()
     }
 
-    fn make_transcript(
-        chr_idx: usize,
-        genome_start: u64,
-        genome_end: u64,
-        is_reverse: bool,
-    ) -> Transcript {
-        use cigar::op::{Kind, Op};
-        let read_len = (genome_end - genome_start) as usize;
+    fn rc(s: &[u8]) -> Vec<u8> {
+        s.iter().rev().map(|&b| comp(b)).collect()
+    }
+
+    fn params(extra: &[&str]) -> Parameters {
+        let mut args = vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--chimSegmentMin",
+            "12",
+        ];
+        args.extend_from_slice(extra);
+        Parameters::parse_from(args)
+    }
+
+    /// A one-block transcript at `g_start` with the given CIGAR.
+    fn tx(chr: usize, g_start: u64, cigar: &[(Kind, usize)], score: i32) -> Transcript {
+        let ops: Vec<Op> = cigar.iter().map(|&(k, l)| Op::new(k, l)).collect();
+        let g_len: usize = cigar
+            .iter()
+            .filter(|(k, _)| k.consumes_reference())
+            .map(|&(_, l)| l)
+            .sum();
         Transcript {
-            chr_idx,
-            genome_start,
-            genome_end,
-            is_reverse,
-            exons: vec![Exon {
-                genome_start,
-                genome_end,
-                read_start: 0,
-                read_end: read_len,
-                i_frag: 0,
-            }],
-            cigar: vec![Op::new(Kind::Match, read_len)],
-            score: read_len as i32,
-            n_mismatch: 0,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-        }
-    }
-
-    /// Helper to create a minimal SeedCluster for chimeric detection tests
-    fn make_test_cluster(
-        chr_idx: usize,
-        genome_start: u64,
-        genome_end: u64,
-        is_reverse: bool,
-    ) -> SeedCluster {
-        SeedCluster {
-            alignments: vec![WindowAlignment {
-                seed_idx: 0,
-                read_pos: 0,
-                length: (genome_end - genome_start) as usize,
-                genome_pos: genome_start,
-                sa_pos: genome_start,
-                n_rep: 1,
-                is_anchor: true,
-                mate_id: 2,
-                pre_ext_score: (genome_end - genome_start) as i32,
-            }],
-            chr_idx,
-            genome_start,
-            genome_end,
-            is_reverse,
-            anchor_idx: 0,
-            anchor_bin: 0,
-        }
-    }
-
-    #[test]
-    fn test_genomic_distance_same_chr() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(0, 1200, 1300, false);
-
-        assert_eq!(genomic_distance(&c1, &c2), 100);
-        assert_eq!(genomic_distance(&c2, &c1), 100);
-    }
-
-    #[test]
-    fn test_genomic_distance_overlapping() {
-        let c1 = make_test_cluster(0, 1000, 1200, false);
-        let c2 = make_test_cluster(0, 1100, 1300, false);
-
-        assert_eq!(genomic_distance(&c1, &c2), 0);
-    }
-
-    #[test]
-    fn test_genomic_distance_different_chr() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(1, 1000, 1100, false);
-
-        assert_eq!(genomic_distance(&c1, &c2), u64::MAX);
-    }
-
-    #[test]
-    fn test_is_chimeric_signature_different_chr() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(1, 1000, 1100, false);
-
-        assert!(is_chimeric_signature(&c1, &c2));
-    }
-
-    #[test]
-    fn test_is_chimeric_signature_strand_break() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(0, 1200, 1300, true);
-
-        assert!(is_chimeric_signature(&c1, &c2));
-    }
-
-    #[test]
-    fn test_is_chimeric_signature_large_distance() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(0, 2_000_000, 2_000_100, false);
-
-        assert!(is_chimeric_signature(&c1, &c2));
-    }
-
-    #[test]
-    fn test_is_chimeric_signature_close_same_strand() {
-        let c1 = make_test_cluster(0, 1000, 1100, false);
-        let c2 = make_test_cluster(0, 1200, 1300, false);
-
-        assert!(!is_chimeric_signature(&c1, &c2));
-    }
-
-    // --- transcript_to_segment tests ---
-
-    #[test]
-    fn test_transcript_to_segment_basic() {
-        let t = make_transcript(0, 1000, 1100, false);
-        let seg = transcript_to_segment(&t).unwrap();
-
-        assert_eq!(seg.chr_idx, 0);
-        assert_eq!(seg.genome_start, 1000);
-        assert_eq!(seg.genome_end, 1100);
-        assert!(!seg.is_reverse);
-        assert_eq!(seg.read_start, 0);
-        assert_eq!(seg.read_end, 100);
-        assert_eq!(seg.score, 100);
-    }
-
-    #[test]
-    fn test_transcript_to_segment_empty_returns_error() {
-        let t = Transcript {
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 0,
+            chr_idx: chr,
+            genome_start: g_start,
+            genome_end: g_start + g_len as u64,
             is_reverse: false,
-            exons: vec![],
-            cigar: vec![],
-            score: 0,
-            n_mismatch: 0,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-        };
-        assert!(transcript_to_segment(&t).is_err());
-    }
-
-    // --- detect_inter_mate_chimeric tests ---
-
-    fn params(args: &[&str]) -> Parameters {
-        let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
-        full_args.extend_from_slice(args);
-        Parameters::parse_from(full_args)
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_concordant_returns_none() {
-        // Normal FR pair on the same chromosome, close together → not chimeric
-        let params = params(&["--chimSegmentMin", "10"]);
-        let index = make_test_index();
-
-        let t1 = make_transcript(0, 10, 60, false); // mate1 forward
-        let t2 = make_transcript(0, 80, 130, true); // mate2 reverse, same chr, close
-        let read_seq = vec![0u8; 50];
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_different_chromosomes() {
-        let params = params(&["--chimSegmentMin", "10"]);
-        let index = make_test_index();
-
-        let t1 = make_transcript(0, 10, 60, false); // mate1 chr0
-        let t2 = make_transcript(1, 10, 60, true); // mate2 chr1
-        let read_seq = vec![0u8; 50];
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_some());
-        let chim = result.unwrap();
-        // Donor is the mate with earlier read_start (both 0 here; donor is t1 by read_start tie)
-        assert_ne!(chim.donor.chr_idx, chim.acceptor.chr_idx);
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_same_strand() {
-        // Both mates forward on the same chromosome → chimeric (strand break)
-        let params = params(&["--chimSegmentMin", "10"]);
-        let index = make_test_index();
-
-        let t1 = make_transcript(0, 10, 60, false); // mate1 forward
-        let t2 = make_transcript(0, 80, 130, false); // mate2 also forward (abnormal)
-        let read_seq = vec![0u8; 50];
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_too_far() {
-        // Opposite-strand pair but >1Mb apart → chimeric
-        let params = params(&["--chimSegmentMin", "10"]);
-        let index = make_test_index();
-
-        // Use large positions — out-of-bounds for sequence but score.rs guards handle this
-        let t1 = make_transcript(0, 10, 60, false);
-        let t2 = make_transcript(0, 2_000_000, 2_000_050, true);
-        let read_seq = vec![0u8; 50];
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_segment_too_short() {
-        // chimSegmentMin=100 but segments are only 20bp → None
-        let params = params(&["--chimSegmentMin", "100"]);
-        let index = make_test_index();
-
-        let t1 = make_transcript(0, 10, 30, false);
-        let t2 = make_transcript(1, 10, 30, true);
-        let read_seq = vec![0u8; 20];
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_inter_mate_chimeric_empty_exons_returns_none() {
-        let params = params(&["--chimSegmentMin", "10"]);
-        let index = make_test_index();
-        let read_seq = vec![0u8; 50];
-
-        let t1 = make_transcript(0, 10, 60, false);
-        let mut t2 = make_transcript(1, 10, 60, true);
-        t2.exons.clear();
-
-        let result = detect_inter_mate_chimeric(&t1, &t2, &read_seq, "read1", &params, &index);
-        assert!(result.is_none());
-    }
-
-    // --- detect_chimeric_old tests ---
-
-    fn make_read_seq(n: usize) -> Vec<u8> {
-        vec![0u8; n]
-    }
-
-    // Build a transcript with a soft-clip at one end: the exon covers [left_clip..read_len-right_clip].
-    fn make_clipped_transcript(
-        chr_idx: usize,
-        genome_start: u64,
-        is_reverse: bool,
-        read_len: usize,
-        left_clip: usize,
-        right_clip: usize,
-    ) -> Transcript {
-        use cigar::op::{Kind, Op};
-        let aligned_len = read_len - left_clip - right_clip;
-        let mut cigar = vec![];
-        if left_clip > 0 {
-            cigar.push(Op::new(Kind::SoftClip, left_clip));
-        }
-        cigar.push(Op::new(Kind::Match, aligned_len));
-        if right_clip > 0 {
-            cigar.push(Op::new(Kind::SoftClip, right_clip));
-        }
-        Transcript {
-            chr_idx,
-            genome_start,
-            genome_end: genome_start + aligned_len as u64,
-            is_reverse,
             exons: vec![Exon {
-                genome_start,
-                genome_end: genome_start + aligned_len as u64,
-                read_start: left_clip,
-                read_end: left_clip + aligned_len,
+                genome_start: g_start,
+                genome_end: g_start + g_len as u64,
+                read_start: 0,
+                read_end: g_len,
                 i_frag: 0,
             }],
-            cigar,
-            score: aligned_len as i32,
+            cigar: ops,
+            score,
             n_mismatch: 0,
             n_gap: 0,
             n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
+            junction_motifs: vec![SpliceMotif::GtAg],
+            junction_annotated: vec![false],
         }
     }
 
-    #[test]
-    fn test_detect_chimeric_old_no_chimera_single_transcript() {
-        // Only one transcript → no partner → None
-        let params = params(&["--chimSegmentMin", "20"]);
-        let index = make_test_index();
-        let read_len = 100usize;
-        let t1 = make_clipped_transcript(0, 50, false, read_len, 0, 0);
-        let read_seq = make_read_seq(read_len);
-        let result = detect_chimeric_old(
-            std::slice::from_ref(&t1),
-            &t1,
-            &read_seq,
-            "r",
-            &params,
-            &index,
-        )
-        .unwrap();
-        assert!(result.is_empty());
+    fn exon(gn: u64, r: usize, l: usize, frag: u8) -> ChimExon {
+        ChimExon { g: gn, r, l, frag }
+    }
+
+    fn wintr(exons: Vec<ChimExon>, canon_sj: Vec<i32>, score: i32) -> WinTr {
+        let n = canon_sj.len();
+        WinTr::build(0, 0, exons, canon_sj, vec![false; n], score, 1000).unwrap()
     }
 
     #[test]
-    fn test_detect_chimeric_old_inter_chr_pair() {
-        // Primary: covers read[0..80] on chr0; secondary: covers read[80..100] on chr1.
-        // With chimSegmentMin=20, scoreDropMax=20, scoreSeparation=10, this should produce a chimera.
-        let params = params(&[
-            "--chimSegmentMin",
-            "15",
-            "--chimScoreDropMax",
-            "100",
-            "--chimScoreSeparation",
-            "10",
-            "--chimJunctionOverhangMin",
-            "10",
-        ]);
-        let index = make_test_index();
-        let read_len = 100usize;
-        // Primary: chr0, read[0..80], right clip = 20
-        let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 20);
-        // Partner: chr1, read[80..100], left clip = 80
-        let t_partner = make_clipped_transcript(1, 0, false, read_len, 80, 0);
-
-        let all = vec![t_main.clone(), t_partner];
-        let result =
-            detect_chimeric_old(&all, &t_main, &read_seq_n(read_len), "r", &params, &index)
-                .unwrap();
-        // Should find a chimeric alignment
-        assert_eq!(result.len(), 1);
-        let chim = &result[0];
-        assert_ne!(chim.donor.chr_idx, chim.acceptor.chr_idx);
-    }
-
-    fn read_seq_n(n: usize) -> Vec<u8> {
-        vec![0u8; n]
-    }
-
-    #[test]
-    fn test_detect_chimeric_old_segment_too_short() {
-        // Segments are too short after chimSegmentMin filter
-        let params = params(&["--chimSegmentMin", "50", "--chimScoreDropMax", "100"]);
-        let index = make_test_index();
-        let read_len = 100usize;
-        let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 60); // 40 bp → < 50
-        let t_partner = make_clipped_transcript(1, 0, false, read_len, 60, 0); // 40 bp → < 50
-        let all = vec![t_main.clone(), t_partner];
-        let result =
-            detect_chimeric_old(&all, &t_main, &read_seq_n(read_len), "r", &params, &index)
-                .unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_detect_chimeric_old_score_drop_too_large() {
-        // Score drop is too large: chimScoreDropMax=5 means combined_score + 5 >= read_len=100
-        // combined_score = 50 + 50 - 0 = 100, 100 + 5 = 105 >= 100 → should pass
-        // But with drop=5, score = 40+40=80, 80+5=85 < 100 → should fail
-        let params = params(&[
-            "--chimSegmentMin",
-            "20",
-            "--chimScoreDropMax",
-            "5",
-            "--chimScoreSeparation",
-            "200", // suppress uniqueness filter
-        ]);
-        let index = make_test_index();
-        let read_len = 100usize;
-        let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 40); // 60 bp aligned
-        let t_partner = make_clipped_transcript(1, 0, false, read_len, 60, 0); // 40 bp aligned
-        // combined_score = 60 + 40 = 100, 100 + 5 = 105 >= 100 → OK, should pass
-        let all = vec![t_main.clone(), t_partner];
-        let result =
-            detect_chimeric_old(&all, &t_main, &read_seq_n(read_len), "r", &params, &index)
-                .unwrap();
-        // Score drop filter: 100 + 5 >= 100 → passes; uniqueness: score_separation=200, next=-inf → passes
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn test_detect_chimeric_old_diff_mates_waives_gap() {
-        // Combined read len 100, mate boundary at 50: mate1=[0..50), mate2=[50..100).
-        // Primary covers read[0..40] (mate1, chr0); partner covers read[60..100] (mate2, chr1).
-        // The 20bp inter-segment gap exceeds chimSegmentReadGapMax (0), so the standard
-        // gap check fails — but the segments are in different mates, so STAR's diffMates
-        // waives it. Without a mate boundary the chimera is rejected; with one it is found.
-        let params = params(&[
-            "--chimSegmentMin",
-            "15",
-            "--chimScoreDropMax",
-            "100",
-            "--chimScoreSeparation",
-            "200",
-            "--chimJunctionOverhangMin",
-            "10",
-        ]);
-        let index = make_test_index();
-        let read_len = 100usize;
-        let t_main = make_clipped_transcript(0, 0, false, read_len, 0, 60); // read[0..40], mate1
-        let t_partner = make_clipped_transcript(1, 0, false, read_len, 60, 0); // read[60..100], mate2
-        let all = vec![t_main.clone(), t_partner];
-        let read_seq = read_seq_n(read_len);
-
-        // No boundary (SE / per-mate pool): gap check enforced → rejected.
-        let without = detect_chimeric_old(&all, &t_main, &read_seq, "r", &params, &index).unwrap();
-        assert!(
-            without.is_empty(),
-            "gap check should reject without diffMates"
+    fn cigar_blocks_become_star_exons_with_gap_codes() {
+        // 5S10M2I10M3D10M100N10M5S: an insertion, a deletion and a GT/AG
+        // junction each end an exon, and each gap gets its own `canonSJ`.
+        let t = tx(
+            0,
+            1000,
+            &[
+                (Kind::SoftClip, 5),
+                (Kind::Match, 10),
+                (Kind::Insertion, 2),
+                (Kind::Match, 10),
+                (Kind::Deletion, 3),
+                (Kind::Match, 10),
+                (Kind::Skip, 100),
+                (Kind::Match, 10),
+                (Kind::SoftClip, 5),
+            ],
+            40,
         );
+        let (exons, gaps, _) = mate_blocks(&t, 0, 0);
+        assert_eq!(
+            exons,
+            vec![
+                exon(1000, 5, 10, 0),
+                exon(1010, 17, 10, 0),
+                exon(1023, 27, 10, 0),
+                exon(1133, 37, 10, 0),
+            ]
+        );
+        assert_eq!(gaps, vec![SJ_INSERTION, SJ_DELETION, 1]);
+    }
 
-        // Combined read with mate boundary at 50: diffMates waives the gap → chimera found.
-        let with =
-            detect_chimeric_old_impl(&all, &t_main, &read_seq, "r", &params, &index, Some(50))
-                .unwrap();
-        assert_eq!(with.len(), 1, "diffMates should waive the inter-mate gap");
-        assert_ne!(with[0].donor.chr_idx, with[0].acceptor.chr_idx);
+    #[test]
+    fn cigar_p_writes_the_mate_gap_and_its_clips() {
+        let fwd = vec![0u8; 21];
+        let read = ChimRead::new(&fwd, [10, 10], "r", [&[], &[]]);
+        // Mate1 clipped by 2 at the start, mate2 by 3 at the end, 22 bases apart.
+        let t = wintr(vec![exon(100, 2, 8, 0), exon(130, 11, 7, 1)], vec![-3], 10);
+        assert_eq!(cigar_p(&t, &read), "2S8M22p7M3S");
+        // A trailing clip on mate1 is `s1`, written before the `prm`.
+        let t = wintr(vec![exon(100, 2, 6, 0), exon(130, 11, 7, 1)], vec![-3], 10);
+        assert_eq!(cigar_p(&t, &read), "2S6M2S24p7M3S");
+        // Overlapping mates: the overlap only, and STAR drops both clips there.
+        let t = wintr(vec![exon(100, 2, 6, 0), exon(103, 13, 7, 1)], vec![-3], 10);
+        assert_eq!(cigar_p(&t, &read), "2S6M-3p7M1S");
+    }
+
+    #[test]
+    fn align_score_is_star_rescoring() {
+        let gn = genome();
+        let mut fwd = slice(&gn, 100, 60);
+        fwd[30] = comp(fwd[30]); // one mismatch
+        let read = ChimRead::new(&fwd, [60, 0], "r", [&fwd, &[]]);
+        let scorer = AlignmentScorer::from_params_minimal();
+        let t = wintr(vec![exon(100, 0, 60, 0)], vec![], 0);
+        // 59 matches - 1 mismatch, then ceil(log2(60) * -0.25 - 0.5) = -1.
+        assert_eq!(align_score(&t, &read, &gn, &scorer), 57);
+        // Split around a 40-base deletion: -2 open -2*40 per base (STAR
+        // defaults), and the genomic span grows to 100.
+        let t = wintr(
+            vec![exon(100, 0, 30, 0), exon(170, 30, 30, 0)],
+            vec![SJ_DELETION],
+            0,
+        );
+        let expected = (30 - 2 * 40 - 2) // first half matches, deletion
+            + slice(&gn, 170, 30)
+                .iter()
+                .zip(&fwd[30..])
+                .map(|(a, b)| if a == b { 1 } else { -1 })
+                .sum::<i32>()
+            + ((100f64).log2() * -0.25 - 0.5).ceil() as i32;
+        assert_eq!(align_score(&t, &read, &gn, &scorer), expected);
+    }
+
+    #[test]
+    fn window_dedup_follows_stitch_window_aligns() {
+        let w = |e: Vec<ChimExon>, s: i32| wintr(e, vec![], s);
+        let a = w(vec![exon(100, 0, 50, 0)], 50);
+        // Covered by `a` and scoring lower: never recorded.
+        let sub = w(vec![exon(110, 10, 30, 0)], 30);
+        // Unrelated diagonal: kept and ordered by score.
+        let other = w(vec![exon(500, 0, 40, 0)], 40);
+        let win = Windows::new(vec![vec![a.clone(), sub, other]], 100);
+        let scores: Vec<i32> = win.tr[0].iter().map(|t| t.max_score).collect();
+        assert_eq!(scores, vec![50, 40]);
+
+        // A later transcript that covers an earlier one evicts it, even when
+        // the earlier one scored higher (`uOld==0` has no score test).
+        let cover = w(vec![exon(100, 0, 60, 0)], 45);
+        let win = Windows::new(vec![vec![a, cover]], 100);
+        assert_eq!(win.tr[0].len(), 1);
+        assert_eq!(win.tr[0][0].max_score, 45);
+
+        // Equal scores: the shorter genomic span goes first.
+        let long = w(vec![exon(100, 0, 20, 0), exon(300, 20, 20, 0)], 40);
+        let short = w(vec![exon(600, 0, 40, 0)], 40);
+        let mut long = long;
+        long.canon_sj = vec![1];
+        long.sj_annot = vec![false];
+        let win = Windows::new(vec![vec![long, short.clone()]], 100);
+        assert_eq!(win.tr[0][0].exons, short.exons);
+    }
+
+    /// A single-end read, half chr0 and half chr1: the old detector pins the
+    /// better half and finds the other as its partner.
+    #[test]
+    fn old_path_reports_an_inter_chromosomal_se_chimera() {
+        let gn = genome();
+        let mut fwd = slice(&gn, 100, 60);
+        fwd.extend(slice(&gn, CHR_PAD + 500, 60));
+        let read = ChimRead::new(&fwd, [120, 0], "r", [&fwd, &[]]);
+        let prm = params(&[]);
+        let scorer = AlignmentScorer::from_params(&prm);
+        let a = tx(0, 100, &[(Kind::Match, 60), (Kind::SoftClip, 60)], 59);
+        let b = tx(
+            1,
+            CHR_PAD + 500,
+            &[(Kind::SoftClip, 60), (Kind::Match, 60)],
+            58,
+        );
+        let windows = vec![
+            vec![WinTr::single(&a, 0, 0, 0, 120).unwrap()],
+            vec![WinTr::single(&b, 0, 0, 0, 120).unwrap()],
+        ];
+        let out = chimeric_detection(windows, &read, &gn, &scorer, &prm);
+        assert_eq!(out.len(), 1);
+        let j = out[0].junction_line.as_ref().unwrap();
+        assert_eq!((j.donor_chr, j.acceptor_chr), (0, 1));
+        // chimJ0 is the first base past the donor, chimJ1 the base before the
+        // acceptor.
+        assert_eq!((j.donor_break, j.acceptor_break), (160, CHR_PAD + 499));
+        assert_eq!(j.donor_cigar, "60M60S");
+        assert_eq!(j.acceptor_cigar, "60S60M");
+        assert!(out[0].multimap.is_none());
+    }
+
+    /// Two equally good partners: `chimScoreNext + chimScoreSeparation >=
+    /// chimScoreBest`, so the old detector reports nothing.
+    #[test]
+    fn old_path_drops_an_ambiguous_partner() {
+        let gn = genome();
+        let mut fwd = slice(&gn, 100, 60);
+        fwd.extend(slice(&gn, CHR_PAD + 500, 60));
+        let read = ChimRead::new(&fwd, [120, 0], "r", [&fwd, &[]]);
+        let prm = params(&[]);
+        let scorer = AlignmentScorer::from_params(&prm);
+        let a = tx(0, 100, &[(Kind::Match, 60), (Kind::SoftClip, 60)], 59);
+        let b = tx(
+            1,
+            CHR_PAD + 500,
+            &[(Kind::SoftClip, 60), (Kind::Match, 60)],
+            58,
+        );
+        let b2 = tx(
+            1,
+            CHR_PAD + 800,
+            &[(Kind::SoftClip, 60), (Kind::Match, 60)],
+            58,
+        );
+        let windows = vec![
+            vec![WinTr::single(&a, 0, 0, 0, 120).unwrap()],
+            vec![WinTr::single(&b, 0, 0, 0, 120).unwrap()],
+            vec![WinTr::single(&b2, 0, 0, 0, 120).unwrap()],
+        ];
+        assert!(chimeric_detection(windows, &read, &gn, &scorer, &prm).is_empty());
+    }
+
+    /// Mates on two chromosomes bracket the junction: STAR's `chimMotif = -1`
+    /// branch, with no scan, and each segment printed as its own mate.
+    #[test]
+    fn pe_mates_bracketing_the_junction_are_type_minus_one() {
+        let gn = genome();
+        let m1 = slice(&gn, 100, 60);
+        let m2_rc = slice(&gn, CHR_PAD + 500, 60); // RC(mate2) maps forward
+        let m2 = rc(&m2_rc);
+        let mut fwd = m1.clone();
+        fwd.push(11);
+        fwd.extend(&m2_rc);
+        let read = ChimRead::new(&fwd, [60, 60], "r", [&m1, &m2]);
+        let prm = params(&[]);
+        let scorer = AlignmentScorer::from_params(&prm);
+        let a = tx(0, 100, &[(Kind::Match, 60)], 59);
+        let b = tx(1, CHR_PAD + 500, &[(Kind::Match, 60)], 59);
+        let windows = vec![
+            vec![WinTr::single(&a, 0, 0, 0, 121).unwrap()],
+            vec![WinTr::single(&b, 0, 61, 1, 121).unwrap()],
+        ];
+        let out = chimeric_detection(windows, &read, &gn, &scorer, &prm);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].junction_type, -1);
+        let j = out[0].junction_line.as_ref().unwrap();
+        assert_eq!((j.donor_break, j.acceptor_break), (160, CHR_PAD + 499));
+        assert_eq!(
+            (j.donor_cigar.as_str(), j.acceptor_cigar.as_str()),
+            ("60M", "60M")
+        );
+    }
+
+    /// `--chimMultimapNmax` re-scores each stitched chimera with `alignScore`
+    /// and reports the run-level columns.
+    #[test]
+    fn mult_path_rescores_and_reports_context() {
+        let gn = genome();
+        let mut fwd = slice(&gn, 100, 60);
+        fwd.extend(slice(&gn, CHR_PAD + 500, 60));
+        let read = ChimRead::new(&fwd, [120, 0], "r", [&fwd, &[]]);
+        let prm = params(&["--chimMultimapNmax", "10"]);
+        let scorer = AlignmentScorer::from_params(&prm);
+        let a = tx(0, 100, &[(Kind::Match, 60), (Kind::SoftClip, 60)], 59);
+        let b = tx(
+            1,
+            CHR_PAD + 500,
+            &[(Kind::SoftClip, 60), (Kind::Match, 60)],
+            59,
+        );
+        let windows = vec![
+            vec![WinTr::single(&a, 0, 0, 0, 120).unwrap()],
+            vec![WinTr::single(&b, 0, 0, 0, 120).unwrap()],
+        ];
+        let out = chimeric_detection(windows, &read, &gn, &scorer, &prm);
+        assert_eq!(out.len(), 1);
+        let m = out[0].multimap.unwrap();
+        // Two exact 60-base blocks score 60 - 1 each after the span penalty;
+        // a non-GT/AG junction costs `chimScoreJunctionNonGTAG` (-1) more.
+        let expected = if out[0].junction_type == 0 { 117 } else { 118 };
+        assert_eq!(m.chim_score, expected);
+        assert_eq!(
+            (m.chim_n, m.max_possible_score, m.max_non_chim_score),
+            (1, 120, 59)
+        );
     }
 }
