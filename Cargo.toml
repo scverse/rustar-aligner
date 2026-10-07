@@ -46,7 +46,7 @@ chrono = "0.4"
 tempfile = "3"
 bitflags = { version = "2.12.1", features = ["std"] }
 shlex = "2.0.1"
-caps-sa = "0.6"
+caps-sa = "0.7"
 # mimalloc as the global allocator. Two reasons:
 #   1. **Memory return**: glibc malloc creates one arena per worker
 #      thread (rayon spawns ~num_cpus workers + sub-threads) and

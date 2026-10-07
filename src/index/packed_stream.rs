@@ -226,6 +226,6 @@ mod tests {
         let mut got: Vec<u8> = Vec::new();
         let sw = PackedStreamWriter::new(&mut got, 33);
         let _w = sw.finish().unwrap();
-        assert!(got.is_empty());
+        assert_eq!(got, []);
     }
 }

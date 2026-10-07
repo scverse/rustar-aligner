@@ -343,7 +343,18 @@ impl Genome {
     /// - `chrStart.txt` — chromosome start positions + final n_genome entry
     /// - `chrNameLength.txt` — tab-separated name + length
     /// - `genomeParameters.txt` — key-value pairs of genome generation parameters
-    pub fn write_index_files(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+    ///
+    /// `effective_sjdb_overhang` is the overhang actually baked into the
+    /// genome (STAR's `mapGen.sjdbOverhang`): `params.sjdb_overhang` when
+    /// sjdb junctions were inserted, `0` when the index has no sjdb —
+    /// STAR writes the effective value, not the parameter, into
+    /// `genomeParameters.txt`, and its loader trusts it at align time.
+    pub fn write_index_files(
+        &self,
+        dir: &Path,
+        params: &Parameters,
+        effective_sjdb_overhang: u32,
+    ) -> Result<(), Error> {
         use std::fs;
         use std::io::Write;
 
@@ -393,7 +404,7 @@ impl Genome {
         // trailing whitespace on vector values). STAR's loader reads these
         // keys via `<<` streaming; the leading `###` comment lines are
         // skipped.
-        self.write_genome_parameters_txt(dir, params)?;
+        self.write_genome_parameters_txt(dir, params, effective_sjdb_overhang)?;
 
         // --genomeTransformType Haploid: the block map for reverse conversion.
         if let Some(blocks) = &self.transform_blocks {
@@ -405,40 +416,42 @@ impl Genome {
         Ok(())
     }
 
-    fn write_genome_parameters_txt(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+    fn write_genome_parameters_txt(
+        &self,
+        dir: &Path,
+        params: &Parameters,
+        effective_sjdb_overhang: u32,
+    ) -> Result<(), Error> {
         use std::fs;
         use std::io::Write;
 
         let path = dir.join("genomeParameters.txt");
         let mut f = fs::File::create(&path).map_err(|e| Error::io(e, &path))?;
 
-        // STAR writes: `### <commandLineFull>\n` where commandLineFull is
-        // "<argv[0]>   --<name1> <val1>   --<name2> <val2> ...".  We emit
-        // the same skeleton using our known-at-invocation parameters.
-        // Not exposed for retrospective exact-byte match against an arbitrary
-        // STAR run's commandLineFull — see `DIVERGENCE.md` (§3.1) for the short
-        // list of parameters we echo.
-        let fasta_list = params
-            .genome_fasta_files
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let gtf = params
-            .sjdb_gtf_file
-            .as_ref()
-            .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-        writeln!(
-            f,
-            "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}      --genomeSAindexNbases {sai}   --sjdbGTFfile {gtf}   --sjdbOverhang {ov}",
-            thr = params.run_thread_n,
-            dir = dir.display(),
-            fa = fasta_list,
-            sai = params.genome_sa_index_nbases,
-            gtf = gtf,
-            ov = params.sjdb_overhang,
-        )
-        .map_err(|e| Error::io(e, &path))?;
+        // STAR writes: `### <commandLineFull>\n` — an echo of the actual
+        // invocation. Emit the real command line (STAR's loader skips
+        // `###` comment lines, and byte-matching an arbitrary STAR run's
+        // argv is impossible anyway — see `DIVERGENCE.md` §3.1); fall
+        // back to a parameter skeleton for callers constructed without
+        // a command line.
+        if let Some(cmd) = params.command_line.as_deref() {
+            writeln!(f, "### {cmd}").map_err(|e| Error::io(e, &path))?;
+        } else {
+            let fasta_list = params
+                .genome_fasta_files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(
+                f,
+                "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}",
+                thr = params.run_thread_n,
+                dir = dir.display(),
+                fa = fasta_list,
+            )
+            .map_err(|e| Error::io(e, &path))?;
+        }
 
         // GstrandBit: floor(log2(nGenome + limitSjdbInsertNsj*sjdbLength))+1,
         // clamped at a minimum of 32. STAR's default limitSjdbInsertNsj is
@@ -469,7 +482,7 @@ impl Genome {
         writeln!(f, "genomeTransformType\tNone").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "genomeTransformVCF\t-").map_err(|e| Error::io(e, &path))?;
 
-        writeln!(f, "sjdbOverhang\t{}", params.sjdb_overhang).map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbOverhang\t{effective_sjdb_overhang}").map_err(|e| Error::io(e, &path))?;
 
         // sjdbFileChrStartEnd: empty vector → `-` plus STAR's trailing space.
         writeln!(f, "sjdbFileChrStartEnd\t- ").map_err(|e| Error::io(e, &path))?;

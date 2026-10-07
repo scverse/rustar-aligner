@@ -13,6 +13,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- Production genome indexing now enables caps-sa 0.7's bounded geometric LCP
+  memoization through its stable policy API. On the complete ruSTAR-shaped
+  GRCh38 plus GENCODE v50 fixture (6.56 billion symbols, 6.18 billion retained
+  suffixes, 1.40 million segments, 32 physical cores), the final caps-sa 0.7
+  implementation built the SA in 172.953 s versus 267.592 s for its original
+  0.7 baseline: 35.4% faster, with peak RSS reduced from 10,512,408 to
+  9,169,892 KiB. The complete output hash was unchanged.
+
 - `cluster_seeds` reuses its window-bin map across reads on a thread instead
   of rebuilding it per read. Merging two windows re-keys every bin in the
   merged span, so the per-read pre-sizing was only a floor and the map
@@ -169,6 +177,21 @@ Sections commonly used: Features, Bug fixes, Other changes.
   union: they came from one molecule. Writes `matrix.mtx`,
   `features.tsv` and `transcriptEndDistanceDistribution.txt` under
   `Solo.out/Transcript3p/raw/`.
+- **Chimeric multimapping detection (`--chimMultimapNmax`)**, STAR's
+  newer enumeration path. Instead of pinning the best transcript and
+  looking for one partner, it walks every transcript pair, keeps those
+  within `--chimMultimapScoreRange` of the best chimeric score, and
+  reports them all. A read whose fusion partner maps equally well to two
+  places yields two junctions rather than an arbitrary one.
+  `--chimNonchimScoreDropMin` gates the search on the linear alignment
+  leaving enough of the read unexplained, and a read with more surviving
+  loci than the cap reports none at all, as STAR does. The default of 0
+  keeps the old single-best path.
+
+- **`--chimFilter banGenomicN`** (STAR's default) drops a chimeric
+  junction whose flanking genomic bases are not real bases: sequence
+  around an assembly gap yields junctions that look clean by score and
+  mean nothing. `--chimFilter None` keeps everything.
 
 ### Bug fixes
 
