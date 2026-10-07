@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(quality_split(&read, 14), vec![(0, 14)]);
 
         // Above both and the read is not seeded at all — STAR's `uT:A:0`.
-        assert!(quality_split(&read, 15).is_empty());
+        assert_eq!(quality_split(&read, 15), []);
     }
 
     /// The boundary is inclusive: STAR skips a run only when it is *shorter*
@@ -844,7 +844,7 @@ mod tests {
     fn quality_split_keeps_a_run_of_exactly_seed_split_min() {
         let read = vec![2u8; 12];
         assert_eq!(quality_split(&read, 12), vec![(0, 12)]);
-        assert!(quality_split(&read, 13).is_empty());
+        assert_eq!(quality_split(&read, 13), []);
     }
 
     /// Leading and trailing `N` are skipped rather than included.
@@ -995,7 +995,7 @@ mod tests {
 
         // Get positions for first seed
         let positions = seeds[0].get_genome_positions(&index);
-        assert!(!positions.is_empty());
+        assert_ne!(positions, []);
 
         // Should have at least one valid position
         for (pos, _is_reverse) in positions {

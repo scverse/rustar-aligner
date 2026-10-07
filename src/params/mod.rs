@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 /// Parse a memory string into bytes. Accepts plain integers or a suffix:
 /// K/k = ×1024, M/m = ×1024², G/g = ×1024³, T/t = ×1024⁴.
@@ -1517,11 +1517,12 @@ impl Parameters {
         args: impl IntoIterator<Item = T>,
     ) -> Self {
         Self::try_parse_from(args).unwrap_or_else(|e| {
-            if cfg!(test) {
-                panic!("{e}")
-            } else {
-                e.format(&mut <Self as CommandFactory>::command()).exit()
-            }
+            // Tests panic with the message instead of exiting the process.
+            #[cfg(test)]
+            panic!("{e}");
+            #[cfg(not(test))]
+            e.format(&mut <Self as clap::CommandFactory>::command())
+                .exit();
         })
     }
 
