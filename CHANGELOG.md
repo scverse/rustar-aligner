@@ -13,6 +13,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
+  direct `noodles-bgzf` dependency exists only to enable its `libdeflate`
+  feature; bumping one without the other puts two copies in the tree, and
+  noodles then writes BAM through the copy without libdeflate. BAM output is
+  byte-identical before and after. (0.117 needs Rust 1.91, above the 1.89 MSRV.)
+
 - Production genome indexing now enables caps-sa 0.7's bounded geometric LCP
   memoization through its stable policy API. On the complete ruSTAR-shaped
   GRCh38 plus GENCODE v50 fixture (6.56 billion symbols, 6.18 billion retained
@@ -20,6 +26,7 @@ Sections commonly used: Features, Bug fixes, Other changes.
   implementation built the SA in 172.953 s versus 267.592 s for its original
   0.7 baseline: 35.4% faster, with peak RSS reduced from 10,512,408 to
   9,169,892 KiB. The complete output hash was unchanged.
+
 - The splice-junction sorts that produce `SJ.out.tab`, the `SJ` solo-feature
   rows and the `BySJout` survivor set now order on the whole key (chromosome,
   start, end, strand, motif) rather than on coordinates alone. The counts come
@@ -28,6 +35,7 @@ Sections commonly used: Features, Bug fixes, Other changes.
   that differs between runs or thread counts. `tests/determinism.rs` locks it:
   the same reads at one and at eight threads, and two runs at eight threads,
   produce byte-identical output in single-pass and two-pass mode. Answers #210.
+
 - `cluster_seeds` reuses its window-bin map across reads on a thread instead
   of rebuilding it per read. Merging two windows re-keys every bin in the
   merged span, so the per-read pre-sizing was only a floor and the map
@@ -72,12 +80,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
   bucket was permanently zero. On the nf-core/rnaseq test data (50 000 pairs,
   yeast chrI + GFP) this moves rustar from `too short 7374 / other 0` to
   `too short 3778 / other 3596`, against STAR's `3766 / 3609`. Closes #48.
+
 - `--soloBarcodeMate 1` no longer runs without clipping. The flag says the
   barcode lives inside mate 1, and nothing else says how many bases that is,
   so STAR refuses the run unless the mate is clipped
   (`ParametersSolo.cpp:145-150`). Without the check the CB+UMI prefix was
   aligned as if it were cDNA (28 bases of it for 10x v3) and the run reported
   nothing. Closes #227.
+
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
 
