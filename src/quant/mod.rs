@@ -803,7 +803,7 @@ mod tests {
 
         // Read in gap between exons
         let t = make_transcript(0, 250, 290, false);
-        assert!(ann.overlapping_genes(&t).is_empty());
+        assert_eq!(ann.overlapping_genes(&t), []);
     }
 
     #[test]

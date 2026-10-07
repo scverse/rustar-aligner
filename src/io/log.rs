@@ -135,6 +135,76 @@ pub fn write_log_out(
     Ok(())
 }
 
+/// Write a STAR-shaped `Log.out` for `genomeGenerate`.
+///
+/// STAR writes its run log to `<outFileNamePrefix>Log.out` during
+/// `genomeGenerate` and copies it into the genome directory at the end
+/// (`genomeGenerate.cpp`), so a STAR-built index directory always
+/// contains a `Log.out`. The content is a free-form run log (timestamps,
+/// disk-space notes) that can never byte-match across runs; this mirrors
+/// the structure — version header, command-line/parameter sections, and
+/// the final `DONE: Genome generation, EXITING` line — so tooling that
+/// expects the file finds a familiar shape.
+pub fn write_genome_generate_log(
+    path: &Path,
+    params: &Parameters,
+    time_start: chrono::DateTime<chrono::Local>,
+    time_finish: chrono::DateTime<chrono::Local>,
+) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut out = BufWriter::new(file);
+
+    let short_fmt = "%b %e %H:%M:%S"; // "Feb 10 17:11:26"
+
+    writeln!(out, "STAR version={}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(
+        out,
+        "STAR compilation time,server,dir={} :",
+        time_start.format("%Y-%m-%dT%H:%M:%S%:z")
+    )?;
+    writeln!(out, "STAR git: ")?;
+
+    let cmd = params.command_line.as_deref().unwrap_or("");
+    let pairs = cli_params(cmd);
+
+    writeln!(out, "##### Command Line:")?;
+    writeln!(out, "{cmd}")?;
+
+    writeln!(out, "###### All USER parameters from Command Line:")?;
+    for (k, v) in &pairs {
+        writeln!(out, "{k:<30}{v}     ~RE-DEFINED")?;
+    }
+    writeln!(out, "##### Finished reading parameters from all sources")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "##### Final user re-defined parameters-----------------:"
+    )?;
+    for (k, v) in &pairs {
+        writeln!(out, "{k:<34}{v}")?;
+    }
+    writeln!(out)?;
+    writeln!(out, "-------------------------------")?;
+    writeln!(out, "##### Final effective command line:")?;
+    writeln!(out, "{cmd}")?;
+    writeln!(out, "----------------------------------------")?;
+    writeln!(out)?;
+
+    writeln!(
+        out,
+        "{} ... starting to generate Genome files",
+        time_start.format(short_fmt)
+    )?;
+    writeln!(
+        out,
+        "{} ..... finished successfully",
+        time_finish.format(short_fmt)
+    )?;
+    writeln!(out, "DONE: Genome generation, EXITING")?;
+
+    Ok(())
+}
+
 /// Write STAR-compatible `Log.progress.out`.
 ///
 /// STAR updates this file periodically during alignment; for short runs (and

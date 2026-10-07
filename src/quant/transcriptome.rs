@@ -572,10 +572,9 @@ impl TranscriptomeIndex {
                 ));
             }
         }
-        // STAR sorts by sjStart only (funCompareUint2 on the first uint64).
-        // Keep it stable so gene list order across duplicates matches
-        // transcript-insertion order.
-        junctions.sort_by_key(|&(s, _, _, _, _)| s);
+        // STAR sorts by (sjStart, sjEnd) — `funCompareUint2` compares TWO
+        // uint64s (`GTF_transcriptGeneSJ.cpp:140`).
+        junctions.sort_by_key(|&(s, e, _, _, _)| (s, e));
 
         let strand_char = |s: u8| match s {
             1 => '+',
@@ -583,38 +582,42 @@ impl TranscriptomeIndex {
             _ => '.',
         };
 
-        // Dedup pass: merge genes across identical (chr, start, end, strand).
+        // Collapse pass (`GTF_transcriptGeneSJ.cpp:145-158`): a new output
+        // row starts whenever (start, end, strand) differs from the
+        // PREVIOUS sorted entry; otherwise the gene joins the current
+        // row's gene set. STAR stores genes in a `std::set`, so the
+        // comma-joined list is ascending and duplicate-free.
         let mut i = 0;
         while i < junctions.len() {
             let (sj_start, sj_end, chr_idx, strand, gene1) = junctions[i];
+            let mut genes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            genes.insert(gene1);
+            let mut j = i + 1;
+            while j < junctions.len() {
+                let (s2, e2, _c2, st2, g2) = junctions[j];
+                if s2 == sj_start && e2 == sj_end && st2 == strand {
+                    genes.insert(g2);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+
             let chr_offset = genome.chr_start[chr_idx];
             let start_1based = sj_start + 1 - chr_offset;
             let end_1based = (sj_end + 1) - chr_offset;
             write!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}",
                 genome.chr_name[chr_idx],
                 start_1based,
                 end_1based,
                 strand_char(strand),
-                gene1
             )
             .map_err(|e| Error::io(e, &path))?;
-
-            // Append genes from subsequent entries with the same key.
-            let mut j = i + 1;
-            let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-            seen.insert(gene1);
-            while j < junctions.len() {
-                let (s2, e2, c2, st2, g2) = junctions[j];
-                if s2 == sj_start && e2 == sj_end && c2 == chr_idx && st2 == strand {
-                    if seen.insert(g2) {
-                        write!(out, ",{g2}").map_err(|e| Error::io(e, &path))?;
-                    }
-                    j += 1;
-                } else {
-                    break;
-                }
+            for (k, g) in genes.iter().enumerate() {
+                let sep = if k == 0 { '\t' } else { ',' };
+                write!(out, "{sep}{g}").map_err(|e| Error::io(e, &path))?;
             }
             writeln!(out).map_err(|e| Error::io(e, &path))?;
             i = j;

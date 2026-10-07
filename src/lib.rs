@@ -108,6 +108,8 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
     }
 
+    let time_start = chrono::Local::now();
+
     info!("Building genome index (streaming SA + on-the-fly SAindex)...");
     // Streaming path: opens SA file early, packs each caps-sa emit
     // directly to disk + into the SAindex builder, never holding the
@@ -136,6 +138,29 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
         GenomeIndex::generate_streaming(&orig_params)?;
     }
+
+    // STAR writes `Log.out` to `<outFileNamePrefix>` during genomeGenerate
+    // and copies it into the genome directory at the end, so a STAR-built
+    // index directory always contains one; mirror that. The genomeDir copy
+    // is a second independent write, not `fs::copy` from the prefix file:
+    // concurrent genomeGenerate processes sharing a working directory (the
+    // integration-test harness does this) race on `<prefix>Log.out`, and on
+    // Windows `CopyFileEx` opens its source without write sharing, turning
+    // that race into a sharing-violation error (os error 32). Two plain
+    // creates use share-all flags and cannot collide.
+    let time_finish = chrono::Local::now();
+    crate::io::log::write_genome_generate_log(
+        &params.output_path("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
+    crate::io::log::write_genome_generate_log(
+        &params.genome_dir.join("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
 
     info!("Genome generation complete!");
     Ok(())
@@ -1424,7 +1449,10 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -1607,6 +1635,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 chim_writer.write_alignment(
                                     chim_aln,
                                     &index.genome.chr_name,
+                                    &index.genome.chr_start,
                                     &chim_aln.read_name,
                                 )?;
                             }
@@ -1673,6 +1702,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     chim_writer.write_alignment(
                                         chim_aln,
                                         &index.genome.chr_name,
+                                        &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
                                 }
@@ -2764,7 +2794,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -2934,6 +2967,20 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         if let Some(ref mut tw) = tr_writer {
                             tw.write_batch(&batch.transcriptome_records)?;
                         }
+                        // Chimeric.out.junction. The writer was created and
+                        // flushed here but never written to, so a PE run reported
+                        // chimeric reads in Log.final.out and left the junction
+                        // file empty.
+                        if let Some(ref mut chim_writer) = chimeric_writer {
+                            for chim_aln in &batch.chimeric_alns {
+                                chim_writer.write_alignment(
+                                    chim_aln,
+                                    &index.genome.chr_name,
+                                    &index.genome.chr_start,
+                                    &chim_aln.read_name,
+                                )?;
+                            }
+                        }
                         if params.chim_out_within_bam() {
                             use crate::chimeric::build_within_bam_records;
                             for chim_aln in &batch.chimeric_alns {
@@ -2993,6 +3040,16 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             writer.write_batch(&records)?;
                             if let Some(ref mut tw) = tr_writer {
                                 tw.write_batch(&meta.transcriptome_records)?;
+                            }
+                            if let Some(ref mut chim_writer) = chimeric_writer {
+                                for chim_aln in &meta.chimeric_alns {
+                                    chim_writer.write_alignment(
+                                        chim_aln,
+                                        &index.genome.chr_name,
+                                        &index.genome.chr_start,
+                                        &chim_aln.read_name,
+                                    )?;
+                                }
                             }
                             if params.chim_out_within_bam() {
                                 use crate::chimeric::build_within_bam_records;

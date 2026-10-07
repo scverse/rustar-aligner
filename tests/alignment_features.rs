@@ -102,7 +102,12 @@ fn build_index(fasta: &Path, genome_dir: &Path, sa_nbases: &str, gtf: Option<&Pa
         .arg("--genomeFastaFiles")
         .arg(fasta)
         .arg("--genomeSAindexNbases")
-        .arg(sa_nbases);
+        .arg(sa_nbases)
+        // Per-test prefix: genomeGenerate writes `<prefix>Log.out`, and the
+        // default `./` prefix would make concurrently running test
+        // processes share one file in the crate directory.
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"));
     if let Some(g) = gtf {
         cmd.arg("--sjdbGTFfile")
             .arg(g)
@@ -2203,4 +2208,187 @@ fn test_read_name_separator_cuts_the_qname_and_is_configurable() {
             "--readNameSeparator - should keep the whole name, got {qname}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test — qualitySplit / --seedSplitMin
+// ---------------------------------------------------------------------------
+
+/// Read (QNAME, FLAG, CIGAR, AS) for each record in an Aligned.out.sam.
+fn sam_flags_by_name(sam_path: &Path) -> Vec<(String, u16, String, i32)> {
+    fs::read_to_string(sam_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let score = f
+                .iter()
+                .find_map(|t| t.strip_prefix("AS:i:"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            (
+                f[0].to_string(),
+                f[1].parse().unwrap(),
+                f[5].to_string(),
+                score,
+            )
+        })
+        .collect()
+}
+
+/// A seed must not be allowed to run through a genomic `N`, and a read whose
+/// only run of real bases is shorter than `--seedSplitMin` must not be seeded.
+///
+/// Both sides encode `N` as 4, so an MMP comparing bases for equality will
+/// happily match a read `N` against an assembly gap. STAR forecloses that by
+/// splitting the read on `N` before the search
+/// (`qualitySplit`, `SequenceFuns.cpp:411`) and skipping runs below
+/// `seedSplitMin`; a read left with no run at all is reported `uT:A:0`.
+///
+/// The genome here carries a planted 60 bp `N` run, and the reads carry the
+/// *original* bases at those coordinates — so the read is real sequence while
+/// the genome is a gap. That separates this from a read that merely contains
+/// `N`, which is unmappable for the ordinary reason.
+#[test]
+fn test_seed_split_min_bans_seeds_that_span_genomic_n() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut genome = build_genome();
+
+    // A 50 bp gap, with the read's real bases drawn from just *past* it. Both
+    // halves of the read then have something to match: the 50 `N` match the gap
+    // base for base (4 == 4 on both sides) and the 10-base tail matches real
+    // sequence. Drawing the tail from inside the gap instead leaves it with no
+    // real genome to align to, and the read is rejected for an unrelated reason.
+    let gap_start = 5000usize;
+    let gap_len = 50usize;
+    let tail: Vec<u8> = genome[gap_start + gap_len..gap_start + gap_len + 10].to_vec();
+    genome[gap_start..gap_start + gap_len].fill(b'N');
+
+    // A second, narrower gap with 30 real bases either side, for a read that
+    // spans it with a good run on both flanks.
+    let span_gap_start = 4000usize;
+    let span_left: Vec<u8> = genome[span_gap_start - 30..span_gap_start].to_vec();
+    let span_right: Vec<u8> = genome[span_gap_start + 20..span_gap_start + 50].to_vec();
+    genome[span_gap_start..span_gap_start + 20].fill(b'N');
+
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let fastq_path = tmpdir.path().join("gap_reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        let mut emit = |name: &str, seq: &[u8]| {
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "+").unwrap();
+            writeln!(f, "{}", "I".repeat(seq.len())).unwrap();
+        };
+
+        // 50 read-`N` then the 10 real bases. The genome is `N` under the first
+        // 50, so a base-equality MMP matches all 60 and maps this as
+        // `chr1:5001 60M AS:i:59`; the 10-base tail on its own is below
+        // seedSplitMin=12, so STAR seeds nothing and reports `uT:A:0`.
+        let mut over_gap = vec![b'N'; gap_len];
+        over_gap.extend_from_slice(&tail);
+        emit("over_gap", &over_gap);
+
+        // Control: ordinary read from clean sequence, must still map.
+        emit("clean", &genome[8000..8060]);
+
+        // 10 read-`N` then 50 real bases off clean sequence. The `N` run is
+        // below seedSplitMin and skipped, but the 50-base run clears it, so the
+        // read must still map — the split skips bad runs, it does not give up
+        // on a read for containing `N`.
+        let mut n_prefix = vec![b'N'; 10];
+        n_prefix.extend_from_slice(&genome[8200..8250]);
+        emit("n_prefix_long", &n_prefix);
+
+        // 30 real | 20 N | 30 real, straddling the narrower gap. Both flanks
+        // clear seedSplitMin, so this maps either way — but the MMP must stop
+        // at the edge of each good run. Let it run on and the seed swallows the
+        // 20 `N`, which then score as matches.
+        let mut span = span_left.clone();
+        span.extend(std::iter::repeat_n(b'N', 20));
+        span.extend_from_slice(&span_right);
+        emit("span_gap", &span);
+    }
+
+    let run = |args: &[&str], out: &str| -> PathBuf {
+        let output_dir = tmpdir.path().join(out);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        let mut cmd = cargo_bin_cmd!("rustar-aligner");
+        cmd.args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "SAM",
+            "--outSAMunmapped",
+            "Within",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .args(args)
+        .assert()
+        .success();
+        output_dir.join("Aligned.out.sam")
+    };
+
+    let flags = sam_flags_by_name(&run(&[], "out_default"));
+    let rec_of = |name: &str, recs: &[(String, u16, String, i32)]| -> (u16, String, i32) {
+        recs.iter()
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, f, c, s)| (*f, c.clone(), *s))
+            .unwrap_or_else(|| panic!("{name} missing from SAM; got {recs:?}"))
+    };
+    let flag_of = |name: &str, recs: &[(String, u16, String, i32)]| -> u16 { rec_of(name, recs).0 };
+
+    assert_eq!(
+        flag_of("over_gap", &flags) & 0x4,
+        0x4,
+        "a read whose only real run is 10 bases must not be seeded across the \
+         genomic N run — this is the case that mapped as full-length 60M before \
+         qualitySplit existed"
+    );
+    assert_eq!(
+        flag_of("clean", &flags) & 0x4,
+        0,
+        "a read from clean sequence must still map"
+    );
+
+    assert_eq!(
+        flag_of("n_prefix_long", &flags) & 0x4,
+        0,
+        "a read with a short leading N run but a 50-base good run must still map"
+    );
+
+    // Verified against STAR 2.7.11b on this same synthetic genome: it reports
+    // `80M AS:i:58`. The 20 `N` contribute nothing (`if (G<4 && R<4)`), so an
+    // MMP allowed to run past the end of a good run scores them as matches and
+    // lands on AS:i:78 instead.
+    let (span_flag, span_cigar, span_score) = rec_of("span_gap", &flags);
+    assert_eq!(span_flag & 0x4, 0, "span_gap must map");
+    assert_eq!(span_cigar, "80M");
+    assert_eq!(
+        span_score, 58,
+        "the MMP must stop at the edge of each good run, so the 20 N score \
+         nothing; AS:i:78 means the seed ran through the gap"
+    );
+
+    // The threshold is the flag, not a constant: raising it past the good run
+    // unmaps reads that map at the default, which rules out the gate being
+    // hardcoded to the N case.
+    let flags_high = sam_flags_by_name(&run(&["--seedSplitMin", "61"], "out_high"));
+    assert_eq!(
+        flag_of("clean", &flags_high) & 0x4,
+        0x4,
+        "--seedSplitMin 61 leaves no qualifying run in a 60-base read"
+    );
 }

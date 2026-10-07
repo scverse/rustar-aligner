@@ -201,15 +201,27 @@ pub fn extract_junctions_configured(
             let exon1 = &exons[i];
             let exon2 = &exons[i + 1];
 
-            let intron_start_local_1b = exon1.end + 1;
-            let intron_end_local_1b = exon2.start.saturating_sub(1);
-
-            if intron_end_local_1b <= intron_start_local_1b {
-                log::warn!(
-                    "Invalid junction coordinates: {intron_start_local_1b}-{intron_end_local_1b} (possibly overlapping exons)"
-                );
+            // STAR (`GTF_transcriptGeneSJ.cpp:123-134`): touching exons
+            // (`exS <= exE+1`) silently produce no junction; overlapping
+            // exons (`exS <= exE`) additionally warn. Anything else is a
+            // junction — including 1-base introns (`exS == exE+2`), which
+            // STAR keeps.
+            if exon2.start <= exon1.end + 1 {
+                if exon2.start <= exon1.end {
+                    log::warn!(
+                        "Overlapping exons in GTF: {}:{}-{} and {}-{}",
+                        exon1.seqname,
+                        exon1.start,
+                        exon1.end,
+                        exon2.start,
+                        exon2.end
+                    );
+                }
                 continue;
             }
+
+            let intron_start_local_1b = exon1.end + 1;
+            let intron_end_local_1b = exon2.start - 1;
 
             let intron_start = chr_off + intron_start_local_1b - 1;
             let intron_end = chr_off + intron_end_local_1b - 1;
