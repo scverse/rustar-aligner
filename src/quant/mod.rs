@@ -25,6 +25,10 @@ use crate::junction::gtf::GtfRecord;
 // ---------------------------------------------------------------------------
 
 /// Per-gene annotation built from GTF exon records.
+///
+/// `Default` is the empty annotation, no genes, no intervals, used by runs
+/// that need a solo context without a gene model (`--soloType CB_samTagOut`).
+#[derive(Default)]
 pub struct GeneAnnotation {
     /// gene_id strings in GTF-file order (index = gene_idx).
     pub gene_ids: Vec<String>,

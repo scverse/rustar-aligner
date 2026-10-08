@@ -44,6 +44,46 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **STARsolo per-read barcode SAM tags (Phase 14.7).** `--outSAMattributes`
+  now accepts `CR CY UR UY CB UB gx gn sM sS sQ sF` next to the existing
+  `GX GN`, and emits them in BAM output only, as STAR does.
+
+  - `CR`/`CY`/`UR`/`UY` (raw barcode and UMI with their qualities), `sM`
+    (STAR's `cbMatch` assessment code) and `sS`/`sQ` (the whole barcode read)
+    are written as each read is processed, on mapped and unmapped records
+    alike, for both the single-end and the `--soloBarcodeMate 1` solo path.
+  - `CB` (corrected barcode) and `UB` (collapsed UMI) come from STAR's
+    readInfo: UMI collapsing records what each read was counted as, and the
+    buffered records are rewritten before the sort. Reads that were not
+    counted get `-`, as in STAR. Both tags therefore require
+    `--outSAMtype BAM SortedByCoordinate` and a gene-level first
+    `--soloFeatures` entry, which is now validated.
+  - `--soloType CB_samTagOut` is implemented: whitelist correction into `CB`
+    with no gene model, no UMI collapsing and no `Solo.out` output. As in
+    STAR, it rejects `UB` and accepts only `Exact`/`1MM` for
+    `--soloCBmatchWLtype`.
+  - `gx`/`gn` name every gene of the alignment they sit on (`;`-joined), and
+    `sF` reports `(overlap type, genes for the read)`, falling back to
+    `(-1, -1)` on a sense-strand read whose alignment has no gene of its own.
+    All the gene tags now reach the paired-end solo path too, where a mate pair
+    counts as one alignment.
+  - `--soloUMIdedup 1MM_Directional`/`1MM_Directional_UMItools` now count
+    distinct corrected UMIs off STAR's absorb chain
+    (`umiArrayCorrect_Directional`) rather than counting unabsorbed UMIs; the
+    two agree except where a chain is longer than one step.
+
+- **Paired-end cDNA with a separate barcode read.** `--readFilesIn` accepts
+  STAR's three-file solo layout (`cDNA_read1 cDNA_read2 barcode_read`), so
+  paired-end cDNA now works with a separate barcode read for every barcode
+  chemistry, `CB_samTagOut` included. A third file without `--soloType` is
+  refused rather than ignored.
+
+- **`--soloBarcodeReadLength` is honoured.** As in STAR, the default expects the
+  barcode read to be exactly CB+UMI long and treats any other length as a fatal
+  input error naming the read; `0` turns the check off and pads a short read
+  with `N` (quality `H`), which then scores as an N-containing barcode instead
+  of being dropped silently.
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
