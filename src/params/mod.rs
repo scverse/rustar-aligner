@@ -658,7 +658,9 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
-    /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
+    /// Memory budget for the coordinate sort. Accepts bytes or a suffix: 8G, 512M, 1T.
+    /// Records beyond it spill to sorted runs beside the output and are merged, so the
+    /// output does not depend on it. 0 = 512 MiB (STAR: genome + SA size; see DIVERGENCE.md §4.3).
     #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
 
@@ -749,7 +751,8 @@ pub struct Parameters {
     #[arg(long = "outWigReferencesPrefix", default_value = "-")]
     pub out_wig_references_prefix: String,
 
-    /// Directory for intermediate files.
+    /// Directory for intermediate files (coordinate-sort spill runs). `-` puts
+    /// them beside the output.
     #[arg(long = "outTmpDir", default_value = "-")]
     pub out_tmp_dir: String,
 
