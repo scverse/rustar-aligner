@@ -44,6 +44,17 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **DegNorm degradation normalization** (rustar-aligner extension, no STAR
+  counterpart): `--quantMode GeneCoverage` records per-gene, per-exonic-base
+  coverage during alignment and writes `GeneCoverage.out.bin`; `--runMode
+  degNorm` merges several samples' coverage files through a port of DegNorm's
+  rank-one NMF over-approximation and writes `DegNorm.out/` with
+  `DegradationIndex.tab`, `AdjustedCounts.tab`, `RawCounts.tab`,
+  `ScaleFactors.tab`, and `Summary.txt`. Parameters: `--degNormIter`,
+  `--degNormNmfIter`, `--degNormDownsampleRate`, `--degNormMinimaxCoverage`,
+  `--degNormSkipBaselineSelection`, `--degNormBins`,
+  `--degNormMinHighCoverage`, `--degNormSampleId`. Off by default; alignment
+  output is unchanged. See `DIVERGENCE.md` §4.3.
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 

@@ -8,6 +8,7 @@
 /// Submodules:
 /// - `transcriptome` — transcript-level alignment projection for
 ///   `--quantMode TranscriptomeSAM` (Salmon / RSEM input).
+pub mod coverage;
 pub mod transcriptome;
 
 use std::io::Write as _;
@@ -545,6 +546,9 @@ impl GeneCounts {
 pub struct QuantContext {
     pub gene_ann: GeneAnnotation,
     pub counts: GeneCounts,
+    /// Per-gene exonic coverage, present only when `--quantMode GeneCoverage`
+    /// was requested (DegNorm phase 1; not a STAR feature).
+    pub coverage: Option<coverage::GeneCoverage>,
 }
 
 impl QuantContext {
@@ -555,13 +559,23 @@ impl QuantContext {
         feature_exon: &str,
         chr_prefix: &str,
         gene_tag: &str,
+        with_coverage: bool,
     ) -> Result<Self, Error> {
         let exons = crate::junction::gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
         let gene_ann = GeneAnnotation::from_gtf_exons_configured(&exons, genome, gene_tag);
         let n = gene_ann.n_genes();
         log::info!("quantMode GeneCounts: {n} genes loaded from GTF");
         let counts = GeneCounts::new(n);
-        Ok(QuantContext { gene_ann, counts })
+        let coverage = if with_coverage {
+            Some(coverage::GeneCoverage::new(&gene_ann))
+        } else {
+            None
+        };
+        Ok(QuantContext {
+            gene_ann,
+            counts,
+            coverage,
+        })
     }
 }
 

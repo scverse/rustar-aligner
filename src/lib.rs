@@ -29,6 +29,7 @@ pub mod bam_dedup;
 pub mod chimeric;
 pub mod clip;
 pub mod cpu;
+pub mod degnorm;
 pub mod genome;
 pub mod index;
 pub mod io;
@@ -82,6 +83,7 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         RunMode::InputAlignmentsFromBAM => bam_dedup::run(params),
         RunMode::LiftOver => liftover::run(params),
         RunMode::SoloCellFiltering => crate::solo::count::run_cell_filtering(params),
+        RunMode::DegNorm => degnorm::run_mode(params),
     }
 }
 
@@ -325,10 +327,10 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // Build gene-count context if --quantMode GeneCounts was requested.
     // GTF requirement is already validated in params.validate().
     let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
-        if params.quant_gene_counts() {
+        if params.quant_gene_counts() || params.quant_gene_coverage() {
             let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
             info!(
-                "quantMode GeneCounts: building gene annotation from {}",
+                "quantMode GeneCounts/GeneCoverage: building gene annotation from {}",
                 gtf_path.display()
             );
             let ctx = crate::quant::QuantContext::build(
@@ -337,6 +339,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
                 &params.sjdb_gtf_feature_exon,
                 &params.sjdb_gtf_chr_prefix,
                 &params.sjdb_gtf_tag_exon_parent_gene,
+                params.quant_gene_coverage(),
             )?;
             Some(std::sync::Arc::new(ctx))
         } else {
@@ -450,9 +453,19 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 
     // Write ReadsPerGene.out.tab if quantMode GeneCounts was requested.
     if let Some(ref ctx) = quant_ctx {
-        let quant_path = params.output_path("ReadsPerGene.out.tab");
-        ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
-        info!("Wrote {}", quant_path.display());
+        if params.quant_gene_counts() {
+            let quant_path = params.output_path("ReadsPerGene.out.tab");
+            ctx.counts.write_output(&quant_path, &ctx.gene_ann)?;
+            info!("Wrote {}", quant_path.display());
+        }
+        // quantMode GeneCoverage (DegNorm phase 1, not a STAR mode).
+        if let Some(ref cov) = ctx.coverage {
+            let cov_path = params.output_path("GeneCoverage.out.bin");
+            let sample_id = params.deg_norm_sample_id_or_default();
+            let is_paired = params.read_files_in.len() == 2 && !params.solo_enabled();
+            cov.write_file(&cov_path, &ctx.gene_ann, &sample_id, is_paired)?;
+            info!("Wrote {}", cov_path.display());
+        }
     }
 
     info!("Alignment complete!");
@@ -1940,6 +1953,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         if let Some(ref q) = quant {
                             q.counts
                                 .count_se_read(&transcripts, n_for_mapq, &q.gene_ann);
+                            if let Some(ref cov) = q.coverage {
+                                cov.count_se_read(&transcripts, &q.gene_ann);
+                            }
                         }
 
                         // Record junction statistics (per-read dedup, fix A)
@@ -3348,6 +3364,9 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 has_half_mapped,
                                 &q.gene_ann,
                             );
+                            if let Some(ref cov) = q.coverage {
+                                cov.count_pe_read(&bm_deref, &q.gene_ann);
+                            }
                         }
 
                         // Record junction statistics

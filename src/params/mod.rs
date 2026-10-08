@@ -39,6 +39,8 @@ pub enum RunMode {
     LiftOver,
     /// Cell-call an existing raw count matrix, without aligning anything.
     SoloCellFiltering,
+    /// rustar-aligner extension: DegNorm degradation normalization merge pass.
+    DegNorm,
 }
 
 impl std::str::FromStr for RunMode {
@@ -50,9 +52,10 @@ impl std::str::FromStr for RunMode {
             "inputAlignmentsFromBAM" => Ok(Self::InputAlignmentsFromBAM),
             "liftOver" => Ok(Self::LiftOver),
             "soloCellFiltering" => Ok(Self::SoloCellFiltering),
+            "degNorm" => Ok(Self::DegNorm),
             _ => Err(format!(
                 "unknown runMode '{s}'; expected 'alignReads', 'genomeGenerate', \
-                 'inputAlignmentsFromBAM', 'liftOver', or 'soloCellFiltering'"
+                 'inputAlignmentsFromBAM', 'liftOver', 'soloCellFiltering', or 'degNorm'"
             )),
         }
     }
@@ -66,6 +69,7 @@ impl std::fmt::Display for RunMode {
             Self::InputAlignmentsFromBAM => write!(f, "inputAlignmentsFromBAM"),
             Self::LiftOver => write!(f, "liftOver"),
             Self::SoloCellFiltering => write!(f, "soloCellFiltering"),
+            Self::DegNorm => write!(f, "degNorm"),
         }
     }
 }
@@ -1133,6 +1137,50 @@ pub struct Parameters {
     )]
     pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
 
+    // ── DegNorm (rustar-aligner extension, not STAR) ────────────────────
+    /// Sample name recorded in `GeneCoverage.out.bin`
+    /// (`--quantMode GeneCoverage`). Defaults to the basename of
+    /// `--outFileNamePrefix`.
+    #[arg(long = "degNormSampleId", default_value = "")]
+    pub deg_norm_sample_id: String,
+
+    /// `GeneCoverage.out.bin` files, one per sample, for `--runMode degNorm`.
+    /// At least two are required: a degradation index is defined across
+    /// samples, not within one.
+    #[arg(long = "degNormCoverageFiles", num_args = 0.., value_name = "FILE")]
+    pub deg_norm_coverage_files: Vec<PathBuf>,
+
+    /// Outer DegNorm iterations (DegNorm's `--iter`).
+    #[arg(long = "degNormIter", default_value_t = 5)]
+    pub deg_norm_iter: usize,
+
+    /// NMF-OA iterations per gene per outer iteration (DegNorm's `--nmf-iter`).
+    #[arg(long = "degNormNmfIter", default_value_t = 100)]
+    pub deg_norm_nmf_iter: usize,
+
+    /// Systematic "take every" downsample rate over transcript positions
+    /// (DegNorm's `--downsample-rate`); 1 = no downsampling.
+    #[arg(long = "degNormDownsampleRate", default_value_t = 1)]
+    pub deg_norm_downsample_rate: usize,
+
+    /// A gene enters the DegNorm fit only if its maximum coverage reaches this
+    /// value in every sample (DegNorm's `--minimax-coverage`).
+    #[arg(long = "degNormMinimaxCoverage", default_value_t = 0)]
+    pub deg_norm_minimax_coverage: u32,
+
+    /// Skip baseline selection: faster, less accurate DI scores.
+    #[arg(long = "degNormSkipBaselineSelection", default_value_t = false)]
+    pub deg_norm_skip_baseline_selection: bool,
+
+    /// Number of bins used by baseline selection.
+    #[arg(long = "degNormBins", default_value_t = 20)]
+    pub deg_norm_bins: usize,
+
+    /// Minimum number of high-coverage transcript positions required before a
+    /// gene is sent through baseline selection.
+    #[arg(long = "degNormMinHighCoverage", default_value_t = 50)]
+    pub deg_norm_min_high_coverage: usize,
+
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
     #[arg(long = "twopassMode", default_value = "None")]
@@ -1665,6 +1713,16 @@ impl Parameters {
             }
         }
 
+        // degNorm merges per-sample GeneCoverage files; a degradation index is
+        // defined across samples, so one file is never enough.
+        if params.run_mode() == RunMode::DegNorm && params.deg_norm_coverage_files.len() < 2 {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--runMode degNorm requires at least 2 --degNormCoverageFiles (one per sample); \
+                 a degradation index is defined across samples, not within one",
+            ));
+        }
+
         // --outWigType at alignReads: only `bedGraph` (stranded, full-length) is
         // implemented. `wiggle`, `--outWigStrand Unstranded`, and the 2nd word
         // (`read1_5p`/`read2`) are STAR features of `--runMode
@@ -1702,18 +1760,21 @@ impl Parameters {
 
         // Unknown --quantMode values are fatal, as in STAR
         // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
-        // leading "-" means none.
+        // leading "-" means none. GeneCoverage is rustar's own addition for
+        // DegNorm (DIVERGENCE.md §4.4).
         if params.quant_mode.first().is_some_and(|m| m != "-")
-            && let Some(bad) = params
-                .quant_mode
-                .iter()
-                .find(|m| !matches!(m.as_str(), "TranscriptomeSAM" | "GeneCounts"))
+            && let Some(bad) = params.quant_mode.iter().find(|m| {
+                !matches!(
+                    m.as_str(),
+                    "TranscriptomeSAM" | "GeneCounts" | "GeneCoverage"
+                )
+            })
         {
             return Err(command.error(
                 ErrorKind::InvalidValue,
                 format!(
                     "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
-                     GeneCounts, or -"
+                     GeneCounts, GeneCoverage, or -"
                 ),
             ));
         }
@@ -1723,6 +1784,15 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode GeneCounts requires --sjdbGTFfile",
+            ));
+        }
+
+        // quantMode GeneCoverage (rustar-aligner extension, DegNorm phase 1)
+        // needs the same gene model.
+        if params.quant_gene_coverage() && params.sjdb_gtf_file.is_none() {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantMode GeneCoverage requires --sjdbGTFfile",
             ));
         }
 
@@ -2148,6 +2218,31 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "GeneCounts")
     }
 
+    /// Returns true if `--quantMode GeneCoverage` was requested.
+    ///
+    /// Not a STAR mode: this is the rustar-aligner extension that captures
+    /// per-gene exonic coverage for the DegNorm pipeline (`--runMode degNorm`).
+    pub fn quant_gene_coverage(&self) -> bool {
+        self.quant_mode.iter().any(|m| m == "GeneCoverage")
+    }
+
+    /// Sample id recorded in `GeneCoverage.out.bin`: `--degNormSampleId` when
+    /// set, otherwise the basename of `--outFileNamePrefix`, otherwise
+    /// `sample`.
+    pub fn deg_norm_sample_id_or_default(&self) -> String {
+        if !self.deg_norm_sample_id.is_empty() {
+            return self.deg_norm_sample_id.clone();
+        }
+        let trimmed = self.out_file_name_prefix.trim_end_matches('/');
+        let base = trimmed.rsplit('/').next().unwrap_or("");
+        let base = base.trim_end_matches(['.', '_']);
+        if base.is_empty() {
+            "sample".to_string()
+        } else {
+            base.to_string()
+        }
+    }
+
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
@@ -2257,6 +2352,73 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    #[test]
+    fn quant_mode_gene_coverage_is_recognised() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "GeneCoverage",
+            "--sjdbGTFfile",
+            "a.gtf",
+        ])
+        .unwrap();
+        assert!(p.quant_gene_coverage());
+        assert!(!p.quant_gene_counts());
+    }
+
+    #[test]
+    fn quant_mode_gene_coverage_requires_gtf() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneCoverage"]).is_err());
+    }
+
+    #[test]
+    fn deg_norm_sample_id_falls_back_to_output_prefix() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "sampleA");
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+            "--degNormSampleId",
+            "explicit",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "explicit");
+    }
+
+    #[test]
+    fn run_mode_degnorm_parses_and_validates() {
+        let p = try_parse(&[
+            "--runMode",
+            "degNorm",
+            "--degNormCoverageFiles",
+            "a.bin",
+            "b.bin",
+        ])
+        .unwrap();
+        assert_eq!(p.run_mode(), RunMode::DegNorm);
+        assert_eq!(p.deg_norm_coverage_files.len(), 2);
+        assert_eq!(p.deg_norm_iter, 5);
+        assert_eq!(p.deg_norm_nmf_iter, 100);
+        assert_eq!(p.deg_norm_bins, 20);
+        assert_eq!(p.deg_norm_min_high_coverage, 50);
+        assert_eq!(p.deg_norm_downsample_rate, 1);
+    }
+
+    #[test]
+    fn run_mode_degnorm_requires_two_coverage_files() {
+        assert!(try_parse(&["--runMode", "degNorm", "--degNormCoverageFiles", "a.bin"]).is_err());
+        assert!(try_parse(&["--runMode", "degNorm"]).is_err());
     }
 
     #[test]

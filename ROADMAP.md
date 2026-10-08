@@ -348,3 +348,22 @@ Single-cell quantification layered around the existing aligner: the cDNA read al
 **Phase 14.5–14.11 + performance** (2026-07): completed the feature-parity set — `Summary.csv` (STARsolo-faithful, CellRanger funnel split to its own file), `--soloCellFilter` CellRanger2.2/TopCells/**EmptyDrops_CR** (Monte-Carlo ambient rescue in the `filtered/` writer), `--soloFeatures` **GeneFull/SJ/Velocyto** (spliced/unspliced/ambiguous per Sullivan 2025), `--soloMultiMappers` Uniform/PropUnique/EM/Rescue, chemistries **CB_UMI_Complex** (multi-segment) and **SmartSeq** (plate-based, SE + PE fragment counts), and a rustar-vs-STARsolo SJ + multi-mapper diff harness. Performance: pipelined solo FASTQ decode, parallelized matrix build + EmptyDrops MC, libdeflate/zlib-rs for matrix gzip + BGZF, and an **O(log n + k) segment-tree gene-overlap query** (replacing STAR's linear scan — the #1 solo hotspot, ~14% wall reduction). Sparse suffix array (`--genomeSAsparseD`, byte-identical to STAR's D=2) for a 31% smaller index. 516 tests, 0 clippy warnings.
 
 **Native three-way benchmark** (2026-07, `test/aws/`): fresh single-instance EC2 comparison on a real 10x dataset (`5k_Mouse_PBMCs_5p_gem-x_GEX`, 5′ GEM-X, GRCm39-2024-A), all native x86_64, 10 threads, NVMe, page cache dropped, no BAM. Wall / peak RSS / cells: **STARsolo 2.7.11b** 87 s / 28.3 GB / 4,061; **rustar-aligner** 121 s / 25.7 GB / 3,689 (→ ~105 s with the segment-tree query merged after this run); **rustar `--genomeSAsparseD 2`** 119 s / **17.7 GB** / 3,692; **CellRanger 10.0.0** 347 s / 13.1 GB / 3,858. `Gene/raw` matrix byte-identical to STARsolo's. Supersedes the earlier Docker-emulation numbers above (those were penalized by Rosetta/virtiofs). Remaining gap to STARsolo is small and output-identical; rustar owns the memory frontier via sparse SA.
+
+---
+
+## Phase 18: DegNorm degradation normalization (not a STAR feature)
+
+| Sub-phase | Item | Status |
+|-----------|------|--------|
+| 18.1 | `--quantMode GeneCoverage` — per-gene, per-exonic-base coverage during alignment | ✅ Complete |
+| 18.2 | `--runMode degNorm` — multi-sample NMF-OA fit, DI scores, adjusted counts | ✅ Complete |
+| 18.3 | Validation against the Python DegNorm on a real multi-sample dataset | ⬜ Planned |
+| 18.4 | Coverage-curve plots / estimated coverage matrices | ⬜ Not planned |
+
+**Phase 18.1–18.2** (2026-08-20): DegNorm (Xiong et al., *Genome Biology* 2019) corrects RNA-seq counts for sample- and gene-specific transcript degradation. Since the model is a rank-one over-approximation *across samples*, a Degradation Index cannot be produced inside a single alignment run; the work splits in two.
+
+Phase 1, during alignment: `--quantMode GeneCoverage` allocates a flat `AtomicU32` array over the concatenated merged exons of every gene (transcript space) and accumulates coverage on the same unique-hit path `GeneCounts` uses (unique alignment, exactly one overlapping gene). Paired-end mate blocks are merged first, so an overlapping pair contributes one per base. Output `GeneCoverage.out.bin`: a gzip stream with magic `RSDGNCOV`, a per-gene table (length + raw count), the gene id block, and the flat coverage array. `src/quant/coverage.rs`.
+
+Phase 2, `--runMode degNorm`: loads N coverage files, validates a shared gene model, and runs the port in `src/degnorm/` — `nmf.rs` (leading singular triplet by power iteration on the `p x p` Gram matrix, dual-ascent NMF over-approximation, `ratio_svd`), `baseline.rs` (high-coverage filter, bin-dropping baseline search, DI with DegNorm's `+1` denominator and `[0, 0.9]` clamp), `run.rs` (initial depth factors from low-DI genes, `--degNormIter` outer rounds, sample-average DI for genes that skip baseline selection, `rayon` fan-out over genes). Writes `DegNorm.out/{DegradationIndex,AdjustedCounts,RawCounts,ScaleFactors}.tab` and `Summary.txt`.
+
+Alignment output is unchanged when `GeneCoverage` is on (asserted in `tests/degnorm.rs`). Recorded in [DIVERGENCE.md](DIVERGENCE.md) §4.3; user guide at `docs/src/content/docs/guides/degnorm.md`; design spec at `docs/superpowers/specs/2026-08-20-degnorm-design.md`.

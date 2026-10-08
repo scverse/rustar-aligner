@@ -216,6 +216,7 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 - Chimeric alignment detection — SE and PE, 4-tier pipeline: transcript-pair search, multi-cluster, soft-clip re-seeding, residual outer re-seeding for multi-junction fusions (`--chimSegmentMin`)
 - Gene-level read counting (`--quantMode GeneCounts` → `ReadsPerGene.out.tab`)
 - Transcriptome-coordinate SAM output (`--quantMode TranscriptomeSAM`)
+- Transcript-degradation normalization, DegNorm-style (`--quantMode GeneCoverage` during alignment, then `--runMode degNorm` across samples) — per-gene Degradation Index scores and degradation-adjusted counts; not a STAR feature
 - **Single-cell quantification (STARsolo)** — `--soloType CB_UMI_Simple`, `CB_UMI_Complex` (multi-segment barcodes), and `SmartSeq` (plate-based, SE + PE); features `Gene`, `GeneFull` (pre-mRNA), `SJ`, and `Velocyto` (spliced/unspliced/ambiguous); barcode correction (`--soloCBmatchWLtype` Exact/1MM/1MM_multi/…), UMI dedup (`--soloUMIdedup` 1MM_All/1MM_CR/1MM_Directional/…), multi-gene UMI filtering, multi-mapper resolution (`--soloMultiMappers` Uniform/PropUnique/EM/Rescue), cell calling (`--soloCellFilter` CellRanger2.2/TopCells/EmptyDrops_CR), gzip output, and `Summary.csv` — writes STARsolo-compatible `Solo.out/<feature>/{raw,filtered}/{matrix.mtx, barcodes.tsv, features.tsv}`
 - WASP allele-specific-mapping filter (`--waspOutputMode SAMtag`, `--varVCFfile`) — vW/vA/vG tags, SE + PE
 - Paired-end mate-overlap merging (`--peOverlapNbasesMin`, `--peOverlapMMp`)

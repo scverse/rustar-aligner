@@ -165,6 +165,20 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **Source.** `src/io/bam.rs` (`CoordinateSorter`).
 
+### 4.4 DegNorm degradation normalization (`--quantMode GeneCoverage`, `--runMode degNorm`)
+
+**What STAR does.** Nothing: STAR has no transcript-degradation model and no per-gene coverage output.
+
+**What rustar-aligner does.** Two optional, off-by-default additions. `--quantMode GeneCoverage` accumulates per-gene, per-exonic-base coverage during alignment and writes `GeneCoverage.out.bin`. `--runMode degNorm` merges several samples' coverage files and fits the rank-one NMF over-approximation of [DegNorm](https://nustatbioinfo.github.io/DegNorm/) (Xiong et al., *Genome Biology* 2019), writing Degradation Index scores and degradation-adjusted counts to `DegNorm.out/`.
+
+**Why.** Degradation bias is gene- and sample-specific, so a global size factor cannot remove it. DegNorm normally recovers coverage curves by re-reading sorted, indexed BAMs; the aligner already assigns each unique read to a gene for `ReadsPerGene.out.tab`, so the curves cost almost nothing to produce there.
+
+**Impact.** None on alignment output: coverage comes from the same uniquely mapped, unambiguously assigned reads that feed `ReadsPerGene.out.tab` column 1, and the integration suite asserts the SAM records are identical with and without the flag. A degradation index is defined across samples, so `--runMode degNorm` requires at least two coverage files and cannot run inside a single alignment.
+
+**Source.** `src/quant/coverage.rs`, `src/degnorm/` (ported from DegNorm's `degnorm/nmf.py`). No STAR source: this feature has no STAR counterpart.
+
+---
+
 ## 5. Known residual single-read differences
 
 These are **not** deliberate divergences — they are tracked residual diffs on the 10k yeast benchmark, kept here for completeness. Each is a single read; none is a systematic behaviour difference.
