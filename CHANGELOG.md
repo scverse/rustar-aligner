@@ -129,6 +129,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- **STARsolo barcode resolution**: `--soloCBtype`,
+  `--soloAdapterSequence` / `--soloAdapterMismatchesNmax` for
+  adapter-anchored `CB_UMI_Complex` geometry, and
+  `--soloOutFormatFeaturesGeneField3`. Barcode correction now applies
+  STAR's `cbMinP` posterior threshold (0.975) and its `oneExact`
+  guard, so a low-confidence correction is dropped rather than accepted.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
@@ -286,6 +292,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
   2.7.11b the variant is a no-op. It now removes a UMI seen in two or
   more genes from **all** of them, the behaviour the option name
   describes. Recorded in `DIVERGENCE.md` (closes #144).
+- The STARsolo adapter search took the leftmost match inside the
+  mismatch budget; STAR's `localAlignHammingDist` takes the
+  best-scoring one. Since `CB_UMI_Complex` measures barcode positions
+  from the adapter, the wrong offset shifted the whole barcode. Ties now
+  go to the leftmost of the best, and an `N` in the adapter is a
+  wildcard rather than a mismatch.
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block

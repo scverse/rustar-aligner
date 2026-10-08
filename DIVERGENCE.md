@@ -63,6 +63,36 @@ The site that acts on those zeroed counts, however, gates on a different flag (`
 **Impact.** Degenerate inputs only — any dataset large enough to reach the significance test has far more than five distinct frequencies. On those inputs an uninitialised read can place arbitrary mass on unseen genes, which makes the multinomial log-probabilities meaningless; zero keeps them defined.
 
 **Source.** `src/solo/sgt.rs`, locked by `solo::sgt::tests::too_few_frequencies_leaves_the_unseen_mass_at_zero` (asserting the exact bit pattern, since the point is that nothing was written). STAR: `SoloFeature_emptyDrops_CR.cpp`, `SimpleGoodTuring/sgt.h`.
+### 1.2 Homopolymer UMIs are rejected whichever base repeats
+
+**What STAR does.** STAR means to reject a UMI made of one repeated base, and under `CB_UMI_Simple` it does. Under `CB_UMI_Complex` it rejects only poly-A, letting poly-C, poly-G and poly-T through.
+
+The mechanism is an initialisation-order defect, not a rule. The four packed constants are built in the `SoloReadBarcode` constructor (`SoloReadBarcode.cpp:16-21`):
+
+```cpp
+for (uint32 jj=0;jj<4;jj++) {
+    homoPolymer[jj]=0;
+    for (uint32 ii=0; ii<pSolo.umiL;ii++)
+        homoPolymer[jj]=(homoPolymer[jj]<<2)+jj;
+};
+```
+
+but `CB_UMI_Complex` does not know its UMI length until it has extracted one, and sets it at read-processing time (`SoloReadBarcode_getCBandUMI.cpp:353-354`):
+
+```cpp
+if ( pSolo.umiL == 0 )
+    pSolo.umiL = umiSeq.size();
+```
+
+So when `umiL` is still 0 at construction, the loop body never runs and all four constants stay `0`. The check (`SoloReadBarcode_getCBandUMI.cpp:139`) then compares the packed UMI against `0` four times. Poly-A packs to `0`, because `A` is nucleotide 0, so poly-A is still caught; poly-C, poly-G and poly-T pack to non-zero values and match nothing.
+
+**What rustar-aligner does.** Rejects all four homopolymers, in every barcode geometry.
+
+**Why.** A UMI of one repeated base carries no information whichever base it is, so rejecting only poly-A is not a threshold choice to be matched but an accident of when a length becomes known. STAR's own `CB_UMI_Simple` path, where `umiL` is set from the parameters before construction, rejects all four; the complex path is the outlier. Matching the accident would mean counting poly-T UMIs as real molecules.
+
+**Impact.** Under `--soloType CB_UMI_Complex`, reads whose UMI is a non-A homopolymer are dropped here and counted by STAR. On real data these are rare and are sequencing artefacts. Note this is not a new behaviour in this PR: rustar-aligner has always rejected all four. What is new is that it is now deliberate, locked by a test, and recorded here rather than being an undocumented difference.
+
+**Source.** `src/solo/whitelist.rs` (`check_umi`, `umi_valid_rejects_every_homopolymer`). STAR: `SoloReadBarcode.cpp:16-21`, `SoloReadBarcode_getCBandUMI.cpp:139` and `:353-354`.
 
 ---
 

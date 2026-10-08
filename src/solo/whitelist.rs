@@ -751,4 +751,31 @@ mod tests {
         assert!(n.mm1_multi_nbase && n.pseudocounts);
         assert!(CbMatchType::from_str("bogus").is_err());
     }
+
+    #[test]
+    fn umi_valid_rejects_every_homopolymer() {
+        // STAR has a quirk (`umiL = 0`) under which a non-A homopolymer UMI
+        // slips through its filter. That is a defect, not a rule: a UMI of one
+        // repeated base carries no information whichever base it is. All four
+        // are rejected here, deliberately diverging from 2.7.11b.
+        // Sequences are base codes: 0..=3 for ACGT, 4 for N.
+        for (code, base) in [(0u8, 'A'), (1, 'C'), (2, 'G'), (3, 'T')] {
+            let umi = vec![code; 10];
+            assert!(
+                matches!(check_umi(&umi), UmiCheck::Homopolymer),
+                "poly-{base} should be rejected"
+            );
+        }
+
+        // A UMI that merely starts with a run is fine.
+        assert!(matches!(
+            check_umi(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            UmiCheck::Ok(_)
+        ));
+        // N anywhere still fails on its own grounds.
+        assert!(matches!(
+            check_umi(&[0, 0, 0, 0, 4, 0, 0, 0, 0, 0]),
+            UmiCheck::NinUmi
+        ));
+    }
 }
