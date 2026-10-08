@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn binary_target_is_not_empty() {
-        assert!(!binary_target().is_empty());
+        assert_ne!(binary_target(), "");
     }
 
     #[test]
