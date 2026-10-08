@@ -101,9 +101,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     // Long reads.
     "winReadCoverageBasesMin",
     // Chimeric multimapping.
-    // CellRanger4 adapter clipping.
-    "clip5pAdapterMMp",
-    "clip5pAdapterSeq",
     // Genome index types and transforms.
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
