@@ -65,6 +65,29 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`mappedFilter` ported as STAR has it** (`ReadAlign_mappedFilter.cpp`).
+  The read is judged on its best alignment alone, in STAR's order: too short
+  (score or matched bases), then too many mismatches, then too many loci; the
+  whole set is kept or dropped together. Single-end filtered each alignment
+  separately, so a secondary could be dropped on its own numbers.
+  - Matched bases are STAR's `nMatch` (read equals genome), not the aligned
+    length, which counted mismatches and `N` as matches and made
+    `--outFilterMatchNminOverLread` looser than STAR's.
+  - `--outFilterMismatchNoverLmax` divides by the mapped length (`rLength`),
+    not the read length, in single-end and paired-end.
+  - `--outFilterIntronMotifs` / `--outFilterIntronStrands` apply when a
+    transcript is finalized, as in `stitchWindowAligns`, so a rejected
+    transcript cannot set the score range or become a chimeric segment.
+    Paired-end did not apply them at all.
+  - Paired-end reads with more than `--outFilterMultimapNmax` loci are reported
+    as "too many loci"; they were cleared inside the filter and fell through to
+    "too short". A failing best pair now reports its own reason.
+
+  Yeast 10k: alignments unchanged; PE unmapped types now match STAR read for
+  read (`too many loci` 0 → 21, STAR 21). Human chr21 SE: multi / too many
+  loci / too short 6051 / 221 / 2008 → 6113 / 234 / 1956 (STAR 6116 / 232 /
+  1955). Supersedes #169 and #252.
+
 - **Multi-member gzip input is no longer truncated.** Compressed input was
   decoded with `flate2::read::GzDecoder`, which stops at the end of the first
   gzip member; a `.gz` made of several concatenated members (bcl2fastq output,
