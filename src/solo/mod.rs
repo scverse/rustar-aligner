@@ -1535,7 +1535,7 @@ mod tests {
         }
 
         // Every available backend agrees, bit for bit.
-        assert!(!per_backend.is_empty());
+        assert_ne!(per_backend.len(), 0);
         let first = per_backend[0];
         for (i, r) in per_backend.iter().enumerate() {
             assert_eq!(*r, first, "backend {:?} diverged", backends[i]);

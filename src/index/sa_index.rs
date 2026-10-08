@@ -139,6 +139,7 @@ impl SaIndex {
         }
         let num_indices = Self::calculate_num_indices(nbases) as usize;
         let absent_mask: u64 = 1u64 << (gstrand_bit + 2);
+        let n_mark_mask: u64 = 1u64 << (gstrand_bit + 1);
 
         // `isaStep` from STAR: `nSA / 4^nbases`. With 5.9 B SA entries
         // and `nbases = 14`, this is ~22 — i.e. on average we expect
@@ -159,6 +160,20 @@ impl SaIndex {
         let firsts: Vec<AtomicU64> = (0..num_indices)
             .into_par_iter()
             .map(|_| AtomicU64::new(u64::MAX))
+            .collect();
+
+        // STAR's `SAiMarkNbit` marks: when a suffix's k-mer prefix hits an
+        // N at level `iL4`, STAR ORs `SAiMarkNmaskC` onto the *last written*
+        // entry `SAi[start[iL1] + ind0[iL1]]` for every level `iL1 >= iL4`
+        // (`genomeSAindex.cpp:140-145`). The target slots are collected here
+        // as a shared bitset and OR-ed into `firsts` after the gap-fill.
+        // Genome-only indexes come out byte-identical to STAR's; on sjdb
+        // builds a handful of mark bits can land one slot away from STAR's
+        // because STAR places them against the pre-insertion base genome —
+        // see DIVERGENCE.md §3.1a.
+        let marks: Vec<AtomicU64> = (0..num_indices.div_ceil(64))
+            .into_par_iter()
+            .map(|_| AtomicU64::new(0))
             .collect();
 
         let sa_mask: u64 = if sa_word_length == 64 {
@@ -306,11 +321,75 @@ impl SaIndex {
                         (hi, next_kmer, next_il4)
                     };
 
+                // Absolute-index variant of `calc_kmer` for the chunk-
+                // boundary backward scan below: reads one SA entry at an
+                // absolute SA index via its own small pread (page-cached,
+                // and only a handful of entries are ever visited).
+                let calc_kmer_abs = |idx: usize| -> std::io::Result<(u64, i32)> {
+                    let bit = idx as u64 * sa_word_length as u64;
+                    let byte = bit / 8;
+                    let shift = (bit % 8) as u32;
+                    let mut b = [0u8; 16];
+                    let _ = read_at(sa_file, &mut b, byte)?;
+                    let word = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    let packed = (word >> shift) & sa_mask;
+                    let pos = packed & gstrand_mask;
+                    let is_reverse = (packed >> gstrand_bit) != 0;
+                    let genome_pos = if is_reverse {
+                        pos as usize + n_genome
+                    } else {
+                        pos as usize
+                    };
+                    let mut kmer: u64 = 0;
+                    for ii in 0..nbases as usize {
+                        if genome_pos + ii >= genome_seq.len() {
+                            return Ok((kmer << (2 * (nbases as usize - ii)), ii as i32));
+                        }
+                        let g = genome_seq[genome_pos + ii];
+                        if g >= 4 {
+                            return Ok((kmer << (2 * (nbases as usize - ii)), ii as i32));
+                        }
+                        kmer = (kmer << 2) | (g as u64);
+                    }
+                    Ok((kmer, -1))
+                };
+
                 // Per-chunk last-written kmer index at each level.
-                // `None` means "nothing written in this chunk yet";
-                // the first iteration always writes (matches STAR's
-                // `isa == 0` special-case).
+                // `None` means "nothing written yet anywhere before this
+                // point" (only possible at the very start of the SA;
+                // matches STAR's `isa == 0` special-case).
+                //
+                // For chunks after the first, seed `ind0_local` with the
+                // state STAR's serial scan would have on entering this
+                // chunk: for each level `iL`, the level-`iL` prefix of the
+                // most recent suffix before `chunk_start` whose first
+                // `iL+1` bases contain no N. Suffix prefixes are sorted and
+                // level validity is prefix-monotone, so a short backward
+                // walk resolves all levels (typically 1-2 entries). Without
+                // this seed, the N-mark targets at chunk boundaries would
+                // be unknown and cross-chunk `SAiMarkNbit` marks would be
+                // dropped.
                 let mut ind0_local: [Option<u64>; 32] = [None; 32];
+                {
+                    let mut lo = 0usize; // levels < lo are resolved
+                    let mut j = chunk_start;
+                    while lo < nbases as usize && j > 0 {
+                        j -= 1;
+                        let (kmer, il4) = calc_kmer_abs(j)?;
+                        let valid = if il4 < 0 {
+                            nbases as usize
+                        } else {
+                            il4 as usize
+                        };
+                        if valid > lo {
+                            for (il, slot) in ind0_local.iter_mut().enumerate().take(valid).skip(lo)
+                            {
+                                *slot = Some(kmer >> (2 * (nbases as usize - 1 - il)));
+                            }
+                            lo = valid;
+                        }
+                    }
+                }
                 let mut i: usize = 0;
                 let (mut ind_full, mut il4) = calc_kmer(i);
 
@@ -318,15 +397,25 @@ impl SaIndex {
                     let sa_idx = (chunk_start + i) as u64;
                     for il in 0..nbases as usize {
                         if il as i32 == il4 {
-                            // N at level `il`. STAR sets the N flag
-                            // on `ind0[il1]` for `il1 >= il4`; we
-                            // don't track the N flag in this version
-                            // (our `hierarchical_lookup` doesn't
-                            // consult it), so just break out of the
-                            // level loop. This means our SAindex
-                            // file is not byte-identical to STAR's
-                            // in the N-bit positions — documented
-                            // limitation.
+                            // N at level `il`: STAR ORs `SAiMarkNmaskC`
+                            // onto the last-written entry at every level
+                            // `il1 >= il4` (`genomeSAindex.cpp:140-145`).
+                            // Record the target slots; the bit is OR-ed
+                            // into the packed values after the gap-fill.
+                            // `None` (nothing written yet at that level
+                            // anywhere in the SA) is skipped — STAR never
+                            // hits that case on a real genome because the
+                            // lexicographically smallest suffixes are
+                            // N-free.
+                            for (il1, slot0) in
+                                ind0_local.iter().enumerate().take(nbases as usize).skip(il)
+                            {
+                                if let Some(prev) = slot0 {
+                                    let slot = (genome_sa_index_start[il1] + prev) as usize;
+                                    marks[slot / 64]
+                                        .fetch_or(1u64 << (slot % 64), Ordering::Relaxed);
+                                }
+                            }
                             break;
                         }
                         let ind_pref = ind_full >> (2 * (nbases as usize - 1 - il));
@@ -385,9 +474,24 @@ impl SaIndex {
             }
         }
 
+        // Apply the collected `SAiMarkNbit` marks. Marked slots are always
+        // present slots (they were the last-written `ind0` entry when the
+        // mark was recorded), so this ORs the N bit onto a first-occurrence
+        // `sa_idx` value — exactly STAR's `SAi[..] | SAiMarkNmaskC`.
+        for (w, mword) in marks.iter().enumerate() {
+            let mut m = mword.load(Ordering::Relaxed);
+            while m != 0 {
+                let slot = w * 64 + m.trailing_zeros() as usize;
+                firsts[slot].fetch_or(n_mark_mask, Ordering::Relaxed);
+                m &= m - 1;
+            }
+        }
+        drop(marks);
+
         // Final sequential pack into the output `PackedArray`.
         // Every slot in `firsts` is now valid (either the
-        // first-occurrence `sa_idx` or `next | absent_mask`).
+        // first-occurrence `sa_idx`, possibly with the N-mark bit,
+        // or `next | absent_mask`).
         let mut data = PackedArray::new(sai_word_length, num_indices);
         for (i, slot) in firsts.iter().enumerate() {
             data.write(i, slot.load(Ordering::Relaxed));
@@ -466,21 +570,25 @@ impl SaIndex {
             "Building SA index: nbases={nbases}, num_indices={num_indices}, word_length={word_length}"
         );
 
-        // Initialize packed array with "absent" markers
-        let mut data = PackedArray::new(word_length, num_indices as usize);
-        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
+        let absent_mask: u64 = 1u64 << (gstrand_bit + 2);
+        let n_mark_mask: u64 = 1u64 << (gstrand_bit + 1);
 
-        for i in 0..num_indices as usize {
-            data.write(i, absent_marker);
-        }
+        // STAR-exact serial build (`genomeSAindex.cpp` reference
+        // algorithm): record the first-occurrence `sa_idx` of every
+        // present k-mer, collect `SAiMarkNbit` targets when a suffix's
+        // prefix hits an N, then gap-fill absent slots with
+        // `next_present_sa_idx | absent_mask` and tail-fill with
+        // `n_sa | absent_mask` — the same encoding `build_parallel`
+        // emits, byte-identical to STAR's SAindex.
+        let mut firsts: Vec<u64> = vec![u64::MAX; num_indices as usize];
+        let mut marks: Vec<u64> = vec![0u64; (num_indices as usize).div_ceil(64)];
+        let mut ind0: [Option<u64>; 32] = [None; 32];
 
-        // Iterate through SA and record first occurrence of each k-mer.
         // Inner k-loop maintains `kmer_idx` **incrementally** — one
-        // base read per k iteration (vs. the original `O(k²)` read
-        // pattern that re-scanned the prefix for every k). When an N
-        // is encountered at position `genome_pos + (k - 1)` we
-        // `break` rather than `continue`: every longer k-mer at this
-        // same `genome_pos` necessarily includes that N too.
+        // base read per k iteration. When an N (or the genome end) is
+        // hit at level `k - 1`, STAR ORs the N-mark onto the last
+        // written entry of every level `>= k - 1` and stops: every
+        // longer k-mer at this `genome_pos` includes that N too.
         for sa_idx in 0..sa.len() {
             let sa_entry = sa.get(sa_idx);
             let (pos, is_reverse) = sa.decode(sa_entry);
@@ -492,22 +600,63 @@ impl SaIndex {
 
             let mut kmer_idx: u64 = 0;
             for k in 1..=nbases {
-                if genome_pos + (k as usize) > genome.sequence.len() {
+                let il = (k - 1) as usize;
+                let past_end = genome_pos + (k as usize) > genome.sequence.len();
+                if past_end || genome.sequence.base(genome_pos + il) >= 4 {
+                    for (il1, prev0) in ind0.iter().enumerate().take(nbases as usize).skip(il) {
+                        if let Some(prev) = prev0 {
+                            let slot = (genome_sa_index_start[il1] + prev) as usize;
+                            marks[slot / 64] |= 1u64 << (slot % 64);
+                        }
+                    }
                     break;
                 }
-                let next_base = genome.sequence.base(genome_pos + (k - 1) as usize);
-                if next_base >= 4 {
-                    break;
-                }
-                kmer_idx = (kmer_idx << 2) | (next_base as u64);
+                kmer_idx = (kmer_idx << 2) | (genome.sequence.base(genome_pos + il) as u64);
 
-                let sai_pos = genome_sa_index_start[(k - 1) as usize] + kmer_idx;
-                let current_entry = data.read(sai_pos as usize);
-                let is_absent = (current_entry >> (gstrand_bit + 2)) & 1 != 0;
-                if is_absent {
-                    data.write(sai_pos as usize, sa_idx as u64);
+                let is_new = match ind0[il] {
+                    None => true,
+                    Some(prev) => kmer_idx > prev,
+                };
+                if is_new {
+                    let sai_pos = (genome_sa_index_start[il] + kmer_idx) as usize;
+                    if firsts[sai_pos] == u64::MAX {
+                        firsts[sai_pos] = sa_idx as u64;
+                    }
+                    ind0[il] = Some(kmer_idx);
                 }
             }
+        }
+
+        // Backward gap-fill per level, then apply N-marks, then pack.
+        for (il, &level_start_raw) in genome_sa_index_start
+            .iter()
+            .enumerate()
+            .take(nbases as usize)
+        {
+            let level_start = level_start_raw as usize;
+            let level_size = 4u64.pow(il as u32 + 1) as usize;
+            let mut next_present: u64 = sa.len() as u64;
+            for off in (0..level_size).rev() {
+                let slot = level_start + off;
+                if firsts[slot] == u64::MAX {
+                    firsts[slot] = next_present | absent_mask;
+                } else {
+                    next_present = firsts[slot];
+                }
+            }
+        }
+        for (w, &mword) in marks.iter().enumerate() {
+            let mut m = mword;
+            while m != 0 {
+                let slot = w * 64 + m.trailing_zeros() as usize;
+                firsts[slot] |= n_mark_mask;
+                m &= m - 1;
+            }
+        }
+
+        let mut data = PackedArray::new(word_length, num_indices as usize);
+        for (i, &v) in firsts.iter().enumerate() {
+            data.write(i, v);
         }
 
         Ok(SaIndex {
