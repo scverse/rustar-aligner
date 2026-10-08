@@ -955,10 +955,14 @@ where
 
     // @HD line. `--outSAMheaderHD` replaces it wholesale, given as the
     // tab-separated fields STAR expects (`@HD VN:1.4 SO:coordinate`).
+    // STAR writes `VN:1.4` (`samHeaders.cpp:94`), not the latest spec version.
+    let star_version = sam::header::record::value::map::header::Version::new(1, 4);
     if params.out_sam_header_hd.is_empty() {
-        builder = builder.set_header(Map::default());
+        builder = builder.set_header(Map::<sam::header::record::value::map::Header>::new(
+            star_version,
+        ));
     } else {
-        let mut hd = Map::<sam::header::record::value::map::Header>::default();
+        let mut hd = Map::<sam::header::record::value::map::Header>::new(star_version);
         for field in &params.out_sam_header_hd {
             let field = field.trim();
             // STAR takes the leading `@HD` as part of the value list; ignore it.
@@ -974,6 +978,12 @@ where
                 return Err(Error::Parameter(format!(
                     "--outSAMheaderHD tag '{tag}' is not two characters"
                 )));
+            }
+            if tag == "VN" {
+                *hd.version_mut() = value
+                    .parse()
+                    .map_err(|e| Error::Parameter(format!("invalid @HD version '{value}': {e}")))?;
+                continue;
             }
             let tag_bytes: [u8; 2] = tag.as_bytes()[..2].try_into().unwrap();
             let other_tag: HeaderOtherTag<_> = HeaderOtherTag::try_from(tag_bytes)
@@ -1767,6 +1777,31 @@ mod tests {
 
         // Check that we have a program line (just check header is valid)
         assert_eq!(header.reference_sequences().len(), 1);
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_version_matches_star() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        // STAR's default @HD line is `@HD VN:1.4` (samHeaders.cpp:94).
+        assert_eq!(header.header().unwrap().version(), Version::new(1, 4));
+
+        // A VN given in --outSAMheaderHD is the version, not an extra field.
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "@HD",
+            "VN:1.6",
+            "SO:unsorted",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 6));
+        assert_eq!(hd.other_fields().len(), 1, "only SO besides VN");
     }
 
     #[test]
