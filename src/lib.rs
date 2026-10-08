@@ -2277,8 +2277,13 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 stats.record_alignment(0, max_multimaps);
                                 stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                                 // No alignment → barcode still counts toward stats (unmapped → no gene).
-                                let outcome =
-                                    solo.process_read(&[], 0, sread.barcode.as_ref(), &[]);
+                                let outcome = solo.process_read(
+                                    &[],
+                                    0,
+                                    sread.barcode.as_ref(),
+                                    &[],
+                                    &read.quality,
+                                );
                                 return Ok(SoloReadProduct {
                                     sam_records: buffer,
                                     per_feature: outcome.per_feature,
@@ -2325,6 +2330,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 transcripts.len(),
                                 sread.barcode.as_ref(),
                                 &junctions,
+                                &read.quality,
                             );
 
                             // Build SAM records for the cDNA alignment (same as SE path).
@@ -2664,7 +2670,12 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     .iter()
                                     .map(|pa| (&pa.mate1_transcript, &pa.mate2_transcript))
                                     .collect();
-                                solo.process_read_pe(&pairs, pread.barcode.as_ref(), &junctions)
+                                solo.process_read_pe(
+                                    &pairs,
+                                    pread.barcode.as_ref(),
+                                    &junctions,
+                                    &pread.mate1.quality,
+                                )
                             } else if let Some(PairedAlignmentResult::HalfMapped {
                                 mapped_transcript,
                                 ..
@@ -2675,9 +2686,16 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     1,
                                     pread.barcode.as_ref(),
                                     &junctions,
+                                    &pread.mate1.quality,
                                 )
                             } else {
-                                solo.process_read(&[], 0, pread.barcode.as_ref(), &[])
+                                solo.process_read(
+                                    &[],
+                                    0,
+                                    pread.barcode.as_ref(),
+                                    &[],
+                                    &pread.mate1.quality,
+                                )
                             };
 
                             // SAM records (skipped under `--outSAMtype None`).
