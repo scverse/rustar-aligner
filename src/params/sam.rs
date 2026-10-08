@@ -140,29 +140,35 @@ pub enum OutSamFormat {
     None,
 }
 
-/// STAR's `--outSAMtype` sort order component (only applies to BAM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutSamSortOrder {
-    Unsorted,
-    SortedByCoordinate,
-}
-
 /// Combined `--outSAMtype` value.
+///
+/// STAR accepts `BAM Unsorted`, `BAM SortedByCoordinate`, or both in either
+/// order (`outBAMunsorted` / `outBAMcoord` in Parameters.cpp), so the two BAM
+/// outputs are independent flags rather than one sort order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OutSamType {
     pub format: OutSamFormat,
-    pub sort_order: Option<OutSamSortOrder>,
+    /// `Aligned.out.bam` is requested (STAR `outBAMunsorted`).
+    pub bam_unsorted: bool,
+    /// `Aligned.sortedByCoord.out.bam` is requested (STAR `outBAMcoord`).
+    pub bam_sorted: bool,
 }
 
 impl std::fmt::Display for OutSamType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.format, &self.sort_order) {
-            (OutSamFormat::Sam, _) => write!(f, "SAM"),
-            (OutSamFormat::None, _) => write!(f, "None"),
-            (OutSamFormat::Bam, Some(OutSamSortOrder::SortedByCoordinate)) => {
-                write!(f, "BAM SortedByCoordinate")
+        match self.format {
+            OutSamFormat::Sam => write!(f, "SAM"),
+            OutSamFormat::None => write!(f, "None"),
+            OutSamFormat::Bam => {
+                write!(f, "BAM")?;
+                if self.bam_unsorted {
+                    write!(f, " Unsorted")?;
+                }
+                if self.bam_sorted {
+                    write!(f, " SortedByCoordinate")?;
+                }
+                Ok(())
             }
-            (OutSamFormat::Bam, _) => write!(f, "BAM Unsorted"),
         }
     }
 }
@@ -182,24 +188,34 @@ impl clap::FromArgMatches for OutSamType {
         *self = match tokens.as_slice() {
             ["SAM"] => Self {
                 format: OutSamFormat::Sam,
-                sort_order: None,
+                ..Self::default()
             },
             ["None"] => Self {
                 format: OutSamFormat::None,
-                sort_order: None,
+                ..Self::default()
             },
-            ["BAM", "Unsorted"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::Unsorted),
-            },
-            ["BAM", "SortedByCoordinate"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::SortedByCoordinate),
-            },
+            ["BAM", rest @ ..]
+                if !rest.is_empty()
+                    && rest
+                        .iter()
+                        .all(|t| matches!(*t, "Unsorted" | "SortedByCoordinate")) =>
+            {
+                Self {
+                    format: OutSamFormat::Bam,
+                    bam_unsorted: rest.contains(&"Unsorted"),
+                    bam_sorted: rest.contains(&"SortedByCoordinate"),
+                }
+            }
             other => {
                 return Err(invalid_multi_arg(
                     other,
-                    &["SAM", "None", "BAM Unsorted", "BAM SortedByCoordinate"],
+                    &[
+                        "SAM",
+                        "None",
+                        "BAM Unsorted",
+                        "BAM SortedByCoordinate",
+                        "BAM Unsorted SortedByCoordinate",
+                    ],
                 ));
             }
         };
@@ -212,10 +228,10 @@ impl clap::Args for OutSamType {
         cmd.arg(
             clap::Arg::new("outSAMtype")
                 .long("outSAMtype")
-                .num_args(1..=2)
+                .num_args(1..=3)
                 .default_values(["SAM"])
                 .help(
-                    "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None. \
+                    "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, BAM Unsorted SortedByCoordinate (both files), None. \
                      Provide as space-separated tokens, e.g. `--outSAMtype BAM SortedByCoordinate`.",
                 ),
         )

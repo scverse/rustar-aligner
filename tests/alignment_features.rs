@@ -290,6 +290,95 @@ fn test_bam_sorted_output() {
 }
 
 // ---------------------------------------------------------------------------
+// `--outSAMtype BAM Unsorted SortedByCoordinate` writes both BAMs from the same
+// records (STAR: outBAMunsorted and outBAMcoord both set).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bam_unsorted_and_sorted_together() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "4", None);
+
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        // Reads written out of genomic order so the two outputs differ in order.
+        for (n, i) in (0..30usize).rev().enumerate() {
+            let start = 100 + i * 100;
+            let seq = &genome[start..start + 50];
+            writeln!(f, "@read{}", n + 1).unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "+").unwrap();
+            writeln!(f, "{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let run = |name: &str, words: &[&str]| -> PathBuf {
+        let dir = tmpdir.path().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/", dir.display());
+        let mut args = vec![
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "BAM",
+        ];
+        args.extend_from_slice(words);
+        args.extend_from_slice(&["--outFileNamePrefix", &prefix]);
+        cargo_bin_cmd!("rustar-aligner")
+            .args(args)
+            .assert()
+            .success();
+        dir
+    };
+    let names = |path: &Path| -> Vec<String> {
+        let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+        reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|r| {
+                let r = r.unwrap();
+                format!(
+                    "{}:{:?}",
+                    r.name().map(|n| n.to_string()).unwrap_or_default(),
+                    r.alignment_start().map(|p| p.unwrap().get())
+                )
+            })
+            .collect()
+    };
+
+    let both = run("both", &["Unsorted", "SortedByCoordinate"]);
+    let swapped = run("swapped", &["SortedByCoordinate", "Unsorted"]);
+    let only_u = run("only_u", &["Unsorted"]);
+    let only_s = run("only_s", &["SortedByCoordinate"]);
+
+    for dir in [&both, &swapped] {
+        assert_eq!(
+            names(&dir.join("Aligned.out.bam")),
+            names(&only_u.join("Aligned.out.bam"))
+        );
+        assert_eq!(
+            names(&dir.join("Aligned.sortedByCoord.out.bam")),
+            names(&only_s.join("Aligned.sortedByCoord.out.bam"))
+        );
+    }
+    assert!(!names(&both.join("Aligned.out.bam")).is_empty());
+    // The two files really are in different orders.
+    assert_ne!(
+        names(&both.join("Aligned.out.bam")),
+        names(&both.join("Aligned.sortedByCoord.out.bam"))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 3 — Paired-end alignment
 // ---------------------------------------------------------------------------
 
