@@ -1,7 +1,7 @@
 //! Integration tests for the bulk total-RNA options (rustar-aligner
 //! extensions, not in STAR):
 //!
-//! - `--quantMode GeneSplicing` (per-gene spliced / unspliced / ambiguous);
+//! - `--quantGeneSplicing Yes` (per-gene spliced / unspliced / ambiguous);
 //! - `--quantTranscriptomeUnspliced Intron|PreMRNA` (`<gene_id>-I` targets
 //!   in TranscriptomeSAM).
 //!
@@ -343,7 +343,8 @@ fn new_options_leave_existing_outputs_unchanged() {
             "--quantMode",
             "GeneCounts",
             "TranscriptomeSAM",
-            "GeneSplicing",
+            "--quantGeneSplicing",
+            "Yes",
             "--quantTranscriptomeUnspliced",
             "None",
         ],
@@ -378,7 +379,7 @@ fn new_options_leave_existing_outputs_unchanged() {
             log_final_without_times(&other.join("Log.final.out"))
         );
     }
-    // GeneSplicing and --quantTranscriptomeUnspliced None leave the
+    // --quantGeneSplicing Yes and --quantTranscriptomeUnspliced None leave the
     // transcriptome BAM untouched.
     let base_bam = base.join("Aligned.toTranscriptome.out.bam");
     assert_eq!(
@@ -416,7 +417,12 @@ fn simulated_total_rna_mixture() {
         &gtf,
         &fq,
         "star",
-        &["--quantMode", "TranscriptomeSAM", "GeneSplicing"],
+        &[
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantGeneSplicing",
+            "Yes",
+        ],
     );
     let intron = align(
         &tmp,
@@ -565,7 +571,7 @@ fn splicing_status_tag_in_genomic_sam() {
         &gtf,
         &fq,
         "sp",
-        &["--outSAMattributes", "Standard", "sp"],
+        &["--outSAMsplicingStatus", "Yes"],
     );
     let base = align(&tmp, &gdir, &gtf, &fq, "nosp", &[]);
     let sam = read(&out.join("Aligned.out.sam"));

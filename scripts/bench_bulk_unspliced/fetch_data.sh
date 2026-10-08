@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetch the public data for the bulk total-RNA benchmark
-# (--quantTranscriptomeUnspliced, --quantMode GeneSplicing).
+# (--quantTranscriptomeUnspliced, --quantGeneSplicing Yes).
 #
 #   DATA=/path/to/bench bash scripts/bench_bulk_unspliced/fetch_data.sh
 #

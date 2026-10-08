@@ -87,7 +87,7 @@ The first four rows are summary categories: `N_unmapped`, `N_multimapping`, `N_n
 
 ### `sample_ReadsPerGeneSplicing.out.tab` / `sample_ReadsPerGeneSplicing.summary.tsv`
 
-Written when `--quantMode GeneSplicing` is set (rustar-aligner extension, not in STAR). The table has a header line and one line per gene with spliced, unspliced and ambiguous counts for the unstranded, forward and reverse strand conventions (nine count columns). The summary gives read accounting and the spliced / unspliced / ambiguous fractions per strand convention. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
+Written when `--quantGeneSplicing Yes` is set (rustar-aligner extension, not in STAR). The table has a header line and one line per gene with spliced, unspliced and ambiguous counts for the unstranded, forward and reverse strand conventions (nine count columns). The summary gives read accounting and the spliced / unspliced / ambiguous fractions per strand convention. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Unmapped reads
 

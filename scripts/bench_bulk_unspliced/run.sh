@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Bulk total-RNA benchmark for --quantTranscriptomeUnspliced and
-# --quantMode GeneSplicing. Run fetch_data.sh first.
+# --quantGeneSplicing Yes. Run fetch_data.sh first.
 #
 #   DATA=/path/to/bench BIN=target/release/rustar-aligner THREADS=16 \
 #     bash scripts/bench_bulk_unspliced/run.sh
 #   python3 scripts/bench_bulk_unspliced/analyze.py "$DATA"
 #
 # For every pseudo-replicate library it runs rustar-aligner three times:
-#   star/    : --quantMode TranscriptomeSAM GeneSplicing (STAR projection)
+#   star/    : --quantMode TranscriptomeSAM --quantGeneSplicing Yes (STAR projection)
 #   intron/  : TranscriptomeSAM + --quantTranscriptomeUnspliced Intron
 #   premrna/ : TranscriptomeSAM + --quantTranscriptomeUnspliced PreMRNA
 # then quantifies each transcriptome BAM with `salmon quant -a`, against the
@@ -47,7 +47,7 @@ for r1 in "$DATA"/reads/*_rep?_1.fq.gz; do
     mkdir -p "$o"
     fa=$DATA/targets/$mode.fa
     case $mode in
-      star) extra=(--quantMode TranscriptomeSAM GeneSplicing) ;;
+      star) extra=(--quantMode TranscriptomeSAM --quantGeneSplicing Yes) ;;
       intron) extra=(--quantMode TranscriptomeSAM --quantTranscriptomeUnspliced Intron) ;;
       premrna) extra=(--quantMode TranscriptomeSAM --quantTranscriptomeUnspliced PreMRNA) ;;
     esac

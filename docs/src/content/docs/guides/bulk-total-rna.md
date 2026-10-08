@@ -7,12 +7,15 @@ Ribo-depleted ("total") RNA-seq libraries contain a large share of unspliced
 pre-mRNA: intronic reads routinely make up a third to more than half of the
 fragments. rustar-aligner has three **opt-in** options for this kind of data.
 None of them exists in STAR; without them every output is the same as STAR's.
+They are separate flags, not new values of STAR's parameters, and all three
+need a GTF-aware index (`genomeGenerate` with `--quantGeneSplicing Yes`
+requires `--sjdbGTFfile`).
 
 | Option | What it adds |
 |---|---|
 | `--quantTranscriptomeUnspliced Intron` or `PreMRNA` | one unspliced target per gene, `<gene_id>-I`, in `Aligned.toTranscriptome.out.bam` |
-| `--outSAMattributes ... sp` | an `sp:A` splicing-status tag on every genomic alignment |
-| `--quantMode GeneSplicing` | spliced / unspliced / ambiguous read counts per gene |
+| `--outSAMsplicingStatus Yes` | an `sp:A` splicing-status tag on every genomic alignment |
+| `--quantGeneSplicing Yes` | spliced / unspliced / ambiguous read counts per gene |
 
 ## Why pre-mRNA matters for transcript quantification
 
@@ -113,18 +116,19 @@ Keep the `-I` targets out of isoform-level analyses, and out of tximport's
 
 ## Splicing-status tag (`sp`)
 
-`--outSAMattributes Standard sp` adds `sp:A:S` (spliced: compatible only with
+`--outSAMsplicingStatus Yes` adds `sp:A:S` (spliced: compatible only with
 mature mRNA, the read need not cross a junction), `sp:A:U` (unspliced: needs
 pre-mRNA) or `sp:A:A` (ambiguous: both) to every genomic alignment record,
 from the rules below applied to every annotated transcript that contains the
 alignment, on either strand and whatever its gene. There is no tag when no
 transcript contains the alignment. Both mates of a pair carry the fragment
-status. `sp` is in no preset and is not used by STAR or STARsolo.
+status, after the `--outSAMattributes` tags. The `sp` tag name is not used by
+STAR or STARsolo.
 
-## Spliced / unspliced gene counts (`GeneSplicing`)
+## Spliced / unspliced gene counts (`--quantGeneSplicing`)
 
 ```bash
-rustar-aligner ... --quantMode GeneCounts GeneSplicing
+rustar-aligner ... --quantMode GeneCounts --quantGeneSplicing Yes
 ```
 
 A cheap per-library measure of pre-mRNA content, and a gene-level table. Each

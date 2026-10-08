@@ -33,10 +33,6 @@ bitflags::bitflags! {
         const VW = 1 << 12;
         const VA = 1 << 13;
         const VG = 1 << 14;
-        /// `sp:A` — rustar-aligner extension (not in STAR): splicing status of
-        /// the alignment against the annotation (S spliced, U unspliced,
-        /// A ambiguous). Needs a GTF-aware index. Not in any preset.
-        const SP = 1 << 15;
 
         // STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
         const STANDARD =
@@ -76,7 +72,6 @@ impl FromStr for SamAttributes {
             "vW" => Self::VW,
             "vA" => Self::VA,
             "vG" => Self::VG,
-            "sp" => Self::SP,
             other => return Err(format!("unknown --outSAMattributes token '{other}'")),
         })
     }

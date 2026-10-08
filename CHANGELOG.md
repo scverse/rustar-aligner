@@ -55,16 +55,19 @@ Sections commonly used: Features, Bug fixes, Other changes.
     intron is no longer forced onto the retained-intron isoform. Writes
     `Aligned.toTranscriptome.targets.tsv` and, on request, the unspliced
     sequences (`--quantTranscriptomeUnsplicedFasta Yes`).
-  - `--outSAMattributes sp` tags genomic alignments `sp:A:S|U|A`
+  - `--outSAMsplicingStatus Yes` tags genomic alignments `sp:A:S|U|A`
     (spliced / unspliced / ambiguous).
-  - `--quantMode GeneSplicing` writes `ReadsPerGeneSplicing.out.tab` and
+  - `--quantGeneSplicing Yes` writes `ReadsPerGeneSplicing.out.tab` and
     `ReadsPerGeneSplicing.summary.tsv`, using STARsolo's spliced / unspliced
     classification on each read or pair.
-
-### Bug fixes
-
-- Unknown `--quantMode` values are now rejected, as in STAR, instead of
-  being silently ignored.
+  - These are separate rustar-aligner flags, not new values of STAR's
+    `--quantMode` or `--outSAMattributes`, so a STAR command line keeps its
+    STAR meaning.
+  - Behaviour change: `genomeGenerate` with `--quantGeneSplicing Yes` now
+    requires `--sjdbGTFfile`, as it already did for
+    `--quantMode TranscriptomeSAM`. `--quantGeneSplicing Yes`,
+    `--outSAMsplicingStatus Yes` and `--quantTranscriptomeUnspliced` all need
+    a GTF-aware index at `alignReads`.
 
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)

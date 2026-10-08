@@ -1119,9 +1119,7 @@ pub struct Parameters {
 
     // ── Quantification ──────────────────────────────────────────────────
     /// Quantification mode(s): GeneCounts, TranscriptomeSAM, or empty for none.
-    /// Space-separated, e.g. `--quantMode GeneCounts`. rustar-aligner also
-    /// accepts `GeneSplicing` (not in STAR): per-gene spliced / unspliced /
-    /// ambiguous counts for bulk data, using STARsolo's spliced / unspliced rules.
+    /// Space-separated, e.g. `--quantMode GeneCounts`.
     #[arg(long = "quantMode", num_args = 0..)]
     pub quant_mode: Vec<String>,
 
@@ -1164,6 +1162,21 @@ pub struct Parameters {
     /// the file is of the order of the genome size.
     #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
     pub quant_transcriptome_unspliced_fasta: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` writes per-gene spliced /
+    /// unspliced / ambiguous counts for bulk data
+    /// (`ReadsPerGeneSplicing.out.tab` and `.summary.tsv`), using STARsolo's
+    /// spliced / unspliced rules. Needs a GTF-aware index.
+    #[arg(long = "quantGeneSplicing", default_value = "No")]
+    pub quant_gene_splicing: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` adds an `sp:A` tag to the
+    /// genomic SAM/BAM records with the alignment's splicing status against
+    /// the annotation (S spliced, U unspliced, A ambiguous). Needs a
+    /// GTF-aware index. Kept out of `--outSAMattributes` so that STAR's
+    /// parameter keeps STAR's meaning.
+    #[arg(long = "outSAMsplicingStatus", default_value = "No")]
+    pub out_sam_splicing_status: String,
 
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
@@ -1816,8 +1829,21 @@ impl Parameters {
         {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
-                "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+                "--quantMode TranscriptomeSAM and --quantGeneSplicing Yes require \
+                 --sjdbGTFfile at genomeGenerate",
             ));
+        }
+
+        for (flag, value) in [
+            ("--quantGeneSplicing", &params.quant_gene_splicing),
+            ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
+        ] {
+            if !matches!(value.as_str(), "Yes" | "No") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("{flag} must be Yes or No, got '{value}'"),
+                ));
+            }
         }
 
         // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
@@ -2205,10 +2231,16 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
     }
 
-    /// Returns true if `--quantMode GeneSplicing` (rustar-aligner extension:
+    /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
     /// bulk spliced / unspliced / ambiguous gene counts) was requested.
     pub fn quant_gene_splicing(&self) -> bool {
-        self.quant_mode.iter().any(|m| m == "GeneSplicing")
+        self.quant_gene_splicing == "Yes"
+    }
+
+    /// Returns true if `--outSAMsplicingStatus Yes` (rustar-aligner extension:
+    /// `sp:A` splicing-status tag on genomic records) was requested.
+    pub fn out_sam_splicing_status(&self) -> bool {
+        self.out_sam_splicing_status == "Yes"
     }
 
     /// True when a single-cell run is requested (`--soloType` != None).
@@ -2900,19 +2932,24 @@ mod tests {
     }
 
     #[test]
-    fn sp_attribute_is_opt_in() {
+    fn splicing_status_tag_is_opt_in() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
-        assert!(!p.out_sam_attributes.contains(SamAttributes::SP));
-        let p = try_parse(&[
-            "--readFilesIn",
-            "r.fq",
-            "--outSAMattributes",
-            "Standard",
-            "sp",
-        ])
-        .unwrap();
-        assert!(p.out_sam_attributes.contains(SamAttributes::SP));
+        assert!(!p.out_sam_splicing_status());
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "Yes"]).unwrap();
+        assert!(p.out_sam_splicing_status());
         assert!(p.out_sam_attributes.contains(SamAttributes::NH));
+        // Not a value of STAR's --outSAMattributes.
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMattributes",
+                "Standard",
+                "sp"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "yes"]).is_err());
     }
 
     #[test]
@@ -2924,11 +2961,13 @@ mod tests {
             "r.fq",
             "--quantMode",
             "TranscriptomeSAM",
-            "GeneSplicing",
+            "--quantGeneSplicing",
+            "Yes",
         ])
         .unwrap();
         assert!(p.quant_gene_splicing());
         assert!(p.quant_transcriptome_sam());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneSplicing", "1"]).is_err());
     }
 
     #[test]

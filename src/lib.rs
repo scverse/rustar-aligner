@@ -325,24 +325,23 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // Use the transcriptome index loaded alongside the genome (populated
     // from transcriptInfo.tab / exonInfo.tab / geneInfo.tab at load time
     // — see GenomeIndex::load). Only wire it through to the pipeline when
-    // `--quantMode TranscriptomeSAM` or `GeneSplicing` is requested.
+    // `--quantMode TranscriptomeSAM`, `--quantGeneSplicing Yes` or
+    // `--outSAMsplicingStatus Yes` is requested.
     let tr_idx_all: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
         if params.quant_transcriptome_sam()
             || params.quant_gene_splicing()
-            || params
-                .out_sam_attributes
-                .contains(crate::params::SamAttributes::SP)
+            || params.out_sam_splicing_status()
         {
             let tr = index.transcriptome.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--quantMode TranscriptomeSAM / GeneSplicing and --outSAMattributes sp \
+                    "--quantMode TranscriptomeSAM, --quantGeneSplicing and --outSAMsplicingStatus \
                      require a GTF-aware index; \
                      re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
                      at alignReads so transcriptInfo.tab can be (re)built"
                 )
             })?;
             info!(
-                "quantMode TranscriptomeSAM/GeneSplicing: using {} transcripts from genome index",
+                "TranscriptomeSAM / GeneSplicing / sp tag: using {} transcripts from genome index",
                 tr.n_transcripts()
             );
             Some(std::sync::Arc::new(tr.clone()))
@@ -384,14 +383,12 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     };
 
     // Build the per-read quantification context if --quantMode GeneCounts
-    // and/or GeneSplicing was requested. GeneCounts' GTF requirement is
+    // and/or --quantGeneSplicing / --outSAMsplicingStatus was requested. GeneCounts' GTF requirement is
     // already validated in params.validate().
     let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> = if params
         .quant_gene_counts()
         || params.quant_gene_splicing()
-        || params
-            .out_sam_attributes
-            .contains(crate::params::SamAttributes::SP)
+        || params.out_sam_splicing_status()
     {
         let gene = if params.quant_gene_counts() {
             let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
@@ -415,11 +412,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             .map(|tr| crate::quant::SplicingQuant::new(std::sync::Arc::clone(tr)));
         let splice_tag = tr_idx_all
             .as_ref()
-            .filter(|_| {
-                params
-                    .out_sam_attributes
-                    .contains(crate::params::SamAttributes::SP)
-            })
+            .filter(|_| params.out_sam_splicing_status())
             .map(std::sync::Arc::clone);
         Some(std::sync::Arc::new(crate::quant::QuantContext {
             gene,

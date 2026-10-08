@@ -1,7 +1,7 @@
 # Bulk total-RNA benchmark
 
 Public-data benchmark for `--quantTranscriptomeUnspliced` and
-`--quantMode GeneSplicing` (see the "Bulk total RNA-seq" guide).
+`--quantGeneSplicing Yes` (see the "Bulk total RNA-seq" guide).
 
 - Reference: GRCh38 primary assembly + GENCODE v50 comprehensive annotation
   (reference chromosomes) + GENCODE v50 transcript FASTA.

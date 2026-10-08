@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Check that this branch, run WITHOUT the new options, reproduces a main
-# build's outputs on real data (and that adding GeneSplicing /
+# build's outputs on real data (and that adding --quantGeneSplicing /
 # --quantTranscriptomeUnspliced None changes none of them).
 #
 #   DATA=... BIN_MAIN=/path/to/main/rustar-aligner BIN=target/release/rustar-aligner \
@@ -27,7 +27,7 @@ run() { # bin outdir extra...
 }
 run "$BIN_MAIN" "$OUT/main" --quantMode TranscriptomeSAM
 run "$BIN" "$OUT/branch" --quantMode TranscriptomeSAM
-run "$BIN" "$OUT/branch_new" --quantMode TranscriptomeSAM GeneSplicing \
+run "$BIN" "$OUT/branch_new" --quantMode TranscriptomeSAM --quantGeneSplicing Yes \
   --quantTranscriptomeUnspliced None
 
 digest() { # dir

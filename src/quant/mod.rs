@@ -543,11 +543,11 @@ impl GeneCounts {
 // ---------------------------------------------------------------------------
 
 /// Bundles the per-read quantifications requested by `--quantMode`
-/// (`GeneCounts`, `GeneSplicing`) for cheap Arc sharing across threads.
+/// (`GeneCounts`, `--quantGeneSplicing`, `--outSAMsplicingStatus`) for cheap Arc sharing across threads.
 pub struct QuantContext {
     /// `--quantMode GeneCounts`: exon-union gene counts.
     pub gene: Option<GeneQuant>,
-    /// `--quantMode GeneSplicing`: spliced / unspliced / ambiguous per gene.
+    /// `--quantGeneSplicing Yes`: spliced / unspliced / ambiguous per gene.
     pub splicing: Option<SplicingQuant>,
     /// `--outSAMattributes sp`: annotated transcripts for the per-alignment
     /// splicing-status tag.
