@@ -272,7 +272,9 @@ Sections commonly used: Features, Bug fixes, Other changes.
   merge). `--limitBAMsortRAM N` now spills above `N` rather than
   aborting the run, and `--limitBAMsortRAM 0` means 512 MiB instead of
   "unlimited". Runs beyond 64 are merged in balanced passes so a small
-  budget on a large run cannot exhaust file descriptors.
+  budget on a large run cannot exhaust file descriptors. Spill runs go to
+  `--outTmpDir` when given (previously accepted and ignored), otherwise beside
+  the output, and are always removed. See DIVERGENCE.md §4.3.
 
 ### Bumps
 

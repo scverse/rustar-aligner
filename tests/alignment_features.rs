@@ -2134,8 +2134,6 @@ fn test_sorted_bam_spills_to_disk_and_matches_unbounded_sort() {
     assert!(leftover.is_empty(), "spill files left behind: {leftover:?}");
 }
 
-
-
 // ---------------------------------------------------------------------------
 // --runMode soloCellFiltering
 // ---------------------------------------------------------------------------

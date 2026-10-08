@@ -136,7 +136,14 @@ fn resolve_bam_sort_ram(params: &Parameters) -> u64 {
 /// tmpfs on many Linux distributions, so spilling there would keep the records in
 /// RAM and defeat the budget entirely. STAR likewise keeps its sort scratch
 /// (`_STARtmp`) beside the output.
+/// Where spill runs go. STAR puts its sort temporaries under `--outTmpDir` when
+/// given (`Parameters.cpp:493-498`), so that is honoured. Otherwise they sit
+/// beside the output rather than in STAR's `<prefix>_STARtmp/`; see
+/// DIVERGENCE.md §4.3.
 fn sort_temp_dir(params: &Parameters) -> std::path::PathBuf {
+    if params.out_tmp_dir != "-" {
+        return std::path::PathBuf::from(&params.out_tmp_dir);
+    }
     let prefix = params.output_path("");
     match prefix.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -195,6 +202,10 @@ impl CoordinateSorter {
 
     /// Create an empty spill-run file beside the output.
     fn new_run(&self) -> Result<tempfile::NamedTempFile, Error> {
+        // Created on the first spill only, so a run that never spills leaves
+        // no directory behind.
+        std::fs::create_dir_all(&self.temp_dir)
+            .map_err(|source| Error::io(source, &self.temp_dir))?;
         tempfile::Builder::new()
             .prefix("rustar-bamsort-")
             .suffix(".tmp")
@@ -1104,7 +1115,7 @@ mod tests {
     fn test_sorted_bam_empty_output_is_a_valid_bam() {
         let (decoded, runs) = sorted_output(&[], 1 << 30, 64);
         assert_eq!(runs, 0);
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, []);
     }
 
     #[test]
