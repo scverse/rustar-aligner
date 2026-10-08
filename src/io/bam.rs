@@ -589,15 +589,17 @@ fn render_sam_text_lenient(header: &sam::Header, sort_order: Option<&str>) -> Ve
     if let Some(hd) = header.header() {
         buf.extend_from_slice(b"@HD\tVN:");
         buf.extend_from_slice(hd.version().to_string().as_bytes());
-        if let Some(so) = sort_order {
-            buf.extend_from_slice(b"\tSO:");
-            buf.extend_from_slice(so.as_bytes());
-        }
         for (tag, value) in hd.other_fields() {
             buf.push(b'\t');
             buf.extend_from_slice(tag.as_ref());
             buf.push(b':');
             buf.extend_from_slice(value);
+        }
+        // Appended after the user's fields, even when they carry their own SO,
+        // as STAR's `samHeaderSortedCoord` does (`samHeaders.cpp:100`).
+        if let Some(so) = sort_order {
+            buf.extend_from_slice(b"\tSO:");
+            buf.extend_from_slice(so.as_bytes());
         }
         buf.push(b'\n');
     }
@@ -1144,6 +1146,30 @@ mod tests {
         assert!(
             estimated_record_bytes(&large) >= estimated_record_bytes(&small) + 300,
             "estimate must account for SEQ and QUAL"
+        );
+    }
+
+    #[test]
+    fn sorted_header_appends_so_after_the_user_hd_fields() {
+        let genome = create_test_genome();
+        let render = |extra: &[&str]| {
+            let mut args = vec!["rustar-aligner", "--readFilesIn", "test.fq"];
+            args.extend_from_slice(extra);
+            let params = Parameters::parse_from(args);
+            let header = crate::io::sam::build_sam_header(&genome, &params).unwrap();
+            let text = render_sam_text_lenient(&header, Some("coordinate"));
+            String::from_utf8(text)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        // STAR: samHeaderHD + "\tSO:coordinate" (samHeaders.cpp:100).
+        assert_eq!(render(&[]), "@HD\tVN:1.4\tSO:coordinate");
+        assert_eq!(
+            render(&["--outSAMheaderHD", "@HD", "VN:1.6", "GO:query"]),
+            "@HD\tVN:1.6\tGO:query\tSO:coordinate"
         );
     }
 }

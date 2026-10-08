@@ -957,7 +957,8 @@ where
     // tab-separated fields STAR expects (`@HD VN:1.4 SO:coordinate`).
     // STAR writes `VN:1.4` (`samHeaders.cpp:94`), not the latest spec version.
     let star_version = sam::header::record::value::map::header::Version::new(1, 4);
-    if params.out_sam_header_hd.is_empty() {
+    // `-` is STAR's default value for --outSAMheaderHD, meaning "no override".
+    if params.out_sam_header_hd.is_empty() || params.out_sam_header_hd == ["-"] {
         builder = builder.set_header(Map::<sam::header::record::value::map::Header>::new(
             star_version,
         ));
@@ -1802,6 +1803,23 @@ mod tests {
         let hd = header.header().unwrap();
         assert_eq!(hd.version(), Version::new(1, 6));
         assert_eq!(hd.other_fields().len(), 1, "only SO besides VN");
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_dash_is_the_default() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "-",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 4));
+        assert_eq!(hd.other_fields().len(), 0);
     }
 
     #[test]
