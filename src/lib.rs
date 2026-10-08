@@ -1860,7 +1860,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         let (clipped_seq, clipped_qual) =
                             clip_read(&read.sequence, &read.quality, clip5p, clip3p);
 
-                        let mut buffer = BufferedSamRecords::new();
+                        let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                         let mut chimeric_alns = Vec::new();
                         let tr_local = tr.as_ref().map(Arc::clone);
 
@@ -2270,7 +2270,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // Nbases; used to soft-clip all trimmed bases (STARsolo convention).
                             let total_clip5p = cr4_5p + clip5p;
                             let total_clip3p = cr4_3p + clip3p;
-                            let mut buffer = BufferedSamRecords::new();
+                            let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
 
                             if clipped_seq.is_empty() {
@@ -2569,7 +2569,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 clip5p_m2,
                                 clip3p_m2,
                             );
-                            let mut buffer = BufferedSamRecords::new();
+                            let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
 
                             let (results, _pe_chimeric, n_for_mapq, unmapped_reason) =
@@ -3230,7 +3230,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             m2_clip3p,
                         );
 
-                        let mut buffer = BufferedSamRecords::new();
+                        let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                         let tr_local = tr.as_ref().map(Arc::clone);
 
                         // Record read bases for Log.final.out (both mates)
