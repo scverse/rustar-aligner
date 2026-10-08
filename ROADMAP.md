@@ -348,3 +348,63 @@ Single-cell quantification layered around the existing aligner: the cDNA read al
 **Phase 14.5–14.11 + performance** (2026-07): completed the feature-parity set — `Summary.csv` (STARsolo-faithful, CellRanger funnel split to its own file), `--soloCellFilter` CellRanger2.2/TopCells/**EmptyDrops_CR** (Monte-Carlo ambient rescue in the `filtered/` writer), `--soloFeatures` **GeneFull/SJ/Velocyto** (spliced/unspliced/ambiguous per Sullivan 2025), `--soloMultiMappers` Uniform/PropUnique/EM/Rescue, chemistries **CB_UMI_Complex** (multi-segment) and **SmartSeq** (plate-based, SE + PE fragment counts), and a rustar-vs-STARsolo SJ + multi-mapper diff harness. Performance: pipelined solo FASTQ decode, parallelized matrix build + EmptyDrops MC, libdeflate/zlib-rs for matrix gzip + BGZF, and an **O(log n + k) segment-tree gene-overlap query** (replacing STAR's linear scan — the #1 solo hotspot, ~14% wall reduction). Sparse suffix array (`--genomeSAsparseD`, byte-identical to STAR's D=2) for a 31% smaller index. 516 tests, 0 clippy warnings.
 
 **Native three-way benchmark** (2026-07, `test/aws/`): fresh single-instance EC2 comparison on a real 10x dataset (`5k_Mouse_PBMCs_5p_gem-x_GEX`, 5′ GEM-X, GRCm39-2024-A), all native x86_64, 10 threads, NVMe, page cache dropped, no BAM. Wall / peak RSS / cells: **STARsolo 2.7.11b** 87 s / 28.3 GB / 4,061; **rustar-aligner** 121 s / 25.7 GB / 3,689 (→ ~105 s with the segment-tree query merged after this run); **rustar `--genomeSAsparseD 2`** 119 s / **17.7 GB** / 3,692; **CellRanger 10.0.0** 347 s / 13.1 GB / 3,858. `Gene/raw` matrix byte-identical to STARsolo's. Supersedes the earlier Docker-emulation numbers above (those were penalized by Rosetta/virtiofs). Remaining gap to STARsolo is small and output-identical; rustar owns the memory frontier via sparse SA.
+
+---
+
+## Where the port actually stands (2026-08-27, measured)
+
+Numbers below come from two runs anyone can reproduce, not from recollection:
+`test/yeast_tier.sh` (ERR12389696 against the R64-1-1 genome, no annotation)
+and `test/nfcore_diff.py` (the nf-core/rnaseq test data). Both compare against
+STAR 2.7.11b on the same inputs.
+
+### Yeast tier, 50 000 pairs, 84 006 mates compared
+
+| | count | share |
+|---|---|---|
+| same chromosome, position and CIGAR | 82 879 | 98.658% |
+| same NH | 83 976 | 99.964% |
+| mates only in STAR's output | 8 | |
+| mates only in rustar-aligner's output | 2 | |
+
+Of the 1 127 mates placed differently, **1 113 are multi-mappers whose primary
+differs**, and those are ties rather than disagreements: 1 110 of them have an
+identical set of loci on both sides, and 1 108 have an identical primary
+alignment score. That is the documented tie-break divergence
+([DIVERGENCE.md](DIVERGENCE.md) §1.1), not a faithfulness gap.
+
+What remains after excluding ties is **about 15 mates in 84 006**, in three
+shapes:
+
+1. **STAR splices where we soft-clip** (the largest group). `ERR12389696.13842`
+   mate2: STAR `143M831334N7M` at AS 291, rustar `144M6S` at AS 288. Running
+   the same read with `--alignIntronMax 1000000` produces STAR's alignment
+   exactly, so the cause is window binning, not scoring: with
+   `alignIntronMax=0` the bin width stays at `2^winBinNbits`, and the two
+   pieces land in windows too far apart to stitch. STAR reaches it anyway.
+2. **The reverse**: `ERR12389696.15864` is a pair only rustar reports, both
+   mates spliced across ~420 kb.
+3. **A different stitch of the same locus**: `ERR12389696.27612` mate2, STAR
+   `32M288N97M21S` at AS 252 against rustar `129M21S` at AS 250 — the spliced
+   alternative exists on mate1 and is chosen there, but not on mate2.
+
+### nf-core/rnaseq test data, 50 000 pairs
+
+| | STAR | rustar-aligner |
+|---|---|---|
+| uniquely mapped | 41 691 | 41 684 |
+| multi-mapped | 934 | 942 |
+| deepest multimapper (NH) | 14 | 14 |
+| unmapped: too short | 3 766 | 3 778 |
+| unmapped: other | 3 609 | 3 596 |
+
+Both remaining gaps on this dataset were bugs found from user reports and are
+fixed: the unmapped-reason split (#48) and the multimapper depth (#31).
+
+### What "finished" needs, from here
+
+- The ten themes of #143, most of which have a rebased pull request waiting.
+- The 19 STAR parameters still in `NOT_YET_ACCEPTED`, every one of which is
+  implemented by one of those pull requests.
+- The ~15 non-tie mates above, which are all window-formation or
+  stitch-preference differences, i.e. the P1 theme rather than new features.
