@@ -1687,10 +1687,12 @@ fn build_paired_mate_record(
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(combined_score));
     }
     // nM (mismatch count) before NM (edit distance), matching STAR's tag order.
+    // Like AS, STAR's nM is per pair: both mates carry the sum of their
+    // mismatches. NM stays per mate.
     if attrs.contains(SamAttributes::NMM) {
         data.insert(
             Tag::new(b'n', b'M'),
-            Value::from(transcript.n_mismatch as i32),
+            Value::from((transcript.n_mismatch + mate_transcript.n_mismatch) as i32),
         );
     }
     if attrs.contains(SamAttributes::NM) {
@@ -2425,7 +2427,7 @@ mod tests {
         // Check TLEN
         assert_eq!(rec.template_length(), 250);
 
-        // AS is the combined score (STAR behavior); nM is per-mate mismatches
+        // AS and nM are per pair (STAR behavior)
         let data = rec.data();
         assert_eq!(
             data.get(&Tag::ALIGNMENT_SCORE),
@@ -2434,8 +2436,8 @@ mod tests {
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "nM should be 0 (no mismatches in this mate)"
+            Some(&Value::from(1_i32)),
+            "nM should be the pair total (0 in this mate + 1 in its mate)"
         );
     }
 
@@ -3851,7 +3853,7 @@ mod tests {
 
         let genome = make_test_genome();
 
-        // Mate1: score=100, 0 mismatches, no junctions
+        // Mate1: score=100, 1 mismatch, no junctions
         let mate1_trans = Transcript {
             chr_idx: 0,
             genome_start: 0,
@@ -3866,7 +3868,7 @@ mod tests {
             }],
             cigar: vec![Op::new(Kind::Match, 4)],
             score: 100,
-            n_mismatch: 0,
+            n_mismatch: 1,
             n_gap: 0,
             n_junction: 0,
             junction_motifs: vec![],
@@ -3930,11 +3932,11 @@ mod tests {
             Some(&Value::from(180_i32)),
             "Mate1 AS should be combined score (100+80=180)"
         );
-        // NM attribute maps to nM tag (mismatches only)
+        // nM is per pair, like AS: mate1's 1 mismatch + mate2's 2
         assert_eq!(
             rec1.data().get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "Mate1 nM should be 0"
+            Some(&Value::from(3_i32)),
+            "Mate1 nM should be the pair total (1+2=3)"
         );
 
         // Mate2 also gets combined AS
@@ -3963,11 +3965,11 @@ mod tests {
             Some(&Value::from(180_i32)),
             "Mate2 AS should be combined score (100+80=180)"
         );
-        // nM = mismatches only (no indel contribution)
+        // nM = pair mismatches only (no indel contribution)
         assert_eq!(
             rec2.data().get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(2_i32)),
-            "Mate2 nM should be 2 (mismatches only, not edit distance)"
+            Some(&Value::from(3_i32)),
+            "Mate2 nM should be the pair total (1+2=3), not edit distance"
         );
     }
 

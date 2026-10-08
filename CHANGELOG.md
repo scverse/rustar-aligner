@@ -65,6 +65,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Paired-end `nM` is the pair total, as in STAR.** Both mates of a pair
+  carried their own mismatch count; STAR, like it does for `AS`, writes the sum
+  over both mates on each of them (rustar-aligner wrote 5 and 4 where STAR
+  writes 9 on both). `NM` stays per mate. On 2M GEUVADIS ERR188021 pairs
+  against chr21, `nM` now matches STAR 2.7.11b on all but 356 of 880,979
+  paired records whose own alignment STAR also reports, against 247,069
+  mismatches before; the 356 left are pairs whose other mate aligns
+  differently.
+
 - **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
   both ends of a single match block** (e.g. `1S97M2S`). With the default
   `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
