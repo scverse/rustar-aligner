@@ -24,7 +24,7 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
+pub use sam::{OutSamFormat, OutSamType, OutSamUnmapped, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -1365,11 +1365,11 @@ impl Parameters {
     }
 
     /// Whether the run produces per-read alignment records (SAM/BAM). False only
-    /// for `--outSAMtype None` written to a file (no `--outStd`): the alignment
+    /// for `--outSAMtype None` (STAR writes nothing to `--outStd` then either): the alignment
     /// loops then skip building SAM records entirely, which is a large saving for
     /// solo / quant-only runs that only need the count matrix.
     pub fn emits_alignments(&self) -> bool {
-        !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
+        self.out_sam_type.format != OutSamFormat::None
     }
 
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
@@ -2405,10 +2405,7 @@ mod tests {
         assert_eq!(p.read_files_command, Some("zcat".to_string()));
         assert_eq!(p.run_thread_n, NonZeroUsize::new(16).unwrap());
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(
-            p.out_sam_type.sort_order,
-            Some(OutSamSortOrder::SortedByCoordinate)
-        );
+        assert!(p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
         assert_eq!(p.out_file_name_prefix, "/out/sample1_");
         assert_eq!(p.out_filter_multimap_nmax, 20);
         assert_eq!(p.align_intron_max, 1_000_000);
@@ -2580,11 +2577,30 @@ mod tests {
     fn out_sam_type_parsing() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Sam);
-        assert_eq!(p.out_sam_type.sort_order, None);
+        assert!(!p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Unsorted"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(p.out_sam_type.sort_order, Some(OutSamSortOrder::Unsorted));
+        assert!(p.out_sam_type.bam_unsorted && !p.out_sam_type.bam_sorted);
+
+        for order in [
+            ["Unsorted", "SortedByCoordinate"],
+            ["SortedByCoordinate", "Unsorted"],
+        ] {
+            let p = try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMtype",
+                "BAM",
+                order[0],
+                order[1],
+            ])
+            .unwrap();
+            assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
+            assert!(p.out_sam_type.bam_unsorted && p.out_sam_type.bam_sorted);
+        }
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Bogus"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM", "Unsorted"]).is_err());
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "None"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::None);

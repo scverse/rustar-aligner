@@ -206,6 +206,29 @@ impl AlignmentWriter for NoQsWriter {
     }
 }
 
+/// Feeds the same records to several writers (`--outSAMtype BAM Unsorted
+/// SortedByCoordinate`: STAR writes every record to both BAM outputs).
+struct TeeWriter(Vec<Box<dyn AlignmentWriter>>);
+
+impl AlignmentWriter for TeeWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        for w in &mut self.0 {
+            w.write_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), error::Error> {
+        for w in &mut self.0 {
+            w.finish()?;
+        }
+        Ok(())
+    }
+}
+
 /// Null writer that discards all output (for two-pass mode pass 1)
 struct NullWriter;
 
@@ -721,11 +744,15 @@ fn run_single_pass(
         };
 
     // 4. Route to SAM or BAM output based on --outSAMtype / --outStd
-    use crate::params::{OutSamSortOrder, OutStd};
+    use crate::params::OutStd;
 
     let out_type = &params.out_sam_type;
 
-    // Build boxed writer — stdout takes precedence over file output.
+    // Build the boxed writer. As in STAR (Parameters.cpp), `--outStd` redirects
+    // only the output of the matching kind (SAM, BAM_Unsorted or
+    // BAM_SortedByCoordinate) to stdout; every other requested output still goes
+    // to its file. `BAM Unsorted SortedByCoordinate` opens both BAM outputs and
+    // feeds them the same records through a tee.
     // `--outSAMmode None` asks for no alignment output at all; everything else
     // (SJ.out.tab, Log.final.out, counts) is still produced, so the alignment
     // is still run and only the records are dropped.
@@ -733,30 +760,15 @@ fn run_single_pass(
         info!("--outSAMmode None: no alignment records will be written");
         Box::new(NullWriter)
     } else {
-        match params.out_std {
-            OutStd::Sam => {
-                info!("Writing SAM to stdout (--outStd SAM)");
-                Box::new(crate::io::sam::SamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::BamUnsorted => {
-                info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
-                Box::new(crate::io::bam::BamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::BamSortedByCoordinate => {
-                info!("Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)");
-                Box::new(crate::io::bam::SortedBamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::None => match out_type.format {
-                OutSamFormat::Sam => {
+        match out_type.format {
+            OutSamFormat::Sam => {
+                if params.out_std == OutStd::Sam {
+                    info!("Writing SAM to stdout (--outStd SAM)");
+                    Box::new(crate::io::sam::SamStdoutWriter::create(
+                        &index.genome,
+                        params,
+                    )?)
+                } else {
                     let output_path = params.output_path("Aligned.out.sam");
                     info!("Writing SAM to {}", output_path.display());
                     if let Some(parent) = output_path.parent() {
@@ -764,32 +776,57 @@ fn run_single_pass(
                     }
                     Box::new(SamWriter::create(&output_path, &index.genome, params)?)
                 }
-                OutSamFormat::Bam => {
-                    let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
-                    let output_path = if sorted {
-                        params.output_path("Aligned.sortedByCoord.out.bam")
+            }
+            OutSamFormat::Bam => {
+                let mut outputs: Vec<Box<dyn AlignmentWriter>> = Vec::new();
+                if out_type.bam_unsorted {
+                    outputs.push(if params.out_std == OutStd::BamUnsorted {
+                        info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
+                        Box::new(crate::io::bam::BamStdoutWriter::create(
+                            &index.genome,
+                            params,
+                        )?)
                     } else {
-                        params.output_path("Aligned.out.bam")
-                    };
-                    info!("Writing BAM to {}", output_path.display());
-                    if let Some(parent) = output_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    if sorted {
+                        let output_path = params.output_path("Aligned.out.bam");
+                        info!("Writing BAM to {}", output_path.display());
+                        if let Some(parent) = output_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        Box::new(BamWriter::create(&output_path, &index.genome, params)?)
+                    });
+                }
+                if out_type.bam_sorted {
+                    outputs.push(if params.out_std == OutStd::BamSortedByCoordinate {
+                        info!(
+                            "Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)"
+                        );
+                        Box::new(crate::io::bam::SortedBamStdoutWriter::create(
+                            &index.genome,
+                            params,
+                        )?)
+                    } else {
+                        let output_path = params.output_path("Aligned.sortedByCoord.out.bam");
+                        info!("Writing BAM to {}", output_path.display());
+                        if let Some(parent) = output_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
                         Box::new(SortedBamWriter::create(
                             &output_path,
                             &index.genome,
                             params,
                         )?)
-                    } else {
-                        Box::new(BamWriter::create(&output_path, &index.genome, params)?)
-                    }
+                    });
                 }
-                OutSamFormat::None => {
-                    info!("--outSAMtype None: skipping alignment output (count/quant only)");
-                    Box::new(NullWriter)
+                if outputs.len() == 1 {
+                    outputs.remove(0)
+                } else {
+                    Box::new(TeeWriter(outputs))
                 }
-            },
+            }
+            OutSamFormat::None => {
+                info!("--outSAMtype None: skipping alignment output (count/quant only)");
+                Box::new(NullWriter)
+            }
         }
     };
 
