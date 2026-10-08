@@ -21,6 +21,11 @@ impl GenomeIndex {
     pub fn load(genome_dir: &Path, params: &Parameters) -> Result<Self, Error> {
         log::info!("Loading genome from {}...", genome_dir.display());
 
+        // Refuse an index older than --versionGenome before reading a byte of
+        // it: an older layout read with today's reader is silently wrong, not
+        // loudly wrong.
+        check_genome_version(genome_dir, &params.version_genome)?;
+
         // Load Genome file
         let genome = load_genome(genome_dir, params)?;
         log::info!(
@@ -148,6 +153,74 @@ impl GenomeIndex {
             sjdb_overhang,
         })
     }
+}
+
+/// Parse a STAR genome version string (`2.7.4a`) into a comparable tuple:
+/// the numeric components, then the trailing letter suffix (`a` -> 1).
+///
+/// STAR compares these versions as strings, which orders `2.7.10a` before
+/// `2.7.4a`; comparing components avoids that trap.
+fn parse_genome_version(v: &str) -> Option<(Vec<u32>, u32)> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let digits_end = v.rfind(|c: char| c.is_ascii_digit()).map_or(0, |i| i + 1);
+    let (numeric, suffix) = v.split_at(digits_end);
+    let mut parts = Vec::new();
+    for p in numeric.split('.') {
+        parts.push(p.parse::<u32>().ok()?);
+    }
+    let suffix_rank = suffix.bytes().next().map_or(0, |b| {
+        u32::from(b.to_ascii_lowercase().saturating_sub(b'a')) + 1
+    });
+    Some((parts, suffix_rank))
+}
+
+/// Read `versionGenome` from `genomeParameters.txt`.
+fn read_genome_version(genome_dir: &Path) -> Result<Option<String>, Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(e, &path)),
+    };
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("versionGenome")
+            && let Some(value) = rest.split_whitespace().next()
+        {
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Fail when the index on disk is older than `required` (`--versionGenome`).
+///
+/// An index with no recorded version, or a version neither side can parse, is
+/// accepted with a warning: refusing it would break directories that load
+/// correctly today, and the version line is advisory metadata, not a checksum.
+pub(crate) fn check_genome_version(genome_dir: &Path, required: &str) -> Result<(), Error> {
+    let Some(found) = read_genome_version(genome_dir)? else {
+        log::warn!(
+            "{} has no versionGenome line; skipping the version check",
+            genome_dir.join("genomeParameters.txt").display()
+        );
+        return Ok(());
+    };
+    let (Some(found_v), Some(required_v)) =
+        (parse_genome_version(&found), parse_genome_version(required))
+    else {
+        log::warn!("could not compare genome version '{found}' against '{required}'");
+        return Ok(());
+    };
+    if found_v < required_v {
+        return Err(Error::Index(format!(
+            "genome index in {} has versionGenome {found}, older than the required {required}.              Regenerate the index with --runMode genomeGenerate, or lower --versionGenome if              you know the layout is compatible",
+            genome_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
@@ -402,5 +475,57 @@ mod tests {
         for i in 0..loaded_index.suffix_array.len().min(5) {
             assert_eq!(loaded_index.suffix_array.get(i), index.suffix_array.get(i));
         }
+    }
+
+    // ── --versionGenome ──────────────────────────────────────────────────
+
+    fn write_genome_params(dir: &std::path::Path, version_line: &str) {
+        std::fs::write(dir.join("genomeParameters.txt"), version_line).unwrap();
+    }
+
+    #[test]
+    fn version_genome_rejects_an_older_index() {
+        let dir = tempfile::tempdir().unwrap();
+        write_genome_params(dir.path(), "versionGenome\t2.7.1a\n");
+        let err = check_genome_version(dir.path(), "2.7.4a").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2.7.1a"),
+            "error should quote the found version: {msg}"
+        );
+        assert!(
+            msg.contains("2.7.4a"),
+            "error should quote the required version: {msg}"
+        );
+    }
+
+    #[test]
+    fn version_genome_accepts_equal_and_newer_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        write_genome_params(dir.path(), "versionGenome\t2.7.4a\n");
+        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
+
+        write_genome_params(dir.path(), "versionGenome\t2.7.10b\n");
+        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
+    }
+
+    #[test]
+    fn version_genome_orders_by_component_not_lexically() {
+        // A string comparison puts "2.7.10a" before "2.7.4a"; component
+        // comparison must not.
+        let older = parse_genome_version("2.7.4a").unwrap();
+        let newer = parse_genome_version("2.7.10a").unwrap();
+        assert!(newer > older, "2.7.10a must sort after 2.7.4a");
+        assert!(parse_genome_version("2.7.4b").unwrap() > older);
+    }
+
+    #[test]
+    fn version_genome_missing_line_is_accepted_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        write_genome_params(dir.path(), "genomeType\tFull\n");
+        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
+        // No genomeParameters.txt at all is also accepted.
+        std::fs::remove_file(dir.path().join("genomeParameters.txt")).unwrap();
+        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
     }
 }

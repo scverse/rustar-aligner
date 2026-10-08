@@ -83,15 +83,7 @@ const ACCEPTED_BUT_INERT: &[(&str, &str)] = &[
 /// Adding a name here must always be a deliberate act. Removing one is what
 /// progress looks like.
 const NOT_YET_ACCEPTED: &[&str] = &[
-    // STAR meta-parameters, none of them accepted here. clap rejects them, so
-    // a user who passes one is told rather than quietly ignored, which is the
-    // behaviour these three need most: silently dropping `--parametersFiles`
-    // would discard every parameter in that file.
-    "parametersFiles",
-    "sysShell",
-    "versionGenome",
-    // Aligner core (annotated-junction stitching, alignEndsType, in-recursion
-    // length penalty).
+    // Aligner core; implemented by the aligner-core PR, not here.
     "alignEndsProtrude",
     "alignInsertionFlush",
     "alignSoftClipAtReferenceEnds",
@@ -183,6 +175,33 @@ fn star_parameter_surface_is_fully_accounted_for() {
          NOT_YET_ACCEPTED; remove them from that list:\n  {}",
         unexpectedly_present.len(),
         unexpectedly_present.join("\n  ")
+    );
+}
+
+/// The coverage figure itself, measured from clap rather than asserted by
+/// hand: how many of STAR 2.7.11b's parameter names this CLI accepts. The
+/// denominator is whatever `star_2.7.11b_params.txt` holds, not a number
+/// written here.
+///
+/// The floor rises as the port advances. It exists so that a regression that
+/// silently drops a parameter fails here rather than in a user's pipeline.
+#[test]
+fn star_parameter_coverage_meets_the_floor() {
+    const FLOOR: usize = 180;
+
+    let star = star_parameter_names();
+    let ours = recognised_flags();
+    let accepted = star.iter().filter(|n| ours.contains(n.as_str())).count();
+
+    println!(
+        "STAR parameter coverage: {accepted}/{} accepted, {} still missing",
+        star.len(),
+        star.len() - accepted
+    );
+    assert!(
+        accepted >= FLOOR,
+        "STAR parameter coverage fell to {accepted}/{}; the floor is {FLOOR}",
+        star.len()
     );
 }
 

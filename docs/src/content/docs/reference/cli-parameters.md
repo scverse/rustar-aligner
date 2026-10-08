@@ -24,13 +24,16 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--genomeSAindexNbases` | `14` | Length of the SA pre-indexing string (log2). Lower for small genomes. |
 | `--genomeChrBinNbits` | `18` | Log2 of chromosome bin size. |
 | `--genomeSAsparseD` | `1` | SA sparsity (higher = less RAM, slower mapping). |
+| `--versionGenome` | `2.7.4a` | Earliest genome index version accepted; an older index is refused rather than misread. |
 
 ## Read input
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). |
-| `--readFilesCommand` | — | Decompression command, e.g. `zcat` for `.gz`. |
+| `--readFilesCommand` | — | Decompression command, e.g. `zcat` or `gunzip -c` for `.gz`. Run through a shell, so multi-word commands work. |
+| `--sysShell` | `-` | Shell that runs `--readFilesCommand`. `-` uses `/bin/sh` on Unix; on Windows the command is split into words and run directly. |
+| `--parametersFiles` | `-` | STAR-format parameter file(s): `parameterName value...` per line, `#` and `//` comments. Command-line values win. `-` means none. |
 | `--readMapNumber` | `-1` | Number of reads to map (`-1` = all). |
 | `--clip5pNbases` | `0` | Bases to clip from the 5' end of each mate. |
 | `--clip3pNbases` | `0` | Bases to clip from the 3' end of each mate. |

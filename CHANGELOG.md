@@ -44,6 +44,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Three more STAR 2.7.11b parameters, all with behaviour rather than
+  acceptance**: `--parametersFiles` (STAR-format parameter files, command
+  line wins, unknown name or empty value is fatal), `--versionGenome` (an
+  index older than the requested version is refused instead of misread), and
+  `--sysShell`, alongside a `--readFilesCommand` fix: it now runs through a
+  shell, so multi-word commands such as `gunzip -c` work instead of failing
+  as a missing program. Machine-checked STAR parameter coverage rises to
+  181/203.
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 

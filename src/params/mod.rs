@@ -530,6 +530,24 @@ pub struct Parameters {
     #[arg(long = "readFilesIn", num_args = 1..=2)]
     pub read_files_in: Vec<PathBuf>,
 
+    /// STAR-format parameter file(s): lines of `parameterName value...`,
+    /// `#` and `//` comments, one parameter per line. `-` means none. Values
+    /// given on the command line override values read from a file, and
+    /// `parametersFiles` itself may only appear on the command line.
+    #[arg(long = "parametersFiles", num_args = 1.., default_value = "-")]
+    pub parameters_files: Vec<String>,
+
+    /// Shell used to run `--readFilesCommand`; `-` selects the platform
+    /// default (`/bin/sh` on Unix). STAR's `sysShell`.
+    #[arg(long = "sysShell", default_value = "-")]
+    pub sys_shell: String,
+
+    /// Earliest genome index version this run accepts. A genome directory
+    /// written by an older STAR / rustar-aligner is rejected rather than read
+    /// with the wrong layout.
+    #[arg(long = "versionGenome", default_value = "2.7.4a")]
+    pub version_genome: String,
+
     /// Command to decompress input files (e.g. "zcat" for .gz)
     #[arg(long = "readFilesCommand")]
     pub read_files_command: Option<String>,
@@ -1530,6 +1548,166 @@ impl Parameters {
     }
 
     /// Parse and validate parameter combinations.
+    /// Long-flag names clap accepts, walked recursively so flattened argument
+    /// groups are included. Shared with the parameter-file loader so a file
+    /// can only set parameters this build actually has.
+    fn recognised_long_flags(command: &clap::Command) -> std::collections::BTreeSet<String> {
+        fn walk(cmd: &clap::Command, out: &mut std::collections::BTreeSet<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    out.insert(long.to_string());
+                }
+                for alias in arg.get_all_aliases().unwrap_or_default() {
+                    out.insert(alias.to_string());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, out);
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        walk(command, &mut out);
+        out
+    }
+
+    /// Parse one STAR parameter file into `--name value...` arguments.
+    ///
+    /// STAR's `Parameters::scanOneLine`: an empty line is skipped, a first
+    /// token starting with `#` or `//` is a comment, an unrecognised name is
+    /// fatal, and a name with no value is fatal. `parametersFiles` inside a
+    /// file is refused, as in STAR, where it is command-line only.
+    fn parse_parameters_file(
+        path: &str,
+        known: &std::collections::BTreeSet<String>,
+        command: &clap::Command,
+    ) -> Result<Vec<std::ffi::OsString>, clap::Error> {
+        use clap::error::ErrorKind;
+
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            let mut cmd = command.clone();
+            cmd.error(
+                ErrorKind::Io,
+                format!("could not read --parametersFiles '{path}': {e}"),
+            )
+        })?;
+
+        let mut out: Vec<std::ffi::OsString> = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let mut words = line.split_whitespace();
+            let Some(name) = words.next() else {
+                continue; // blank line
+            };
+            if name.starts_with('#') || name.starts_with("//") {
+                continue; // comment
+            }
+            if name == "parametersFiles" {
+                let mut cmd = command.clone();
+                return Err(cmd.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "parametersFiles cannot be set inside a parameter file                          ({path}, line {}); it is a command-line-only parameter",
+                        lineno + 1
+                    ),
+                ));
+            }
+            if !known.contains(name) {
+                let mut cmd = command.clone();
+                return Err(cmd.error(
+                    ErrorKind::UnknownArgument,
+                    format!(
+                        "unrecognised parameter name '{name}' in --parametersFiles                          {path} (line {})",
+                        lineno + 1
+                    ),
+                ));
+            }
+            let values: Vec<&str> = words.collect();
+            if values.is_empty() {
+                let mut cmd = command.clone();
+                return Err(cmd.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "empty value for parameter '{name}' in --parametersFiles                          {path} (line {})",
+                        lineno + 1
+                    ),
+                ));
+            }
+            out.push(std::ffi::OsString::from(format!("--{name}")));
+            for v in values {
+                out.push(std::ffi::OsString::from(v));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Expand `--parametersFiles` into leading arguments.
+    ///
+    /// Returns `args` unchanged when no file is requested. Otherwise the file
+    /// arguments are placed before the user's own arguments, and any flag the
+    /// user also passed on the command line is dropped from the file side, so
+    /// the command line wins even for the multi-value parameters where clap
+    /// would otherwise append rather than replace.
+    fn expand_parameters_files(
+        args: &[std::ffi::OsString],
+        command: &clap::Command,
+    ) -> Result<Vec<std::ffi::OsString>, clap::Error> {
+        let lossy: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // Collect the values of every --parametersFiles occurrence.
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lossy.len() {
+            if lossy[i] == "--parametersFiles" {
+                let mut j = i + 1;
+                while j < lossy.len() && !lossy[j].starts_with("--") {
+                    files.push(lossy[j].clone());
+                    j += 1;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        files.retain(|f| f != "-");
+        if files.is_empty() {
+            return Ok(args.to_vec());
+        }
+
+        let known = Self::recognised_long_flags(command);
+        let mut file_args: Vec<std::ffi::OsString> = Vec::new();
+        for f in &files {
+            file_args.extend(Self::parse_parameters_file(f, &known, command)?);
+        }
+
+        // Flags the user set directly; the file must not also set them.
+        let user_flags: std::collections::BTreeSet<&str> =
+            lossy.iter().filter_map(|a| a.strip_prefix("--")).collect();
+        let mut filtered: Vec<std::ffi::OsString> = Vec::new();
+        let mut skipping = false;
+        for a in file_args {
+            let text = a.to_string_lossy().into_owned();
+            if let Some(flag) = text.strip_prefix("--") {
+                skipping = user_flags.contains(flag);
+                if skipping {
+                    continue;
+                }
+                filtered.push(a);
+            } else if !skipping {
+                filtered.push(a);
+            }
+        }
+
+        let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(filtered.len() + args.len());
+        if let Some(program) = args.first() {
+            out.push(program.clone());
+        }
+        out.extend(filtered);
+        out.extend(args.iter().skip(1).cloned());
+        Ok(out)
+    }
+
     pub fn try_parse() -> Result<Self, clap::Error> {
         Self::try_parse_from(std::env::args_os())
     }
@@ -1543,7 +1721,11 @@ impl Parameters {
         let args: Vec<_> = args.into_iter().map(Into::into).collect();
 
         let mut command = <Self as clap::CommandFactory>::command();
-        let matches = command.clone().get_matches_from(args.iter());
+        // `--parametersFiles` is expanded before clap sees the arguments:
+        // file values become leading arguments, so a value repeated on the
+        // command line wins (STAR reads files first, then the command line).
+        let expanded = Self::expand_parameters_files(&args, &command)?;
+        let matches = command.clone().get_matches_from(expanded.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
         params.command_line = {
@@ -2143,6 +2325,17 @@ impl Parameters {
         Ok(params)
     }
 
+    /// The `--readFilesCommand`, bound to the shell `--sysShell` selects.
+    ///
+    /// `None` when no command was given, in which case compression is
+    /// detected from the file extension.
+    pub fn read_command(&self) -> Option<crate::io::fastq::ReadCommand> {
+        self.read_files_command
+            .as_deref()
+            .filter(|c| !c.trim().is_empty() && *c != "-")
+            .map(|c| crate::io::fastq::ReadCommand::new(c, &self.sys_shell))
+    }
+
     /// Returns true if `--quantMode GeneCounts` was requested.
     pub fn quant_gene_counts(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "GeneCounts")
@@ -2257,6 +2450,112 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    // ── --parametersFiles ────────────────────────────────────────────────
+
+    fn write_param_file(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn parameters_file_sets_values_and_skips_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(
+            dir.path(),
+            "star.params",
+            "# a comment\n\
+             // another comment\n\
+             \n\
+             outFilterMismatchNmax 3\n\
+             runThreadN 4\n\
+             outSAMattributes NH HI AS nM\n",
+        );
+        let p = try_parse(&["--readFilesIn", "r.fq", "--parametersFiles", &f]).unwrap();
+        assert_eq!(p.out_filter_mismatch_nmax, 3);
+        assert_eq!(p.run_thread_n, NonZeroUsize::new(4).unwrap());
+    }
+
+    #[test]
+    fn parameters_file_is_overridden_by_the_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(dir.path(), "star.params", "outFilterMismatchNmax 3\n");
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--parametersFiles",
+            &f,
+            "--outFilterMismatchNmax",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(p.out_filter_mismatch_nmax, 7);
+    }
+
+    #[test]
+    fn parameters_file_multi_value_is_replaced_not_appended() {
+        // clap appends repeated occurrences of a multi-value argument, so the
+        // loader has to drop the file's copy rather than rely on ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(dir.path(), "star.params", "readFilesIn a.fq b.fq\n");
+        let p = try_parse(&["--parametersFiles", &f, "--readFilesIn", "c.fq"]).unwrap();
+        assert_eq!(p.read_files_in, vec![PathBuf::from("c.fq")]);
+    }
+
+    #[test]
+    fn parameters_file_dash_means_none() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--parametersFiles", "-"]).unwrap();
+        assert_eq!(p.parameters_files, vec!["-".to_string()]);
+    }
+
+    #[test]
+    fn parameters_file_rejects_unknown_parameter_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(dir.path(), "star.params", "notAParameter 1\n");
+        let err = try_parse(&["--readFilesIn", "r.fq", "--parametersFiles", &f]).unwrap_err();
+        assert!(
+            err.to_string().contains("notAParameter"),
+            "error should name the offending parameter: {err}"
+        );
+    }
+
+    #[test]
+    fn parameters_file_rejects_empty_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(dir.path(), "star.params", "outFilterMismatchNmax\n");
+        let err = try_parse(&["--readFilesIn", "r.fq", "--parametersFiles", &f]).unwrap_err();
+        assert!(
+            err.to_string().contains("empty value"),
+            "error should say the value is empty: {err}"
+        );
+    }
+
+    #[test]
+    fn parameters_file_rejects_nested_parameters_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = write_param_file(dir.path(), "star.params", "parametersFiles other.params\n");
+        let err = try_parse(&["--readFilesIn", "r.fq", "--parametersFiles", &f]).unwrap_err();
+        assert!(
+            err.to_string().contains("command-line-only"),
+            "error should explain the restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn parameters_file_missing_is_an_error_naming_the_path() {
+        let err = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--parametersFiles",
+            "/nonexistent/star.params",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("/nonexistent/star.params"),
+            "error should name the unreadable file: {err}"
+        );
     }
 
     #[test]
