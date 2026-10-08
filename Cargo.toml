@@ -34,9 +34,8 @@ memmap2 = "0.9"
 byteorder = "1"
 noodles = { version = "0.116", features = ["fastq", "sam", "bam", "bgzf"] }
 bstr = "1"
-# Use the pure-Rust `zlib-rs` backend instead of flate2's default `miniz_oxide`:
-# ~2-3x faster inflate/deflate on the FASTQ decode + BGZF (BAM) paths, with no C
-# toolchain dependency. Backend is chosen at build time; API is unchanged.
+# `zlib-rs` backend rather than the default `miniz_oxide`: 2-3x faster
+# inflate/deflate, still pure Rust. Rationale in DEPENDENCIES.md.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rayon = "1"
 rustc-hash = "2"
@@ -46,20 +45,10 @@ tempfile = "3"
 bitflags = { version = "2.12.1", features = ["std"] }
 shlex = "2.0.1"
 caps-sa = "0.7"
-# mimalloc as the global allocator. Two reasons:
-#   1. **Memory return**: glibc malloc creates one arena per worker
-#      thread (rayon spawns ~num_cpus workers + sub-threads) and
-#      caches freed allocations in those arenas indefinitely. On
-#      genome-scale runs that adds 10-20 GB of allocator slack to
-#      peak RSS for no good reason. mimalloc's per-thread heaps
-#      release whole segments back to the OS when threads abandon
-#      them, so the cache size stays bounded.
-#   2. **Speed**: mimalloc has lower per-allocation cost than
-#      glibc's, which adds up on the millions of small allocations
-#      caps-sa makes during phase 1 / phase 4.
-# `default-features = false` skips the secure / debug builds (no
-# extra cost in release, but the default features add a few hundred
-# kB of fast-path stubs we don't need).
+# mimalloc as the global allocator: bounded allocator slack on
+# genome-scale runs (glibc's per-thread arenas added 10-20 GB of peak
+# RSS) and a lower per-allocation cost. `default-features = false`
+# skips the secure/debug builds. Full rationale in DEPENDENCIES.md.
 mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
