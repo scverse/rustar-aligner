@@ -465,6 +465,158 @@ fn test_spliced_alignment() {
     }
 }
 
+/// Annotated junctions with a 3-4 base terminal overhang must still be
+/// found (STAR's `alignSJDBoverhangMin` defaults to 3): STAR aligns these reads
+/// spliced; rustar-aligner used to soft-clip or misalign the short end.
+#[test]
+fn test_annotated_junction_short_overhang() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // 47 bp of Exon1's end + 3 bp of Exon2's start, and 4 bp of Exon1's end
+    // + 46 bp of Exon2's start.
+    let mut right_short = genome[10003..10050].to_vec();
+    right_short.extend_from_slice(&genome[10250..10253]);
+    let mut left_short = genome[10046..10050].to_vec();
+    left_short.extend_from_slice(&genome[10250..10296]);
+
+    let fastq_path = tmpdir.path().join("short_overhang.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for (name, seq) in [("right3", &right_short), ("left4", &left_short)] {
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_short_overhang");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    let alignments: Vec<(String, String, String)> = content
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            (
+                cols[0].to_string(),
+                cols[3].to_string(),
+                cols[5].to_string(),
+            )
+        })
+        .collect();
+    let expect = |name: &str, pos: &str, cigar: &str| {
+        assert!(
+            alignments
+                .iter()
+                .any(|(n, p, c)| n == name && p == pos && c == cigar),
+            "{name}: expected {pos} {cigar}, got {alignments:?}"
+        );
+    };
+    expect("right3", "10004", "47M200N3M");
+    expect("left4", "10047", "4M200N46M");
+}
+
+/// An annotated AT-AC junction whose donor exon ends with the intron's last
+/// base ("C"): the junction fits at the annotated position or one base to the
+/// left (non-canonical), and the junction scan scores both -8 and keeps the
+/// left one. STAR stitches the two halves of a seed that crosses the inserted
+/// junction sequence (Gsj) through the annotated junction directly, without the
+/// scan. Expected alignments are STAR 2.7.11b's on this genome: `r25` has no
+/// Gsj seed (25 bp exceeds the 24 bp flank), so STAR scans too.
+#[test]
+fn test_annotated_atac_junction_with_boundary_repeat() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut genome = build_genome();
+    // Exon1 ends with C; the intron becomes AT...AC (last intron base C).
+    genome[10049] = b'C';
+    genome[10050] = b'A';
+    genome[10051] = b'T';
+    genome[10248] = b'A';
+    genome[10249] = b'C';
+    // Keep exon2's first base different from C so only the left shift ties.
+    if genome[10250] == b'C' {
+        genome[10250] = b'G';
+    }
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // (name, bases on exon1, bases on exon2)
+    let reads = [("r25", 25, 25), ("r14", 14, 36), ("r4", 4, 46)];
+    let fastq_path = tmpdir.path().join("atac.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for (name, n1, n2) in reads {
+            let mut seq = genome[10050 - n1..10050].to_vec();
+            seq.extend_from_slice(&genome[10250..10250 + n2]);
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(&seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_atac");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    let got: Vec<(String, String, String)> = content
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            (c[0].to_string(), c[3].to_string(), c[5].to_string())
+        })
+        .collect();
+    for (name, pos, cigar) in [
+        ("r25", "10026", "24M200N26M"),
+        ("r14", "10037", "14M200N36M"),
+        ("r4", "10047", "4M200N46M"),
+    ] {
+        assert!(
+            got.iter()
+                .any(|(n, p, c)| n == name && p == pos && c == cigar),
+            "{name}: expected {pos} {cigar} (STAR 2.7.11b), got {got:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 5 — BySJout filtering
 // ---------------------------------------------------------------------------

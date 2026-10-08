@@ -65,6 +65,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Annotated junctions are stitched like STAR when a seed crosses them, and
+  paired-end windows drop covered sub-alignments.** A seed that crosses an
+  inserted (Gsj) junction is split into donor and acceptor halves. Window
+  dedup merged the acceptor half into a genomic seed on the same diagonal
+  (STAR keys it on the junction index, `WA_sjA`); the stitcher rejected a
+  splice whose second exon was shorter than `alignSJoverhangMin` before
+  checking whether the junction was annotated (`alignSJDBoverhangMin` is 3);
+  and the two halves went through the junction scan, which on a junction
+  whose boundary base repeats can settle on an equally scored unannotated
+  position (STAR stitches them through the annotated junction directly). For
+  pairs, a lower-scoring pair whose blocks are all covered by another pair
+  in the same window was reported as an extra multimapper (`66M9S` beside
+  `66M2I7M`); STAR drops it, as the single-end path already did. On 2M
+  GEUVADIS ERR188021 pairs against chr21, 402 reads now get STAR's exact
+  alignment and 4 lose it; annotated splices go from 7,957 to 8,197 (STAR:
+  8,203). Runtime +2.5%.
+
 - **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
   both ends of a single match block** (e.g. `1S97M2S`). With the default
   `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
