@@ -311,7 +311,7 @@ See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase t
 
 **Prerequisite met**: position agreement >99% (SE 99.815% tie-adj, PE 99.883%). Phase unblocked 2026-06-10.
 
-**Status**: A working, STARsolo-faithful single-cell pipeline — Gene count matrix **byte-identical to STARsolo's**, with GeneFull/SJ/Velocyto features, CB_UMI_Simple/Complex/SmartSeq chemistries, EmptyDrops_CR + CellRanger2.2 cell calling, multi-mapper resolution, and `Summary.csv`. Validated in a native three-way benchmark against STARsolo and CellRanger (see below). Remaining: per-record `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` (14.7, in review as #226).
+**Status**: A working, STARsolo-faithful single-cell pipeline — Gene count matrix **byte-identical to STARsolo's**, with GeneFull/SJ/Velocyto features, CB_UMI_Simple/Complex/SmartSeq chemistries, EmptyDrops_CR + CellRanger2.2 cell calling, multi-mapper resolution, and `Summary.csv`. Validated in a native three-way benchmark against STARsolo and CellRanger (see below). Remaining: per-record `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` (14.7).
 
 Single-cell quantification layered around the existing aligner: the cDNA read aligns through the normal SE path; a paired **barcode read** (R1 = cell barcode + UMI) is parsed, corrected against a whitelist, assigned to a gene, UMI-deduplicated, and emitted as a sparse per-cell count matrix. Target: faithful port of STARsolo (all features). See [docs-old/phase14_starsolo.md](docs-old/phase14_starsolo.md) for the full design and sub-phase tracking.
 
@@ -324,7 +324,7 @@ Single-cell quantification layered around the existing aligner: the cDNA read al
 | 14.CR | CellRanger 4/5-matching flags (`1MM_CR`, `MultiGeneUMI_CR`, `1MM_multi_Nbase_pseudocounts`, `CellRanger4` clip) | ✅ Complete |
 | 14.5 | `Summary.csv` (STARsolo-faithful; CellRanger funnel split out) | ✅ Complete |
 | 14.6 | Cell filtering (`--soloCellFilter`: CellRanger2.2, TopCells, EmptyDrops_CR MC rescue) | ✅ Complete |
-| 14.7 | `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` | 🔄 In review (#226) |
+| 14.7 | `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` | ⬜ Planned |
 | 14.8 | More features: GeneFull, SJ, Velocyto (spliced/unspliced/ambiguous) | ✅ Complete |
 | 14.9 | Multi-gene resolution (`--soloMultiMappers`: Uniform/PropUnique/EM/Rescue) | ✅ Complete |
 | 14.10 | Other chemistries: CB_UMI_Complex, SmartSeq (SE + PE fragment counts) | ✅ Complete |
