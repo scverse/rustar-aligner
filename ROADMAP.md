@@ -258,7 +258,7 @@ All 127 SE position disagreements (100 diff-chr + 27 same-chr) verified as **gen
 
 ## Debugging Tools
 
-**STAR debug tracing** (added 2026-03-19): Instrumented STAR binary at `/home/jamfer/Dropbox/Bioinformatics/tools/repos/STAR/source/STAR` with read-name-filtered trace points.
+**STAR debug tracing** (added 2026-03-19): an instrumented STAR build with read-name-filtered trace points. The patch is not in this repository (it was built on one contributor's machine), so `test/debug_star.sh` needs `STAR_BIN` pointing at such a build.
 
 Usage:
 ```bash
