@@ -2320,7 +2320,9 @@ fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
     {
-        Ok(Box::new(BufReader::new(flate2::read::GzDecoder::new(file))))
+        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
+            file,
+        ))))
     } else {
         Ok(Box::new(BufReader::new(file)))
     }
@@ -2545,7 +2547,10 @@ mod tests {
         let mut tied = HashMap::default();
         tied.insert(0u32, 1u32);
         tied.insert(1u32, 1u32);
-        assert!(filter_multi_gene_umi(&tied, UmiFiltering::MultiGeneUmiCr).is_empty());
+        assert_eq!(
+            filter_multi_gene_umi(&tied, UmiFiltering::MultiGeneUmiCr),
+            []
+        );
 
         // A tie at the maximum loses even when a third gene sits below it.
         let mut tied_with_loser = HashMap::default();
@@ -2630,7 +2635,10 @@ mod tests {
 
         // MultiGeneUMI_All discards it from both: a UMI in two genes is
         // evidence of a collision, not of the deeper gene.
-        assert!(filter_multi_gene_umi(&cross, UmiFiltering::MultiGeneUmiAll).is_empty());
+        assert_eq!(
+            filter_multi_gene_umi(&cross, UmiFiltering::MultiGeneUmiAll),
+            []
+        );
 
         // A single-gene UMI is untouched by every mode, including _All.
         let mut single: HashMap<u32, u32> = HashMap::default();
