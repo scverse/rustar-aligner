@@ -1760,18 +1760,21 @@ impl Parameters {
 
         // Unknown --quantMode values are fatal, as in STAR
         // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
-        // leading "-" means none.
+        // leading "-" means none. GeneCoverage is rustar's own addition for
+        // DegNorm (DIVERGENCE.md §4.4).
         if params.quant_mode.first().is_some_and(|m| m != "-")
-            && let Some(bad) = params
-                .quant_mode
-                .iter()
-                .find(|m| !matches!(m.as_str(), "TranscriptomeSAM" | "GeneCounts"))
+            && let Some(bad) = params.quant_mode.iter().find(|m| {
+                !matches!(
+                    m.as_str(),
+                    "TranscriptomeSAM" | "GeneCounts" | "GeneCoverage"
+                )
+            })
         {
             return Err(command.error(
                 ErrorKind::InvalidValue,
                 format!(
                     "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
-                     GeneCounts, or -"
+                     GeneCounts, GeneCoverage, or -"
                 ),
             ));
         }

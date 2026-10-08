@@ -452,7 +452,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 10,
             combined_wt_score: 0,
-            combined_n_match: 12,
         };
         cov.count_pe_read(&[&pair], &ann);
         assert_eq!(cov.gene_slice(0)[..10], [1u32; 10]);

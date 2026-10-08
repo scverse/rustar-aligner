@@ -164,6 +164,7 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 **Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
 
 **Source.** `src/io/bam.rs` (`CoordinateSorter`).
+
 ### 4.4 DegNorm degradation normalization (`--quantMode GeneCoverage`, `--runMode degNorm`)
 
 **What STAR does.** Nothing: STAR has no transcript-degradation model and no per-gene coverage output.
