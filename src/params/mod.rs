@@ -1700,6 +1700,24 @@ impl Parameters {
             }
         }
 
+        // Unknown --quantMode values are fatal, as in STAR
+        // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
+        // leading "-" means none.
+        if params.quant_mode.first().is_some_and(|m| m != "-")
+            && let Some(bad) = params
+                .quant_mode
+                .iter()
+                .find(|m| !matches!(m.as_str(), "TranscriptomeSAM" | "GeneCounts"))
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
+                     GeneCounts, or -"
+                ),
+            ));
+        }
+
         // quantMode GeneCounts requires a GTF file
         if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
             return Err(command.error(
@@ -2802,6 +2820,25 @@ mod tests {
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip
         );
+    }
+
+    #[test]
+    fn unknown_quant_mode_is_rejected() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneVelocyto"]).is_err());
+        // Not a STAR value either (Parameters.cpp:898-936 allows only these two).
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneSplicing"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantMode",
+                "TranscriptomeSAM",
+                "Genecounts"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).is_ok());
     }
 
     #[test]

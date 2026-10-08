@@ -65,6 +65,19 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
+  both ends of a single match block** (e.g. `1S97M2S`). With the default
+  `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
+  right clip was dropped when folding clips into the CIGAR, the record came out
+  shorter than its sequence, and BAM encoding failed with "read
+  length-sequence length mismatch", ending the run. Seen on human chr21
+  paired-end data. From #283.
+
+- **Unknown `--quantMode` values are rejected**, as STAR does
+  (`Parameters.cpp:898-936`): only `TranscriptomeSAM`, `GeneCounts` or `-`. A
+  typo such as `Genecounts` used to be ignored silently, producing no counts
+  and no error. From #283.
+
 - **`mappedFilter` ported as STAR has it** (`ReadAlign_mappedFilter.cpp`).
   The read is judged on its best alignment alone, in STAR's order: too short
   (score or matched bases), then too many mismatches, then too many loci; the
