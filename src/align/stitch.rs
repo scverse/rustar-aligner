@@ -1395,36 +1395,21 @@ fn stitch_align_to_transcript(
         return None;
     }
 
+    // Seeds on one diagonal (adjacent or separated by a gap-free filler) are
+    // never stitched. STAR's `stitchAlignToTranscript` leaves `jCan=999` on
+    // this path, so its closing test `jCan<0 || (jCan<7 && ...)` fails and the
+    // stitch returns -1000007. The bases between such seeds are reached by the
+    // end extension of whichever seed is kept, which is bounded by the
+    // max-score and mismatch rules of `extendAlign`, not by the gap scoring.
+    if read_gap == genome_gap {
+        return None;
+    }
+
     let mut new_wt = wt.clone();
     let mut d_score: i32 = 0;
     let mut gap_mm: u32 = 0;
 
-    if read_gap == 0 && genome_gap == 0 {
-        // Adjacent seeds — just extend the last exon
-        if let Some(last) = new_wt.exons.last_mut() {
-            last.read_end = eff_read_pos + eff_length;
-            last.genome_end = eff_genome_pos + eff_length as u64;
-        }
-    } else if read_gap == genome_gap {
-        // Equal gap: base-by-base scoring
-        let shared = read_gap as usize;
-        let (region_score, region_mm) = score_region(
-            read_seq,
-            last_exon.read_end,
-            last_exon.genome_end,
-            shared,
-            index,
-            cluster.is_reverse,
-        );
-        gap_mm = region_mm;
-        d_score += region_score;
-
-        // Extend last exon through the gap and the new seed
-        if let Some(last) = new_wt.exons.last_mut() {
-            last.read_end = eff_read_pos + eff_length;
-            last.genome_end = eff_genome_pos + eff_length as u64;
-        }
-    } else if genome_gap > read_gap {
+    if genome_gap > read_gap {
         // Deletion or splice junction
         let del = (genome_gap - read_gap) as u32;
         let shared = read_gap as usize;
@@ -3985,5 +3970,68 @@ mod tests {
         let additive_buggy = baseline + motif_score + scorer.sjdb_score;
         let replacement_correct = baseline + scorer.sjdb_score;
         assert_ne!(additive_buggy, replacement_correct);
+    }
+
+    /// STAR never stitches two seeds that sit on one diagonal (`rGap == gGap`):
+    /// `stitchAlignToTranscript` leaves `jCan=999` there and its closing
+    /// `jCan<0 || (jCan<7 && ...)` test returns -1000007. Adjacent seeds
+    /// (`rGap == gGap == 0`) take the same path.
+    #[test]
+    fn same_diagonal_seeds_are_not_stitched() {
+        let index = make_simple_index();
+        let scorer = AlignmentScorer::from_params_minimal();
+        let cluster = SeedCluster {
+            alignments: vec![],
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 10,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        let mut wt = WorkingTranscript::new();
+        wt.exons.push(ExonBlock {
+            read_start: 0,
+            read_end: 2,
+            genome_start: 0,
+            genome_end: 2,
+            mate_id: 2,
+            sj_a: None,
+        });
+        wt.read_start = 0;
+        wt.read_end = 2;
+        wt.genome_start = 0;
+        wt.genome_end = 2;
+        wt.score = 2;
+        let read = [0u8, 1, 2, 3, 0, 1, 2, 3];
+        let mut jcache = crate::align::score::JunctionScanCache::new();
+        // gap of one base on both sides, then directly adjacent
+        for start in [3usize, 2] {
+            let wa = WindowAlignment {
+                seed_idx: 0,
+                read_pos: start,
+                length: 2,
+                genome_pos: start as u64,
+                sa_pos: start as u64,
+                n_rep: 1,
+                is_anchor: true,
+                mate_id: 2,
+                sj_a: None,
+                pre_ext_score: 2,
+            };
+            let out = stitch_align_to_transcript(
+                &wt,
+                &wa,
+                &read,
+                &index,
+                &scorer,
+                &cluster,
+                None,
+                0,
+                &mut jcache,
+                "",
+            );
+            assert!(out.is_none(), "same-diagonal stitch at {start} must fail");
+        }
     }
 }
