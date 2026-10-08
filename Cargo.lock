@@ -452,6 +452,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hyalite"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928dd1c1c1bb653798ceed0f98d334225629a4d345f0cf8fa4d6b2998f6b8255"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +986,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "flate2",
+ "hyalite",
  "libdeflater",
  "libmimalloc-sys",
  "log",
