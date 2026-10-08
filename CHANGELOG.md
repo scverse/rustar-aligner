@@ -129,6 +129,26 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- `--soloOutLayout CellRanger` writes the solo matrices in the shape
+  `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
+  `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
+  on every barcode and one raw column per observed barcode. It implies
+  `--soloOutGzip yes`, `--soloOutRawBarcodes Observed` and an `outs/`
+  output directory, each still overridable on the command line. Counts are
+  unchanged. It is the default on 10x geometry, which **changes where
+  output files are written** on those runs; see `DIVERGENCE.md` §3.3.
+
+- On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
+  UMI), the five CellRanger-matching flags now **default** to their
+  CellRanger values. Any flag named on the command line wins, and the
+  substitution is logged. **This changes default output on 10x runs** and
+  diverges from STARsolo; see `DIVERGENCE.md` §1.3.
+
+- `--soloOutRawBarcodes Observed` writes the raw matrix with one column
+  per *observed* barcode instead of one per whitelist barcode, matching
+  what CellRanger's `raw_feature_bc_matrix` contains. Counts are
+  unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
+  **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
