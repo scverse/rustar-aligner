@@ -77,35 +77,65 @@ fn score_region(
     is_reverse: bool,
 ) -> (i32, u32) {
     let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
+    let seq = index.genome.sequence.view();
+
+    // Bound the run once instead of testing the read end per base, then walk it
+    // in chunks with the genome bases staged into a stack buffer. That leaves
+    // the inner loop comparing two plain byte slices of equal length, which
+    // vectorizes; the previous form re-derived a bounds-checked `Option` per
+    // base and could not. `break`-on-genome-end is preserved by stopping at a
+    // short fill.
+    let run = length.min(read_seq.len().saturating_sub(read_start));
     let mut score = 0i32;
     let mut n_mismatch = 0u32;
+    let mut gbuf = [0u8; SCORE_REGION_CHUNK];
 
-    for i in 0..length {
-        let read_pos = read_start + i;
-        if read_pos >= read_seq.len() {
+    let mut done = 0usize;
+    while done < run {
+        let want = (run - done).min(SCORE_REGION_CHUNK);
+        let got = seq.bases_into(
+            (genome_start + (done + genome_offset as usize) as u64) as usize,
+            &mut gbuf[..want],
+        );
+        if got == 0 {
             break;
         }
-        let read_base = read_seq[read_pos];
-        let Some(genome_base) = index
-            .genome
-            .get_base(genome_start + i as u64 + genome_offset)
-        else {
-            break;
-        };
-        // N in read or genome: skip, no score contribution (STAR: `if (G<4 && R<4)`)
-        if read_base >= 4 || genome_base >= 4 {
-            continue;
+        let reads = &read_seq[read_start + done..read_start + done + got];
+        let genomes = &gbuf[..got];
+
+        // STAR: `if (G < 4 && R < 4)` — N on either side contributes nothing.
+        // Counting matches and mismatches separately keeps this a branchless
+        // reduction; `score` is exactly `matches - mismatches` as before.
+        let mut matches = 0u32;
+        let mut mism = 0u32;
+        // Bitwise `&`, not `&&`, on purpose: the lazy operators put branches in
+        // the loop body and the reduction stops vectorizing. Measured on 50k
+        // yeast pairs, the `&&` spelling gives back most of this function's
+        // gain (median 2.125s vs 2.085s wall), so the lint is suppressed rather
+        // than followed. Both operands are cheap comparisons on values already
+        // in registers, so there is nothing to short-circuit away.
+        #[allow(clippy::needless_bitwise_bool)]
+        for (&rb, &gb) in reads.iter().zip(genomes.iter()) {
+            let valid = (rb < 4) & (gb < 4);
+            let eq = rb == gb;
+            matches += u32::from(valid & eq);
+            mism += u32::from(valid & !eq);
         }
-        if read_base == genome_base {
-            score += 1;
-        } else {
-            score -= 1;
-            n_mismatch += 1;
+        score += matches as i32 - mism as i32;
+        n_mismatch += mism;
+
+        done += got;
+        if got < want {
+            break;
         }
     }
 
     (score, n_mismatch)
 }
+
+/// Bases staged per iteration by [`score_region`]. Large enough that the
+/// staging copy is amortized, small enough to sit on the stack.
+const SCORE_REGION_CHUNK: usize = 256;
 
 fn count_mismatches(
     read_seq: &[u8],
@@ -207,6 +237,10 @@ fn extend_alignment(
     }
 
     let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
+    // Resolve the genome storage once: both extension loops below read one base
+    // per iteration, and `Genome::get_base` re-checks the `GenomeSeq` variant on
+    // every call.
+    let seq = index.genome.sequence.view();
 
     // --alignEndsType end-to-end extension (STAR extendAlign.cpp, extendToEnd==true):
     // force extension over the entire remaining read, scoring +1 match / -1 mismatch
@@ -246,13 +280,14 @@ fn extend_alignment(
                 }
                 genome_start - 1 - i as u64
             };
-            let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset) else {
+            let genome_base = seq.base((genome_pos + genome_offset) as usize);
+            if genome_base == crate::genome::OUT_OF_RANGE {
                 return ExtendResult {
                     extend_len: 0,
                     max_score: EXTEND_TO_END_KILL,
                     n_mismatch: n_mm_max + 1,
                 };
-            };
+            }
             // Chromosome boundary: cannot extend to the read end here.
             if genome_base == 5 {
                 return ExtendResult {
@@ -320,9 +355,10 @@ fn extend_alignment(
         };
 
         // Get genome base (with strand offset)
-        let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset) else {
+        let genome_base = seq.base((genome_pos + genome_offset) as usize);
+        if genome_base == crate::genome::OUT_OF_RANGE {
             break;
-        };
+        }
 
         // Stop at chromosome boundary (padding = 5)
         if genome_base == 5 {
@@ -1155,6 +1191,7 @@ fn stitch_align_to_transcript(
     cluster: &SeedCluster,
     junction_db: Option<&crate::junction::SpliceJunctionDb>,
     align_mates_gap_max: u64,
+    jcache: &mut crate::align::score::JunctionScanCache,
     _debug_name: &str,
 ) -> Option<WorkingTranscript> {
     let last_exon = wt.exons.last().unwrap();
@@ -1393,7 +1430,8 @@ fn stitch_align_to_transcript(
         // is motif detection (splice) vs pure positional score (deletion).
         // donor_sa = exclusive end of exon A = STAR's gAend+1. jr_shift = STAR's jR.
         let donor_sa = last_exon.genome_end;
-        let (jr_shift, motif, motif_score, jj_l, jj_r) = scorer.find_best_junction_position(
+        let (jr_shift, motif, motif_score, jj_l, jj_r) = scorer.find_best_junction_position_cached(
+            jcache,
             read_seq,
             last_exon.read_end,
             donor_sa,
@@ -2205,6 +2243,7 @@ fn stitch_recurse(
     recursion_count: &mut u32,
     align_mates_gap_max: u64,
     original_is_reverse: bool,
+    jcache: &mut crate::align::score::JunctionScanCache,
     debug_name: &str,
 ) {
     const MAX_RECURSION: u32 = 100_000;
@@ -2453,6 +2492,7 @@ fn stitch_recurse(
             recursion_count,
             align_mates_gap_max,
             original_is_reverse,
+            jcache,
             debug_name,
         );
     } else {
@@ -2466,6 +2506,7 @@ fn stitch_recurse(
             cluster,
             junction_db,
             align_mates_gap_max,
+            jcache,
             debug_name,
         ) {
             stitch_recurse(
@@ -2482,6 +2523,7 @@ fn stitch_recurse(
                 recursion_count,
                 align_mates_gap_max,
                 original_is_reverse,
+                jcache,
                 debug_name,
             );
         }
@@ -2512,6 +2554,7 @@ fn stitch_recurse(
         recursion_count,
         align_mates_gap_max,
         original_is_reverse,
+        jcache,
         debug_name,
     );
 }
@@ -3170,6 +3213,10 @@ pub(crate) fn stitch_seeds_core(
     // last-anchor index to thread through here.
     let mut working_transcripts: Vec<WorkingTranscript> = Vec::new();
     let mut recursion_count: u32 = 0;
+    // One memo table per window. `stitch_read`, the genome and the strand are
+    // fixed for the whole recursion below, which is what makes the six-field
+    // key in `JunctionScanCache` a complete identifier for a scan.
+    let mut jcache = crate::align::score::JunctionScanCache::new();
 
     stitch_recurse(
         0,
@@ -3185,6 +3232,7 @@ pub(crate) fn stitch_seeds_core(
         &mut recursion_count,
         align_mates_gap_max,
         stitch_is_reverse,
+        &mut jcache,
         debug_read_name,
     );
 
