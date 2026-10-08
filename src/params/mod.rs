@@ -1346,6 +1346,12 @@ pub struct Parameters {
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,
+
+    /// The command line as STAR records it (`Parameters.cpp`, `commandLine`):
+    /// the arguments joined by single spaces, a value argument containing
+    /// white space wrapped in double quotes. Written to the `@CO` header line.
+    #[arg(skip)]
+    pub star_command_line: Option<String>,
 }
 
 impl Parameters {
@@ -1546,6 +1552,20 @@ impl Parameters {
         let matches = command.clone().get_matches_from(args.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
+        params.star_command_line = Some(
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let a = a.to_string_lossy();
+                    if i > 0 && !a.starts_with("--") && a.contains([' ', '\t']) {
+                        format!("\"{a}\"")
+                    } else {
+                        a.into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         params.command_line = {
             let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
             shlex::try_join(args.iter().map(AsRef::as_ref)).ok()

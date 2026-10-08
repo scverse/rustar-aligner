@@ -24,7 +24,7 @@ use noodles::sam::header::record::value::{
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write as _};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -98,7 +98,9 @@ impl SamWriter {
         let header = build_sam_header(genome, params)?;
         let mut writer = sam::io::Writer::new(buf_writer);
 
-        writer.write_header(&header)?;
+        writer
+            .get_mut()
+            .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
 
         Ok(Self { writer, header })
     }
@@ -875,7 +877,9 @@ impl SamStdoutWriter {
     pub fn create(genome: &Genome, params: &Parameters) -> Result<Self, Error> {
         let header = build_sam_header(genome, params)?;
         let mut writer = sam::io::Writer::new(BufWriter::new(std::io::stdout()));
-        writer.write_header(&header)?;
+        writer
+            .get_mut()
+            .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
         Ok(Self { writer, header })
     }
 
@@ -955,10 +959,15 @@ where
 
     // @HD line. `--outSAMheaderHD` replaces it wholesale, given as the
     // tab-separated fields STAR expects (`@HD VN:1.4 SO:coordinate`).
-    if params.out_sam_header_hd.is_empty() {
-        builder = builder.set_header(Map::default());
+    // STAR writes `VN:1.4` (`samHeaders.cpp:94`), not the latest spec version.
+    let star_version = sam::header::record::value::map::header::Version::new(1, 4);
+    // `-` is STAR's default value for --outSAMheaderHD, meaning "no override".
+    if params.out_sam_header_hd.is_empty() || params.out_sam_header_hd == ["-"] {
+        builder = builder.set_header(Map::<sam::header::record::value::map::Header>::new(
+            star_version,
+        ));
     } else {
-        let mut hd = Map::<sam::header::record::value::map::Header>::default();
+        let mut hd = Map::<sam::header::record::value::map::Header>::new(star_version);
         for field in &params.out_sam_header_hd {
             let field = field.trim();
             // STAR takes the leading `@HD` as part of the value list; ignore it.
@@ -974,6 +983,12 @@ where
                 return Err(Error::Parameter(format!(
                     "--outSAMheaderHD tag '{tag}' is not two characters"
                 )));
+            }
+            if tag == "VN" {
+                *hd.version_mut() = value
+                    .parse()
+                    .map_err(|e| Error::Parameter(format!("invalid @HD version '{value}': {e}")))?;
+                continue;
             }
             let tag_bytes: [u8; 2] = tag.as_bytes()[..2].try_into().unwrap();
             let other_tag: HeaderOtherTag<_> = HeaderOtherTag::try_from(tag_bytes)
@@ -1072,19 +1087,101 @@ where
         builder = builder.add_program(id, extra);
     }
 
-    // `--outSAMheaderCommentFile` contributes one @CO line per line of the
-    // named file. `-` (the default) means no comments.
-    if params.out_sam_header_comment_file != "-" {
-        let path = std::path::Path::new(&params.out_sam_header_comment_file);
-        let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
-        for line in contents.lines() {
-            if !line.is_empty() {
-                builder = builder.add_comment(line);
+    Ok(builder.build())
+}
+
+/// Which SAM header text to render.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderKind {
+    /// `Aligned.out.sam` / unsorted BAM.
+    Main,
+    /// Coordinate-sorted BAM: `SO:coordinate` appended to the `@HD` line.
+    MainSorted,
+    /// `Aligned.toTranscriptome.out.bam`: `@SQ` (transcripts) and `@RG` only.
+    Transcriptome,
+}
+
+/// Render the SAM header text in STAR's line order (`samHeaders.cpp`):
+/// `@HD`, `@SQ`, user `@PG` (`--outSAMheaderPG`), the program `@PG`, the
+/// `--outSAMheaderCommentFile` lines verbatim, `@RG`, then
+/// `@CO user command line: ...`. The `@HD` line is the user's
+/// `--outSAMheaderHD` text verbatim (no `VN` is added), else `@HD\tVN:1.4`.
+/// The transcriptome BAM carries only `@SQ` and `@RG` lines.
+pub fn render_header_text(
+    header: &sam::Header,
+    params: &Parameters,
+    kind: HeaderKind,
+) -> Result<Vec<u8>, Error> {
+    let mut buf: Vec<u8> = Vec::new();
+
+    if kind != HeaderKind::Transcriptome {
+        if params.out_sam_header_hd.is_empty() || params.out_sam_header_hd[0] == "-" {
+            buf.extend_from_slice(b"@HD\tVN:1.4");
+        } else {
+            buf.extend_from_slice(params.out_sam_header_hd.join("\t").as_bytes());
+        }
+        if kind == HeaderKind::MainSorted {
+            buf.extend_from_slice(b"\tSO:coordinate");
+        }
+        buf.push(b'\n');
+    }
+
+    // Raw bytes so reference names with characters noodles forbids pass through.
+    for (name, rs) in header.reference_sequences() {
+        buf.extend_from_slice(b"@SQ\tSN:");
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(b"\tLN:");
+        buf.extend_from_slice(usize::from(rs.length()).to_string().as_bytes());
+        buf.push(b'\n');
+    }
+
+    if kind != HeaderKind::Transcriptome {
+        if !params.out_sam_header_pg.is_empty() && params.out_sam_header_pg[0] != "-" {
+            buf.extend_from_slice(params.out_sam_header_pg.join("\t").as_bytes());
+            buf.push(b'\n');
+        }
+        if let Some(pg) = header.programs().as_ref().get(&b"rustar-aligner"[..]) {
+            buf.extend_from_slice(b"@PG\tID:rustar-aligner");
+            for (tag, value) in pg.other_fields() {
+                buf.push(b'\t');
+                buf.extend_from_slice(tag.as_ref());
+                buf.push(b':');
+                buf.extend_from_slice(value);
+            }
+            buf.push(b'\n');
+        }
+        if params.out_sam_header_comment_file != "-" {
+            let path = std::path::Path::new(&params.out_sam_header_comment_file);
+            let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+            for line in contents.lines() {
+                // STAR copies non-blank lines as they are (each should start with @CO).
+                if !line.trim().is_empty() {
+                    buf.extend_from_slice(line.as_bytes());
+                    buf.push(b'\n');
+                }
             }
         }
     }
 
-    Ok(builder.build())
+    for (id, rg) in header.read_groups() {
+        buf.extend_from_slice(b"@RG\tID:");
+        buf.extend_from_slice(id);
+        for (tag, value) in rg.other_fields() {
+            buf.push(b'\t');
+            buf.extend_from_slice(tag.as_ref());
+            buf.push(b':');
+            buf.extend_from_slice(value);
+        }
+        buf.push(b'\n');
+    }
+
+    if kind != HeaderKind::Transcriptome {
+        buf.extend_from_slice(b"@CO\tuser command line: ");
+        buf.extend_from_slice(params.star_command_line.as_deref().unwrap_or("").as_bytes());
+        buf.push(b'\n');
+    }
+
+    Ok(buf)
 }
 
 /// Insert `RG:Z:<id>` on the record when an ID is set. `Parameters::try_parse_from`
@@ -1767,6 +1864,48 @@ mod tests {
 
         // Check that we have a program line (just check header is valid)
         assert_eq!(header.reference_sequences().len(), 1);
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_version_matches_star() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        // STAR's default @HD line is `@HD VN:1.4` (samHeaders.cpp:94).
+        assert_eq!(header.header().unwrap().version(), Version::new(1, 4));
+
+        // A VN given in --outSAMheaderHD is the version, not an extra field.
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "@HD",
+            "VN:1.6",
+            "SO:unsorted",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 6));
+        assert_eq!(hd.other_fields().len(), 1, "only SO besides VN");
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_dash_is_the_default() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "-",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 4));
+        assert_eq!(hd.other_fields().len(), 0);
     }
 
     #[test]
