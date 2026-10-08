@@ -572,10 +572,9 @@ impl TranscriptomeIndex {
                 ));
             }
         }
-        // STAR sorts by sjStart only (funCompareUint2 on the first uint64).
-        // Keep it stable so gene list order across duplicates matches
-        // transcript-insertion order.
-        junctions.sort_by_key(|&(s, _, _, _, _)| s);
+        // STAR sorts by (sjStart, sjEnd) — `funCompareUint2` compares TWO
+        // uint64s (`GTF_transcriptGeneSJ.cpp:140`).
+        junctions.sort_by_key(|&(s, e, _, _, _)| (s, e));
 
         let strand_char = |s: u8| match s {
             1 => '+',
@@ -583,38 +582,42 @@ impl TranscriptomeIndex {
             _ => '.',
         };
 
-        // Dedup pass: merge genes across identical (chr, start, end, strand).
+        // Collapse pass (`GTF_transcriptGeneSJ.cpp:145-158`): a new output
+        // row starts whenever (start, end, strand) differs from the
+        // PREVIOUS sorted entry; otherwise the gene joins the current
+        // row's gene set. STAR stores genes in a `std::set`, so the
+        // comma-joined list is ascending and duplicate-free.
         let mut i = 0;
         while i < junctions.len() {
             let (sj_start, sj_end, chr_idx, strand, gene1) = junctions[i];
+            let mut genes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            genes.insert(gene1);
+            let mut j = i + 1;
+            while j < junctions.len() {
+                let (s2, e2, _c2, st2, g2) = junctions[j];
+                if s2 == sj_start && e2 == sj_end && st2 == strand {
+                    genes.insert(g2);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+
             let chr_offset = genome.chr_start[chr_idx];
             let start_1based = sj_start + 1 - chr_offset;
             let end_1based = (sj_end + 1) - chr_offset;
             write!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}",
                 genome.chr_name[chr_idx],
                 start_1based,
                 end_1based,
                 strand_char(strand),
-                gene1
             )
             .map_err(|e| Error::io(e, &path))?;
-
-            // Append genes from subsequent entries with the same key.
-            let mut j = i + 1;
-            let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-            seen.insert(gene1);
-            while j < junctions.len() {
-                let (s2, e2, c2, st2, g2) = junctions[j];
-                if s2 == sj_start && e2 == sj_end && c2 == chr_idx && st2 == strand {
-                    if seen.insert(g2) {
-                        write!(out, ",{g2}").map_err(|e| Error::io(e, &path))?;
-                    }
-                    j += 1;
-                } else {
-                    break;
-                }
+            for (k, g) in genes.iter().enumerate() {
+                let sep = if k == 0 { '\t' } else { ',' };
+                write!(out, "{sep}{g}").map_err(|e| Error::io(e, &path))?;
             }
             writeln!(out).map_err(|e| Error::io(e, &path))?;
             i = j;
@@ -1298,31 +1301,22 @@ fn rebuild_cigar_without_softclips(
         end_idx -= 1;
     }
 
-    let body = &cigar[start_idx..end_idx];
-    for (i, op) in body.iter().enumerate() {
-        if i == 0 && left_clip > 0 {
-            // Fold left_clip into the first op if it's match-like.
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch => out.push(op.add_len(left_clip)),
-                _ => {
-                    // Extension landed on a non-match op (shouldn't normally
-                    // happen).  Emit as Match.
-                    out.push(Op::new(Kind::Match, left_clip));
-                    out.push(*op);
-                }
-            }
-        } else if i + 1 == body.len() && right_clip > 0 {
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch => {
-                    out.push(op.add_len(right_clip));
-                }
-                _ => {
-                    out.push(*op);
-                    out.push(Op::new(Kind::Match, right_clip));
-                }
-            }
-        } else {
-            out.push(*op);
+    // Fold each clip into its own end independently: with a single-op body
+    // (e.g. `1S97M2S`) both clips land on the same op.
+    out.extend_from_slice(&cigar[start_idx..end_idx]);
+    let is_match = |op: &Op| matches!(op.kind(), Kind::Match | Kind::SequenceMatch);
+    if left_clip > 0 {
+        match out.first_mut() {
+            Some(op) if is_match(op) => *op = op.add_len(left_clip),
+            // Extension landed on a non-match op (should not normally
+            // happen): emit it as Match.
+            _ => out.insert(0, Op::new(Kind::Match, left_clip)),
+        }
+    }
+    if right_clip > 0 {
+        match out.last_mut() {
+            Some(op) if is_match(op) => *op = op.add_len(right_clip),
+            _ => out.push(Op::new(Kind::Match, right_clip)),
         }
     }
     out
@@ -2579,5 +2573,38 @@ mod tests {
         // Last entry equals overall maximum tr_end
         let overall_max = *idx.tr_end.iter().max().unwrap();
         assert_eq!(*idx.tr_end_max_sorted.last().unwrap(), overall_max);
+    }
+
+    #[test]
+    fn softclip_rebuild_folds_both_clips_into_a_single_op() {
+        use cigar::op::{Kind, Op};
+        let c = |v: &[(Kind, usize)]| v.iter().map(|&(k, n)| Op::new(k, n)).collect::<Vec<_>>();
+        // 1S97M2S (seen on 2x100 human reads): both clips on the one M.
+        assert_eq!(
+            rebuild_cigar_without_softclips(
+                &c(&[(Kind::SoftClip, 1), (Kind::Match, 97), (Kind::SoftClip, 2)]),
+                1,
+                2
+            ),
+            c(&[(Kind::Match, 100)])
+        );
+        assert_eq!(
+            rebuild_cigar_without_softclips(
+                &c(&[
+                    (Kind::SoftClip, 3),
+                    (Kind::Match, 40),
+                    (Kind::Skip, 500),
+                    (Kind::Match, 50),
+                    (Kind::SoftClip, 7)
+                ]),
+                3,
+                7
+            ),
+            c(&[(Kind::Match, 43), (Kind::Skip, 500), (Kind::Match, 57)])
+        );
+        assert_eq!(
+            rebuild_cigar_without_softclips(&c(&[(Kind::Match, 98), (Kind::SoftClip, 2)]), 0, 2),
+            c(&[(Kind::Match, 100)])
+        );
     }
 }

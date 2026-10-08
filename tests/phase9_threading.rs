@@ -76,6 +76,8 @@ fn test_single_thread_alignment() {
         .arg(&fasta_path)
         .arg("--genomeSAindexNbases")
         .arg("5")
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"))
         .assert()
         .success();
 
@@ -135,6 +137,8 @@ fn test_multi_thread_alignment() {
         .arg(&fasta_path)
         .arg("--genomeSAindexNbases")
         .arg("5")
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"))
         .assert()
         .success();
 
@@ -191,6 +195,8 @@ fn test_thread_count_consistency() {
         .arg(&fasta_path)
         .arg("--genomeSAindexNbases")
         .arg("5")
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"))
         .assert()
         .success();
 

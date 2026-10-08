@@ -79,7 +79,7 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 **Impact.** rustar-aligner's result is the better alignment in each case. These are counted against exact faithfulness in the raw metric but are improvements, not regressions.
 
-**Source.** See `CLAUDE.md` (PE status) and `STAR-RS-COMPARISON.md`.
+**Source.** See `STAR-RS-COMPARISON.md`, and the PE benchmark section of `CONTRIBUTING.md`.
 
 ---
 
@@ -89,13 +89,39 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 **What STAR does.** At `genomeGenerate`, STAR writes a `### <commandLineFull>` header line reproducing the full command line that built the index.
 
-**What rustar-aligner does.** rustar-aligner emits a fixed skeleton containing the parameters it knows at invocation (`--runMode`, `--runThreadN`, `--genomeDir`, `--genomeFastaFiles`, `--genomeSAindexNbases`, `--sjdbGTFfile`, `--sjdbOverhang`). The remaining value lines of `genomeParameters.txt` match STAR's `genomeParametersWrite.cpp` order and tab/space formatting.
+**What rustar-aligner does.** rustar-aligner echoes its own actual command line after `### ` (falling back to a parameter skeleton for API callers constructed without one). Every value line of `genomeParameters.txt` matches STAR's `genomeParametersWrite.cpp` order and tab/space formatting, including the *effective* `sjdbOverhang` (0 when the index has no sjdb, mirroring `mapGen.sjdbOverhang`).
 
-**Why.** The header is informational; reproducing an arbitrary STAR invocation's exact argv byte-for-byte serves no functional purpose and the index loads identically either way.
+**Why.** The header is informational; the binary path and argument spacing can never byte-match an arbitrary STAR invocation, and the index loads identically either way.
 
-**Impact.** The `###` header line will not byte-match an arbitrary STAR run. No effect on alignment, index loading, or any downstream tool.
+**Impact.** The `###` header line will not byte-match a STAR run (different `argv[0]` and spacing). Every other line matches byte-for-byte. No effect on alignment, index loading, or any downstream tool.
 
 **Source.** `src/genome/mod.rs` (`genomeParameters.txt` writer).
+
+---
+
+### 3.1a `SAindex` N-mark bits adjacent to junction-flank k-mers
+
+**What STAR does.** With `--sjdbGTFfile`, STAR builds the base-genome `SAindex` first (`genomeSAindex.cpp`) and then *patches* it while inserting junction-flank suffixes (`sjdbBuildIndex.cpp`). `SAiMarkNbit` marks — "suffixes for this k-mer slot may border an N" — are placed against the **base-genome** k-mer landscape: a mark lands on the last k-mer that was present *before* the junction flanks were inserted, marks are silently dropped when an inserted flank suffix takes over a slot's first-occurrence value (`sjdbBuildIndex.cpp:228-231` overwrites the packed value, flags included), and flank suffixes that touch the inter-junction spacer get marks via a separate T-fill backward-scan rule (`sjdbBuildIndex.cpp:262-284`).
+
+**What rustar-aligner does.** rustar-aligner builds the final genome+flank text in one pass and replicates `genomeSAindex.cpp`'s serial mark semantics over that final text: the mark lands on the last k-mer *present in the final index* before the N-run.
+
+**Why.** On GRCh38 + GENCODE v49 this changes a handful of bits (2 slots out of 357,913,940 on the measured build): exactly the slots where a k-mer became present only via a junction flank. STAR's placement there is an artifact of its incremental patch, not a semantic choice; reproducing it would mean simulating the two-phase build. Both placements are valid conservative markers — the bit only widens seed-search bounds near Ns.
+
+**Impact.** ≤ a few bytes of the ~1.5 GB `SAindex` differ on sjdb builds (indexes built *without* a GTF are byte-identical). STAR loads either file and produces identical alignments (verified on 100k read pairs). No effect on any coordinate, count, or emitted record.
+
+**Source.** `src/index/sa_index.rs` (`build_parallel`, `build`).
+
+---
+
+### 3.1b `Log.out` in the genome directory
+
+**What STAR does.** `genomeGenerate` writes its free-form run log to `<outFileNamePrefix>Log.out` and copies it into the genome directory, so a STAR-built index always contains a `Log.out`.
+
+**What rustar-aligner does.** The same — a STAR-shaped `Log.out` (version header, command-line/parameter sections, phase timestamps, `DONE: Genome generation, EXITING`) is written to the output prefix and copied into the genome directory.
+
+**Impact.** The file's *content* is a run log (timestamps, host-specific paths) and can never byte-match across runs or tools; only its presence and shape are mirrored. Nothing loads it at align time.
+
+**Source.** `src/io/log.rs` (`write_genome_generate_log`), `src/lib.rs` (`genome_generate`).
 
 ---
 
@@ -127,7 +153,18 @@ For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exo
 
 rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` samples with a bit-exact libc++ `mt19937` (`src/solo/libcxx_rng.rs`) so its Monte-Carlo null matches STAR's — a convergence with STAR rather than a divergence from it.
 
-### 4.3 DegNorm degradation normalization (`--quantMode GeneCoverage`, `--runMode degNorm`)
+### 4.3 Coordinate-sort memory budget and spilling
+
+**What STAR does.** `--outSAMtype BAM SortedByCoordinate` collects alignments into `--outBAMsortingBinsN` coordinate bins on disk under `outFileTmp` (`--outTmpDir`, else `<prefix>_STARtmp/`), then sorts each bin in memory. `--limitBAMsortRAM 0` is replaced by the genome size plus the SA and SAindex sizes (`STAR.cpp:234-236`). If any single bin needs more than that, STAR exits with a fatal error and asks to be re-run with a larger value (`bamSortByCoordinate.cpp:29-34`).
+
+**What rustar-aligner does.** An external merge sort. Records fill a buffer of `--limitBAMsortRAM` bytes (estimated), which is sorted and spilled as a run when full; the runs are k-way merged at the end, at most 64 open at a time. `--limitBAMsortRAM 0` means 512 MiB. The run never fails for lack of sort memory. Spill runs go to `--outTmpDir` when given, otherwise beside the output, and are always removed (`--outTmpKeep` has no effect).
+
+**Why.** Peak memory stays bounded whatever the output size, without STAR's failure mode. A genome-size default would also be unknown to the writer when it is created, and an unbounded buffer was what this replaced.
+
+**Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
+
+**Source.** `src/io/bam.rs` (`CoordinateSorter`).
+### 4.4 DegNorm degradation normalization (`--quantMode GeneCoverage`, `--runMode degNorm`)
 
 **What STAR does.** Nothing: STAR has no transcript-degradation model and no per-gene coverage output.
 
@@ -149,7 +186,7 @@ These are **not** deliberate divergences — they are tracked residual diffs on 
 - **1 STAR-only PE mate** — `ERR12389696.18919121`: an SA-level difference.
 - **1 rustar-aligner-only PE mate** — `ERR12389696.6302610`: a pre-existing false positive.
 
-See `CLAUDE.md` ("Known Issues" / "PE Status") for the current status of these.
+See `ROADMAP.md` and `STAR-RS-COMPARISON.md` for the current status of these.
 
 ---
 

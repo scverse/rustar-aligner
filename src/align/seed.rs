@@ -59,10 +59,20 @@ impl Seed {
         //   for(istart=0;istart<Nstart;istart++)
         //     while(istart*Lstart + Lmapped + seedMapMin < readLen) { ... Lmapped += L; }
 
+        // STAR splits the read on `N` before seeding and searches each good
+        // piece independently (`ReadAlign_mapOneRead.cpp:17,43`), so no seed can
+        // span a run of `N`. A read with no run of at least `seedSplitMin` ACGT
+        // bases produces no pieces and is not seeded at all.
+        let pieces = quality_split(read_seq, params.seed_split_min);
+        if pieces.is_empty() {
+            return Ok(seeds);
+        }
+
         // Search L→R (forward direction on read): sparse chain search
         search_direction_sparse(
             read_seq,
             read_len,
+            &pieces,
             index,
             min_seed_length,
             params,
@@ -76,11 +86,20 @@ impl Seed {
             return Ok(seeds);
         }
 
-        // Search R→L (reverse direction on read): sparse chain search on RC read
+        // Search R→L (reverse direction on read): sparse chain search on RC read.
+        // The RC read carries the same good pieces mirrored end-for-end, which
+        // is how STAR's `iDir==1` walks each piece from its right edge
+        // (`Shift = splitR[0] + splitR[1] - istart*Lstart - 1 - Lmapped`).
         let rc_read = reverse_complement_read(read_seq);
+        let rc_pieces: Vec<(usize, usize)> = pieces
+            .iter()
+            .rev()
+            .map(|&(start, len)| (read_len - start - len, len))
+            .collect();
         search_direction_sparse(
             &rc_read,
             read_len,
+            &rc_pieces,
             index,
             min_seed_length,
             params,
@@ -207,6 +226,49 @@ fn reverse_complement_read(read_seq: &[u8]) -> Vec<u8> {
     read_seq.iter().rev().map(|&b| complement_base(b)).collect()
 }
 
+/// STAR's cap on how many good pieces one read is split into
+/// (`Parameters.cpp:473`). Internal to STAR, not a CLI parameter.
+const MAX_N_SPLIT: usize = 10;
+
+/// STAR's `qualitySplit` (`SequenceFuns.cpp:411`): the maximal runs of ACGT
+/// that the seed search is allowed to look at, as `(start, length)`.
+///
+/// Everything above base 3 — `N`, and STAR's inter-mate spacer — ends a run.
+/// Runs shorter than `seed_split_min` are dropped rather than shortened, and at
+/// most `MAX_N_SPLIT` are returned; a read with no good run yields none and is
+/// never seeded, which is how STAR reports `uT:A:0` for a read that is mostly
+/// `N`.
+///
+/// Confining the search this way is not merely an optimisation. An MMP compares
+/// encoded bases for equality, and an `N` is 4 on both sides, so a read `N`
+/// sitting over a genome `N` *matches*. Without the split, a read of 50 `N`
+/// followed by 10 real bases maps across an assembly gap as a full-length
+/// alignment; STAR leaves it unmapped.
+fn quality_split(read_seq: &[u8], seed_split_min: usize) -> Vec<(usize, usize)> {
+    let mut pieces = Vec::new();
+    let mut i = 0usize;
+    let len = read_seq.len();
+    while i < len && pieces.len() < MAX_N_SPLIT {
+        // Skip to the next good base.
+        while i < len && read_seq[i] > 3 {
+            i += 1;
+        }
+        if i == len {
+            break;
+        }
+        let start = i;
+        while i < len && read_seq[i] <= 3 {
+            i += 1;
+        }
+        // STAR `continue`s on a short run: it is skipped, not truncated, and
+        // does not count against the cap.
+        if i - start >= seed_split_min {
+            pieces.push((start, i - start));
+        }
+    }
+    pieces
+}
+
 /// Result of an MMP (Maximal Mappable Prefix) search at a single position.
 /// Always provides the advance length for Lmapped tracking, even when no
 /// seed is stored (matching STAR's behavior).
@@ -232,6 +294,7 @@ struct MmpResult {
 fn search_direction_sparse(
     read_seq: &[u8],
     original_read_len: usize,
+    pieces: &[(usize, usize)],
     index: &GenomeIndex,
     min_seed_length: usize,
     params: &Parameters,
@@ -243,6 +306,8 @@ fn search_direction_sparse(
 
     // STAR (ReadAlign_mapOneRead.cpp lines 41-42):
     //   seedSearchStartLmax = min(P.seedSearchStartLmax, seedSearchStartLmaxOverLread*(Lread-1))
+    // Derived from the whole read, outside the per-piece loop, exactly as STAR
+    // does — only Nstart/Lstart below are per piece.
     let effective_start_lmax = if read_len > 0 {
         let over_lread_limit =
             (params.seed_search_start_lmax_over_lread * (read_len as f64 - 1.0)) as usize;
@@ -251,74 +316,95 @@ fn search_direction_sparse(
         params.seed_search_start_lmax
     };
 
-    // STAR (line 48): Nstart = seedSearchStartLmax>0 && seedSearchStartLmax<readLen
-    //                          ? readLen/seedSearchStartLmax + 1 : 1
-    // Same formula for both L→R and R→L (computed once before the iDir loop).
-    // For readLen=150, seedSearchStartLmax=50: Nstart=150/50+1=4, Lstart=37.
-    let nstart = if effective_start_lmax > 0 && effective_start_lmax < read_len {
-        read_len / effective_start_lmax + 1
-    } else {
-        1
-    };
-    let lstart = read_len / nstart; // STAR: Lstart = (splitR[1]-splitR[0]) / Nstart
+    // STAR's `for (uint ip=0; ip<Nsplit; ip++)` (`:43`). A read with no `N` has
+    // exactly one piece spanning it, so this reduces to the previous whole-read
+    // search.
+    for &(piece_start, piece_len) in pieces {
+        // STAR (line 47): Nstart = seedSearchStartLmax>0 && seedSearchStartLmax<splitR[1][ip]
+        //                          ? splitR[1][ip]/seedSearchStartLmax + 1 : 1
+        // Measured against the *piece* length, not the read's.
+        let nstart = if effective_start_lmax > 0 && effective_start_lmax < piece_len {
+            piece_len / effective_start_lmax + 1
+        } else {
+            1
+        };
+        let lstart = piece_len / nstart; // STAR: Lstart = splitR[1][ip] / Nstart
 
-    for istart in 0..nstart {
-        let start_pos = (istart * lstart).min(read_len);
-        let mut pos = start_pos;
+        // The MMP may not run past the end of the piece: STAR bounds it with
+        // `seedLength = splitR[1][ip] - Lmapped - istart*Lstart`. Truncating the
+        // slice does the same thing here, since the search only ever reads
+        // forward from its start position.
+        let piece_end = piece_start + piece_len;
+        let piece_seq = &read_seq[..piece_end];
 
-        // From this starting position, search forward with Lmapped tracking.
-        // Continue while remaining bases >= seedMapMin (STAR: istart*Lstart + Lmapped + seedMapMin < readLen).
-        // Chains advance until only seedMapMin (5) bases remain.
-        loop {
-            if pos >= read_len {
-                break;
-            }
-            // Stop if remaining bases < seedMapMin (matches STAR's while condition:
-            // istart*Lstart + Lmapped + P.seedMapMin < splitR[1][ip]).
-            // STAR chains continue until only seedMapMin (5) bases remain, NOT
-            // seedSearchStartLmax (50). This allows chains to reach terminal small
-            // exons (e.g. 9M after intron) near the read end.
-            if read_len - pos < min_seed_length {
-                break;
-            }
+        for istart in 0..nstart {
+            let start_pos = piece_start + (istart * lstart).min(piece_len);
+            let mut pos = start_pos;
 
-            let result =
-                find_seed_at_position(read_seq, pos, index, min_seed_length, false, params);
-
-            if !debug_name.is_empty() {
-                let dir = if is_rc { "RC" } else { "FWD" };
-                let seed_info = match &result.seed {
-                    Some(s) => format!("seed(len={} sa={}-{})", s.length, s.sa_start, s.sa_end),
-                    None => "no_seed".to_string(),
-                };
-                eprintln!(
-                    "[DEBUG-SEED {}] {} istart={} pos={} advance={} {}",
-                    debug_name, dir, istart, pos, result.advance, seed_info
-                );
-            }
-
-            if let Some(mut seed) = result.seed {
-                // Apply seedSearchLmax cap
-                if params.seed_search_lmax > 0 && seed.length > params.seed_search_lmax {
-                    seed.length = params.seed_search_lmax;
+            // From this starting position, search forward with Lmapped tracking.
+            // Continue while remaining bases >= seedMapMin (STAR: istart*Lstart + Lmapped + seedMapMin < splitR[1][ip]).
+            // Chains advance until only seedMapMin (5) bases remain.
+            loop {
+                if pos >= piece_end {
+                    break;
+                }
+                // Stop if remaining bases < seedMapMin (matches STAR's while condition:
+                // istart*Lstart + Lmapped + P.seedMapMin < splitR[1][ip]).
+                // STAR chains continue until only seedMapMin (5) bases remain, NOT
+                // seedSearchStartLmax (50). This allows chains to reach terminal small
+                // exons (e.g. 9M after intron) near the read end. Measured to the
+                // end of the piece, since that is where this chain must stop.
+                if piece_end - pos < min_seed_length {
+                    break;
                 }
 
-                seed.search_rc = is_rc;
+                let result =
+                    find_seed_at_position(piece_seq, pos, index, min_seed_length, false, params);
 
-                // Convert RC read_pos back to original read coordinates
-                if is_rc {
-                    seed.read_pos = original_read_len - seed.read_pos - seed.length;
+                if !debug_name.is_empty() {
+                    let dir = if is_rc { "RC" } else { "FWD" };
+                    let seed_info = match &result.seed {
+                        Some(s) => {
+                            format!("seed(len={} sa={}-{})", s.length, s.sa_start, s.sa_end)
+                        }
+                        None => "no_seed".to_string(),
+                    };
+                    eprintln!(
+                        "[DEBUG-SEED {}] {} piece={}+{} istart={} pos={} advance={} {}",
+                        debug_name,
+                        dir,
+                        piece_start,
+                        piece_len,
+                        istart,
+                        pos,
+                        result.advance,
+                        seed_info
+                    );
                 }
 
-                seeds.push(seed);
+                if let Some(mut seed) = result.seed {
+                    // Apply seedSearchLmax cap
+                    if params.seed_search_lmax > 0 && seed.length > params.seed_search_lmax {
+                        seed.length = params.seed_search_lmax;
+                    }
 
-                if seeds.len() >= params.seed_per_read_nmax {
-                    return;
+                    seed.search_rc = is_rc;
+
+                    // Convert RC read_pos back to original read coordinates
+                    if is_rc {
+                        seed.read_pos = original_read_len - seed.read_pos - seed.length;
+                    }
+
+                    seeds.push(seed);
+
+                    if seeds.len() >= params.seed_per_read_nmax {
+                        return;
+                    }
                 }
+
+                pos += result.advance; // Always advance by MMP length (matches STAR)
+                // Remaining-length check at loop top: stop when < seedMapMin bases remain
             }
-
-            pos += result.advance; // Always advance by MMP length (matches STAR)
-            // Remaining-length check at loop top: stop when < seedMapMin bases remain
         }
     }
 }
@@ -729,6 +815,78 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// A read with no `N` is one piece, so nothing about the ordinary path moves.
+    #[test]
+    fn quality_split_returns_the_whole_read_when_it_is_all_acgt() {
+        let read = vec![0u8, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2];
+        assert_eq!(quality_split(&read, 12), vec![(0, 15)]);
+    }
+
+    /// Runs are split at any base above 3 and measured against `seedSplitMin`.
+    #[test]
+    fn quality_split_cuts_at_n_and_drops_runs_below_seed_split_min() {
+        // 14 ACGT, one N, then 13 ACGT: both flanks clear a minimum of 12.
+        let mut read = vec![0u8; 14];
+        read.push(4);
+        read.extend(std::iter::repeat_n(1u8, 13));
+        assert_eq!(quality_split(&read, 12), vec![(0, 14), (15, 13)]);
+
+        // Raise the floor above the right-hand run and only the left survives.
+        assert_eq!(quality_split(&read, 14), vec![(0, 14)]);
+
+        // Above both and the read is not seeded at all — STAR's `uT:A:0`.
+        assert_eq!(quality_split(&read, 15), []);
+    }
+
+    /// The boundary is inclusive: STAR skips a run only when it is *shorter*
+    /// than the minimum (`if ((iR-iR1)<minLsplit) continue`).
+    #[test]
+    fn quality_split_keeps_a_run_of_exactly_seed_split_min() {
+        let read = vec![2u8; 12];
+        assert_eq!(quality_split(&read, 12), vec![(0, 12)]);
+        assert_eq!(quality_split(&read, 13), []);
+    }
+
+    /// Leading and trailing `N` are skipped rather than included.
+    #[test]
+    fn quality_split_ignores_n_at_both_ends() {
+        let mut read = vec![4u8; 5];
+        read.extend(std::iter::repeat_n(3u8, 20));
+        read.extend(std::iter::repeat_n(4u8, 7));
+        assert_eq!(quality_split(&read, 12), vec![(5, 20)]);
+    }
+
+    /// The real case: a read that is mostly `N` with a short real tail has no
+    /// qualifying piece, so it is never seeded even though the tail would match
+    /// the genome. Without the split the `N` run matches an assembly gap base
+    /// for base, because both sides encode `N` as 4.
+    #[test]
+    fn quality_split_rejects_a_read_that_is_mostly_n() {
+        let mut read = vec![4u8; 50];
+        read.extend([2u8, 2, 2, 2, 2, 3, 3, 3, 1, 3]); // the 10 real bases
+        assert!(
+            quality_split(&read, 12).is_empty(),
+            "a 10-base tail is below seedSplitMin=12, so there is nothing to seed"
+        );
+        // Lower the floor to 10 and the tail becomes searchable.
+        assert_eq!(quality_split(&read, 10), vec![(50, 10)]);
+    }
+
+    /// STAR caps the number of pieces at `maxNsplit` (`Parameters.cpp:473`).
+    #[test]
+    fn quality_split_stops_at_the_piece_cap() {
+        // 12 runs of 12 good bases separated by single Ns; only 10 are kept.
+        let mut read = Vec::new();
+        for _ in 0..12 {
+            read.extend(std::iter::repeat_n(0u8, 12));
+            read.push(4);
+        }
+        let pieces = quality_split(&read, 12);
+        assert_eq!(pieces.len(), MAX_N_SPLIT);
+        assert_eq!(pieces[0], (0, 12));
+        assert_eq!(pieces[MAX_N_SPLIT - 1], (13 * (MAX_N_SPLIT - 1), 12));
+    }
+
     fn make_test_index(sequence: &str) -> GenomeIndex {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, ">chr1").unwrap();
@@ -766,8 +924,19 @@ mod tests {
             .collect()
     }
 
+    /// Test parameters, with `seedSplitMin` lowered unless the caller sets it.
+    ///
+    /// The tests below drive the seed search with 4–8 base reads, which the
+    /// real default of 12 declines to seed at all — correctly, since STAR's
+    /// `qualitySplit` skips any run shorter than the minimum. Lowering it here
+    /// keeps these focused on the search itself. The split's own behaviour is
+    /// covered by the `quality_split_*` tests and, end to end at the shipped
+    /// default, by `test_seed_split_min_bans_seeds_that_span_genomic_n`.
     fn params(args: &[&str]) -> Parameters {
         let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
+        if !args.contains(&"--seedSplitMin") {
+            full_args.extend_from_slice(&["--seedSplitMin", "1"]);
+        }
         full_args.extend_from_slice(args);
         Parameters::parse_from(full_args)
     }
@@ -826,7 +995,7 @@ mod tests {
 
         // Get positions for first seed
         let positions = seeds[0].get_genome_positions(&index);
-        assert!(!positions.is_empty());
+        assert_ne!(positions, []);
 
         // Should have at least one valid position
         for (pos, _is_reverse) in positions {
@@ -1020,9 +1189,12 @@ mod tests {
         let params = params(&[]);
 
         let mut rc_seeds = Vec::new();
+        // No `N` in this read, so the whole of it is a single good piece.
+        let rc_pieces = quality_split(&rc_read, 4);
         search_direction_sparse(
             &rc_read,
             read.len(),
+            &rc_pieces,
             &index,
             4,
             &params,
