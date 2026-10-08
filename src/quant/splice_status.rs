@@ -998,7 +998,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 440,
             combined_wt_score: 0,
-            combined_n_match: 85,
         };
         let r = classify_read(&AlignBlocks::from_pair(&pair), &idx);
         assert_eq!(r[1], ReadSplicing::Gene(g1, SpliceStatus::Unspliced));
@@ -1167,7 +1166,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 550,
             combined_wt_score: 0,
-            combined_n_match: 100,
         };
         let mut recs = vec![noodles::sam::alignment::RecordBuf::default(); 2];
         tag_records_pe(&mut recs, &[pair], &idx);

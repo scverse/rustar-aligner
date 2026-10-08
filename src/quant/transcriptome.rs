@@ -3028,7 +3028,10 @@ mod tests {
         );
         // Intron 2 / exon 3 boundary: only an unspliced target can hold it,
         // provided the flank covers the exonic part.
-        assert!(project_se_unspliced(&ext, 0, 480, 530, false).is_empty());
+        assert_eq!(
+            project_se_unspliced(&ext, 0, 480, 530, false),
+            Vec::<String>::new()
+        );
         let ext49 = idx.with_unspliced_targets(QuantTranscriptomeUnspliced::Intron, 49);
         assert_eq!(project_se_unspliced(&ext49, 0, 480, 530, false), ["G1-I"]);
         // Cassette exon of G2: its inclusion isoform and G2-I.
