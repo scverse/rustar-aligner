@@ -1206,7 +1206,7 @@ fn stitch_align_to_transcript(
         // STAR allows at most ONE mate-boundary crossing per combined PE transcript.
         // stitchAlignToTranscript.cpp returns -1000007/-1000008 for the 3rd+ seed when
         // mates overlap (genome positions interleaved), naturally limiting WTs to 2 exons.
-        // rustar-aligner's overlap-trimming allows continued stitching, inflating combined_n_match.
+        // rustar-aligner's overlap-trimming allows continued stitching, inflating the matched-base count.
         // Fix: if the WT already has exons from BOTH mates, a second crossing is invalid.
         let has_m0 = wt.exons.iter().any(|e| e.mate_id == 0);
         let has_m1 = wt.exons.iter().any(|e| e.mate_id == 1);
@@ -2397,6 +2397,17 @@ fn stitch_recurse(
                     wt.read_start = first.read_start;
                     wt.genome_start = first.genome_start;
                 }
+            }
+
+            // STAR's intron filters run here, after the extensions and before the
+            // window's dedup (`stitchWindowAligns.cpp:146-180` vs `:337-381`): a
+            // rejected transcript must not evict one it covers. For a pair the
+            // junctions of both mates are on this one transcript.
+            if !scorer
+                .intron_filter
+                .passes(wt.junction_motifs.iter().zip(wt.junction_annotated.iter()))
+            {
+                return;
             }
 
             // Dedup via blocks_overlap: drop if subset of existing higher-score transcript.
@@ -3745,6 +3756,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: crate::align::score::IntronFilter::default(),
         };
 
         // Left overhang (prev.length) = 3, below min of 5
@@ -3789,6 +3801,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: crate::align::score::IntronFilter::default(),
         };
 
         // Both overhangs >= 5

@@ -89,16 +89,19 @@ Sections commonly used: Features, Bug fixes, Other changes.
   - `--outFilterMismatchNoverLmax` divides by the mapped length (`rLength`),
     not the read length, in single-end and paired-end.
   - `--outFilterIntronMotifs` / `--outFilterIntronStrands` apply when a
-    transcript is finalized, as in `stitchWindowAligns`, so a rejected
-    transcript cannot set the score range or become a chimeric segment.
-    Paired-end did not apply them at all.
+    transcript is finalized and before the window's dedup, as in
+    `stitchWindowAligns`, so a rejected transcript cannot evict one it covers,
+    set the score range or become a chimeric segment. Paired-end did not apply
+    them at all. `--outSAMstrandField intronMotif` also drops a spliced
+    transcript whose strand is undefined, as STAR does.
   - Paired-end reads with more than `--outFilterMultimapNmax` loci are reported
     as "too many loci"; they were cleared inside the filter and fell through to
-    "too short". A failing best pair now reports its own reason.
+    "too short". A failing best pair now reports its own reason, and a pair
+    with no transcript in any window is "other", as in single-end.
 
   Yeast 10k: alignments unchanged; PE unmapped types now match STAR read for
   read (`too many loci` 0 → 21, STAR 21). Human chr21 SE: multi / too many
-  loci / too short 6051 / 221 / 2008 → 6113 / 234 / 1956 (STAR 6116 / 232 /
+  loci / too short 6051 / 221 / 2008 → 6114 / 234 / 1956 (STAR 6116 / 232 /
   1955). Supersedes #169 and #252.
 
 - **Multi-member gzip input is no longer truncated.** Compressed input was

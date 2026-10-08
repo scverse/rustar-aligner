@@ -52,6 +52,69 @@ pub struct AlignmentScorer {
     /// Read-end extension policy (alignEndsType). `ext[iMate][iEnd]==true` forces
     /// full end-to-end extension (no terminal soft-clip) of that mate/end.
     pub align_ends_type: crate::params::AlignEndsType,
+    /// STAR's stitch-time intron filters; see [`IntronFilter`].
+    pub intron_filter: IntronFilter,
+}
+
+/// The three intron checks STAR applies when a transcript is finalized
+/// (`stitchWindowAligns.cpp:146-180`), before the window's dedup: a rejected
+/// transcript never enters the window, so it cannot evict another, set the
+/// score range, become `trBest`, or be a chimeric segment.
+#[derive(Debug, Clone)]
+pub struct IntronFilter {
+    pub motifs: crate::params::IntronMotifFilter,
+    pub strands: crate::params::IntronStrandFilter,
+    /// `--outSAMstrandField intronMotif`, which also drops a spliced
+    /// transcript whose junctions leave its strand undefined.
+    pub strand_field_intron_motif: bool,
+}
+
+impl Default for IntronFilter {
+    fn default() -> Self {
+        Self {
+            motifs: crate::params::IntronMotifFilter::None,
+            strands: crate::params::IntronStrandFilter::RemoveInconsistentStrands,
+            strand_field_intron_motif: false,
+        }
+    }
+}
+
+impl IntronFilter {
+    /// Whether a transcript with these junctions (motif, annotated) survives.
+    pub fn passes<'a>(
+        &self,
+        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
+    ) -> bool {
+        use crate::params::{IntronMotifFilter, IntronStrandFilter};
+        // `intronMotifs[sjStr]` counts: STAR's sjStr is 0 for a non-canonical
+        // junction, else the motif's strand.
+        let (mut n_junctions, mut plus, mut minus) = (0u32, 0u32, 0u32);
+        for (m, _) in junctions.clone() {
+            n_junctions += 1;
+            match m.implied_strand() {
+                Some('+') => plus += 1,
+                Some('-') => minus += 1,
+                _ => {}
+            }
+        }
+        if self.strands == IntronStrandFilter::RemoveInconsistentStrands && plus > 0 && minus > 0 {
+            return false;
+        }
+        // `sjMotifStrand` is defined only when exactly one strand is present.
+        let motif_strand_defined = (plus > 0) != (minus > 0);
+        if self.strand_field_intron_motif && n_junctions > 0 && !motif_strand_defined {
+            return false;
+        }
+        match self.motifs {
+            IntronMotifFilter::None => true,
+            IntronMotifFilter::RemoveNoncanonical => !junctions
+                .into_iter()
+                .any(|(m, _)| *m == SpliceMotif::NonCanonical),
+            IntronMotifFilter::RemoveNoncanonicalUnannotated => !junctions
+                .into_iter()
+                .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated),
+        }
+    }
 }
 
 impl AlignmentScorer {
@@ -80,6 +143,7 @@ impl AlignmentScorer {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         }
     }
 
@@ -120,6 +184,11 @@ impl AlignmentScorer {
             out_filter_score_min_over_lread: params.out_filter_score_min_over_lread,
             // Parsed+validated in Parameters::validate; default to Local if unset.
             align_ends_type: params.align_ends_type.parse().unwrap_or_default(),
+            intron_filter: IntronFilter {
+                motifs: params.out_filter_intron_motifs.clone(),
+                strands: params.out_filter_intron_strands.clone(),
+                strand_field_intron_motif: params.out_sam_strand_field == "intronMotif",
+            },
         }
     }
 
@@ -910,6 +979,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -955,6 +1025,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -999,6 +1070,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1041,6 +1113,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1076,6 +1149,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -1109,6 +1183,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -1150,6 +1225,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -1189,6 +1265,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1229,6 +1306,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1337,6 +1415,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1417,6 +1496,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1469,6 +1549,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         }
     }
 

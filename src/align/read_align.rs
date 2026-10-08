@@ -1,5 +1,5 @@
 /// Read alignment driver function
-use crate::align::score::{AlignmentScorer, SpliceMotif};
+use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::stitch::{
     PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
@@ -8,7 +8,7 @@ use crate::align::stitch::{
 use crate::align::transcript::{Exon, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
-use crate::params::{IntronMotifFilter, IntronStrandFilter, MultimapperOrder, Parameters};
+use crate::params::{MultimapperOrder, Parameters};
 use crate::stats::UnmappedReason;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -42,43 +42,6 @@ fn shuffle_tied_prefix<T>(items: &mut [T], score_fn: impl Fn(&T) -> i32, seed: u
     crate::rng::shuffle_deterministic(&mut items[..tied], seed);
 }
 
-/// STAR's intron filters, applied when a transcript is finalized
-/// (`stitchWindowAligns.cpp:146-180`): a rejected transcript never enters the
-/// window, so it cannot become `trBest`, widen the score range, or be a
-/// chimeric segment. For a pair, `motifs` covers the junctions of both mates,
-/// as STAR's combined transcript does.
-fn passes_intron_filters<'a>(
-    motifs: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
-    params: &Parameters,
-) -> bool {
-    let noncanonical_ok = match params.out_filter_intron_motifs {
-        IntronMotifFilter::None => true,
-        IntronMotifFilter::RemoveNoncanonical => {
-            !motifs.clone().any(|(m, _)| *m == SpliceMotif::NonCanonical)
-        }
-        IntronMotifFilter::RemoveNoncanonicalUnannotated => !motifs
-            .clone()
-            .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated),
-    };
-    if !noncanonical_ok {
-        return false;
-    }
-    if params.out_filter_intron_strands == IntronStrandFilter::RemoveInconsistentStrands {
-        let (mut plus, mut minus) = (false, false);
-        for (m, _) in motifs {
-            match m.implied_strand() {
-                Some('+') => plus = true,
-                Some('-') => minus = true,
-                _ => {}
-            }
-        }
-        if plus && minus {
-            return false;
-        }
-    }
-    true
-}
-
 /// STAR's `nMatch`: aligned bases where the read equals the genome. Mismatches
 /// and positions with an `N` on either side are not counted
 /// (`extendAlign.cpp:35-41`, `stitchAlignToTranscript.cpp:68-87`), so this is
@@ -88,16 +51,19 @@ fn passes_intron_filters<'a>(
 /// walks its reverse complement.
 fn star_n_match(t: &Transcript, read: &[u8], genome: &crate::genome::Genome) -> u32 {
     use noodles::sam::alignment::record::cigar::op::Kind;
-    let rc;
-    let frame: &[u8] = if t.is_reverse {
-        rc = read
-            .iter()
-            .rev()
-            .map(|&b| if b < 4 { 3 - b } else { b })
-            .collect::<Vec<u8>>();
-        &rc
-    } else {
-        read
+    // Base `i` of the frame the CIGAR walks, without building the reverse
+    // complement: this runs once per read.
+    let frame = |i: usize| -> u8 {
+        let b = if t.is_reverse {
+            read.len().checked_sub(i + 1).and_then(|j| read.get(j))
+        } else {
+            read.get(i)
+        };
+        match b {
+            Some(&b) if t.is_reverse && b < 4 => 3 - b,
+            Some(&b) => b,
+            None => 4,
+        }
     };
     let (mut r, mut g) = (0usize, t.genome_start);
     let mut n = 0u32;
@@ -106,7 +72,7 @@ fn star_n_match(t: &Transcript, read: &[u8], genome: &crate::genome::Genome) -> 
         match op.kind() {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 for k in 0..len {
-                    let rb = frame.get(r + k).copied().unwrap_or(4);
+                    let rb = frame(r + k);
                     let gb = genome.get_base(g + k as u64).unwrap_or(4);
                     if rb < 4 && gb < 4 && rb == gb {
                         n += 1;
@@ -155,9 +121,6 @@ pub struct PairedAlignment {
     /// Combined pair score: sum of per-mate finalized scores (each includes genomic length penalty).
     /// Used for multi-mapper score-range ranking and mappedFilter quality check.
     pub combined_wt_score: i32,
-    /// Combined coverage: sum of exon read spans from both mates.
-    /// Mirrors STAR's nMatch check in mappedFilter.
-    pub combined_n_match: u32,
 }
 
 impl PairedAlignment {
@@ -247,6 +210,20 @@ pub fn align_read(
     read_name: &str,
     index: &GenomeIndex,
     params: &Parameters,
+) -> Result<AlignReadResult, Error> {
+    align_read_inner(read_seq, read_name, index, params, true)
+}
+
+/// `align_read` with or without STAR's `mappedFilter`. The `--peOverlapNbasesMin`
+/// merged read is mapped without it: STAR runs only `mapOneRead` on it
+/// (`ReadAlign_peOverlapMergeMap.cpp`) and filters once the alignments are back
+/// in the paired frame.
+fn align_read_inner(
+    read_seq: &[u8],
+    read_name: &str,
+    index: &GenomeIndex,
+    params: &Parameters,
+    mapped_filter: bool,
 ) -> Result<AlignReadResult, Error> {
     let debug_read = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
 
@@ -378,7 +355,7 @@ pub fn align_read(
 
     for (ci, cluster) in clusters.iter().enumerate() {
         let debug_name = if debug_read { read_name } else { "" };
-        let mut cluster_transcripts = stitch_seeds_with_jdb_debug(
+        let cluster_transcripts = stitch_seeds_with_jdb_debug(
             cluster,
             read_seq,
             index,
@@ -387,12 +364,6 @@ pub fn align_read(
             params.align_transcripts_per_window_nmax,
             debug_name,
         );
-        cluster_transcripts.retain(|t| {
-            passes_intron_filters(
-                t.junction_motifs.iter().zip(t.junction_annotated.iter()),
-                params,
-            )
-        });
         if debug_read {
             eprintln!(
                 "[DEBUG {}] Cluster[{}]: {} transcripts from DP",
@@ -504,27 +475,36 @@ pub fn align_read(
     // many loci. The intron filters are not here: STAR applies them per transcript
     // at stitch time, which is where they now run.
     let lread_m1 = (read_seq.len() as f64) - 1.0;
-    let unmapped_by_filter = transcripts.first().and_then(|best| {
-        let n_match = star_n_match(best, read_seq, &index.genome);
-        let r_length = star_r_length(best);
-        if best.score < params.out_filter_score_min
-            || best.score < (params.out_filter_score_min_over_lread * lread_m1) as i32
-            || n_match < params.out_filter_match_nmin
-            || n_match < (params.out_filter_match_nmin_over_lread * lread_m1) as u32
-        {
-            Some(UnmappedReason::TooShort)
-        } else if best.n_mismatch > params.out_filter_mismatch_nmax
-            || f64::from(best.n_mismatch) / f64::from(r_length.max(1))
-                > params.out_filter_mismatch_nover_lmax
-        {
-            Some(UnmappedReason::TooManyMismatches)
-        } else {
-            None
-        }
-    });
+    let unmapped_by_filter = transcripts
+        .first()
+        .filter(|_| mapped_filter)
+        .and_then(|best| {
+            let n_match = star_n_match(best, read_seq, &index.genome);
+            let r_length = star_r_length(best);
+            if best.score < params.out_filter_score_min
+                || best.score < (params.out_filter_score_min_over_lread * lread_m1) as i32
+                || n_match < params.out_filter_match_nmin
+                || n_match < (params.out_filter_match_nmin_over_lread * lread_m1) as u32
+            {
+                Some(UnmappedReason::TooShort)
+            } else if best.n_mismatch > params.out_filter_mismatch_nmax
+                || f64::from(best.n_mismatch) / f64::from(r_length.max(1))
+                    > params.out_filter_mismatch_nover_lmax
+            {
+                Some(UnmappedReason::TooManyMismatches)
+            } else {
+                None
+            }
+        });
     if debug_read {
         eprintln!("[DEBUG {read_name}] mappedFilter on trBest: {unmapped_by_filter:?}");
     }
+
+    // Note: STAR sometimes finds 2 equivalent indel placements in homopolymer runs
+    // via its recursive stitcher's seed exploration (NH=2 instead of NH=1 for ~5 reads).
+    // Generating equivalents post-hoc causes more harm than good (41 false NH=2 vs 5 fixed).
+    // The root cause is jR scanning placing insertions at different positions — fixing that
+    // would be a better approach than post-hoc enumeration.
 
     // STAR's chimericDetection, which runs after multMapSelect/mappedFilter
     // whatever their outcome, over the window transcripts.
@@ -584,7 +564,7 @@ pub fn align_read(
         transcripts.clear();
         n_for_mapq = 0;
         Some(reason)
-    } else if transcripts.len() > params.out_filter_multimap_nmax as usize {
+    } else if mapped_filter && transcripts.len() > params.out_filter_multimap_nmax as usize {
         // `n_for_mapq` already holds the loci count; drop the alignments.
         transcripts.clear();
         Some(UnmappedReason::TooManyLoci)
@@ -702,6 +682,10 @@ pub fn align_paired_read(
     // transcripts — whole pairs and single mates alike.
     let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
     let chim_on = params.chim_segment_min > 0;
+    // Whether any window kept a transcript. STAR counts a read with none as
+    // "other" (`nW==0`), not "too short"; a pair our pairing step later
+    // rejects still counts, since STAR's `trAll` has it.
+    let mut any_transcript = false;
 
     // Stitch combined clusters, split WTs by mate_id, finalize each half
     for cluster in clusters.iter().take(params.align_windows_per_read_nmax) {
@@ -770,24 +754,13 @@ pub fn align_paired_read(
                     continue;
                 };
 
+                any_transcript = true;
                 if stitch_is_reverse {
                     t1.is_reverse = true;
                     t2.is_reverse = false;
                 } else {
                     t1.is_reverse = false;
                     t2.is_reverse = true;
-                }
-
-                // STAR's intron filters see the whole combined transcript, so a
-                // junction in either mate can reject the pair.
-                if !passes_intron_filters(
-                    t1.junction_motifs
-                        .iter()
-                        .zip(t1.junction_annotated.iter())
-                        .chain(t2.junction_motifs.iter().zip(t2.junction_annotated.iter())),
-                    params,
-                ) {
-                    continue;
                 }
 
                 let combined_span =
@@ -868,12 +841,7 @@ pub fn align_paired_read(
                         0, // mate1
                     ) {
                         t.is_reverse = stitch_is_reverse;
-                        if !passes_intron_filters(
-                            t.junction_motifs.iter().zip(t.junction_annotated.iter()),
-                            params,
-                        ) {
-                            continue;
-                        }
+                        any_transcript = true;
                         if chim_on {
                             chim_window.extend(crate::chimeric::WinTr::single(
                                 &t,
@@ -912,12 +880,7 @@ pub fn align_paired_read(
                         1, // mate2
                     ) {
                         t.is_reverse = !stitch_is_reverse;
-                        if !passes_intron_filters(
-                            t.junction_motifs.iter().zip(t.junction_annotated.iter()),
-                            params,
-                        ) {
-                            continue;
-                        }
+                        any_transcript = true;
                         if chim_on {
                             chim_window.extend(crate::chimeric::WinTr::single(
                                 &t,
@@ -988,7 +951,7 @@ pub fn align_paired_read(
             merge_params.out_filter_match_nmin_over_lread = 0.0;
             merge_params.out_filter_score_min_over_lread = 0.0;
             let (merged_transcripts, _merged_chim, _n_mapq, _unmapped) =
-                align_read(&merge.merged, read_name, index, &merge_params)?;
+                align_read_inner(&merge.merged, read_name, index, &merge_params, false)?;
             let mut converted: Vec<PairedAlignment> = Vec::new();
             for t in &merged_transcripts {
                 let Some((m1, m2)) = crate::align::pe_overlap::convert_merged_transcript_to_pe(
@@ -1008,15 +971,6 @@ pub fn align_paired_read(
                 let combined_wt_score = (m1.score - scorer.genomic_length_penalty(m1_span))
                     + (m2.score - scorer.genomic_length_penalty(m2_span))
                     + scorer.genomic_length_penalty(combined_span);
-                let combined_n_match: u32 = m1
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum::<u32>()
-                    + m2.exons
-                        .iter()
-                        .map(|e| (e.read_end - e.read_start) as u32)
-                        .sum::<u32>();
                 let is_proper_pair = check_proper_pair(&m1, &m2, params);
                 let insert_size = calculate_insert_size(&m1, &m2);
                 converted.push(PairedAlignment {
@@ -1027,7 +981,6 @@ pub fn align_paired_read(
                     is_proper_pair,
                     insert_size,
                     combined_wt_score,
-                    combined_n_match,
                 });
             }
             if !converted.is_empty() {
@@ -1270,7 +1223,7 @@ pub fn align_paired_read(
         // unmapped pair as too short empties the "other" bucket, which is what
         // #48 measured on paired-end data.
         (None, None) => {
-            let reason = if clusters.is_empty() {
+            let reason = if clusters.is_empty() || !any_transcript {
                 UnmappedReason::Other
             } else {
                 UnmappedReason::TooShort
@@ -1336,17 +1289,6 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Combined coverage: sum of exon read spans from both mates
-    let combined_n_match: u32 = t1
-        .exons
-        .iter()
-        .map(|e| (e.read_end - e.read_start) as u32)
-        .sum::<u32>()
-        + t2.exons
-            .iter()
-            .map(|e| (e.read_end - e.read_start) as u32)
-            .sum::<u32>();
-
     let is_proper_pair = check_proper_pair(t1, t2, params);
     let insert_size = calculate_insert_size(t1, t2);
 
@@ -1358,7 +1300,6 @@ fn try_pair_transcripts(
         is_proper_pair,
         insert_size,
         combined_wt_score,
-        combined_n_match,
     })
 }
 
@@ -1426,7 +1367,10 @@ fn filter_paired_transcripts(
     //
     // Returns why the read is unmapped when the best pair fails, in STAR's
     // order: too short (score or matched bases), then too many mismatches.
-    let best_pa = paired_alns.iter().max_by_key(|pa| pa.combined_wt_score);
+    // The pairs arrive sorted by score (and shuffled among ties under
+    // `--outMultimapperOrder Random`), so the first is the primary, as in SE.
+    // `max_by_key` would return the *last* of tied pairs.
+    let best_pa = paired_alns.first();
     if let Some(best) = best_pa {
         let mate1_len = (best.mate1_region.1 - best.mate1_region.0) as f64;
         let mate2_len = (best.mate2_region.1 - best.mate2_region.0) as f64;
@@ -1533,6 +1477,8 @@ pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::align::score::SpliceMotif;
+    use crate::params::IntronMotifFilter;
 
     use crate::genome::Genome;
     use crate::index::packed_array::PackedArray;
@@ -1629,7 +1575,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 400,
             combined_wt_score: 200,
-            combined_n_match: 200,
         };
         let combined = pair.combined_transcript_for_projection();
         assert_eq!(combined.exons.len(), 2);
@@ -1754,36 +1699,48 @@ mod tests {
 
     #[test]
     fn intron_filters_follow_star() {
-        let params = default_params(); // RemoveInconsistentStrands, motifs None
-        let check = |m: &[SpliceMotif], a: &[bool], p: &Parameters| {
-            passes_intron_filters(m.iter().zip(a.iter()), p)
-        };
+        use crate::align::score::IntronFilter;
+        let check =
+            |m: &[SpliceMotif], a: &[bool], f: &IntronFilter| f.passes(m.iter().zip(a.iter()));
+        let f = AlignmentScorer::from_params(&default_params()).intron_filter;
         assert!(check(
             &[SpliceMotif::GtAg, SpliceMotif::GcAg],
             &[false, false],
-            &params
+            &f
         ));
         assert!(
-            !check(
-                &[SpliceMotif::GtAg, SpliceMotif::CtAc],
-                &[false, false],
-                &params
-            ),
+            !check(&[SpliceMotif::GtAg, SpliceMotif::CtAc], &[false, false], &f),
             "+ and - junctions in one transcript"
         );
         // Non-canonical junctions carry no strand.
         assert!(check(
             &[SpliceMotif::GtAg, SpliceMotif::NonCanonical],
             &[false, false],
-            &params
+            &f
         ));
 
         let mut p = default_params();
         p.out_filter_intron_motifs = IntronMotifFilter::RemoveNoncanonicalUnannotated;
-        assert!(!check(&[SpliceMotif::NonCanonical], &[false], &p));
-        assert!(check(&[SpliceMotif::NonCanonical], &[true], &p));
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[false], &f));
+        assert!(check(&[SpliceMotif::NonCanonical], &[true], &f));
         p.out_filter_intron_motifs = IntronMotifFilter::RemoveNoncanonical;
-        assert!(!check(&[SpliceMotif::NonCanonical], &[true], &p));
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[true], &f));
+
+        // `--outSAMstrandField intronMotif` also drops a spliced transcript
+        // whose strand is undefined (`sjN>0 && sjMotifStrand==0`), but not an
+        // unspliced one.
+        let mut p = default_params();
+        p.out_sam_strand_field = "intronMotif".into();
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[false], &f));
+        assert!(check(
+            &[SpliceMotif::NonCanonical, SpliceMotif::GtAg],
+            &[false, false],
+            &f
+        ));
+        assert!(check(&[], &[], &f));
     }
 
     #[test]
@@ -2260,7 +2217,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 200,
             combined_wt_score: 0,
-            combined_n_match: 200,
         }));
         assert!(matches!(both, PairedAlignmentResult::BothMapped(_)));
 
