@@ -113,6 +113,7 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
             shift_left,
             shift_right,
             strand,
+            src_strand: strand,
         });
     }
 
@@ -270,6 +271,13 @@ pub struct PreparedJunction {
     pub shift_right: u8,
     /// STAR strand code (0 = unknown/dot, 1 = +, 2 = -).
     pub strand: u8,
+    /// Source strand as given by the annotation (STAR's `sjdbLoci.str`
+    /// char, encoded 0 = '.', 1 = '+', 2 = '-') BEFORE motif-based
+    /// derivation. STAR's dedup passes partition and branch on this raw
+    /// value, not the derived one (`sjdbPrepare.cpp:79-88,154-159`).
+    /// Only meaningful during genomeGenerate dedup; set equal to
+    /// `strand` when a junction is reloaded from `sjdbInfo.txt`.
+    pub src_strand: u8,
 }
 
 impl PreparedJunction {
@@ -343,29 +351,74 @@ pub fn prepare_junction(
         shift_left,
         shift_right,
         strand,
+        src_strand: match db_strand {
+            1 | 2 => db_strand,
+            _ => 0,
+        },
     }
 }
 
-/// Sort a prepared junction list into STAR's post-dedup order and apply
-/// the cross-strand deduplication that STAR does after its second sort
-/// (`sjdbPrepare.cpp:141-192`).
+/// Sort a prepared junction list into STAR's post-dedup order,
+/// replicating both dedup passes of `sjdbPrepare.cpp`:
 ///
-/// STAR's first-pass (intra-strand) dedup collapses duplicate sjdb
-/// entries from the same source at the same `(start, end, strand)`.
-/// rustar-aligner's `SpliceJunctionDb` already deduplicates on that key at the
-/// HashMap level, so those first-pass branches never trigger here; the
-/// second-pass cross-strand collision dedup does.
+/// **Pass 1** (`sjdbPrepare.cpp:75-123`): sort by left-shifted
+/// coordinates, partitioned by the raw source strand (`'+'`, `'-'`,
+/// `'.'` sort as separate blocks). Junctions whose shifted coordinates
+/// coincide within a strand block are alternative representations of
+/// the same splice event inside a repeat; STAR keeps one — preferring
+/// canonical motifs, then the smallest left shift. (STAR also compares
+/// source priority here; every rustar source currently shares one
+/// priority, so those branches are omitted.)
 ///
-/// Dedup rules when two surviving junctions share `(stored_start,
-/// stored_end)` but have different strand assignments:
+/// **Pass 2** (`sjdbPrepare.cpp:125-191`): re-sort survivors by their
+/// stored (motif-restored) coordinates and collapse entries that share
+/// `(stored_start, stored_end)` across strand blocks:
 ///
-/// - Undefined strand vs defined strand → keep the defined-strand one.
+/// - Defined-strand entry beats a `'.'`-source entry.
 /// - Both non-canonical → collapse to a single entry with strand = 0
 ///   (undefined).
 /// - One canonical + one not → keep the canonical one.
 /// - Both canonical but on correct vs wrong strand relative to motif —
 ///   keep the one whose strand matches `2 - motif % 2`.
 pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunction> {
+    // Pass 1: shifted coords, strand-partitioned ('+' block, then '-',
+    // then '.', mirroring STAR's `shift1` of 0 / nGenomeReal / 2n).
+    let strand_block = |j: &PreparedJunction| match j.src_strand {
+        1 => 0u8,
+        2 => 1u8,
+        _ => 2u8,
+    };
+    junctions.sort_by(|a, b| {
+        strand_block(a)
+            .cmp(&strand_block(b))
+            .then_with(|| a.start_pos.cmp(&b.start_pos))
+            .then_with(|| a.end_pos.cmp(&b.end_pos))
+    });
+
+    let mut pass1: Vec<PreparedJunction> = Vec::with_capacity(junctions.len());
+    for j in junctions {
+        match pass1.last_mut() {
+            Some(last)
+                if strand_block(last) == strand_block(&j)
+                    && last.start_pos == j.start_pos
+                    && last.end_pos == j.end_pos =>
+            {
+                // sjdbPrepare.cpp:116-121 (equal priority): the new
+                // junction wins if it is canonical and the old one is
+                // not, or if both have the same canonicality and the
+                // new one has the smaller left shift.
+                if (j.motif > 0 && last.motif == 0)
+                    || ((j.motif > 0) == (last.motif > 0) && j.shift_left < last.shift_left)
+                {
+                    *last = j;
+                }
+            }
+            _ => pass1.push(j),
+        }
+    }
+
+    // Pass 2: stored coords, cross-strand collapse.
+    let mut junctions = pass1;
     junctions.sort_by(|a, b| {
         a.stored_start()
             .cmp(&b.stored_start())
@@ -397,31 +450,27 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
 /// caller via a special-case — represented here as returning a cloned
 /// `old` with strand=0).
 fn merge_cross_strand(old: &PreparedJunction, new: &PreparedJunction) -> Option<PreparedJunction> {
-    // Strand 0 = undefined.
-    if old.strand > 0 && new.strand == 0 {
-        return None; // keep old
+    // sjdbPrepare.cpp:154-159 — STAR compares the RECORDED strand of the
+    // old junction (`mapGen.sjdbStrand`, our derived `strand`) against the
+    // RAW source strand of the new one (`sjdbLoci.str`, our `src_strand`).
+    if old.strand > 0 && new.src_strand == 0 {
+        return None; // new junction strand is not defined — keep old
     }
-    if old.strand == 0 && new.strand > 0 {
-        return Some(new.clone()); // replace
+    if old.strand == 0 && new.src_strand != 0 {
+        return Some(new.clone()); // old junction strand is not defined — replace
     }
-    // Both non-canonical → collapse to undefined strand on the old one.
+    // Both non-canonical → collapse to undefined strand on the old one
+    // (sjdbPrepare.cpp:160-163).
     if old.motif == 0 && new.motif == 0 {
         let mut merged = old.clone();
         merged.strand = 0;
         return Some(merged);
     }
-    // One canonical, one not: prefer canonical.
-    if old.motif > 0 && new.motif == 0 {
-        return None;
-    }
-    if old.motif == 0 && new.motif > 0 {
-        return Some(new.clone());
-    }
-    // Both canonical with defined strands. Keep the one on the correct
-    // strand for its motif (2 - motif % 2). If the old one is on the
-    // correct strand, skip the new one; otherwise replace.
-    let old_expected = 2 - (old.motif % 2);
-    if old.strand == old_expected {
+    // sjdbPrepare.cpp:164-170: keep the old junction when it is canonical
+    // and the new one is not, OR when the old junction sits on the correct
+    // strand for its motif (`motif % 2 == 2 - strand`); otherwise the new
+    // junction is on the correct strand and replaces it.
+    if (old.motif > 0 && new.motif == 0) || (old.motif % 2 == 2 - old.strand) {
         None
     } else {
         Some(new.clone())
@@ -735,6 +784,7 @@ mod tests {
             shift_left,
             shift_right: 0,
             strand,
+            src_strand: strand,
         }
     }
 
@@ -917,6 +967,7 @@ mod tests {
                 shift_left: 0,
                 shift_right: 1,
                 strand: 1,
+                src_strand: 1,
             },
             // Non-canonical: stored = shifted (139_187..139_217).
             PreparedJunction {
@@ -927,6 +978,7 @@ mod tests {
                 shift_left: 0,
                 shift_right: 0,
                 strand: 1,
+                src_strand: 1,
             },
         ];
         write_sjdb_info_tab(tmp.path(), &junctions, 99).unwrap();
@@ -951,6 +1003,7 @@ mod tests {
             shift_left: 0,
             shift_right: 0,
             strand: 1,
+            src_strand: 1,
         };
         // Non-canonical with shift_left=3 — STAR writes
         // `stored + shift_left + 1`, which is `original + 1`.
@@ -962,6 +1015,7 @@ mod tests {
             shift_left: 3,
             shift_right: 0,
             strand: 0,
+            src_strand: 0,
         };
         write_sjdb_list_out_tab(tmp.path(), &[canon, noncan], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -992,6 +1046,7 @@ mod tests {
             shift_left: 0,
             shift_right: 0,
             strand: 2,
+            src_strand: 2,
         };
         write_sjdb_list_out_tab(tmp.path(), &[pj_b], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1001,24 +1056,44 @@ mod tests {
 
     #[test]
     fn dedup_prefers_strand_matching_motif() {
-        // motif=1 (GT/AG +) stored on wrong strand (2) vs a competing
-        // motif=2 (CT/AC -) on its correct strand. Same stored coords.
-        // STAR keeps the one whose strand matches `2 - motif%2`.
-        // For motif=1: expected strand = 2 - 1%2 = 1.
-        // For motif=2: expected strand = 2 - 2%2 = 2.
-        let old_wrong = pj(0, 100, 200, 1, 0, 2); // motif 1 wants strand 1, has 2
-        let new_right = pj(0, 100, 200, 2, 0, 2); // motif 2 wants strand 2, has 2
+        // Same stored coords reached from different source-strand blocks
+        // (so pass 1 keeps both and the cross-strand pass 2 decides):
+        // motif=2 (CT/AC, wants strand 2) annotated on '+' vs the same
+        // motif annotated on '-'. STAR keeps the one whose strand matches
+        // `2 - motif%2` (sjdbPrepare.cpp:164-170).
+        let old_wrong = pj(0, 100, 200, 2, 0, 1); // motif 2 wants strand 2, has 1
+        let new_right = pj(0, 100, 200, 2, 0, 2); // motif 2 on its correct strand
         let out = sort_and_dedup(vec![old_wrong, new_right.clone()]);
         assert_eq!(out.len(), 1);
-        // `old_wrong` is on wrong strand for its motif — STAR replaces.
+        // `old_wrong` is on the wrong strand for its motif — STAR replaces.
         assert_eq!(out[0], new_right);
+    }
+
+    #[test]
+    fn dedup_pass1_merges_shifted_duplicates_same_strand() {
+        // Two same-strand junctions whose LEFT-SHIFTED coords coincide are
+        // repeat-shifted copies of one splice event. STAR's first dedup
+        // pass keeps one — canonical first, then smallest shift_left
+        // (sjdbPrepare.cpp:107-122).
+        let shifted_more = pj(0, 100, 200, 1, 5, 1);
+        let shifted_less = pj(0, 100, 200, 1, 2, 1);
+        let out = sort_and_dedup(vec![shifted_more, shifted_less.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], shifted_less);
+
+        // Canonical beats non-canonical regardless of shift.
+        let noncan = pj(0, 300, 400, 0, 1, 1);
+        let canon = pj(0, 300, 400, 3, 4, 1);
+        let out = sort_and_dedup(vec![noncan, canon.clone()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], canon);
     }
 
     #[test]
     fn decode_gsj_hit_outside_buffer_returns_empty() {
         let junctions = vec![pj(0, 1000, 2000, 1, 0, 1)];
         // Hit in the real genome: caller should bypass this function.
-        assert!(decode_gsj_hit(500, 50, 5000, 100, &junctions).is_empty());
+        assert_eq!(decode_gsj_hit(500, 50, 5000, 100, &junctions), []);
     }
 
     #[test]
@@ -1032,10 +1107,16 @@ mod tests {
         let n_genome_real = 5000;
         let overhang = 100u32;
         let hit_pos = n_genome_real + 5;
-        assert!(decode_gsj_hit(hit_pos, 20, n_genome_real, overhang, &junctions).is_empty());
+        assert_eq!(
+            decode_gsj_hit(hit_pos, 20, n_genome_real, overhang, &junctions),
+            []
+        );
         // Acceptor-only hit (slot_offset >= overhang) is also dropped.
         let hit_pos2 = n_genome_real + 120;
-        assert!(decode_gsj_hit(hit_pos2, 20, n_genome_real, overhang, &junctions).is_empty());
+        assert_eq!(
+            decode_gsj_hit(hit_pos2, 20, n_genome_real, overhang, &junctions),
+            []
+        );
     }
 
     #[test]
@@ -1097,16 +1178,19 @@ mod tests {
         let n_genome_real = 5000;
         let overhang = 10u32;
         // Past last junction.
-        assert!(
-            decode_gsj_hit(n_genome_real + 21, 5, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 21, 5, n_genome_real, overhang, &junctions),
+            []
         );
         // On the trailing spacer byte (slot_offset == 2*overhang).
-        assert!(
-            decode_gsj_hit(n_genome_real + 20, 1, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 20, 1, n_genome_real, overhang, &junctions),
+            []
         );
         // Hit extends past the spacer.
-        assert!(
-            decode_gsj_hit(n_genome_real + 19, 3, n_genome_real, overhang, &junctions).is_empty()
+        assert_eq!(
+            decode_gsj_hit(n_genome_real + 19, 3, n_genome_real, overhang, &junctions),
+            []
         );
     }
 
@@ -1133,6 +1217,7 @@ mod tests {
                 shift_left: 0,
                 shift_right: 1,
                 strand: 1,
+                src_strand: 1,
             },
             PreparedJunction {
                 chr_idx: 0,
@@ -1142,6 +1227,7 @@ mod tests {
                 shift_left: 3,
                 shift_right: 0,
                 strand: 0,
+                src_strand: 0,
             },
         ];
         let tmp = tempfile::NamedTempFile::new().unwrap();

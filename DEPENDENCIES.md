@@ -24,8 +24,8 @@ five supported platforms, without a C toolchain unless the row says otherwise.
 | `log` + `env_logger` | 0.4 / 0.11 | MIT OR Apache-2.0 | everywhere | `Log.out` and the progress logs. |
 | `memmap2` | 0.9 | MIT OR Apache-2.0 | `index/packed_array.rs`, `genome/mod.rs`, `index/mod.rs` | The genome, SA and SAindex are read by mapping the files, not by reading them into a `Vec`. A human genome index is tens of gigabytes; mapping is what makes a shared index across processes possible at all. |
 | `byteorder` | 1 | Unlicense OR MIT | `io/bam.rs`, `index/io.rs` | Little-endian field access in the BAM and index formats, both externally specified. |
-| `noodles` | 0.113 | MIT | `io/sam.rs`, `io/bam.rs`, `bam_dedup.rs`, `quant/transcriptome.rs`, `wasp/mod.rs` | SAM/BAM/BGZF/FASTQ readers and writers, pure Rust, self-contained on all five platforms. The alternative (`rust-htslib`) is in section 3. |
-| `noodles-bgzf` | 0.49 | MIT | `io/bam.rs` | BGZF blocks for BAM, with the `libdeflate` feature. |
+| `noodles` | 0.116 | MIT | `io/sam.rs`, `io/bam.rs`, `bam_dedup.rs`, `quant/transcriptome.rs`, `wasp/mod.rs` | SAM/BAM/BGZF/FASTQ readers and writers, pure Rust, self-contained on all five platforms. The alternative (`rust-htslib`) is in section 3. |
+| `noodles-bgzf` | 0.51 | MIT | `io/bam.rs` | BGZF blocks for BAM, with the `libdeflate` feature. |
 | `libdeflater` | 1.25.2 | Apache-2.0 | `solo/count.rs` | gzip for the solo matrix files. Faster than `flate2` on that path, and already in the tree through `noodles-bgzf`'s `libdeflate` feature. |
 | `flate2` (`zlib-rs` backend) | 1 | MIT OR Apache-2.0 | `io/fastq.rs`, `solo/whitelist.rs`, `solo/count.rs`, `bin/emptydrops.rs` | gzip FASTQ input. The `zlib-rs` backend instead of the default `miniz_oxide`: 2-3x faster inflate and deflate on the decode and BGZF paths, still pure Rust, no C toolchain. Backend is a build-time choice; the API is unchanged. |
 | `bstr` | 1 | MIT OR Apache-2.0 | `io/sam.rs`, `chimeric/output.rs` | Byte strings for SAM fields, which are bytes and not guaranteed UTF-8. |
@@ -36,7 +36,7 @@ five supported platforms, without a C toolchain unless the row says otherwise.
 | `tempfile` | 3 | MIT OR Apache-2.0 | `lib.rs`, `stats.rs`, `quant/transcriptome.rs`, `wasp/mod.rs` | Disk buffering for `--outFilterType BySJout` and the sorted-BAM spill, plus test fixtures. |
 | `bitflags` | 2 | MIT OR Apache-2.0 | `params/sam.rs` | The `--outSAMattributes` set. |
 | `shlex` | 2 | MIT OR Apache-2.0 | `params/mod.rs` | Quoting the command line for the `@PG` header, and splitting `--readFilesCommand`. |
-| `caps-sa` | 0.6 | MIT | `index/sa_build.rs` | Suffix-array construction at `genomeGenerate`. Alternatives are in section 4. |
+| `caps-sa` | 0.7 | MIT | `index/sa_build.rs` | Suffix-array construction at `genomeGenerate`. Alternatives are in section 4. |
 | `mimalloc` + `libmimalloc-sys` | 0.1 | MIT | `main.rs` | The global allocator. glibc malloc keeps one arena per worker thread and caches freed allocations in them indefinitely, which added 10-20 GB of slack to peak RSS on genome-scale runs; mimalloc's per-thread heaps release whole segments back to the OS. It is also cheaper per allocation, which matters for the millions of small allocations SA construction makes. |
 
 ## 2. Development-only dependencies

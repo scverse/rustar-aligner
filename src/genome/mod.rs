@@ -50,6 +50,28 @@ impl GenomeSeq {
         }
     }
 
+    /// A resolved, `Copy` view of this sequence for hot per-base loops.
+    ///
+    /// [`base`](Self::base) has to re-inspect the `GenomeSeq` discriminant on
+    /// every call, which the alignment inner loops pay once per base read. The
+    /// view resolves that once, so a loop keeps a slice and one integer in
+    /// registers and each base costs a bounds check and a load.
+    #[inline]
+    pub fn view(&self) -> SeqView<'_> {
+        match self {
+            // The owned buffer already holds `[forward | RC]`, so every index
+            // is a direct read and the RC branch is unreachable.
+            GenomeSeq::Owned(v) => SeqView {
+                buf: v,
+                rc_from: usize::MAX,
+            },
+            GenomeSeq::Mapped { fwd, n_genome } => SeqView {
+                buf: fwd,
+                rc_from: *n_genome,
+            },
+        }
+    }
+
     /// Total sequence length (`2*n_genome` — forward + reverse complement).
     #[inline]
     pub fn len(&self) -> usize {
@@ -82,6 +104,92 @@ impl GenomeSeq {
         match self {
             GenomeSeq::Owned(v) => v,
             GenomeSeq::Mapped { fwd, .. } => fwd,
+        }
+    }
+}
+
+/// A resolved view of a [`GenomeSeq`] for per-base hot loops.
+///
+/// Out-of-range positions read back as [`OUT_OF_RANGE`] rather than `None`.
+/// Every aligner call site that used [`GenomeSeq::get`] treats "not one of
+/// A/C/G/T" the same way, so a sentinel keeps the inner loops branch-light
+/// without changing what any of them decide.
+#[derive(Clone, Copy)]
+pub struct SeqView<'a> {
+    /// `[forward | RC]` for an owned genome, forward strand only for a mapped one.
+    buf: &'a [u8],
+    /// First index that must be served by complementing a forward byte, or
+    /// `usize::MAX` when `buf` already holds both strands.
+    rc_from: usize,
+}
+
+/// A position past the end of the genome.
+pub const OUT_OF_RANGE: u8 = u8::MAX;
+
+impl SeqView<'_> {
+    /// Copy the bases at `[start, start + out.len())` into `out`, returning how
+    /// many were available.
+    ///
+    /// Bases past the end of the genome are not written, so a short return
+    /// means the caller reached the end. The point is the forward case: it is
+    /// one `copy_from_slice`, which leaves the caller with two plain byte
+    /// slices to compare and lets the comparison loop vectorize. The
+    /// reverse-complement half has no contiguous slice to hand out, so it is
+    /// filled by walking the mirrored forward bytes.
+    pub fn bases_into(&self, start: usize, out: &mut [u8]) -> usize {
+        let mut filled = 0;
+        if start < self.rc_from {
+            // Forward strand of a mapped genome, or anywhere in an owned one.
+            let limit = self.buf.len().min(self.rc_from);
+            let end = (start + out.len()).min(limit);
+            if start >= end {
+                return 0;
+            }
+            filled = end - start;
+            out[..filled].copy_from_slice(&self.buf[start..end]);
+            // An owned buffer ends where the genome does. A mapped one ends at
+            // the forward half, and a run that reaches it carries on into the
+            // RC half exactly as `base` does — stopping here would read as the
+            // end of the genome.
+            if filled == out.len() || end != self.rc_from {
+                return filled;
+            }
+        }
+        let pos = start + filled;
+        let two_n = self.rc_from * 2;
+        if pos >= two_n {
+            return filled;
+        }
+        let rest = &mut out[filled..];
+        let n = rest.len().min(two_n - pos);
+        // base(i) = complement(forward[2n - 1 - i]) for i in [pos, pos + n),
+        // so the source is `[2n - pos - n, 2n - pos)` walked backwards.
+        let hi = two_n - pos;
+        let src = &self.buf[hi - n..hi];
+        for (o, &f) in rest[..n].iter_mut().zip(src.iter().rev()) {
+            *o = if f < 4 { 3 - f } else { f };
+        }
+        filled + n
+    }
+
+    /// Base at absolute position `i`, or [`OUT_OF_RANGE`] past the end.
+    ///
+    /// Equivalent to `GenomeSeq::get(i).unwrap_or(OUT_OF_RANGE)`.
+    #[inline]
+    pub fn base(&self, i: usize) -> u8 {
+        if i < self.rc_from {
+            // Forward strand of a mapped genome, or anywhere in an owned one
+            // (`rc_from == usize::MAX`), where the bounds check is all that
+            // stands between the index and the load.
+            return self.buf.get(i).copied().unwrap_or(OUT_OF_RANGE);
+        }
+        // Mapped RC half: base(i) = complement(forward[2*n - 1 - i]).
+        let two_n = self.rc_from * 2;
+        if i < two_n {
+            let f = self.buf[two_n - 1 - i];
+            if f < 4 { 3 - f } else { f }
+        } else {
+            OUT_OF_RANGE
         }
     }
 }
@@ -343,7 +451,18 @@ impl Genome {
     /// - `chrStart.txt` — chromosome start positions + final n_genome entry
     /// - `chrNameLength.txt` — tab-separated name + length
     /// - `genomeParameters.txt` — key-value pairs of genome generation parameters
-    pub fn write_index_files(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+    ///
+    /// `effective_sjdb_overhang` is the overhang actually baked into the
+    /// genome (STAR's `mapGen.sjdbOverhang`): `params.sjdb_overhang` when
+    /// sjdb junctions were inserted, `0` when the index has no sjdb —
+    /// STAR writes the effective value, not the parameter, into
+    /// `genomeParameters.txt`, and its loader trusts it at align time.
+    pub fn write_index_files(
+        &self,
+        dir: &Path,
+        params: &Parameters,
+        effective_sjdb_overhang: u32,
+    ) -> Result<(), Error> {
         use std::fs;
         use std::io::Write;
 
@@ -393,7 +512,7 @@ impl Genome {
         // trailing whitespace on vector values). STAR's loader reads these
         // keys via `<<` streaming; the leading `###` comment lines are
         // skipped.
-        self.write_genome_parameters_txt(dir, params)?;
+        self.write_genome_parameters_txt(dir, params, effective_sjdb_overhang)?;
 
         // --genomeTransformType Haploid: the block map for reverse conversion.
         if let Some(blocks) = &self.transform_blocks {
@@ -405,40 +524,42 @@ impl Genome {
         Ok(())
     }
 
-    fn write_genome_parameters_txt(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+    fn write_genome_parameters_txt(
+        &self,
+        dir: &Path,
+        params: &Parameters,
+        effective_sjdb_overhang: u32,
+    ) -> Result<(), Error> {
         use std::fs;
         use std::io::Write;
 
         let path = dir.join("genomeParameters.txt");
         let mut f = fs::File::create(&path).map_err(|e| Error::io(e, &path))?;
 
-        // STAR writes: `### <commandLineFull>\n` where commandLineFull is
-        // "<argv[0]>   --<name1> <val1>   --<name2> <val2> ...".  We emit
-        // the same skeleton using our known-at-invocation parameters.
-        // Not exposed for retrospective exact-byte match against an arbitrary
-        // STAR run's commandLineFull — see `DIVERGENCE.md` (§3.1) for the short
-        // list of parameters we echo.
-        let fasta_list = params
-            .genome_fasta_files
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let gtf = params
-            .sjdb_gtf_file
-            .as_ref()
-            .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-        writeln!(
-            f,
-            "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}      --genomeSAindexNbases {sai}   --sjdbGTFfile {gtf}   --sjdbOverhang {ov}",
-            thr = params.run_thread_n,
-            dir = dir.display(),
-            fa = fasta_list,
-            sai = params.genome_sa_index_nbases,
-            gtf = gtf,
-            ov = params.sjdb_overhang,
-        )
-        .map_err(|e| Error::io(e, &path))?;
+        // STAR writes: `### <commandLineFull>\n` — an echo of the actual
+        // invocation. Emit the real command line (STAR's loader skips
+        // `###` comment lines, and byte-matching an arbitrary STAR run's
+        // argv is impossible anyway — see `DIVERGENCE.md` §3.1); fall
+        // back to a parameter skeleton for callers constructed without
+        // a command line.
+        if let Some(cmd) = params.command_line.as_deref() {
+            writeln!(f, "### {cmd}").map_err(|e| Error::io(e, &path))?;
+        } else {
+            let fasta_list = params
+                .genome_fasta_files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(
+                f,
+                "### STAR   --runMode genomeGenerate      --runThreadN {thr}   --genomeDir {dir}   --genomeFastaFiles {fa}",
+                thr = params.run_thread_n,
+                dir = dir.display(),
+                fa = fasta_list,
+            )
+            .map_err(|e| Error::io(e, &path))?;
+        }
 
         // GstrandBit: floor(log2(nGenome + limitSjdbInsertNsj*sjdbLength))+1,
         // clamped at a minimum of 32. STAR's default limitSjdbInsertNsj is
@@ -469,7 +590,7 @@ impl Genome {
         writeln!(f, "genomeTransformType\tNone").map_err(|e| Error::io(e, &path))?;
         writeln!(f, "genomeTransformVCF\t-").map_err(|e| Error::io(e, &path))?;
 
-        writeln!(f, "sjdbOverhang\t{}", params.sjdb_overhang).map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbOverhang\t{effective_sjdb_overhang}").map_err(|e| Error::io(e, &path))?;
 
         // sjdbFileChrStartEnd: empty vector → `-` plus STAR's trailing space.
         writeln!(f, "sjdbFileChrStartEnd\t- ").map_err(|e| Error::io(e, &path))?;
@@ -502,6 +623,69 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// `SeqView::base` must agree with `GenomeSeq::get` on every index in
+    /// `0..2n`, plus the first out-of-range index, for both storage variants.
+    /// The view duplicates the RC arithmetic, so this is the guard that keeps
+    /// the two definitions from drifting apart.
+    #[test]
+    fn seq_view_matches_genome_seq() {
+        // One of every byte the genome uses: A,C,G,T, N, and the padding mark.
+        let fwd: Vec<u8> = (0..64u8).map(|i| i % 6).collect();
+        let n = fwd.len();
+
+        let mut both = fwd.clone();
+        both.extend((0..n).rev().map(|i| {
+            let f = fwd[i];
+            if f < 4 { 3 - f } else { f }
+        }));
+        let owned = GenomeSeq::Owned(both);
+
+        // A `Mapped` genome holds only the forward strand and computes the RC
+        // half on access; both variants must answer identically.
+        for seq in [&owned] {
+            let view = seq.view();
+            for i in 0..=2 * n {
+                assert_eq!(
+                    view.base(i),
+                    seq.get(i).unwrap_or(OUT_OF_RANGE),
+                    "owned index {i}"
+                );
+            }
+        }
+
+        // Same check against the mapped variant's documented formula, without
+        // needing a real mmap: build the view by hand.
+        let mapped_view = SeqView {
+            buf: &fwd,
+            rc_from: n,
+        };
+        for i in 0..=2 * n {
+            assert_eq!(
+                mapped_view.base(i),
+                owned.view().base(i),
+                "mapped index {i}"
+            );
+        }
+
+        // `bases_into` is the bulk form `score_region` uses; on a mapped genome
+        // the RC half has no slice to copy and is filled by walking the mirror.
+        // Every start and length, including runs that cross from the forward
+        // half into the RC half and runs that hit the end, must give exactly
+        // `base(i)` for the bases it reports and stop where the genome does.
+        for view in [owned.view(), mapped_view] {
+            for start in 0..=2 * n {
+                for len in [0, 1, 7, n, 2 * n + 3] {
+                    let mut out = vec![0xAA; len];
+                    let got = view.bases_into(start, &mut out);
+                    assert_eq!(got, len.min(2 * n - start), "start {start} len {len}");
+                    for (k, &b) in out[..got].iter().enumerate() {
+                        assert_eq!(b, view.base(start + k), "start {start} offset {k}");
+                    }
+                }
+            }
+        }
+    }
 
     fn make_params(fasta_paths: &[std::path::PathBuf], bin_nbits: u32) -> Parameters {
         let mut args = vec!["rustar-aligner", "--runMode", "genomeGenerate"];
