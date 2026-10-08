@@ -132,12 +132,12 @@ fn align(
         .iter()
         .map(|name| {
             let bytes = fs::read(format!("{prefix}{name}")).unwrap_or_default();
-            // Drop the @PG header line: it records the command line, which
+            // Drop the @PG and @CO header lines: they record the command line, which
             // differs by the thread count itself.
             let filtered: Vec<u8> = if *name == "Aligned.out.sam" {
                 String::from_utf8_lossy(&bytes)
                     .lines()
-                    .filter(|l| !l.starts_with("@PG"))
+                    .filter(|l| !l.starts_with("@PG") && !l.starts_with("@CO"))
                     .collect::<Vec<_>>()
                     .join("\n")
                     .into_bytes()

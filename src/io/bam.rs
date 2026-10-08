@@ -1,6 +1,7 @@
 /// BAM output writer with noodles (streaming, unsorted)
 use crate::error::Error;
 use crate::genome::Genome;
+use crate::io::sam::HeaderKind;
 use crate::params::Parameters;
 use crate::quant::transcriptome::TranscriptomeIndex;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -167,6 +168,7 @@ struct CoordinateSorter {
     buffered_bytes: u64,
     runs: Vec<tempfile::TempPath>,
     header: sam::Header,
+    header_text: Vec<u8>,
     compression: i32,
     ram_limit: u64,
     temp_dir: std::path::PathBuf,
@@ -174,8 +176,9 @@ struct CoordinateSorter {
 }
 
 impl CoordinateSorter {
-    fn new(header: sam::Header, params: &Parameters) -> Self {
+    fn new(header: sam::Header, header_text: Vec<u8>, params: &Parameters) -> Self {
         Self {
+            header_text,
             records: Vec::new(),
             buffered_bytes: 0,
             runs: Vec::new(),
@@ -257,7 +260,7 @@ impl CoordinateSorter {
         self.records.sort_by_key(sort_key);
 
         let mut bgzf = make_bgzf_writer(out, self.compression);
-        write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
+        write_bam_header_lenient(&mut bgzf, &self.header, &self.header_text)?;
         let mut writer = bam::io::Writer::from(bgzf);
 
         let written = if self.runs.is_empty() {
@@ -429,22 +432,21 @@ impl BamWriter {
     fn with_header(
         output_path: &Path,
         header: sam::Header,
+        header_text: &[u8],
         compression: i32,
     ) -> Result<Self, Error> {
         let buf_writer = BufWriter::new(File::create(output_path)?);
         let mut bgzf = make_bgzf_writer(buf_writer, compression);
-        write_bam_header_lenient(&mut bgzf, &header, None)?;
+        write_bam_header_lenient(&mut bgzf, &header, header_text)?;
         let writer = bam::io::Writer::from(bgzf);
         Ok(Self { writer, header })
     }
 
     /// Create a new BAM writer with header from genome index.
     pub fn create(output_path: &Path, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
-        Self::with_header(
-            output_path,
-            crate::io::sam::build_sam_header(genome, params)?,
-            params.out_bam_compression,
-        )
+        let header = crate::io::sam::build_sam_header(genome, params)?;
+        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::Main)?;
+        Self::with_header(output_path, header, &text, params.out_bam_compression)
     }
 
     /// Create a BAM writer whose @SQ header lists the transcripts (not
@@ -460,11 +462,9 @@ impl BamWriter {
             .iter()
             .zip(tr_idx.tr_length.iter())
             .map(|(id, len)| (id.as_str(), *len as usize));
-        Self::with_header(
-            output_path,
-            crate::io::sam::build_sam_header_from_refs(refs, params)?,
-            params.out_bam_compression,
-        )
+        let header = crate::io::sam::build_sam_header_from_refs(refs, params)?;
+        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::Transcriptome)?;
+        Self::with_header(output_path, header, &text, params.out_bam_compression)
     }
 
     /// Write batch of buffered records (for parallel processing)
@@ -495,8 +495,9 @@ impl SortedBamWriter {
         params: &Parameters,
     ) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
+        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::MainSorted)?;
         Ok(Self {
-            sorter: CoordinateSorter::new(header, params),
+            sorter: CoordinateSorter::new(header, text, params),
             output_path: output_path.to_path_buf(),
         })
     }
@@ -530,22 +531,18 @@ impl SortedBamWriter {
 /// only constraint there is "no interior nul", which is enforced upstream
 /// via the usual UTF-8 input.
 ///
-/// `sort_order`: if `Some("coordinate")`, injects `SO:coordinate` into the
-/// @HD line. Pass `None` for unsorted output.
+/// `text`: the SAM header text, from `io::sam::render_header_text`.
 fn write_bam_header_lenient<W: Write>(
     writer: &mut W,
     header: &sam::Header,
-    sort_order: Option<&str>,
+    text: &[u8],
 ) -> Result<(), Error> {
     const MAGIC: &[u8; 4] = b"BAM\x01";
 
     writer.write_all(MAGIC)?;
 
-    // Build the SAM text block byte-for-byte identical to
-    // `sam::io::Writer::write_header` minus the name validator:
-    // `@HD`, `@SQ` (one per reference), `@RG` (if any), `@PG` (if any),
-    // `@CO` (if any), each line terminated by `\n`.
-    let text = render_sam_text_lenient(header, sort_order);
+    // The SAM text block is rendered by `io::sam::render_header_text` in STAR's
+    // line order, without noodles' name validator.
     let l_text = i32::try_from(text.len()).map_err(|_| {
         Error::Index(format!(
             "BAM SAM-text header exceeds i32::MAX bytes: {} bytes",
@@ -553,7 +550,7 @@ fn write_bam_header_lenient<W: Write>(
         ))
     })?;
     writer.write_i32::<LittleEndian>(l_text)?;
-    writer.write_all(&text)?;
+    writer.write_all(text)?;
 
     // Binary reference list: n_ref then (l_name, name\0, l_ref) per ref.
     let refs = header.reference_sequences();
@@ -580,79 +577,6 @@ fn write_bam_header_lenient<W: Write>(
     Ok(())
 }
 
-fn render_sam_text_lenient(header: &sam::Header, sort_order: Option<&str>) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-
-    // @HD line. noodles' Map<Header> in this version doesn't expose
-    // sort_order/group_order via dedicated accessors; we serialize through
-    // the generic `other_fields` map (which includes SO/GO when set).
-    if let Some(hd) = header.header() {
-        buf.extend_from_slice(b"@HD\tVN:");
-        buf.extend_from_slice(hd.version().to_string().as_bytes());
-        for (tag, value) in hd.other_fields() {
-            buf.push(b'\t');
-            buf.extend_from_slice(tag.as_ref());
-            buf.push(b':');
-            buf.extend_from_slice(value);
-        }
-        // Appended after the user's fields, even when they carry their own SO,
-        // as STAR's `samHeaderSortedCoord` does (`samHeaders.cpp:100`).
-        if let Some(so) = sort_order {
-            buf.extend_from_slice(b"\tSO:");
-            buf.extend_from_slice(so.as_bytes());
-        }
-        buf.push(b'\n');
-    }
-
-    // @SQ lines. Use the raw bytes so forbidden characters pass through.
-    for (name, rs) in header.reference_sequences() {
-        buf.extend_from_slice(b"@SQ\tSN:");
-        buf.extend_from_slice(name);
-        buf.extend_from_slice(b"\tLN:");
-        buf.extend_from_slice(usize::from(rs.length()).to_string().as_bytes());
-        // Other optional @SQ fields (AH, AN, AS, DS, M5, SP, TP, UR) —
-        // rustar-aligner doesn't set any today, so skip.
-        buf.push(b'\n');
-    }
-
-    // @RG lines.
-    for (id, rg) in header.read_groups() {
-        buf.extend_from_slice(b"@RG\tID:");
-        buf.extend_from_slice(id);
-        for (tag, value) in rg.other_fields() {
-            buf.push(b'\t');
-            buf.extend_from_slice(tag.as_ref());
-            buf.push(b':');
-            buf.extend_from_slice(value);
-        }
-        buf.push(b'\n');
-    }
-
-    // @PG lines — noodles' map doesn't guarantee insertion order; for
-    // rustar-aligner we emit a single @PG with id "rustar-aligner". If more are added
-    // later, pipe them in here.
-    for (id, pg) in header.programs().as_ref() {
-        buf.extend_from_slice(b"@PG\tID:");
-        buf.extend_from_slice(id);
-        for (tag, value) in pg.other_fields() {
-            buf.push(b'\t');
-            buf.extend_from_slice(tag.as_ref());
-            buf.push(b':');
-            buf.extend_from_slice(value);
-        }
-        buf.push(b'\n');
-    }
-
-    // @CO lines (comments).
-    for comment in header.comments() {
-        buf.extend_from_slice(b"@CO\t");
-        buf.extend_from_slice(comment);
-        buf.push(b'\n');
-    }
-
-    buf
-}
-
 /// Streaming unsorted BAM writer that writes to stdout.
 pub struct BamStdoutWriter {
     writer: bam::io::Writer<bgzf::io::Writer<BufWriter<std::io::Stdout>>>,
@@ -662,11 +586,12 @@ pub struct BamStdoutWriter {
 impl BamStdoutWriter {
     pub fn create(genome: &crate::genome::Genome, params: &Parameters) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
+        let header_text = crate::io::sam::render_header_text(&header, params, HeaderKind::Main)?;
         let mut bgzf = make_bgzf_writer(
             BufWriter::new(std::io::stdout()),
             params.out_bam_compression,
         );
-        write_bam_header_lenient(&mut bgzf, &header, None)?;
+        write_bam_header_lenient(&mut bgzf, &header, &header_text)?;
         let writer = bam::io::Writer::from(bgzf);
         Ok(Self { writer, header })
     }
@@ -693,8 +618,9 @@ pub struct SortedBamStdoutWriter {
 impl SortedBamStdoutWriter {
     pub fn create(genome: &crate::genome::Genome, params: &Parameters) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
+        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::MainSorted)?;
         Ok(Self {
-            sorter: CoordinateSorter::new(header, params),
+            sorter: CoordinateSorter::new(header, text, params),
         })
     }
 
@@ -1157,7 +1083,8 @@ mod tests {
             args.extend_from_slice(extra);
             let params = Parameters::parse_from(args);
             let header = crate::io::sam::build_sam_header(&genome, &params).unwrap();
-            let text = render_sam_text_lenient(&header, Some("coordinate"));
+            let text = crate::io::sam::render_header_text(&header, &params, HeaderKind::MainSorted)
+                .unwrap();
             String::from_utf8(text)
                 .unwrap()
                 .lines()
@@ -1171,5 +1098,58 @@ mod tests {
             render(&["--outSAMheaderHD", "@HD", "VN:1.6", "GO:query"]),
             "@HD\tVN:1.6\tGO:query\tSO:coordinate"
         );
+    }
+
+    #[test]
+    fn header_text_follows_stars_layout() {
+        let genome = create_test_genome();
+        let dir = std::env::temp_dir().join(format!("hdr_text_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let com = dir.join("com.txt");
+        std::fs::write(&com, "@CO\tfirst\n\n  \n@CO\tsecond\n").unwrap();
+        let com = com.to_str().unwrap().to_string();
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMattrRGline",
+            "ID:x",
+            "SM:y z",
+            "--outSAMheaderPG",
+            "@PG",
+            "ID:foo",
+            "--outSAMheaderCommentFile",
+            &com,
+            "--outSAMheaderHD",
+            "@HD",
+            "SO:foo",
+        ]);
+        let header = crate::io::sam::build_sam_header(&genome, &params).unwrap();
+        let text = |k| {
+            String::from_utf8(crate::io::sam::render_header_text(&header, &params, k).unwrap())
+                .unwrap()
+        };
+        let main = text(HeaderKind::Main);
+        let tags: Vec<&str> = main.lines().map(|l| &l[..3]).collect();
+        // User @HD verbatim (no VN), @SQ, user @PG, @PG, comments, @RG, @CO.
+        assert_eq!(main.lines().next().unwrap(), "@HD\tSO:foo");
+        let pos = |t: &str| tags.iter().position(|x| *x == t).unwrap();
+        assert!(pos("@SQ") < pos("@PG") && pos("@PG") < pos("@RG") && pos("@RG") < tags.len() - 1);
+        assert_eq!(
+            main.lines().nth(tags.len() - 1).unwrap()[..21].to_string(),
+            "@CO\tuser command line"
+        );
+        assert!(main.contains("@PG\tID:foo\n"));
+        // Comment file lines are copied as they are, blank lines skipped.
+        assert!(main.contains("\n@CO\tfirst\n@CO\tsecond\n@RG"));
+        assert!(!main.contains("@CO\t@CO"));
+        // The transcriptome BAM header has no @HD, @PG or @CO.
+        let tr = text(HeaderKind::Transcriptome);
+        assert!(
+            tr.lines()
+                .all(|l| l.starts_with("@SQ") || l.starts_with("@RG"))
+        );
+        assert!(tr.contains("@RG\tID:x"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
