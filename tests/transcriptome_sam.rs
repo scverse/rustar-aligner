@@ -166,6 +166,8 @@ fn transcriptome_sam_end_to_end_smoke_test() {
             gtf_path.to_str().unwrap(),
             "--genomeSAindexNbases",
             "5",
+            "--outFileNamePrefix",
+            genome_dir.join("run_").to_str().unwrap(),
         ])
         .assert()
         .success();

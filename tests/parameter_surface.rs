@@ -64,10 +64,9 @@ const ACCEPTED_BUT_INERT: &[(&str, &str)] = &[
         "BGZF writing is single-threaded; output is unaffected",
     ),
     (
-        "outTmpDir",
-        "no intermediate files are written that a user could observe",
+        "outTmpKeep",
+        "the only intermediates are coordinate-sort spill runs, always removed",
     ),
-    ("outTmpKeep", "as outTmpDir: nothing to keep"),
     (
         "readMatesLengthsIn",
         "a read-length hint; lengths are taken from the FASTQ",
@@ -91,16 +90,9 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "alignTranscriptsPerReadNmax",
     "outFilterMismatchNoverReadLmax",
     "seedNoneLociPerWindow",
-    "seedSplitMin",
-    // Aligner core (annotated-junction stitching, alignEndsType, in-recursion
-    // length penalty).
     // Long reads.
     "winReadCoverageBasesMin",
     // Chimeric multimapping.
-    "chimFilter",
-    "chimMultimapNmax",
-    "chimMultimapScoreRange",
-    "chimNonchimScoreDropMin",
     // CellRanger4 adapter clipping.
     "clip5pAdapterMMp",
     "clip5pAdapterSeq",
