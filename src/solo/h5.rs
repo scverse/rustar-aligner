@@ -523,12 +523,9 @@ mod imp {
             let out = tmp.path().join("empty.h5");
             write_10x_h5(&m, &out).unwrap();
             let f = File::open(&out).unwrap();
-            assert!(
-                f.dataset("matrix/data")
-                    .unwrap()
-                    .read_i32()
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                f.dataset("matrix/data").unwrap().read_i32().unwrap(),
+                Vec::<i32>::new()
             );
             assert_eq!(
                 f.dataset("matrix/indptr").unwrap().read_i64().unwrap(),

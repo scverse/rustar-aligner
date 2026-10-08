@@ -79,7 +79,7 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 **Impact.** rustar-aligner's result is the better alignment in each case. These are counted against exact faithfulness in the raw metric but are improvements, not regressions.
 
-**Source.** See `CLAUDE.md` (PE status) and `STAR-RS-COMPARISON.md`.
+**Source.** See `STAR-RS-COMPARISON.md`, and the PE benchmark section of `CONTRIBUTING.md`.
 
 ---
 
@@ -153,6 +153,18 @@ For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exo
 
 rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` samples with a bit-exact libc++ `mt19937` (`src/solo/libcxx_rng.rs`) so its Monte-Carlo null matches STAR's — a convergence with STAR rather than a divergence from it.
 
+### 4.3 Coordinate-sort memory budget and spilling
+
+**What STAR does.** `--outSAMtype BAM SortedByCoordinate` collects alignments into `--outBAMsortingBinsN` coordinate bins on disk under `outFileTmp` (`--outTmpDir`, else `<prefix>_STARtmp/`), then sorts each bin in memory. `--limitBAMsortRAM 0` is replaced by the genome size plus the SA and SAindex sizes (`STAR.cpp:234-236`). If any single bin needs more than that, STAR exits with a fatal error and asks to be re-run with a larger value (`bamSortByCoordinate.cpp:29-34`).
+
+**What rustar-aligner does.** An external merge sort. Records fill a buffer of `--limitBAMsortRAM` bytes (estimated), which is sorted and spilled as a run when full; the runs are k-way merged at the end, at most 64 open at a time. `--limitBAMsortRAM 0` means 512 MiB. The run never fails for lack of sort memory. Spill runs go to `--outTmpDir` when given, otherwise beside the output, and are always removed (`--outTmpKeep` has no effect).
+
+**Why.** Peak memory stays bounded whatever the output size, without STAR's failure mode. A genome-size default would also be unknown to the writer when it is created, and an unbounded buffer was what this replaced.
+
+**Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
+
+**Source.** `src/io/bam.rs` (`CoordinateSorter`).
+
 ## 5. Known residual single-read differences
 
 These are **not** deliberate divergences — they are tracked residual diffs on the 10k yeast benchmark, kept here for completeness. Each is a single read; none is a systematic behaviour difference.
@@ -161,7 +173,7 @@ These are **not** deliberate divergences — they are tracked residual diffs on 
 - **1 STAR-only PE mate** — `ERR12389696.18919121`: an SA-level difference.
 - **1 rustar-aligner-only PE mate** — `ERR12389696.6302610`: a pre-existing false positive.
 
-See `CLAUDE.md` ("Known Issues" / "PE Status") for the current status of these.
+See `ROADMAP.md` and `STAR-RS-COMPARISON.md` for the current status of these.
 
 ---
 
