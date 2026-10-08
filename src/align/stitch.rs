@@ -2369,52 +2369,71 @@ fn passes_finalization_filters(
         }
     };
     let n = wt.exons.len();
+    // Kind of each gap: junction (annotated, repeat shifts), mate boundary
+    // (STAR canonSJ -3) or indel.
+    #[derive(Clone, Copy)]
+    enum Gap {
+        Junction(bool, (u32, u32)),
+        Mate,
+        Other,
+    }
+    let mut gaps: Vec<Gap> = Vec::with_capacity(n.saturating_sub(1));
     let mut junction_idx = 0usize;
-    let mut mate_mapped = 0usize;
-    let mut mate_junctions = 0usize;
-    for (isj, exon) in wt.exons.iter().enumerate() {
-        mate_mapped += exon.read_end - exon.read_start;
-        if isj + 1 < n {
-            let next = &wt.exons[isj + 1];
-            let genome_gap = next.genome_start as i64 - exon.genome_end as i64;
-            let read_gap = next.read_start as i64 - exon.read_end as i64;
-            let del = genome_gap - read_gap.max(0);
-            if exon.mate_id == next.mate_id
-                && del >= scorer.align_intron_min as i64
-                && junction_idx < wt.junction_shifts.len()
-            {
-                let (shift_l, shift_r) = wt.junction_shifts[junction_idx];
-                let left_len = exon.read_end - exon.read_start;
-                let right_len = next.read_end - next.read_start;
-                if wt.junction_annotated[junction_idx] {
-                    let min_oh = scorer.align_sjdb_overhang_min as usize;
-                    if left_len < min_oh || right_len < min_oh {
-                        return false;
-                    }
-                } else if left_len < scorer.align_sj_overhang_min as usize + shift_l as usize
-                    || right_len < scorer.align_sj_overhang_min as usize + shift_r as usize
-                {
-                    return false;
-                }
-                junction_idx += 1;
-                mate_junctions += 1;
-                continue;
-            }
-            if exon.mate_id == next.mate_id {
-                continue;
-            }
+    for w in wt.exons.windows(2) {
+        let (exon, next) = (&w[0], &w[1]);
+        let genome_gap = next.genome_start as i64 - exon.genome_end as i64;
+        let read_gap = next.read_start as i64 - exon.read_end as i64;
+        let del = genome_gap - read_gap.max(0);
+        if exon.mate_id != next.mate_id {
+            gaps.push(Gap::Mate);
+        } else if del >= scorer.align_intron_min as i64 && junction_idx < wt.junction_shifts.len() {
+            gaps.push(Gap::Junction(
+                wt.junction_annotated[junction_idx],
+                wt.junction_shifts[junction_idx],
+            ));
+            junction_idx += 1;
+        } else {
+            gaps.push(Gap::Other);
         }
-        if mate_junctions > 0 {
-            let min_from_fraction =
-                (scorer.align_spliced_mate_map_lmin_over_lmate * mate_len(exon) as f64) as usize;
-            if mate_mapped < scorer.align_spliced_mate_map_lmin as usize
-                || mate_mapped < min_from_fraction
-            {
+    }
+    // As in the finalization of `stitchWindowAligns.cpp:109-123`: an annotated
+    // junction's short exon only counts when the exon sits at a mate end or next to
+    // an unannotated junction.
+    let len = |i: usize| wt.exons[i].read_end - wt.exons[i].read_start;
+    let unannotated = |g: usize| matches!(gaps[g], Gap::Junction(false, _));
+    let sj_min = scorer.align_sj_overhang_min as usize;
+    let sjdb_min = scorer.align_sjdb_overhang_min as usize;
+    for (isj, gap) in gaps.iter().enumerate() {
+        let Gap::Junction(annotated, (shift_l, shift_r)) = *gap else {
+            continue;
+        };
+        let (left_len, right_len) = (len(isj), len(isj + 1));
+        if annotated {
+            let left_edge = isj == 0 || matches!(gaps[isj - 1], Gap::Mate) || unannotated(isj - 1);
+            let right_edge =
+                isj + 2 == n || matches!(gaps[isj + 1], Gap::Mate) || unannotated(isj + 1);
+            if (left_len < sjdb_min && left_edge) || (right_len < sjdb_min && right_edge) {
                 return false;
             }
+        } else if left_len < sj_min + shift_l as usize || right_len < sj_min + shift_r as usize {
+            return false;
         }
-        mate_mapped = 0;
-        mate_junctions = 0;
+    }
+    // Mapped length of each spliced mate.
+    let mut start = 0usize;
+    for end in 0..n {
+        if end + 1 == n || matches!(gaps[end], Gap::Mate) {
+            let spliced = (start..end).any(|g| matches!(gaps[g], Gap::Junction(..)));
+            if spliced {
+                let mapped: usize = (start..=end).map(len).sum();
+                let from_fraction = (scorer.align_spliced_mate_map_lmin_over_lmate
+                    * mate_len(&wt.exons[end]) as f64) as usize;
+                if mapped < scorer.align_spliced_mate_map_lmin as usize || mapped < from_fraction {
+                    return false;
+                }
+            }
+            start = end + 1;
+        }
     }
     true
 }
