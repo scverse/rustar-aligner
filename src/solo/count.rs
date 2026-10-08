@@ -279,32 +279,63 @@ fn directional(umis: &HashMap<u64, u32>, umi_len: usize, dir_count_add: i64) -> 
 // Cell-barcode multi-match resolution (deferred 1MM_multi)
 // ---------------------------------------------------------------------------
 
-/// Resolve a 1MM_multi cell barcode to a single whitelist index using the
-/// count+quality posterior: weight = `(exactCount[cand] + pseudocount) · 10^(−q/10)`
-/// where `q` is the mismatch-position Phred score. `pseudocount` is 1 for the
-/// `*_pseudocounts` match types (CellRanger ≥ 3.0). Returns the argmax, or
-/// `None` if no candidate has positive weight.
+/// STAR's `cbMinP` (`ParametersSolo.cpp`): the winning candidate of a
+/// multi-matching cell barcode must hold at least this share of the summed
+/// posterior, otherwise the read is dropped (`noTooManyWLmatches`). STAR's
+/// default build (no `MATCH_CellRanger`) stores it, and does the comparison, in
+/// single precision.
+const CB_MIN_P: f32 = 0.975;
+
+/// STAR's `QSbase` / `QSmax` (`ParametersSolo.cpp`): Phred+33 qualities, capped
+/// at 33 before they enter the posterior.
+const CB_QS_BASE: u8 = 33;
+const CB_QS_MAX: u8 = 33;
+
+/// Resolve a 1MM_multi cell barcode to a single whitelist index, following
+/// STAR `SoloReadFeature_inputRecords.cpp` (multiple-match branch) exactly.
+///
+/// `exact_counts` is STAR's `cbReadCountExact` before pseudocounts; with the
+/// `*_pseudocounts` match types every whitelist entry gets `pseudocount` (1)
+/// added (`SoloFeature_sumThreads.cpp`). For each candidate with a non-zero
+/// total count, `p = count · 10^(−min(q, 33)/10)`; the strict argmax (first
+/// wins a tie) is accepted only when `p_max ≥ cbMinP · p_total`.
 fn resolve_multi_cb(
     candidates: &[crate::solo::whitelist::CbCandidate],
     exact_counts: &[u64],
     pseudocount: f64,
 ) -> Option<u32> {
-    let mut best: Option<(u32, f64)> = None;
-    let mut total = 0.0f64;
+    let mut ptot = 0.0f32;
+    let mut pmax = 0.0f32;
+    let mut best: Option<u32> = None;
     for c in candidates {
-        let prior = *exact_counts.get(c.wl_index as usize).unwrap_or(&0) as f64 + pseudocount;
-        let q = f64::from(c.mismatch_qual.saturating_sub(33)); // Phred+33 → Phred
-        let weight = prior * 10f64.powf(-q / 10.0);
-        total += weight;
-        match best {
-            Some((_, w)) if w >= weight => {}
-            _ => best = Some((c.wl_index, weight)),
+        let count = *exact_counts.get(c.wl_index as usize).unwrap_or(&0) as f64 + pseudocount;
+        if count <= 0.0 {
+            continue; // `cbReadCountTotal[cbin]>0`: otherwise this cbin does not work
+        }
+        let q = c.mismatch_qual.saturating_sub(CB_QS_BASE).min(CB_QS_MAX);
+        let pin = (count * 10f64.powf(-f64::from(q) / 10.0)) as f32;
+        ptot += pin;
+        if pin > pmax {
+            best = Some(c.wl_index);
+            pmax = pin;
         }
     }
-    match best {
-        Some((idx, w)) if total > 0.0 && w > 0.0 => Some(idx),
-        _ => None,
+    if ptot > 0.0 && pmax >= CB_MIN_P * ptot {
+        best
+    } else {
+        None
     }
+}
+
+/// STAR's `oneExact` guard (`SoloReadFeature_inputRecords.cpp`): with every
+/// `--soloCBmatchWLtype` except the pseudocount ones, a read whose barcode was
+/// corrected to a single whitelist entry is dropped (`noMMtoWLwithoutExact`)
+/// unless some read matched that entry exactly. An exact-match read always
+/// passes (it bumped the count itself), so checking the count alone is
+/// equivalent to STAR's `cbmatch==1 && cbReadCountTotal[cb]==0` test.
+/// `exact_counts` is empty without a whitelist, where nothing is corrected.
+pub(crate) fn cb_passes_one_exact(one_exact: bool, exact_counts: &[u64], cb: u32) -> bool {
+    !one_exact || exact_counts.is_empty() || exact_counts.get(cb as usize).is_some_and(|&n| n > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +409,9 @@ fn build_matrix_body(
         // Move records out of the recorder; fold in resolved 1MM_multi cells.
         let mut records = std::mem::take(&mut *recorder.records.lock().unwrap());
         let exact_counts = ctx.whitelist.exact_count_snapshot();
+        // `oneExact`: drop single-1MM corrections to a barcode never seen exactly.
+        let one_exact = ctx.match_type.one_exact();
+        records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
         let multi = std::mem::take(&mut *recorder.multi_records.lock().unwrap());
         for m in &multi {
             if let Some(cb) = resolve_multi_cb(&m.candidates, &exact_counts, pseudocount) {
@@ -1366,6 +1400,10 @@ pub fn write_gene_matrix(
 
     let gzip = matches!(params.solo_out_gzip.as_str(), "yes" | "Yes" | "true");
     let n_genes = ctx.gene_ann.gene_ids.len();
+    // STAR applies `oneExact` in `inputRecords`, i.e. to every feature's reads
+    // (multi-gene, SJ and Velocyto included), not only the Gene matrix.
+    let one_exact = ctx.match_type.one_exact();
+    let exact_counts = ctx.whitelist.exact_count_snapshot();
     let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
 
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
@@ -1489,7 +1527,8 @@ pub fn write_gene_matrix(
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
         if !multi_methods.is_empty() {
-            let mg = recorder.multi_gene.lock().unwrap();
+            let mut mg = recorder.multi_gene.lock().unwrap();
+            mg.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
             build_multi_matrices(
                 &body,
                 &mg,
@@ -1600,8 +1639,10 @@ pub fn write_gene_matrix(
             gzip,
         )?;
         let umi_len = params.solo_umi_len as usize;
+        let mut sj_records = ctx.sj_records.lock().unwrap();
+        sj_records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
         let nnz = build_sj_matrix(
-            &ctx.sj_records.lock().unwrap(),
+            &sj_records,
             &row,
             method,
             umi_len,
@@ -1641,8 +1682,10 @@ pub fn write_gene_matrix(
             params.solo_velocyto_ambiguous.as_str(),
             "no" | "No" | "false"
         );
+        let mut velocyto_records = ctx.velocyto_records.lock().unwrap();
+        velocyto_records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
         let nnz = build_velocyto_matrices(
-            &ctx.velocyto_records.lock().unwrap(),
+            &velocyto_records,
             method,
             umi_len,
             &velo_dir,
@@ -2606,13 +2649,75 @@ mod tests {
                 mismatch_qual: b'I',
             },
         ];
-        // Same quality → higher exact-count prior wins.
-        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), Some(0));
-        assert_eq!(resolve_multi_cb(&cands, &[3, 10], 0.0), Some(1));
+        // Same quality → the higher exact-count prior wins, once it holds at
+        // least cbMinP (0.975) of the posterior: 1000/1003 = 0.997.
+        assert_eq!(resolve_multi_cb(&cands, &[1000, 3], 0.0), Some(0));
+        assert_eq!(resolve_multi_cb(&cands, &[3, 1000], 0.0), Some(1));
         // No prior signal and no pseudocount → rejected.
         assert_eq!(resolve_multi_cb(&cands, &[0, 0], 0.0), None);
-        // Pseudocount gives every candidate positive weight → argmax accepted.
-        assert!(resolve_multi_cb(&cands, &[0, 0], 1.0).is_some());
+        // A candidate with no exact reads carries no weight, so the other one
+        // holds the whole posterior.
+        assert_eq!(resolve_multi_cb(&cands, &[0, 5], 0.0), Some(1));
+    }
+
+    /// STAR `cbMinP`: the argmax alone is not enough, it has to hold 97.5% of
+    /// the posterior (`SoloReadFeature_inputRecords.cpp`).
+    #[test]
+    fn resolve_multi_rejects_a_winner_below_cb_min_p() {
+        use crate::solo::whitelist::CbCandidate;
+        let cands = vec![
+            CbCandidate {
+                wl_index: 0,
+                mismatch_pos: 1,
+                mismatch_qual: b'I',
+            },
+            CbCandidate {
+                wl_index: 1,
+                mismatch_pos: 2,
+                mismatch_qual: b'I',
+            },
+        ];
+        // 10/13 = 0.77: a clear argmax, still rejected.
+        assert_eq!(resolve_multi_cb(&cands, &[10, 3], 0.0), None);
+        // 40/41 = 0.9756 clears the bar, 38/39 = 0.9744 does not.
+        assert_eq!(resolve_multi_cb(&cands, &[40, 1], 0.0), Some(0));
+        assert_eq!(resolve_multi_cb(&cands, &[38, 1], 0.0), None);
+        // Pseudocounts make every candidate eligible, so a tie at zero is
+        // rejected, and a zero-count rival dilutes the winner: 40+1 against
+        // 0+1 is 41/42 = 0.976, 36+1 against 0+1 is 37/38 = 0.974.
+        assert_eq!(resolve_multi_cb(&cands, &[0, 0], 1.0), None);
+        assert_eq!(resolve_multi_cb(&cands, &[40, 0], 1.0), Some(0));
+        assert_eq!(resolve_multi_cb(&cands, &[36, 0], 1.0), None);
+    }
+
+    /// STAR caps the mismatch quality at `QSmax` = 33 before it enters the
+    /// posterior (`SoloReadFeature_inputRecords.cpp`).
+    #[test]
+    fn resolve_multi_caps_quality_at_qs_max() {
+        use crate::solo::whitelist::CbCandidate;
+        let cand = |wl_index, q: u8| CbCandidate {
+            wl_index,
+            mismatch_pos: 0,
+            mismatch_qual: q + 33,
+        };
+        // Candidate 0 has the counts but a Q60 mismatch, candidate 1 a Q34
+        // one. Capped, both weigh 10^-3.3 and 40/41 = 0.976 goes to candidate
+        // 0. Uncapped, candidate 1 would win the posterior (3.98e-4 against
+        // 40e-6) and fall short of cbMinP, so the read would be dropped.
+        let cands = [cand(0, 60), cand(1, 34)];
+        assert_eq!(resolve_multi_cb(&cands, &[40, 1], 0.0), Some(0));
+    }
+
+    /// STAR `oneExact`: a single-1MM correction counts only if its whitelist
+    /// entry was seen exactly, except under the pseudocount match types.
+    #[test]
+    fn one_exact_drops_a_correction_to_an_unseen_barcode() {
+        let counts = [3u64, 0];
+        assert!(cb_passes_one_exact(true, &counts, 0));
+        assert!(!cb_passes_one_exact(true, &counts, 1));
+        assert!(cb_passes_one_exact(false, &counts, 1));
+        // No whitelist: nothing is corrected, nothing to drop.
+        assert!(cb_passes_one_exact(true, &[], 7));
     }
 
     #[test]
