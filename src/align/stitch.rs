@@ -1387,7 +1387,7 @@ fn stitch_align_to_transcript(
             }
             _ => None,
         };
-        let (jr_shift, motif, motif_score, jj_l, jj_r) = if let Some(pj) = sjdb_junction {
+        let (jr_shift, motif, motif_score, mut jj_l, mut jj_r) = if let Some(pj) = sjdb_junction {
             let prev_len = last_exon.read_end - last_exon.read_start;
             if pj.motif == 0
                 && (eff_length <= pj.shift_right as usize || prev_len <= pj.shift_left as usize)
@@ -1503,6 +1503,10 @@ fn stitch_align_to_transcript(
         gap_mm += shared_mm;
         d_score += shared_score;
 
+        // Junction position used for the exon boundaries. It differs from the
+        // scanned `jr_shift` only for an annotated non-canonical junction (below).
+        let mut jr_exon = jr_shift;
+
         // --- Type-specific scoring and tracking ---
         if is_splice {
             // Check stitch mismatch limit
@@ -1520,6 +1524,49 @@ fn stitch_align_to_transcript(
                         || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
                         || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
                 });
+
+            // STAR stitchAlignToTranscript.cpp:155-172: the scan flushes a
+            // non-canonical junction to the left, where sjdbStart keeps it; an
+            // annotated one is then shifted back by sjdbShiftLeft to its true
+            // coordinate (the score was taken at the flushed position, which
+            // is equivalent on the repeat). The shift is the same in the
+            // forward genome; in the reverse-strand scan space it runs the
+            // other way.
+            if is_annotated && sjdb_junction.is_none() {
+                let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
+                let donor_fwd =
+                    index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
+                let acceptor_fwd = donor_fwd + del as u64 - 1;
+                let prepared = &index.prepared_junctions;
+                let hit = prepared
+                    .binary_search_by(|p| {
+                        p.stored_start()
+                            .cmp(&donor_fwd)
+                            .then(p.stored_end().cmp(&acceptor_fwd))
+                    })
+                    .ok()
+                    .map(|k| &prepared[k]);
+                if let Some(pj) = hit.filter(|pj| pj.motif == 0) {
+                    let sl = pj.shift_left as usize;
+                    let prev_len = last_exon.read_end - last_exon.read_start;
+                    if eff_length <= sl || prev_len <= sl {
+                        return None; // STAR -1000006
+                    }
+                    let shifted = if cluster.is_reverse {
+                        jr_shift - pj.shift_left as i32
+                    } else {
+                        jr_shift + pj.shift_left as i32
+                    };
+                    // STAR: rAend+jR >= rBend, i.e. the shift runs past B. In the
+                    // reverse scan space the roles of A and B are exchanged.
+                    if shifted >= (shared + eff_length) as i32 || prev_len as i32 + shifted < 1 {
+                        return None; // STAR -1000006
+                    }
+                    jr_exon = shifted;
+                    jj_l = u32::from(pj.shift_left);
+                    jj_r = u32::from(pj.shift_right);
+                }
+            }
 
             if is_annotated {
                 d_score += scorer.sjdb_score;
@@ -1541,18 +1588,18 @@ fn stitch_align_to_transcript(
         // --- Common: adjust exon A and create exon B ---
         // jr_shift = STAR's jR: number of shared bases assigned to donor (exon A).
         // Exon A extends right by jr_shift; exon B starts jr_shift bases into the shared region.
-        if jr_shift != 0
+        if jr_exon != 0
             && let Some(last) = new_wt.exons.last_mut()
         {
-            last.read_end = (last.read_end as i64 + jr_shift as i64) as usize;
-            last.genome_end = (last.genome_end as i64 + jr_shift as i64) as u64;
+            last.read_end = (last.read_end as i64 + jr_exon as i64) as usize;
+            last.genome_end = (last.genome_end as i64 + jr_exon as i64) as u64;
         }
 
         // New exon for B side: starts at (eff_read_pos - shared + jr_shift), absorbs
         // the (shared - jr_shift) acceptor-side shared bases plus the full eff_length seed.
-        let b_read_start = (eff_read_pos as i64 - shared as i64 + jr_shift as i64) as usize;
-        let b_genome_start = (eff_genome_pos as i64 - shared as i64 + jr_shift as i64) as u64;
-        let b_len = (eff_length as i64 + shared as i64 - jr_shift as i64).max(0) as usize;
+        let b_read_start = (eff_read_pos as i64 - shared as i64 + jr_exon as i64) as usize;
+        let b_genome_start = (eff_genome_pos as i64 - shared as i64 + jr_exon as i64) as u64;
+        let b_len = (eff_length as i64 + shared as i64 - jr_exon as i64).max(0) as usize;
         new_wt.exons.push(ExonBlock {
             read_start: b_read_start,
             read_end: b_read_start + b_len,
@@ -3468,6 +3515,131 @@ mod tests {
             prepared_junctions: Vec::new(),
             sjdb_overhang: 0,
         }
+    }
+
+    /// An annotated non-canonical junction whose boundary base repeats is stored
+    /// flushed left (`sjdbStart`). Stitching it through the scan, not through
+    /// the Gsj simple path, must put the junction back at its annotated
+    /// position by `sjdbShiftLeft` (stitchAlignToTranscript.cpp:155-172),
+    /// otherwise the same junction is reported one base to the left.
+    #[test]
+    fn annotated_noncanonical_junction_is_shifted_back_to_its_annotation() {
+        use crate::junction::SpliceJunctionDb;
+        use crate::junction::sjdb_insert::PreparedJunction;
+
+        let enc = |s: &str| -> Vec<u8> {
+            s.bytes()
+                .map(|b| match b {
+                    b'A' => 0,
+                    b'C' => 1,
+                    b'G' => 2,
+                    _ => 3,
+                })
+                .collect()
+        };
+        // E1 ends in G, the intron ends in G: one base of left repeat.
+        let e1 = "ACGTTGCAAGTCCATGACTG";
+        let intron = format!("CC{}CG", "A".repeat(26));
+        let e2 = "TGACCTGAGTCAGGTACTAC";
+        let genome_seq = enc(&format!("{e1}{intron}{e2}"));
+        let mut index = make_index_with_seq(&genome_seq);
+        // Annotation: intron [20, 49]; stored flushed left: [19, 48].
+        index.prepared_junctions = vec![PreparedJunction {
+            chr_idx: 0,
+            start_pos: 19,
+            end_pos: 48,
+            motif: 0,
+            shift_left: 1,
+            shift_right: 0,
+            strand: 0,
+            src_strand: 0,
+        }];
+        index.junction_db = SpliceJunctionDb::from_raw_junctions(&[(0, 19, 48, 0)]);
+
+        let read_seq = enc(&format!("{e1}{e2}"));
+        let scorer = crate::align::score::AlignmentScorer {
+            score_gap: 0,
+            score_gap_noncan: -8,
+            score_gap_gcag: -4,
+            score_gap_atac: -8,
+            score_del_open: -2,
+            score_del_base: -2,
+            score_ins_open: -2,
+            score_ins_base: -2,
+            align_intron_min: 21,
+            sjdb_score: 2,
+            align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
+            n_mm_max: 10,
+            p_mm_max: 0.3,
+            align_sj_overhang_min: 5,
+            align_sjdb_overhang_min: 3,
+            align_intron_max: 589_824,
+            score_genomic_length_log2_scale: -0.25,
+            score_stitch_sj_shift: 1,
+            align_spliced_mate_map_lmin: 0,
+            align_spliced_mate_map_lmin_over_lmate: 0.66,
+            out_filter_score_min_over_lread: 0.66,
+            align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: crate::align::score::IntronFilter::default(),
+        };
+        let cluster = SeedCluster {
+            alignments: Vec::new(),
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 70,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        // Seed A: E1 (a Gsj half); seed B: the last 15 bases of E2 (a genomic seed).
+        let mut wt = WorkingTranscript::new();
+        wt.exons.push(ExonBlock {
+            read_start: 0,
+            read_end: 20,
+            genome_start: 0,
+            genome_end: 20,
+            mate_id: 2,
+            sj_a: Some(0),
+        });
+        wt.score = 20;
+        wt.read_start = 0;
+        wt.read_end = 20;
+        wt.genome_start = 0;
+        wt.genome_end = 20;
+        let wa = WindowAlignment {
+            seed_idx: 1,
+            read_pos: 25,
+            length: 15,
+            genome_pos: 55,
+            sa_pos: 55,
+            n_rep: 1,
+            is_anchor: false,
+            mate_id: 2,
+            sj_a: None,
+            pre_ext_score: 15,
+        };
+        let mut jcache = crate::align::score::JunctionScanCache::new();
+        let out = stitch_align_to_transcript(
+            &wt,
+            &wa,
+            &read_seq,
+            &index,
+            &scorer,
+            &cluster,
+            Some(&index.junction_db),
+            0,
+            &mut jcache,
+            "",
+        )
+        .expect("annotated junction stitches");
+        assert_eq!(out.exons.len(), 2);
+        assert_eq!((out.exons[0].read_end, out.exons[0].genome_end), (20, 20));
+        assert_eq!(
+            (out.exons[1].read_start, out.exons[1].genome_start),
+            (20, 50)
+        );
+        assert_eq!(out.junction_annotated, vec![true]);
+        assert_eq!(out.junction_shifts, vec![(1, 0)]);
     }
 
     #[test]
