@@ -173,7 +173,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--chimSegmentReadGapMax` | `0` | Max read-space gap between chimeric segments. |
 | `--chimJunctionOverhangMin` | `20` | Min overhang at chimeric junction. |
 | `--chimScoreJunctionNonGTAG` | `-1` | Score penalty for non-GT/AG chimeric junctions. |
-| `--chimOutType` | `Junctions` | `Junctions`, `WithinBAM`, or both space-separated. |
+| `--chimOutType` | `Junctions` | `Junctions` and/or `WithinBAM`, optionally followed by `HardClip` (default) or `SoftClip` for the supplementary segment. `WithinBAM` requires `--outSAMtype BAM`. |
 
 ## Debug
 
