@@ -34,7 +34,8 @@ impl GenomeIndex {
         log::info!("Loaded suffix array: {} entries", suffix_array.len());
 
         // Load SAindex file
-        let sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        let mut sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        sa_index.sparse_d = read_genome_sa_sparse_d(genome_dir)?;
         log::info!(
             "Loaded SA index: nbases={}, {} indices",
             sa_index.nbases,
@@ -175,6 +176,25 @@ fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
         }
     }
     Ok(None)
+}
+
+/// The suffix-array stride the index was built with (`genomeSAsparseD` in
+/// genomeParameters.txt), 1 when absent. The seed search needs it: with a
+/// sparse SA only every `D`-th position is a suffix, so STAR searches `D`
+/// shifted starts (`maxMappableLength2strands`, `iDist` loop).
+fn read_genome_sa_sparse_d(genome_dir: &Path) -> Result<u64, Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => return Err(Error::io(e, &path)),
+    };
+    Ok(contents
+        .lines()
+        .find_map(|line| line.strip_prefix("genomeSAsparseD\t"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1))
 }
 
 /// Load genome from disk.
@@ -355,6 +375,7 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
         data,
         word_length,
         gstrand_bit,
+        sparse_d: 1,
     })
 }
 
