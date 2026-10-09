@@ -380,6 +380,134 @@ impl GenomeIndex {
         })
     }
 
+    /// STAR's second-pass junction insertion (`sjdbInsertJunctions.cpp` with
+    /// `twoPass.pass2`): the junctions of the loaded genome (priority 30,
+    /// `sjdbList.out.tab`) plus those of the first pass's `SJ.out.tab` (priority
+    /// 0, columns 1-4 as `sjdbLoadFromStream` reads them) go through
+    /// `sjdbPrepare`, their flanks replace the `Gsj` of the genome, and the
+    /// suffix array and SAindex are rebuilt over the result. Returns `None`
+    /// when there is no junction at all.
+    pub(crate) fn insert_pass1_junctions(
+        &self,
+        pass1_sj: &Path,
+        params: &Parameters,
+        sparse_d: u64,
+    ) -> Result<Option<Self>, Error> {
+        let mut genome = self.genome.without_sjdb();
+        let n_real = genome.n_genome_real;
+        let overhang = if self.sjdb_overhang > 0 {
+            self.sjdb_overhang
+        } else {
+            params.sjdb_overhang
+        };
+
+        let mut loci: Vec<(PreparedJunction, u8)> = Vec::new();
+        for pj in &self.prepared_junctions {
+            loci.push((
+                sjdb_insert::prepare_junction(
+                    pj.chr_idx,
+                    pj.original_start(),
+                    pj.original_end(),
+                    pj.strand,
+                    &genome,
+                    n_real,
+                ),
+                30,
+            ));
+        }
+
+        let text = fs::read_to_string(pass1_sj).map_err(|e| Error::io(e, pass1_sj))?;
+        for line in text.lines() {
+            let mut f = line.split_whitespace();
+            let (Some(chr), Some(s), Some(e)) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            let strand = match f.next() {
+                Some("1" | "+") => 1,
+                Some("2" | "-") => 2,
+                _ => 0,
+            };
+            let chr_idx = genome
+                .chr_name
+                .iter()
+                .position(|n| n == chr)
+                .ok_or_else(|| {
+                    Error::Index(format!(
+                        "the sjdb chromosome {chr} is not found among the genomic chromosomes"
+                    ))
+                })?;
+            let (Ok(s), Ok(e)) = (s.parse::<u64>(), e.parse::<u64>()) else {
+                continue;
+            };
+            // 1-based chromosome coordinates to absolute 0-based
+            // (`sjdbS = start + chrStart - 1`).
+            let chr_start = genome.chr_start[chr_idx];
+            loci.push((
+                sjdb_insert::prepare_junction(
+                    chr_idx,
+                    chr_start + s - 1,
+                    chr_start + e - 1,
+                    strand,
+                    &genome,
+                    n_real,
+                ),
+                0,
+            ));
+        }
+        if loci.is_empty() {
+            return Ok(None);
+        }
+
+        let prepared = sjdb_insert::sort_and_dedup_prio(loci);
+        if prepared.len() as u64 > params.limit_sjdb_insert_nsj {
+            return Err(Error::Index(format!(
+                "the number of junctions to be inserted on the fly ={} is larger than the \
+                 limitSjdbInsertNsj={}; re-run with at least --limitSjdbInsertNsj {}",
+                prepared.len(),
+                params.limit_sjdb_insert_nsj,
+                prepared.len()
+            )));
+        }
+        let gsj = sjdb_insert::build_gsj(&prepared, &genome, n_real, overhang)?;
+        genome.append_sjdb(&gsj);
+        let stored: Vec<(usize, u64, u64, u8)> = prepared
+            .iter()
+            .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
+            .collect();
+        let junction_db = SpliceJunctionDb::from_raw_junctions(&stored);
+
+        log::info!(
+            "Inserting {} junctions into the genome (sjdbOverhang={overhang}) ...",
+            prepared.len()
+        );
+        let suffix_array = SuffixArray::build_sparse(&genome, sparse_d)?;
+        let sa_index = SaIndex::build(&genome, &suffix_array, self.sa_index.nbases)?;
+        let idx = GenomeIndex {
+            genome,
+            suffix_array,
+            sa_index,
+            junction_db,
+            transcriptome: self.transcriptome.clone(),
+            prepared_junctions: prepared,
+            sjdb_overhang: overhang,
+        };
+
+        // STAR's `sjdbInsert.outDir` (`_STARgenome/`).
+        let dir = params.output_path("_STARgenome");
+        fs::create_dir_all(&dir).map_err(|e| Error::io(e, &dir))?;
+        sjdb_insert::write_sjdb_info_tab(
+            &dir.join("sjdbInfo.txt"),
+            &idx.prepared_junctions,
+            overhang,
+        )?;
+        sjdb_insert::write_sjdb_list_out_tab(
+            &dir.join("sjdbList.out.tab"),
+            &idx.prepared_junctions,
+            &idx.genome,
+        )?;
+        Ok(Some(idx))
+    }
+
     /// Convert a raw SA position for a reverse-strand match to forward genome coordinates.
     ///
     /// The SA stores reverse-strand positions as offsets within the RC genome region.

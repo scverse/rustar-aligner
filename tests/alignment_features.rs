@@ -952,6 +952,71 @@ fn test_two_pass_mode() {
     );
 }
 
+// Two-pass on an index without annotation (`sjdbInsertJunctions.cpp`, pass 2):
+// the pass-1 `SJ.out.tab` row is unannotated, its junction is inserted into the
+// genome (`_STARgenome/sjdbList.out.tab`) and counted as annotated in pass 2.
+#[test]
+fn test_two_pass_inserts_pass1_junctions() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let mut spliced_read = genome[10025..10050].to_vec();
+    spliced_read.extend_from_slice(&genome[10250..10275]);
+    let fastq_path = tmpdir.path().join("twopass.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for i in 0..20usize {
+            writeln!(f, "@splice{}", i + 1).unwrap();
+            f.write_all(&spliced_read).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_twopass_insert");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--sjdbOverhang",
+            "24",
+            "--twopassMode",
+            "Basic",
+            "--outFilterScoreMinOverLread",
+            "0.3",
+            "--outFilterMatchNminOverLread",
+            "0.3",
+            "--outFilterMismatchNmax",
+            "20",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let annot = |rel: &str| -> Vec<String> {
+        fs::read_to_string(output_dir.join(rel))
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').nth(5).unwrap().to_string())
+            .collect()
+    };
+    let pass1 = annot("_STARpass1/SJ.out.tab");
+    assert_eq!(pass1, ["0"], "pass 1 has one unannotated junction");
+    assert!(output_dir.join("_STARpass1/Log.final.out").exists());
+    let list = fs::read_to_string(output_dir.join("_STARgenome/sjdbList.out.tab")).unwrap();
+    assert_eq!(list.lines().count(), 1, "one junction inserted: {list}");
+    assert_eq!(annot("SJ.out.tab"), ["1"], "pass 2 sees it as annotated");
+}
+
 // ---------------------------------------------------------------------------
 // Test 9 — bare-dot prefix is treated as a literal string prefix (issue #26)
 //
