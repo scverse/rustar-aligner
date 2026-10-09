@@ -565,7 +565,7 @@ fn run_smartseq(
                     }
                     batch.par_iter().for_each(|read| {
                         stats.record_read_bases(read.sequence.len() as u64);
-                        let Ok((transcripts, _chim, n_for_mapq, reason)) =
+                        let Ok((transcripts, _chim, n_for_mapq, reason, _best)) =
                             align_read(&read.sequence, &read.name, index, params)
                         else {
                             return;
@@ -607,7 +607,7 @@ fn run_smartseq(
                         stats.record_read_bases(
                             (pr.mate1.sequence.len() + pr.mate2.sequence.len()) as u64,
                         );
-                        let Ok((results, _chim, n_for_mapq, reason)) = align_paired_read(
+                        let Ok((results, _chim, n_for_mapq, reason, _best)) = align_paired_read(
                             &pr.mate1.sequence,
                             &pr.mate2.sequence,
                             &pr.name,
@@ -1868,6 +1868,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     &read.quality,
                                     params,
                                     crate::stats::UnmappedReason::Other,
+                                    crate::stats::BestTr::default(),
                                 )?;
                                 buffer.push(record);
                             }
@@ -1893,7 +1894,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         }
 
                         // Align read (CPU-intensive, pure function)
-                        let (transcripts, chimeric_results, n_for_mapq, unmapped_reason) =
+                        let (transcripts, chimeric_results, n_for_mapq, unmapped_reason, best_tr) =
                             align_read(&clipped_seq, &read.name, &index, params)?;
 
                         // Collect chimeric alignments if enabled
@@ -2010,6 +2011,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                         params,
                                         unmapped_reason
                                             .unwrap_or(crate::stats::UnmappedReason::Other),
+                                        best_tr,
                                     )?;
                                     buffer.push(record);
                                 }
@@ -2313,7 +2315,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 });
                             }
 
-                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
+                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_read(&clipped_seq, &read.name, &index, params)?;
 
                             let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
@@ -2365,6 +2367,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                             params,
                                             unmapped_reason
                                                 .unwrap_or(crate::stats::UnmappedReason::Other),
+                                            best_tr,
                                         )?;
                                         buffer.push(record);
                                     }
@@ -2598,7 +2601,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
 
-                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason) =
+                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_paired_read(
                                     &m1_seq,
                                     &m2_seq,
@@ -2719,6 +2722,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                         params,
                                         unmapped_reason
                                             .unwrap_or(crate::stats::UnmappedReason::Other),
+                                        best_tr,
                                     )?;
                                     for record in records {
                                         buffer.push(record);
@@ -3264,6 +3268,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                     &paired_read.mate2.quality,
                                     params,
                                     crate::stats::UnmappedReason::Other,
+                                    crate::stats::BestTr::default(),
                                 )?;
                                 for record in records {
                                     buffer.push(record);
@@ -3298,7 +3303,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         }
 
                         // Align paired read (CPU-intensive)
-                        let (results, pe_chimeric, n_for_mapq, unmapped_reason) =
+                        let (results, pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                             align_paired_read(&m1_seq, &m2_seq, &paired_read.name, &index, params)?;
 
                         // --chimOutType WithinBAM: the chimera replaces the read's
@@ -3493,6 +3498,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                     &paired_read.mate2.quality,
                                     params,
                                     unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                    best_tr,
                                 )?;
                                 for record in records {
                                     buffer.push(record);
