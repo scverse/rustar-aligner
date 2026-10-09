@@ -196,7 +196,7 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("--runMode liftOver requires --sjdbGTFfile <gtf>"))?;
 
     let chains = chain_load(&std::fs::read_to_string(chain_file)?);
-    let gtf = std::fs::read_to_string(gtf_file)?;
+    let gtf = crate::junction::gtf::read_annotation_to_string(gtf_file)?;
     let (lifted, unlifted) =
         lift_over_gtf(&chains, &gtf, &chain_file.to_string_lossy()).map_err(anyhow::Error::msg)?;
 

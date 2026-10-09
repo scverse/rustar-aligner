@@ -14,8 +14,35 @@ use crate::error::Error;
 use crate::genome::Genome;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+
+/// Open an annotation file, decompressing it when it is gzip.
+///
+/// The format is read from the first two bytes (`1f 8b`), not from the file
+/// name, so `genes.gtf.gz` as shipped in 10x references and a renamed or piped
+/// file both work. Multi-member gzip (`bgzip`, `cat a.gz b.gz`) is read to the
+/// end. STAR itself reads the GTF as plain text only; this is a convenience on
+/// top, and plain-text input is read exactly as before.
+pub fn open_annotation(path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+    let mut file = BufReader::with_capacity(1 << 19, File::open(path)?);
+    let magic = file.fill_buf()?;
+    if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        Ok(Box::new(BufReader::with_capacity(
+            1 << 19,
+            flate2::read::MultiGzDecoder::new(file),
+        )))
+    } else {
+        Ok(Box::new(file))
+    }
+}
+
+/// The whole annotation file as text, decompressed when it is gzip.
+pub fn read_annotation_to_string(path: &Path) -> std::io::Result<String> {
+    let mut text = String::new();
+    open_annotation(path)?.read_to_string(&mut text)?;
+    Ok(text)
+}
 
 /// GTF record (single line)
 #[derive(Debug, Clone)]
@@ -37,8 +64,8 @@ pub fn parse_gtf_configured(
     feature_exon: &str,
     chr_prefix: &str,
 ) -> Result<Vec<GtfRecord>, Error> {
-    let file = File::open(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
-    let reader = BufReader::new(file);
+    let reader =
+        open_annotation(path).map_err(|e| Error::Gtf(format!("Failed to open GTF file: {e}")))?;
 
     let mut exons = Vec::new();
     let mut line_num = 0;
@@ -251,6 +278,41 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A gzip GTF (as in 10x references, `genes.gtf.gz`) parses to the same
+    /// records as the plain file, including when written as two gzip members
+    /// and when the name does not end in `.gz`.
+    #[test]
+    fn gzip_gtf_parses_like_plain_text() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let gtf = "chr1\tsrc\texon\t100\t200\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\";\n\
+                   chr1\tsrc\tgene\t100\t400\t.\t+\t.\tgene_id \"G1\";\n\
+                   chr1\tsrc\texon\t300\t400\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("genes.gtf");
+        std::fs::write(&plain, gtf).unwrap();
+
+        // Two members, split mid-file; the name hides the compression.
+        let (a, b) = gtf.split_at(gtf.find("chr1\tsrc\texon\t300").unwrap());
+        let mut bytes = Vec::new();
+        for part in [a, b] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(part.as_bytes()).unwrap();
+            bytes.extend(enc.finish().unwrap());
+        }
+        let gz = dir.path().join("genes.annotation");
+        std::fs::write(&gz, bytes).unwrap();
+
+        let key = |r: &GtfRecord| (r.seqname.clone(), r.start, r.end, r.strand);
+        let want: Vec<_> = parse_gtf(&plain).unwrap().iter().map(key).collect();
+        let got: Vec<_> = parse_gtf(&gz).unwrap().iter().map(key).collect();
+        assert_eq!(want.len(), 2);
+        assert_eq!(got, want);
+        assert_eq!(read_annotation_to_string(&gz).unwrap(), gtf);
+    }
 
     #[test]
     fn test_parse_attributes() {
