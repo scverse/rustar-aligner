@@ -1212,7 +1212,7 @@ pub struct Parameters {
     pub chim_score_junction_non_gtag: i32,
 
     /// Chimeric output type
-    #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
+    #[arg(long = "chimOutType", num_args = 1.., default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
     // ── STARsolo (single-cell) ──────────────────────────────────────────
@@ -1380,6 +1380,21 @@ impl Parameters {
     /// Whether `--chimOutType` includes `WithinBAM` (write supplementary BAM records).
     pub fn chim_out_within_bam(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
+    }
+
+    /// `--chimOutType ... HardClip|SoftClip`: whether the supplementary chimeric
+    /// segment is hard-clipped. STAR reads the values in order, so the last of
+    /// the two wins; hard clipping is the default (`ParametersChimeric_initialize.cpp:10-30`).
+    pub fn chim_out_bam_hard_clip(&self) -> bool {
+        self.chim_out_type
+            .iter()
+            .rev()
+            .find_map(|s| match s.as_str() {
+                "HardClip" => Some(true),
+                "SoftClip" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
     }
 
     /// True if the user provided a non-default `--outSAMattrRGline`.
@@ -1697,6 +1712,44 @@ impl Parameters {
                     ErrorKind::InvalidValue,
                     "the --outWigType 2nd word (read1_5p / read2) is not implemented; omit it",
                 ));
+            }
+        }
+
+        // --chimOutType (`ParametersChimeric_initialize.cpp`): unknown values are
+        // fatal. SeparateSAMold is a STAR value this build does not write, so it
+        // is refused rather than silently ignored.
+        if params.chim_segment_min > 0 {
+            for t in &params.chim_out_type {
+                match t.as_str() {
+                    "Junctions" | "WithinBAM" | "HardClip" | "SoftClip" => {}
+                    "SeparateSAMold" => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--chimOutType SeparateSAMold is not supported; use Junctions and/or WithinBAM",
+                        ));
+                    }
+                    other => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "unknown --chimOutType value '{other}'; allowed: Junctions, \
+                                 WithinBAM, HardClip, SoftClip"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if params.chim_out_within_bam() {
+                // WithinBAM needs BAM output (`:76-81`), and adds the NM attribute
+                // that the SA tag reads (`:99-102`).
+                if params.out_sam_type.format != OutSamFormat::Bam {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
+                         or SortedByCoordinate",
+                    ));
+                }
+                params.out_sam_attributes |= SamAttributes::NM;
             }
         }
 
@@ -2641,6 +2694,46 @@ mod tests {
     }
 
     #[test]
+    fn chim_out_type_follows_star() {
+        let base = ["--readFilesIn", "r.fq", "--chimSegmentMin", "12"];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        // WithinBAM needs BAM output, and adds NM.
+        assert!(with(&["--chimOutType", "WithinBAM"]).is_err());
+        let p = with(&[
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::NM));
+        assert!(p.chim_out_bam_hard_clip());
+        // Three values, and the last of HardClip / SoftClip wins.
+        let p = with(&[
+            "--chimOutType",
+            "Junctions",
+            "WithinBAM",
+            "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.chim_out_junctions() && p.chim_out_within_bam());
+        assert!(!p.chim_out_bam_hard_clip());
+        // Unknown values, and the unimplemented SeparateSAMold, are errors.
+        assert!(with(&["--chimOutType", "Junction"]).is_err());
+        assert!(with(&["--chimOutType", "SeparateSAMold"]).is_err());
+        // Without chimeric detection the value is not checked, as in STAR.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--chimOutType", "WithinBAM"]).is_ok());
+    }
+
+    #[test]
     fn chimeric_params() {
         let p = try_parse(&[
             "--readFilesIn",
@@ -2652,6 +2745,9 @@ mod tests {
             "--chimOutType",
             "WithinBAM",
             "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ])
         .unwrap();
         assert_eq!(p.chim_segment_min, 20);

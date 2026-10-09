@@ -65,6 +65,30 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
+  `alignBAM`). The chimera now replaces the read's normal alignment, as in
+  STAR: one segment as a normal record and the other as a supplementary
+  (`0x800`), hard-clipped on the junction side unless `SoftClip`, with `SA`
+  tags built from the other record's final CIGAR. The representative segment
+  is chosen as STAR chooses it; paired segments covering both mates are
+  written as pairs, and mates on either side of the junction as two normal
+  records. Records carry STAR's flags, MAPQ, mate fields, qualities and
+  `NH`/`HI`/`AS`/`nM`/`NM`. Previously the normal alignment was kept and two
+  incomplete records were appended, so no chimeric read matched STAR's
+  output; on yeast 10k every chimeric read now does, apart from known ties.
+  As in STAR, such reads are not counted as mapped in `Log.final.out` and
+  feed neither `SJ.out.tab` nor gene counts.
+  - `WithinBAM` requires `--outSAMtype BAM` and adds `NM` to the output
+    attributes, as STAR does.
+  - `--chimOutType` accepts up to three values (e.g. `Junctions WithinBAM
+    HardClip`) and rejects unknown ones. `SeparateSAMold` is refused rather
+    than silently ignored; it is not implemented.
+
+- **Paired-end `nM` is the pair's mismatch count on both mates**, as STAR
+  writes it (`trOut.nMM`, like `AS`). We wrote each mate's own count, which
+  differed from STAR on 42% of yeast PE pairs; no comparison script checked
+  tags.
+
 - **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
   both ends of a single match block** (e.g. `1S97M2S`). With the default
   `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
