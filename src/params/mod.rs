@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 /// Parse a memory string into bytes. Accepts plain integers or a suffix:
 /// K/k = ×1024, M/m = ×1024², G/g = ×1024³, T/t = ×1024⁴.
@@ -37,6 +37,8 @@ pub enum RunMode {
     GenomeGenerate,
     InputAlignmentsFromBAM,
     LiftOver,
+    /// Cell-call an existing raw count matrix, without aligning anything.
+    SoloCellFiltering,
 }
 
 impl std::str::FromStr for RunMode {
@@ -47,9 +49,10 @@ impl std::str::FromStr for RunMode {
             "genomeGenerate" => Ok(Self::GenomeGenerate),
             "inputAlignmentsFromBAM" => Ok(Self::InputAlignmentsFromBAM),
             "liftOver" => Ok(Self::LiftOver),
+            "soloCellFiltering" => Ok(Self::SoloCellFiltering),
             _ => Err(format!(
                 "unknown runMode '{s}'; expected 'alignReads', 'genomeGenerate', \
-                 'inputAlignmentsFromBAM', or 'liftOver'"
+                 'inputAlignmentsFromBAM', 'liftOver', or 'soloCellFiltering'"
             )),
         }
     }
@@ -62,6 +65,7 @@ impl std::fmt::Display for RunMode {
             Self::GenomeGenerate => write!(f, "genomeGenerate"),
             Self::InputAlignmentsFromBAM => write!(f, "inputAlignmentsFromBAM"),
             Self::LiftOver => write!(f, "liftOver"),
+            Self::SoloCellFiltering => write!(f, "soloCellFiltering"),
         }
     }
 }
@@ -465,9 +469,11 @@ impl std::fmt::Display for SoloType {
 )]
 pub struct Parameters {
     // ── Run ─────────────────────────────────────────────────────────────
-    /// Run mode: alignReads or genomeGenerate
-    #[arg(long = "runMode", default_value = "alignReads")]
-    pub run_mode: RunMode,
+    /// Run mode, plus its arguments. `--runMode soloCellFiltering` takes two
+    /// more tokens: the raw count-matrix directory and the output prefix
+    /// (STAR `SoloFeature_loadRawMatrix.cpp`).
+    #[arg(long = "runMode", num_args = 1.., default_values_t = vec!["alignReads".to_string()])]
+    pub run_mode_in: Vec<String>,
 
     /// Number of threads
     #[arg(long = "runThreadN", default_value_t = NonZeroUsize::new(1).unwrap())]
@@ -527,6 +533,40 @@ pub struct Parameters {
     /// Command to decompress input files (e.g. "zcat" for .gz)
     #[arg(long = "readFilesCommand")]
     pub read_files_command: Option<String>,
+
+    /// Prefix prepended to every path in `--readFilesIn`.
+    #[arg(long = "readFilesPrefix", default_value = "")]
+    pub read_files_prefix: String,
+
+    /// Input format: `Fastx` (default, FASTA/FASTQ).
+    #[arg(long = "readFilesType", num_args = 1..=2, default_values_t = vec!["Fastx".to_string()])]
+    pub read_files_type: Vec<String>,
+
+    /// SAM tag holding the barcode sequence when reading aligned input.
+    #[arg(long = "soloInputSAMattrBarcodeSeq", num_args = 1.., default_values_t = vec!["-".to_string()])]
+    pub solo_input_sam_attr_barcode_seq: Vec<String>,
+
+    /// SAM tag holding the barcode qualities when reading aligned input.
+    #[arg(long = "soloInputSAMattrBarcodeQual", num_args = 1.., default_values_t = vec!["-".to_string()])]
+    pub solo_input_sam_attr_barcode_qual: Vec<String>,
+
+    /// SAM attributes to carry over when reading aligned input.
+    #[arg(long = "readFilesSAMattrKeep", num_args = 1.., default_values_t = vec!["All".to_string()])]
+    pub read_files_sam_attr_keep: Vec<String>,
+
+    /// Characters that terminate a read name. Everything from the first
+    /// occurrence of any of these is dropped. `-` keeps the whole name.
+    #[arg(long = "readNameSeparator", num_args = 1.., default_values_t = vec!["/".to_string()])]
+    pub read_name_separator: Vec<String>,
+
+    /// Phred offset of the input quality strings (33 or 64). 0 selects 33.
+    #[arg(long = "readQualityScoreBase", default_value_t = 33)]
+    pub read_quality_score_base: i32,
+
+    /// Read lengths declared up front, when they are not to be taken from the
+    /// input.
+    #[arg(long = "readMatesLengthsIn", default_value = "NotEqual")]
+    pub read_mates_lengths_in: String,
 
     /// `--soloType SmartSeq` manifest: a TSV with `read1 <TAB> read2 <TAB> cellID`
     /// per line (`read2` = `-` for single-end). Each line is one plate-well cell;
@@ -618,7 +658,9 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
-    /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
+    /// Memory budget for the coordinate sort. Accepts bytes or a suffix: 8G, 512M, 1T.
+    /// Records beyond it spill to sorted runs beside the output and are merged, so the
+    /// output does not depend on it. 0 = 512 MiB (STAR: genome + SA size; see DIVERGENCE.md §4.3).
     #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
 
@@ -626,10 +668,113 @@ pub struct Parameters {
     #[arg(long = "limitGenomeGenerateRAM", default_value = "31G", value_parser = parse_mem_bytes)]
     pub limit_genome_generate_ram: u64,
 
+    /// Size of the I/O buffers, as input and output byte counts.
+    #[arg(long = "limitIObufferSize", num_args = 1..=2,
+          default_values_t = vec![30_000_000u64, 50_000_000u64])]
+    pub limit_io_buffer_size: Vec<u64>,
+
+    /// Soft limit on the number of reads processed.
+    #[arg(long = "limitNreadsSoft", default_value_t = -1i64, allow_hyphen_values = true)]
+    pub limit_nreads_soft: i64,
+
+    /// Maximum size in bytes of the SAM records emitted for one read.
+    #[arg(long = "limitOutSAMoneReadBytes", default_value_t = 100_000u64)]
+    pub limit_out_sam_one_read_bytes: u64,
+
+    /// Maximum number of collapsed junctions.
+    #[arg(long = "limitOutSJcollapsed", default_value_t = 1_000_000u64)]
+    pub limit_out_sj_collapsed: u64,
+
+    /// Maximum number of junctions recorded for one read.
+    #[arg(long = "limitOutSJoneRead", default_value_t = 1_000u64)]
+    pub limit_out_sj_one_read: u64,
+
+    /// Maximum number of junctions inserted on the fly.
+    #[arg(long = "limitSjdbInsertNsj", default_value_t = 1_000_000u64)]
+    pub limit_sjdb_insert_nsj: u64,
+
+    /// Permissions for directories created by the run.
+    #[arg(long = "runDirPerm", default_value = "User_RWX")]
+    pub run_dir_perm: String,
+
+    /// Declared sizes of the genome files.
+    #[arg(long = "genomeFileSizes", num_args = 1.., default_values_t = vec![0u64])]
+    pub genome_file_sizes: Vec<u64>,
+
     /// Route primary alignment output to stdout instead of a file.
     /// Values: None (default), SAM, BAM_Unsorted, BAM_SortedByCoordinate.
     #[arg(long = "outStd", default_value = "None")]
     pub out_std: OutStd,
+
+    /// Alignment output mode: `Full` (default), `NoQS` (omit quality strings)
+    /// or `None` (no alignment output at all).
+    #[arg(long = "outSAMmode", default_value = "Full")]
+    pub out_sam_mode: String,
+
+    /// Post-alignment record filter. Only the default (no filtering) is
+    /// supported; the added-reference modes need align-time reference
+    /// insertion, which this aligner does not do.
+    #[arg(long = "outSAMfilter", num_args = 1.., default_values_t = vec!["None".to_string()])]
+    pub out_sam_filter: Vec<String>,
+
+    /// `@HD` header line, given as its tab-separated fields.
+    #[arg(long = "outSAMheaderHD", num_args = 1..)]
+    pub out_sam_header_hd: Vec<String>,
+
+    /// Extra `@PG` header line, given as its tab-separated fields.
+    #[arg(long = "outSAMheaderPG", num_args = 1..)]
+    pub out_sam_header_pg: Vec<String>,
+
+    /// File whose lines are emitted as `@CO` header comments.
+    #[arg(long = "outSAMheaderCommentFile", default_value = "-")]
+    pub out_sam_header_comment_file: String,
+
+    /// Added to every output quality score. Use -31 to convert Phred+64 input
+    /// to Phred+33 output.
+    #[arg(
+        long = "outQSconversionAdd",
+        default_value_t = 0,
+        allow_hyphen_values = true
+    )]
+    pub out_qs_conversion_add: i32,
+
+    /// Splice-junction output: `Standard` (default) writes SJ.out.tab, `None`
+    /// suppresses it.
+    #[arg(long = "outSJtype", default_value = "Standard")]
+    pub out_sj_type: String,
+
+    /// Which reads contribute to SJ.out.tab: `All` (default) or `Unique`.
+    #[arg(long = "outSJfilterReads", default_value = "All")]
+    pub out_sj_filter_reads: String,
+
+    /// Prefix for reference names in signal output.
+    #[arg(long = "outWigReferencesPrefix", default_value = "-")]
+    pub out_wig_references_prefix: String,
+
+    /// Directory for intermediate files (coordinate-sort spill runs). `-` puts
+    /// them beside the output.
+    #[arg(long = "outTmpDir", default_value = "-")]
+    pub out_tmp_dir: String,
+
+    /// Keep intermediate files after the run.
+    #[arg(long = "outTmpKeep", default_value = "None")]
+    pub out_tmp_keep: String,
+
+    /// Number of bins used when sorting BAM by coordinate.
+    #[arg(long = "outBAMsortingBinsN", default_value_t = 50)]
+    pub out_bam_sorting_bins_n: usize,
+
+    /// Threads used for BAM sorting. 0 selects `--runThreadN`.
+    #[arg(long = "outBAMsortingThreadN", default_value_t = 0)]
+    pub out_bam_sorting_thread_n: usize,
+
+    /// gzip level for the transcriptome BAM, -1 to 10.
+    #[arg(
+        long = "quantTranscriptomeBAMcompression",
+        default_value_t = 1,
+        allow_hyphen_values = true
+    )]
+    pub quant_transcriptome_bam_compression: i32,
 
     /// Strand field: None or intronMotif
     #[arg(long = "outSAMstrandField", default_value = "None")]
@@ -903,6 +1048,12 @@ pub struct Parameters {
     #[arg(long = "seedMapMin", default_value_t = 5)]
     pub seed_map_min: usize,
 
+    /// Min length of a run of ACGT bases for the seed search to consider it
+    /// (STAR default: 12). Reads are split on `N` first, and shorter pieces
+    /// are skipped entirely.
+    #[arg(long = "seedSplitMin", default_value_t = 12)]
+    pub seed_split_min: usize,
+
     /// Max number of loci anchors are allowed to map to
     #[arg(long = "winAnchorMultimapNmax", default_value_t = 50)]
     pub win_anchor_multimap_nmax: usize,
@@ -1023,6 +1174,27 @@ pub struct Parameters {
     #[arg(long = "chimScoreSeparation", default_value_t = 10)]
     pub chim_score_separation: i32,
 
+    /// Post-detection filters for chimeric junctions. `banGenomicN` (the
+    /// default) rejects a junction whose flanking genomic bases include an `N`;
+    /// `None` disables filtering.
+    #[arg(long = "chimFilter", num_args = 1.., default_values_t = vec!["banGenomicN".to_string()])]
+    pub chim_filter: Vec<String>,
+
+    /// Report up to this many chimeric alignments per read. 0 (the default)
+    /// keeps STAR's old single-best behaviour.
+    #[arg(long = "chimMultimapNmax", default_value_t = 0)]
+    pub chim_multimap_nmax: usize,
+
+    /// Score range below the best chimeric score within which multimapping
+    /// chimeras are reported.
+    #[arg(long = "chimMultimapScoreRange", default_value_t = 1)]
+    pub chim_multimap_score_range: i32,
+
+    /// Minimum drop of the best non-chimeric alignment score below the read
+    /// length required before a chimera is considered.
+    #[arg(long = "chimNonchimScoreDropMin", default_value_t = 20)]
+    pub chim_nonchim_score_drop_min: i32,
+
     /// Max multimapping of main chimeric segment
     #[arg(long = "chimMainSegmentMultNmax", default_value_t = 10)]
     pub chim_main_segment_mult_nmax: u32,
@@ -1040,7 +1212,7 @@ pub struct Parameters {
     pub chim_score_junction_non_gtag: i32,
 
     /// Chimeric output type
-    #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
+    #[arg(long = "chimOutType", num_args = 1.., default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
     // ── STARsolo (single-cell) ──────────────────────────────────────────
@@ -1113,6 +1285,21 @@ pub struct Parameters {
     #[arg(long = "soloCBmatchWLtype", default_value = "1MM_multi")]
     pub solo_cb_match_wl_type: String,
 
+    /// `CB`: write `Solo.out/<feature>/CellReads.stats`, a per-cell-barcode
+    /// summary of what happened to the reads carrying it. `None` (the default)
+    /// writes nothing.
+    #[arg(long = "soloCellReadStats", default_value = "None")]
+    pub solo_cell_read_stats: String,
+
+    /// Chromosome names treated as mitochondrial, for the `mito` column of
+    /// `CellReads.stats`. `-` (the default) names none.
+    #[arg(long = "genomeChrSetMitochondrial", num_args = 1.., default_values_t = vec!["-".to_string()])]
+    pub genome_chr_set_mitochondrial: Vec<String>,
+    /// Two-column `CB cluster` file assigning cells to clusters, for
+    /// `--soloFeatures Transcript3p`.
+    #[arg(long = "soloClusterCBfile")]
+    pub solo_cluster_cb_file: Option<PathBuf>,
+
     /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR, TopCells.
     #[arg(long = "soloCellFilter", num_args = 1.., default_values_t = vec!["CellRanger2.2".to_string(), "3000".to_string(), "0.99".to_string(), "10".to_string()])]
     pub solo_cell_filter: Vec<String>,
@@ -1172,6 +1359,16 @@ pub struct Parameters {
 }
 
 impl Parameters {
+    /// The run mode. Validation guarantees it parses, so this cannot fail
+    /// after `validate()`; before it, an unknown mode reads as `alignReads`
+    /// and validation is what rejects it.
+    pub fn run_mode(&self) -> RunMode {
+        self.run_mode_in
+            .first()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(RunMode::AlignReads)
+    }
+
     /// Build an output path by concatenating `suffix` onto `out_file_name_prefix`.
     pub fn output_path(&self, suffix: &str) -> PathBuf {
         PathBuf::from(format!("{}{suffix}", self.out_file_name_prefix))
@@ -1193,6 +1390,21 @@ impl Parameters {
     /// Whether `--chimOutType` includes `WithinBAM` (write supplementary BAM records).
     pub fn chim_out_within_bam(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
+    }
+
+    /// `--chimOutType ... HardClip|SoftClip`: whether the supplementary chimeric
+    /// segment is hard-clipped. STAR reads the values in order, so the last of
+    /// the two wins; hard clipping is the default (`ParametersChimeric_initialize.cpp:10-30`).
+    pub fn chim_out_bam_hard_clip(&self) -> bool {
+        self.chim_out_type
+            .iter()
+            .rev()
+            .find_map(|s| match s.as_str() {
+                "HardClip" => Some(true),
+                "SoftClip" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
     }
 
     /// True if the user provided a non-default `--outSAMattrRGline`.
@@ -1333,11 +1545,12 @@ impl Parameters {
         args: impl IntoIterator<Item = T>,
     ) -> Self {
         Self::try_parse_from(args).unwrap_or_else(|e| {
-            if cfg!(test) {
-                panic!("{e}")
-            } else {
-                e.format(&mut <Self as CommandFactory>::command()).exit()
-            }
+            // Tests panic with the message instead of exiting the process.
+            #[cfg(test)]
+            panic!("{e}");
+            #[cfg(not(test))]
+            e.format(&mut <Self as clap::CommandFactory>::command())
+                .exit();
         })
     }
 
@@ -1363,8 +1576,29 @@ impl Parameters {
             shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
         };
 
+        // The run mode itself must be one this build knows: an unrecognised
+        // one would otherwise fall through to alignReads and silently do
+        // something the user did not ask for.
+        if let Some(mode) = params.run_mode_in.first()
+            && mode.parse::<RunMode>().is_err()
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                mode.parse::<RunMode>().unwrap_err(),
+            ));
+        }
+
+        // `--runMode soloCellFiltering <raw dir> <output prefix>`.
+        if params.run_mode() == RunMode::SoloCellFiltering && params.run_mode_in.len() < 3 {
+            return Err(command.error(
+                ErrorKind::WrongNumberOfValues,
+                "--runMode soloCellFiltering needs the raw count-matrix directory and the \
+                 output prefix: --runMode soloCellFiltering /path/to/raw/ /path/to/out/prefix",
+            ));
+        }
+
         // genomeGenerate requires FASTA files
-        if params.run_mode == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {
+        if params.run_mode() == RunMode::GenomeGenerate && params.genome_fasta_files.is_empty() {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--genomeFastaFiles is required when --runMode genomeGenerate",
@@ -1381,7 +1615,7 @@ impl Parameters {
 
         // alignReads requires read files — except SmartSeq, which gets its reads
         // from --readFilesManifest instead.
-        if params.run_mode == RunMode::AlignReads
+        if params.run_mode() == RunMode::AlignReads
             && params.read_files_in.is_empty()
             && params.solo_type != SoloType::SmartSeq
         {
@@ -1418,7 +1652,7 @@ impl Parameters {
         }
 
         // inputAlignmentsFromBAM: only --bamRemoveDuplicatesType is implemented so far
-        if params.run_mode == RunMode::InputAlignmentsFromBAM {
+        if params.run_mode() == RunMode::InputAlignmentsFromBAM {
             let dedup = params.bam_remove_duplicates_type.as_str();
             if dedup == "-" {
                 return Err(command.error(
@@ -1441,7 +1675,7 @@ impl Parameters {
         }
 
         // liftOver requires a chain file and a GTF to lift
-        if params.run_mode == RunMode::LiftOver {
+        if params.run_mode() == RunMode::LiftOver {
             if params.genome_chain_files.is_empty() {
                 return Err(command.error(
                     ErrorKind::MissingRequiredArgument,
@@ -1489,6 +1723,62 @@ impl Parameters {
                     "the --outWigType 2nd word (read1_5p / read2) is not implemented; omit it",
                 ));
             }
+        }
+
+        // --chimOutType (`ParametersChimeric_initialize.cpp`): unknown values are
+        // fatal. SeparateSAMold is a STAR value this build does not write, so it
+        // is refused rather than silently ignored.
+        if params.chim_segment_min > 0 {
+            for t in &params.chim_out_type {
+                match t.as_str() {
+                    "Junctions" | "WithinBAM" | "HardClip" | "SoftClip" => {}
+                    "SeparateSAMold" => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--chimOutType SeparateSAMold is not supported; use Junctions and/or WithinBAM",
+                        ));
+                    }
+                    other => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "unknown --chimOutType value '{other}'; allowed: Junctions, \
+                                 WithinBAM, HardClip, SoftClip"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if params.chim_out_within_bam() {
+                // WithinBAM needs BAM output (`:76-81`), and adds the NM attribute
+                // that the SA tag reads (`:99-102`).
+                if params.out_sam_type.format != OutSamFormat::Bam {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
+                         or SortedByCoordinate",
+                    ));
+                }
+                params.out_sam_attributes |= SamAttributes::NM;
+            }
+        }
+
+        // Unknown --quantMode values are fatal, as in STAR
+        // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
+        // leading "-" means none.
+        if params.quant_mode.first().is_some_and(|m| m != "-")
+            && let Some(bad) = params
+                .quant_mode
+                .iter()
+                .find(|m| !matches!(m.as_str(), "TranscriptomeSAM" | "GeneCounts"))
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
+                     GeneCounts, or -"
+                ),
+            ));
         }
 
         // quantMode GeneCounts requires a GTF file
@@ -1551,7 +1841,7 @@ impl Parameters {
         // validation time we can only enforce the genomeGenerate rule;
         // for alignReads, GenomeIndex::load checks for the on-disk files
         // and surfaces a clear error if neither source is available.
-        if params.run_mode == RunMode::GenomeGenerate
+        if params.run_mode() == RunMode::GenomeGenerate
             && params.quant_transcriptome_sam()
             && params.sjdb_gtf_file.is_none()
         {
@@ -1561,8 +1851,96 @@ impl Parameters {
             ));
         }
 
+        // --readFilesPrefix is prepended to every input read path, so apply it
+        // here and let every consumer see the final paths.
+        if !params.read_files_prefix.is_empty() {
+            let prefix = std::path::Path::new(&params.read_files_prefix);
+            for rf in &mut params.read_files_in {
+                *rf = prefix.join(&*rf);
+            }
+        }
+
+        // Validate --outSAMmode.
+        if !matches!(params.out_sam_mode.as_str(), "Full" | "NoQS" | "None") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --outSAMmode '{}'; expected Full, NoQS, or None",
+                    params.out_sam_mode
+                ),
+            ));
+        }
+        // Validate --outSJtype.
+        if !matches!(params.out_sj_type.as_str(), "Standard" | "None") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --outSJtype '{}'; expected Standard or None",
+                    params.out_sj_type
+                ),
+            ));
+        }
+        // Validate --outSJfilterReads.
+        if !matches!(params.out_sj_filter_reads.as_str(), "All" | "Unique") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unknown --outSJfilterReads '{}'; expected All or Unique",
+                    params.out_sj_filter_reads
+                ),
+            ));
+        }
+        // Validate --readQualityScoreBase.
+        if !matches!(params.read_quality_score_base, 0 | 33 | 64) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unsupported --readQualityScoreBase {}; expected 33 or 64",
+                    params.read_quality_score_base
+                ),
+            ));
+        }
+        // --outSAMfilter: the added-reference modes require inserting
+        // --genomeFastaFiles references at alignment time, which this aligner
+        // does not do. Reject them loudly rather than accept and ignore.
+        for f in &params.out_sam_filter {
+            if f.as_str() != "None" {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--outSAMfilter {f} is not supported: it requires inserting \
+                         --genomeFastaFiles references at alignment time"
+                    ),
+                ));
+            }
+        }
+        // --readFilesType: only Fastx is supported. Reading pre-aligned SAM
+        // input is separate work; refuse rather than silently treating a SAM
+        // file as FASTQ.
+        {
+            let kind = params
+                .read_files_type
+                .first()
+                .map_or("Fastx", String::as_str);
+            if kind != "Fastx" {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("--readFilesType {kind} is not supported; expected Fastx"),
+                ));
+            }
+        }
+        // Validate --chimFilter.
+        for f in &params.chim_filter {
+            if !matches!(f.as_str(), "banGenomicN" | "None") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("unknown --chimFilter '{f}'; expected banGenomicN or None"),
+                ));
+            }
+        }
+
         // ── STARsolo validation ─────────────────────────────────────────
-        if params.run_mode == RunMode::AlignReads && params.solo_enabled() {
+        if params.run_mode() == RunMode::AlignReads && params.solo_enabled() {
             // CB_UMI_Complex needs one CB position + whitelist per segment.
             if params.solo_type == SoloType::CbUmiComplex {
                 if params.solo_cb_position.is_empty() {
@@ -1615,6 +1993,22 @@ impl Parameters {
                             "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
                         ));
                     }
+                    // The barcode region of that mate is not cDNA, and nothing
+                    // else says how many bases it spans, so STAR refuses the
+                    // run unless the mate is clipped
+                    // (`ParametersSolo.cpp:145-150`). Without this the CB+UMI
+                    // prefix is aligned as if it were sequence: 28 bases of it
+                    // for 10x v3, with no error anywhere in the run.
+                    let mate = 0; // --soloBarcodeMate 1 is mate 1
+                    if params.clip5p(mate) == 0 && params.clip3p(mate) == 0 {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--soloBarcodeMate 1 puts the barcode inside mate 1, which requires \
+                             clipping the barcode off that mate\n\
+                             SOLUTION: clip it from 5' and/or 3' with --clip5pNbases and/or \
+                             --clip3pNbases; give a value per mate, using 0 for no clipping",
+                        ));
+                    }
                 }
                 other => {
                     return Err(command.error(
@@ -1625,15 +2019,15 @@ impl Parameters {
                     ));
                 }
             }
-            // Gene / GeneFull / SJ / Velocyto are implemented.
+            // Gene / GeneFull / SJ / Velocyto / Transcript3p are implemented.
             for f in &params.solo_features {
-                if !matches!(f.as_str(), "SJ" | "Velocyto")
+                if !matches!(f.as_str(), "SJ" | "Velocyto" | "Transcript3p")
                     && f.parse::<crate::solo::SoloFeature>().is_err()
                 {
                     return Err(command.error(
                         ErrorKind::InvalidValue,
                         format!(
-                            "unsupported --soloFeatures '{f}'; supported: Gene, GeneFull, SJ, Velocyto"
+                            "unsupported --soloFeatures '{f}'; supported: Gene, GeneFull, SJ, Velocyto, Transcript3p"
                         ),
                     ));
                 }
@@ -1739,6 +2133,43 @@ impl Parameters {
                         ),
                     ));
                 }
+            }
+            // STAR refuses `MultiGeneUMI_CR` unless the dedup is exactly
+            // `1MM_CR` — one value, that value (`ParametersSolo.cpp:463-468`).
+            // The rule exists because the filter decides ownership from the
+            // corrected-UMI map, which only the CellRanger dedup builds.
+            if params
+                .solo_umi_filtering
+                .iter()
+                .any(|f| f == "MultiGeneUMI_CR")
+                && (params.solo_umi_dedup.len() > 1
+                    || params.solo_umi_dedup.first().map(String::as_str) != Some("1MM_CR"))
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--soloUMIfiltering MultiGeneUMI_CR only works with --soloUMIdedup 1MM_CR\n\
+                     SOLUTION: rerun with --soloUMIfiltering MultiGeneUMI_CR --soloUMIdedup 1MM_CR",
+                ));
+            }
+            // --soloCellReadStats: `CB` is the only value STAR defines.
+            if !matches!(params.solo_cell_read_stats.as_str(), "CB" | "None") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "unknown --soloCellReadStats '{}'; expected CB or None",
+                        params.solo_cell_read_stats
+                    ),
+                ));
+            }
+            // Transcript3p quantifies per cluster, so it needs the clustering.
+            if params.solo_features.iter().any(|f| f == "Transcript3p")
+                && params.solo_cluster_cb_file.is_none()
+            {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--soloFeatures Transcript3p requires --soloClusterCBfile: the EM runs \
+                     per cluster of cells, since one cell has too few UMIs to resolve isoforms",
+                ));
             }
             // Validate --clipAdapterType.
             if !matches!(
@@ -1914,7 +2345,7 @@ mod tests {
     #[test]
     fn defaults() {
         let p = try_parse(&["--readFilesIn", "reads.fq"]).unwrap();
-        assert_eq!(p.run_mode, RunMode::AlignReads);
+        assert_eq!(p.run_mode(), RunMode::AlignReads);
         assert_eq!(p.run_thread_n, NonZeroUsize::new(1).unwrap());
         assert_eq!(p.run_rng_seed, 777);
         assert_eq!(p.genome_dir, PathBuf::from("./GenomeDir"));
@@ -2008,7 +2439,7 @@ mod tests {
             "11",
         ])
         .unwrap();
-        assert_eq!(p.run_mode, RunMode::GenomeGenerate);
+        assert_eq!(p.run_mode(), RunMode::GenomeGenerate);
         assert_eq!(p.genome_dir, PathBuf::from("/data/genome"));
         assert_eq!(
             p.genome_fasta_files,
@@ -2048,7 +2479,7 @@ mod tests {
             "Basic",
         ])
         .unwrap();
-        assert_eq!(p.run_mode, RunMode::AlignReads);
+        assert_eq!(p.run_mode(), RunMode::AlignReads);
         assert_eq!(p.genome_dir, PathBuf::from("/idx/hg38"));
         assert_eq!(
             p.read_files_in,
@@ -2093,8 +2524,8 @@ mod tests {
 
     #[test]
     fn solo_barcode_mate_validation() {
-        let with_mate = |mate: &str| {
-            try_parse(&[
+        let with_mate_and_clip = |mate: &str, clip: Option<(&str, &str)>| {
+            let mut args = vec![
                 "--readFilesIn",
                 "R1.fq",
                 "R2.fq",
@@ -2110,16 +2541,77 @@ mod tests {
                 "Gene",
                 "--soloBarcodeMate",
                 mate,
-            ])
+            ];
+            if let Some((flag, value)) = clip {
+                args.push(flag);
+                args.push(value);
+                args.push("0");
+            }
+            try_parse(&args)
         };
-        // Mate 1 (5' paired-end) is accepted; the helper reports it.
+        let with_mate = |mate: &str| with_mate_and_clip(mate, Some(("--clip5pNbases", "28")));
+
+        // Mate 1 (5' paired-end) with the barcode clipped off: accepted, and
+        // the helper reports it.
         let p = with_mate("1").unwrap();
         assert!(p.solo_barcode_on_mate1());
-        // Mate 0 (default) is the standard SE-solo path.
-        assert!(!with_mate("0").unwrap().solo_barcode_on_mate1());
+        // Mate 0 (default) is the standard SE-solo path; no clip is needed
+        // because the barcode has its own read.
+        assert!(
+            !with_mate_and_clip("0", None)
+                .unwrap()
+                .solo_barcode_on_mate1()
+        );
         // Mate 2 is rejected with a clear message.
         let err = with_mate("2").unwrap_err().to_string();
         assert!(err.contains("soloBarcodeMate"), "unexpected error: {err}");
+    }
+
+    /// STAR refuses `--soloBarcodeMate 1` unless the barcode is clipped off
+    /// that mate (`ParametersSolo.cpp:145-150`): the barcode region is not
+    /// cDNA, and nothing else says how long it is. Without the check the CB+UMI
+    /// prefix is aligned as sequence and the run reports nothing.
+    #[test]
+    fn solo_barcode_mate_1_requires_clipping_that_mate() {
+        let with_clip = |extra: &[&str]| {
+            let mut args = vec![
+                "--readFilesIn",
+                "R1.fq",
+                "R2.fq",
+                "--soloType",
+                "CB_UMI_Simple",
+                "--soloCBwhitelist",
+                "None",
+                "--soloCBmatchWLtype",
+                "Exact",
+                "--sjdbGTFfile",
+                "g.gtf",
+                "--soloFeatures",
+                "Gene",
+                "--soloBarcodeMate",
+                "1",
+            ];
+            args.extend_from_slice(extra);
+            try_parse(&args)
+        };
+
+        // No clip at all: refused, and the message says what to do.
+        let err = with_clip(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("clip5pNbases"),
+            "the error should name the fix: {err}"
+        );
+
+        // A clip on mate 2 only leaves mate 1's barcode in place, so it is
+        // still refused.
+        assert!(with_clip(&["--clip5pNbases", "0", "28"]).is_err());
+
+        // 5' clip on mate 1: accepted.
+        assert!(with_clip(&["--clip5pNbases", "28", "0"]).is_ok());
+        // 3' clip on mate 1: also accepted, for a barcode at the other end.
+        assert!(with_clip(&["--clip3pNbases", "28", "0"]).is_ok());
+        // A single value applies to both mates, which covers mate 1.
+        assert!(with_clip(&["--clip5pNbases", "28"]).is_ok());
     }
 
     #[test]
@@ -2219,6 +2711,46 @@ mod tests {
     }
 
     #[test]
+    fn chim_out_type_follows_star() {
+        let base = ["--readFilesIn", "r.fq", "--chimSegmentMin", "12"];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        // WithinBAM needs BAM output, and adds NM.
+        assert!(with(&["--chimOutType", "WithinBAM"]).is_err());
+        let p = with(&[
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::NM));
+        assert!(p.chim_out_bam_hard_clip());
+        // Three values, and the last of HardClip / SoftClip wins.
+        let p = with(&[
+            "--chimOutType",
+            "Junctions",
+            "WithinBAM",
+            "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.chim_out_junctions() && p.chim_out_within_bam());
+        assert!(!p.chim_out_bam_hard_clip());
+        // Unknown values, and the unimplemented SeparateSAMold, are errors.
+        assert!(with(&["--chimOutType", "Junction"]).is_err());
+        assert!(with(&["--chimOutType", "SeparateSAMold"]).is_err());
+        // Without chimeric detection the value is not checked, as in STAR.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--chimOutType", "WithinBAM"]).is_ok());
+    }
+
+    #[test]
     fn chimeric_params() {
         let p = try_parse(&[
             "--readFilesIn",
@@ -2230,6 +2762,9 @@ mod tests {
             "--chimOutType",
             "WithinBAM",
             "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ])
         .unwrap();
         assert_eq!(p.chim_segment_min, 20);
@@ -2411,6 +2946,25 @@ mod tests {
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip
         );
+    }
+
+    #[test]
+    fn unknown_quant_mode_is_rejected() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneVelocyto"]).is_err());
+        // Not a STAR value either (Parameters.cpp:898-936 allows only these two).
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneSplicing"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantMode",
+                "TranscriptomeSAM",
+                "Genecounts"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).is_ok());
     }
 
     #[test]
@@ -2599,6 +3153,64 @@ mod tests {
             [[false, true], [false, false]]
         );
         assert!(AlignEndsType::from_str("Bogus").is_err());
+    }
+
+    /// STAR refuses `MultiGeneUMI_CR` unless the dedup is exactly `1MM_CR`
+    /// (`ParametersSolo.cpp:463-468`): the filter decides ownership from the
+    /// corrected-UMI map, which only the CellRanger dedup builds. We accepted
+    /// the combination silently and counted with an uncorrected map.
+    #[test]
+    fn multi_gene_umi_cr_requires_the_cellranger_dedup() {
+        // The solo validation block only runs in solo mode, which is also the
+        // only mode where these flags mean anything.
+        let base = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloUMIfiltering",
+            "MultiGeneUMI_CR",
+        ];
+
+        // Paired with 1MM_CR: accepted.
+        let mut ok = base.to_vec();
+        ok.extend_from_slice(&["--soloUMIdedup", "1MM_CR"]);
+        assert!(try_parse(&ok).is_ok());
+
+        // Default dedup (1MM_All) and any other single value: refused.
+        assert!(try_parse(&base).is_err(), "default dedup should be refused");
+        let mut wrong = base.to_vec();
+        wrong.extend_from_slice(&["--soloUMIdedup", "Exact"]);
+        assert!(try_parse(&wrong).is_err());
+
+        // More than one dedup value is refused even when 1MM_CR is among them,
+        // matching STAR's `typesIn.size()>1` half of the condition.
+        let mut multi = base.to_vec();
+        multi.extend_from_slice(&["--soloUMIdedup", "1MM_CR", "Exact"]);
+        assert!(try_parse(&multi).is_err());
+
+        // The pairing rule applies only to MultiGeneUMI_CR.
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "cdna.fq",
+                "bc.fq",
+                "--soloType",
+                "CB_UMI_Simple",
+                "--sjdbGTFfile",
+                "genes.gtf",
+                "--soloCBwhitelist",
+                "wl.txt",
+                "--soloUMIfiltering",
+                "MultiGeneUMI"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

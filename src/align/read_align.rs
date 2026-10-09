@@ -1,5 +1,5 @@
 /// Read alignment driver function
-use crate::align::score::{AlignmentScorer, SpliceMotif};
+use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::stitch::{
     PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
@@ -8,7 +8,7 @@ use crate::align::stitch::{
 use crate::align::transcript::{Exon, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
-use crate::params::{IntronMotifFilter, IntronStrandFilter, MultimapperOrder, Parameters};
+use crate::params::{MultimapperOrder, Parameters};
 use crate::stats::UnmappedReason;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -42,6 +42,59 @@ fn shuffle_tied_prefix<T>(items: &mut [T], score_fn: impl Fn(&T) -> i32, seed: u
     crate::rng::shuffle_deterministic(&mut items[..tied], seed);
 }
 
+/// STAR's `nMatch`: aligned bases where the read equals the genome. Mismatches
+/// and positions with an `N` on either side are not counted
+/// (`extendAlign.cpp:35-41`, `stitchAlignToTranscript.cpp:68-87`), so this is
+/// smaller than the aligned length whenever the alignment has a mismatch.
+///
+/// `read` is the read as it was sequenced; a reverse-strand transcript's CIGAR
+/// walks its reverse complement.
+fn star_n_match(t: &Transcript, read: &[u8], genome: &crate::genome::Genome) -> u32 {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    // Base `i` of the frame the CIGAR walks, without building the reverse
+    // complement: this runs once per read.
+    let frame = |i: usize| -> u8 {
+        let b = if t.is_reverse {
+            read.len().checked_sub(i + 1).and_then(|j| read.get(j))
+        } else {
+            read.get(i)
+        };
+        match b {
+            Some(&b) if t.is_reverse && b < 4 => 3 - b,
+            Some(&b) => b,
+            None => 4,
+        }
+    };
+    let (mut r, mut g) = (0usize, t.genome_start);
+    let mut n = 0u32;
+    for op in &t.cigar {
+        let len = op.len();
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                for k in 0..len {
+                    let rb = frame(r + k);
+                    let gb = genome.get_base(g + k as u64).unwrap_or(4);
+                    if rb < 4 && gb < 4 && rb == gb {
+                        n += 1;
+                    }
+                }
+                r += len;
+                g += len as u64;
+            }
+            Kind::Insertion | Kind::SoftClip => r += len,
+            Kind::Deletion | Kind::Skip => g += len as u64,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// STAR's `rLength`: the sum of exon lengths, i.e. the aligned read bases
+/// including mismatches. The denominator of `--outFilterMismatchNoverLmax`.
+fn star_r_length(t: &Transcript) -> u32 {
+    t.n_matched() as u32
+}
+
 /// Result of aligning a single read: (transcripts, chimeric_alignments, n_for_mapq, unmapped_reason)
 pub type AlignReadResult = (
     Vec<Transcript>,
@@ -68,9 +121,6 @@ pub struct PairedAlignment {
     /// Combined pair score: sum of per-mate finalized scores (each includes genomic length penalty).
     /// Used for multi-mapper score-range ranking and mappedFilter quality check.
     pub combined_wt_score: i32,
-    /// Combined coverage: sum of exon read spans from both mates.
-    /// Mirrors STAR's nMatch check in mappedFilter.
-    pub combined_n_match: u32,
 }
 
 impl PairedAlignment {
@@ -114,7 +164,6 @@ impl PairedAlignment {
             n_junction: m1.n_junction + m2.n_junction,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
-            read_seq: Vec::new(),
         }
     }
 }
@@ -161,6 +210,20 @@ pub fn align_read(
     read_name: &str,
     index: &GenomeIndex,
     params: &Parameters,
+) -> Result<AlignReadResult, Error> {
+    align_read_inner(read_seq, read_name, index, params, true)
+}
+
+/// `align_read` with or without STAR's `mappedFilter`. The `--peOverlapNbasesMin`
+/// merged read is mapped without it: STAR runs only `mapOneRead` on it
+/// (`ReadAlign_peOverlapMergeMap.cpp`) and filters once the alignments are back
+/// in the paired frame.
+fn align_read_inner(
+    read_seq: &[u8],
+    read_name: &str,
+    index: &GenomeIndex,
+    params: &Parameters,
+    mapped_filter: bool,
 ) -> Result<AlignReadResult, Error> {
     let debug_read = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
 
@@ -276,20 +339,12 @@ pub fn align_read(
     // (#ifdef COMPILE_FOR_LONG_READS in stitchPieces.cpp). Standard STAR
     // does NOT filter clusters by seed coverage. Removed to match STAR.
 
-    // Step 2b: Detect chimeric alignments from multi-cluster seeds (Tier 2)
-    let mut chimeric_alignments = Vec::new();
-    if params.chim_segment_min > 0 && clusters.len() > 1 {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        chimeric_alignments
-            .extend(detector.detect_from_multi_clusters(&clusters, read_seq, read_name, index)?);
-    }
-
     // Step 3: Stitch seeds within each cluster
     let scorer = AlignmentScorer::from_params(params);
     let mut transcripts = Vec::new();
-    // Collect all raw (pre-dedup) transcripts for chimericDetectionOld (Tier 1).
-    let mut all_raw_transcripts: Vec<crate::align::transcript::Transcript> = Vec::new();
+    // STAR's `trAll`: every window's transcripts, before any cross-window
+    // dedup or filtering, which is what its chimeric detection reads.
+    let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
 
     // Use junction DB for annotation-aware scoring if available
     let junction_db = if index.junction_db.is_empty() {
@@ -337,7 +392,20 @@ pub fn align_read(
             }
         }
         if params.chim_segment_min > 0 {
-            all_raw_transcripts.extend(cluster_transcripts.iter().cloned());
+            chim_windows.push(
+                cluster_transcripts
+                    .iter()
+                    .filter_map(|t| {
+                        crate::chimeric::WinTr::single(
+                            t,
+                            u8::from(t.is_reverse),
+                            0,
+                            0,
+                            read_seq.len(),
+                        )
+                    })
+                    .collect(),
+            );
         }
         transcripts.extend(cluster_transcripts);
     }
@@ -401,188 +469,35 @@ pub fn align_read(
         transcripts.retain(|t| t.score >= score_threshold);
     }
 
-    // Step 4: Quality filters (STAR's mappedFilter — runs after score-range selection).
-    // STAR uses (Lread-1) for relative thresholds and casts to integer
-    // (ReadAlign_mappedFilter.cpp lines 8-9)
-    let read_length = read_seq.len() as f64;
+    // Step 4: STAR's mappedFilter (`ReadAlign_mappedFilter.cpp`), which runs after
+    // multMapSelect. It looks at the best transcript only and decides for the whole
+    // read: too short (score or matched bases), then too many mismatches, then too
+    // many loci. The intron filters are not here: STAR applies them per transcript
+    // at stitch time, which is where they now run.
     let lread_m1 = (read_seq.len() as f64) - 1.0;
-
-    // Log filtering statistics
-    let pre_filter_count = transcripts.len();
-    let mut filter_reasons = std::collections::HashMap::new();
-
-    transcripts.retain(|t| {
-        // Absolute score threshold
-        if t.score < params.out_filter_score_min {
-            *filter_reasons.entry("score_min").or_insert(0) += 1;
-            return false;
-        }
-
-        // Relative score threshold: STAR casts to intScore (i32)
-        if t.score < (params.out_filter_score_min_over_lread * lread_m1) as i32 {
-            *filter_reasons.entry("score_min_relative").or_insert(0) += 1;
-            return false;
-        }
-
-        // Absolute mismatch count
-        if t.n_mismatch > params.out_filter_mismatch_nmax {
-            *filter_reasons.entry("mismatch_max").or_insert(0) += 1;
-            log::debug!(
-                "Filtered {}: {} mismatches > {} max (read_len={}, score={})",
-                read_name,
-                t.n_mismatch,
-                params.out_filter_mismatch_nmax,
-                read_length,
-                t.score
-            );
-            return false;
-        }
-
-        // Relative mismatch count (mismatches / read_length)
-        let mismatch_rate = t.n_mismatch as f64 / read_length;
-        if mismatch_rate > params.out_filter_mismatch_nover_lmax {
-            *filter_reasons.entry("mismatch_rate").or_insert(0) += 1;
-            log::debug!(
-                "Filtered {}: {:.1}% mismatch rate > {:.1}% max ({}/{} bases, score={})",
-                read_name,
-                mismatch_rate * 100.0,
-                params.out_filter_mismatch_nover_lmax * 100.0,
-                t.n_mismatch,
-                read_length,
-                t.score
-            );
-            return false;
-        }
-
-        // Absolute matched bases
-        let n_matched = t.n_matched();
-        if n_matched < params.out_filter_match_nmin as usize {
-            *filter_reasons.entry("match_min").or_insert(0) += 1;
-            return false;
-        }
-
-        // Relative matched bases: STAR casts to uint (u32)
-        if (n_matched as f64) < params.out_filter_match_nmin_over_lread * lread_m1 {
-            *filter_reasons.entry("match_min_relative").or_insert(0) += 1;
-            return false;
-        }
-
-        // Junction motif filtering
-        match params.out_filter_intron_motifs {
-            IntronMotifFilter::None => {
-                // Accept all motifs
+    let unmapped_by_filter = transcripts
+        .first()
+        .filter(|_| mapped_filter)
+        .and_then(|best| {
+            let n_match = star_n_match(best, read_seq, &index.genome);
+            let r_length = star_r_length(best);
+            if best.score < params.out_filter_score_min
+                || best.score < (params.out_filter_score_min_over_lread * lread_m1) as i32
+                || n_match < params.out_filter_match_nmin
+                || n_match < (params.out_filter_match_nmin_over_lread * lread_m1) as u32
+            {
+                Some(UnmappedReason::TooShort)
+            } else if best.n_mismatch > params.out_filter_mismatch_nmax
+                || f64::from(best.n_mismatch) / f64::from(r_length.max(1))
+                    > params.out_filter_mismatch_nover_lmax
+            {
+                Some(UnmappedReason::TooManyMismatches)
+            } else {
+                None
             }
-            IntronMotifFilter::RemoveNoncanonical => {
-                // Reject if any junction is non-canonical
-                if t.junction_motifs.contains(&SpliceMotif::NonCanonical) {
-                    *filter_reasons.entry("noncanonical_junction").or_insert(0) += 1;
-                    return false;
-                }
-            }
-            IntronMotifFilter::RemoveNoncanonicalUnannotated => {
-                // Only reject if a non-canonical junction is NOT annotated in GTF
-                if t.junction_motifs
-                    .iter()
-                    .zip(t.junction_annotated.iter())
-                    .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated)
-                {
-                    *filter_reasons
-                        .entry("noncanonical_unannotated_junction")
-                        .or_insert(0) += 1;
-                    return false;
-                }
-            }
-        }
-
-        // Intron strand consistency filtering (outFilterIntronStrands)
-        // STAR's RemoveInconsistentStrands removes transcripts that have junctions
-        // with mixed intron strand (some imply + strand, some imply - strand).
-        // This handles chimeric/impossible transcripts spanning both strands.
-        // Note: a reverse-strand read CAN have + strand motifs (antisense reads
-        // from + strand genes in unstranded RNA-seq) — this is valid and STAR
-        // keeps such reads. Only mixed-strand within one transcript is filtered.
-        if params.out_filter_intron_strands == IntronStrandFilter::RemoveInconsistentStrands {
-            let mut has_plus = false;
-            let mut has_minus = false;
-            for motif in &t.junction_motifs {
-                match motif.implied_strand() {
-                    Some('+') => has_plus = true,
-                    Some('-') => has_minus = true,
-                    _ => {}
-                }
-            }
-            if has_plus && has_minus {
-                *filter_reasons.entry("inconsistent_strand").or_insert(0) += 1;
-                return false;
-            }
-        }
-
-        true
-    });
-
-    // Log filtering summary if anything was filtered
-    if pre_filter_count > transcripts.len() {
-        let filtered = pre_filter_count - transcripts.len();
-        log::debug!(
-            "Read {read_name}: Filtered {filtered}/{pre_filter_count} transcripts: {filter_reasons:?}"
-        );
-    }
-
+        });
     if debug_read {
-        eprintln!(
-            "[DEBUG {}] After quality filters: {}/{} transcripts remain (reasons: {:?})",
-            read_name,
-            transcripts.len(),
-            pre_filter_count,
-            filter_reasons
-        );
-    }
-
-    // Step 3b: chimericDetectionOld (Tier 1) — STAR-faithful post-stitching transcript-pair search.
-    // Uses the best post-dedup transcript as the primary segment and searches all raw transcripts
-    // (pre-dedup, from all clusters) for the best complementary partner.
-    if params.chim_segment_min > 0
-        && !all_raw_transcripts.is_empty()
-        && let Some(tr_best) = transcripts.first()
-    {
-        use crate::chimeric::detect_chimeric_old;
-        let chims = detect_chimeric_old(
-            &all_raw_transcripts,
-            tr_best,
-            read_seq,
-            read_name,
-            params,
-            index,
-        )?;
-        chimeric_alignments.extend(chims);
-    }
-
-    // Step 3c: Soft-clip re-mapping (Phase 12.2) — try to align soft-clipped bases when
-    // detect_chimeric_old found no chimeric partner in the existing transcript pool.
-    if params.chim_segment_min > 0
-        && chimeric_alignments.is_empty()
-        && let Some(tr_best) = transcripts.first()
-    {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        if let Some(chim) = detector.detect_from_soft_clips(tr_best, read_seq, read_name, index)? {
-            chimeric_alignments.push(chim);
-        }
-    }
-
-    // Step 3d: Tier 3 — re-seed outer uncovered read regions of each chimeric pair (Phase 17.10).
-    // Extends 2-segment chimeras toward multi-junction fusions by seeding the read bases
-    // that lie outside both chimeric segments.
-    if params.chim_segment_min > 0 && !chimeric_alignments.is_empty() {
-        use crate::chimeric::ChimericDetector;
-        let detector = ChimericDetector::new(params);
-        let mut tier3 = Vec::new();
-        for chim in &chimeric_alignments {
-            let extras =
-                detector.detect_from_chimeric_residuals(chim, read_seq, read_name, index)?;
-            tier3.extend(extras);
-        }
-        chimeric_alignments.extend(tier3);
+        eprintln!("[DEBUG {read_name}] mappedFilter on trBest: {unmapped_by_filter:?}");
     }
 
     // Note: STAR sometimes finds 2 equivalent indel placements in homopolymer runs
@@ -591,18 +506,24 @@ pub fn align_read(
     // The root cause is jR scanning placing insertions at different positions — fixing that
     // would be a better approach than post-hoc enumeration.
 
-    // Step 6: Filter chimeric alignments
-    if params.chim_segment_min > 0 {
-        chimeric_alignments.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
-    }
+    // STAR's chimericDetection, which runs after multMapSelect/mappedFilter
+    // whatever their outcome, over the window transcripts.
+    let chimeric_alignments = if params.chim_segment_min > 0 {
+        let read = crate::chimeric::ChimRead::new(
+            read_seq,
+            [read_seq.len(), 0],
+            read_name,
+            [read_seq, &[]],
+        );
+        crate::chimeric::chimeric_detection(chim_windows, &read, &index.genome, &scorer, params)
+    } else {
+        Vec::new()
+    };
 
     // n_for_mapq = transcripts.len() after dedup and filtering.
     // Multi-transcript DP (Phase 16.10) produces multiple transcripts per window
     // for tandem repeats (e.g. rDNA), yielding correct NH → correct MAPQ.
-    let n_for_mapq = transcripts.len();
+    let mut n_for_mapq = transcripts.len();
 
     if debug_read {
         eprintln!(
@@ -632,26 +553,19 @@ pub fn align_read(
         }
     }
 
-    // STAR's mappedFilter (ReadAlign_mappedFilter.cpp) classifies the read by its
-    // BEST transcript, in strict order: too-short (score/match) → too-many-mismatches
-    // → too-many-loci → mapped. Crucially, `multi` (too many loci) is reached ONLY
-    // when the best alignment PASSES the score/match/mismatch gates. We mirror that:
-    // if the quality filter emptied the set, the best transcript failed → classify
-    // short/mismatch; otherwise, if too many loci survive, it's multi; else mapped.
+    // Too short and too many mismatches drop every alignment; too many loci is
+    // reached only when the best alignment passed both (STAR's unmapType 1, 2, 3).
     let unmapped_reason = if transcripts.is_empty() {
-        let has_mismatch = filter_reasons.contains_key("mismatch_max")
-            || filter_reasons.contains_key("mismatch_rate");
-        let has_other = filter_reasons
-            .keys()
-            .any(|k| *k != "mismatch_max" && *k != "mismatch_rate");
-        if has_mismatch && !has_other {
-            Some(UnmappedReason::TooManyMismatches)
-        } else {
-            Some(UnmappedReason::TooShort)
-        }
-    } else if transcripts.len() > params.out_filter_multimap_nmax as usize {
-        // Best alignment passed quality, but too many loci → STAR unmapType=3.
-        // `n_for_mapq` already holds this count (computed above); drop the alignments.
+        // No window kept a transcript: STAR's `nW==0`, counted as "other".
+        Some(UnmappedReason::Other)
+    } else if let Some(reason) = unmapped_by_filter {
+        // Only too-many-loci carries a loci count to the stats; a read that
+        // failed the quality gates is not counted as mapped anywhere.
+        transcripts.clear();
+        n_for_mapq = 0;
+        Some(reason)
+    } else if mapped_filter && transcripts.len() > params.out_filter_multimap_nmax as usize {
+        // `n_for_mapq` already holds the loci count; drop the alignments.
         transcripts.clear();
         Some(UnmappedReason::TooManyLoci)
     } else {
@@ -757,54 +671,6 @@ pub fn align_paired_read(
     // Cluster combined seeds using the combined read length
     let clusters = cluster_seeds(&combined_seeds, index, params, combined_len, debug_pe);
 
-    // PE chimeric pre-pass: intra-mate multi-cluster detection (Tier 2).
-    // Split clusters by mate_id and run per-mate chimeric detection, mirroring SE behavior.
-    let mut pe_chimeric: Vec<crate::chimeric::ChimericAlignment> = Vec::new();
-    if params.chim_segment_min > 0 && clusters.len() >= 2 {
-        use crate::chimeric::ChimericDetector;
-
-        let mate1_clusters: Vec<_> = clusters
-            .iter()
-            .filter(|c| c.alignments.iter().all(|wa| wa.mate_id == 0))
-            .cloned()
-            .collect();
-
-        // Mate2 clusters: adjust read_pos to be relative to mate2_seq (subtract len1+1)
-        let mate2_clusters: Vec<_> = clusters
-            .iter()
-            .filter(|c| c.alignments.iter().all(|wa| wa.mate_id == 1))
-            .map(|c| {
-                let mut c2 = c.clone();
-                for wa in &mut c2.alignments {
-                    wa.read_pos -= len1 + 1;
-                }
-                c2
-            })
-            .collect();
-
-        let detector = ChimericDetector::new(params);
-        if mate1_clusters.len() >= 2 {
-            pe_chimeric.extend(detector.detect_from_multi_clusters(
-                &mate1_clusters,
-                mate1_seq,
-                read_name,
-                index,
-            )?);
-        }
-        if mate2_clusters.len() >= 2 {
-            pe_chimeric.extend(detector.detect_from_multi_clusters(
-                &mate2_clusters,
-                mate2_seq,
-                read_name,
-                index,
-            )?);
-        }
-        pe_chimeric.retain(|c| {
-            c.meets_min_segment_length(params.chim_segment_min)
-                && c.meets_min_score(params.chim_score_min)
-        });
-    }
-
     // Combined score threshold: use len1+len2 as denominator
     let combined_score_threshold =
         (params.out_filter_score_min_over_lread * (len1 + len2) as f64) as i32;
@@ -812,10 +678,14 @@ pub fn align_paired_read(
     let mut joint_pairs: Vec<PairedAlignment> = Vec::new();
     let mut single_mate1_transcripts: Vec<Transcript> = Vec::new();
     let mut single_mate2_transcripts: Vec<Transcript> = Vec::new();
-    // All finalized mate transcripts (from both joint pairs and single-mate WTs) used
-    // as the search pool for chimericDetectionOld (Tier 1) on each mate independently.
-    let mut all_m1_transcripts: Vec<Transcript> = Vec::new();
-    let mut all_m2_transcripts: Vec<Transcript> = Vec::new();
+    // STAR's `trAll` for chimeric detection: per window, the combined-read
+    // transcripts — whole pairs and single mates alike.
+    let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
+    let chim_on = params.chim_segment_min > 0;
+    // Whether any window kept a transcript. STAR counts a read with none as
+    // "other" (`nW==0`), not "too short"; a pair our pairing step later
+    // rejects still counts, since STAR's `trAll` has it.
+    let mut any_transcript = false;
 
     // Stitch combined clusters, split WTs by mate_id, finalize each half
     for cluster in clusters.iter().take(params.align_windows_per_read_nmax) {
@@ -829,6 +699,8 @@ pub fn align_paired_read(
             params.align_mates_gap_max.into(),
             debug_name,
         );
+        let mut chim_window: Vec<crate::chimeric::WinTr> = Vec::new();
+        let str_ = u8::from(stitch_is_reverse);
 
         for wt in &wts {
             let split_result =
@@ -882,6 +754,7 @@ pub fn align_paired_read(
                     continue;
                 };
 
+                any_transcript = true;
                 if stitch_is_reverse {
                     t1.is_reverse = true;
                     t2.is_reverse = false;
@@ -889,19 +762,12 @@ pub fn align_paired_read(
                     t1.is_reverse = false;
                     t2.is_reverse = true;
                 }
-                t1.read_seq = mate1_seq.to_vec();
-                t2.read_seq = mate2_seq.to_vec();
-
-                if params.chim_segment_min > 0 {
-                    all_m1_transcripts.push(t1.clone());
-                    all_m2_transcripts.push(t2.clone());
-                }
 
                 let combined_span =
                     t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
                 let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
 
-                if let Some(pair) = try_pair_transcripts(
+                let pair = try_pair_transcripts(
                     &t1,
                     &t2,
                     len1,
@@ -909,7 +775,44 @@ pub fn align_paired_read(
                     params,
                     combined_score_threshold,
                     combined_wt_score,
-                ) {
+                );
+                // STAR's `trAll` holds every pair stitching kept. The absolute
+                // score floor in `try_pair_transcripts` is an early `mappedFilter`,
+                // not a stitching rule, so chimeric detection must still see a
+                // pair that only fails that floor — it is often `trBest`.
+                if chim_on
+                    && (pair.is_some()
+                        || try_pair_transcripts(
+                            &t1,
+                            &t2,
+                            len1,
+                            len2,
+                            params,
+                            i32::MIN,
+                            combined_wt_score,
+                        )
+                        .is_some())
+                {
+                    // The strand frame starts with mate1 forward, mate2
+                    // reversed: `[mate1 | spacer | RC(mate2)]` and its reverse
+                    // complement.
+                    let (first, ff, second, sf, off) = if stitch_is_reverse {
+                        (&t2, 1, &t1, 0, len2 + 1)
+                    } else {
+                        (&t1, 0, &t2, 1, len1 + 1)
+                    };
+                    chim_window.extend(crate::chimeric::WinTr::pair(
+                        first,
+                        ff,
+                        second,
+                        sf,
+                        off,
+                        str_,
+                        combined_wt_score,
+                        combined_len,
+                    ));
+                }
+                if let Some(pair) = pair {
                     joint_pairs.push(pair);
                 }
             } else {
@@ -922,8 +825,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[..len1], false)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m1_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(0, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m1_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -934,9 +841,20 @@ pub fn align_paired_read(
                         0, // mate1
                     ) {
                         t.is_reverse = stitch_is_reverse;
-                        t.read_seq = mate1_seq.to_vec();
-                        if params.chim_segment_min > 0 {
-                            all_m1_transcripts.push(t.clone());
+                        any_transcript = true;
+                        if chim_on {
+                            chim_window.extend(crate::chimeric::WinTr::single(
+                                &t,
+                                str_,
+                                crate::align::stitch::mate_read_offset(
+                                    0,
+                                    len1,
+                                    len2,
+                                    stitch_is_reverse,
+                                ),
+                                0,
+                                combined_len,
+                            ));
                         }
                         single_mate1_transcripts.push(t);
                     }
@@ -946,8 +864,12 @@ pub fn align_paired_read(
                     } else {
                         (&stitch_read[len1 + 1..], true)
                     };
-                    if let Some(mut t) = finalize_transcript(
+                    let m2_wt = crate::align::stitch::rebase_single_mate_wt(
                         wt,
+                        crate::align::stitch::mate_read_offset(1, len1, len2, stitch_is_reverse),
+                    );
+                    if let Some(mut t) = finalize_transcript(
+                        &m2_wt,
                         read_slice,
                         index,
                         &scorer,
@@ -958,16 +880,46 @@ pub fn align_paired_read(
                         1, // mate2
                     ) {
                         t.is_reverse = !stitch_is_reverse;
-                        t.read_seq = mate2_seq.to_vec();
-                        if params.chim_segment_min > 0 {
-                            all_m2_transcripts.push(t.clone());
+                        any_transcript = true;
+                        if chim_on {
+                            chim_window.extend(crate::chimeric::WinTr::single(
+                                &t,
+                                str_,
+                                crate::align::stitch::mate_read_offset(
+                                    1,
+                                    len1,
+                                    len2,
+                                    stitch_is_reverse,
+                                ),
+                                1,
+                                combined_len,
+                            ));
                         }
                         single_mate2_transcripts.push(t);
                     }
                 }
             }
         }
+        if chim_on {
+            chim_windows.push(chim_window);
+        }
     }
+
+    // STAR's chimericDetection over the combined-read window transcripts. It
+    // runs after multMapSelect/mappedFilter whatever their outcome, and reads
+    // nothing they decide, so it is done here, before the decision tree
+    // consumes the pairs.
+    let pe_chimeric = if chim_on {
+        let read = crate::chimeric::ChimRead::new(
+            &combined_read,
+            [len1, len2],
+            read_name,
+            [mate1_seq, mate2_seq],
+        );
+        crate::chimeric::chimeric_detection(chim_windows, &read, &index.genome, &scorer, params)
+    } else {
+        Vec::new()
+    };
 
     // --peOverlapNbasesMin: if the mates overlap in genome space, merge them into one
     // single-end read, align that merged read through the same SE pipeline (`align_read`,
@@ -999,7 +951,7 @@ pub fn align_paired_read(
             merge_params.out_filter_match_nmin_over_lread = 0.0;
             merge_params.out_filter_score_min_over_lread = 0.0;
             let (merged_transcripts, _merged_chim, _n_mapq, _unmapped) =
-                align_read(&merge.merged, read_name, index, &merge_params)?;
+                align_read_inner(&merge.merged, read_name, index, &merge_params, false)?;
             let mut converted: Vec<PairedAlignment> = Vec::new();
             for t in &merged_transcripts {
                 let Some((m1, m2)) = crate::align::pe_overlap::convert_merged_transcript_to_pe(
@@ -1019,15 +971,6 @@ pub fn align_paired_read(
                 let combined_wt_score = (m1.score - scorer.genomic_length_penalty(m1_span))
                     + (m2.score - scorer.genomic_length_penalty(m2_span))
                     + scorer.genomic_length_penalty(combined_span);
-                let combined_n_match: u32 = m1
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum::<u32>()
-                    + m2.exons
-                        .iter()
-                        .map(|e| (e.read_end - e.read_start) as u32)
-                        .sum::<u32>();
                 let is_proper_pair = check_proper_pair(&m1, &m2, params);
                 let insert_size = calculate_insert_size(&m1, &m2);
                 converted.push(PairedAlignment {
@@ -1038,7 +981,6 @@ pub fn align_paired_read(
                     is_proper_pair,
                     insert_size,
                     combined_wt_score,
-                    combined_n_match,
                 });
             }
             if !converted.is_empty() {
@@ -1179,8 +1121,19 @@ pub fn align_paired_read(
         );
     }
 
-    // Step 4: quality filter (mappedFilter).
-    filter_paired_transcripts(&mut joint_pairs, params);
+    // Step 4: quality filter (mappedFilter). The best pair is STAR's `trBest`
+    // whenever a pair exists (a single mate cannot clear the combined-length
+    // gates), so a failure here unmaps the read with that reason rather than
+    // falling through to the half-mapped fallback.
+    if let Some(reason) = filter_paired_transcripts(
+        &mut joint_pairs,
+        mate1_seq,
+        mate2_seq,
+        &index.genome,
+        params,
+    ) {
+        return Ok((Vec::new(), pe_chimeric, 0, Some(reason)));
+    }
 
     // Step 5: too-many-loci — STAR checks `multi` AFTER mappedFilter, only when the
     // best pair passes the score/match/mismatch gates (ReadAlign_mappedFilter.cpp).
@@ -1196,39 +1149,6 @@ pub fn align_paired_read(
         ));
     }
 
-    // PE Tier 1: chimericDetectionOld per-mate — mirrors SE behavior but run independently
-    // on each mate's transcript pool (joint-pair halves + single-mate WTs combined).
-    // Runs before the BothMapped early return so chimeras are reported for all pair outcomes.
-    if params.chim_segment_min > 0 {
-        use crate::chimeric::detect_chimeric_old;
-        if let Some(tr_best_m1) = all_m1_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m1_transcripts,
-                tr_best_m1,
-                mate1_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
-        if let Some(tr_best_m2) = all_m2_transcripts.iter().max_by_key(|t| t.score) {
-            let chims = detect_chimeric_old(
-                &all_m2_transcripts,
-                tr_best_m2,
-                mate2_seq,
-                read_name,
-                params,
-                index,
-            )?;
-            pe_chimeric.extend(chims);
-        }
-        pe_chimeric.retain(|chim| {
-            chim.meets_min_segment_length(params.chim_segment_min)
-                && chim.meets_min_score(params.chim_score_min)
-        });
-    }
-
     if !joint_pairs.is_empty() {
         let pe_mapq_n = joint_pairs.len().max(1);
         let results = joint_pairs
@@ -1236,21 +1156,6 @@ pub fn align_paired_read(
             .map(|pa| PairedAlignmentResult::BothMapped(Box::new(pa)))
             .collect();
         return Ok((results, pe_chimeric, pe_mapq_n, None));
-    }
-
-    // Inter-mate chimeric detection: fires when the best single-mate transcripts are discordant
-    // (different chr, same strand, or >1Mb apart). Runs before half-mapped fallback consumes
-    // the transcript vecs.
-    if params.chim_segment_min > 0 {
-        use crate::chimeric::detect_inter_mate_chimeric;
-        let best_m1_chim = single_mate1_transcripts.iter().max_by_key(|t| t.score);
-        let best_m2_chim = single_mate2_transcripts.iter().max_by_key(|t| t.score);
-        if let (Some(t1), Some(t2)) = (best_m1_chim, best_m2_chim)
-            && let Some(chim) =
-                detect_inter_mate_chimeric(t1, t2, mate1_seq, read_name, params, index)
-        {
-            pe_chimeric.push(chim);
-        }
     }
 
     // Half-mapped fallback: report the best-scoring single-mate transcript.
@@ -1311,7 +1216,20 @@ pub fn align_paired_read(
                 ))
             }
         }
-        (None, None) => Ok((Vec::new(), pe_chimeric, 0, Some(UnmappedReason::TooShort))),
+        // STAR splits this case in two (`ReadAlign_mappedFilter.cpp`): a read
+        // with no good window at all is `unmappedOther` ("other"), and only a
+        // read that *had* a window whose best transcript failed the score or
+        // length thresholds is `unmappedShort` ("too short"). Reporting every
+        // unmapped pair as too short empties the "other" bucket, which is what
+        // #48 measured on paired-end data.
+        (None, None) => {
+            let reason = if clusters.is_empty() || !any_transcript {
+                UnmappedReason::Other
+            } else {
+                UnmappedReason::TooShort
+            };
+            Ok((Vec::new(), pe_chimeric, 0, Some(reason)))
+        }
     }
 }
 
@@ -1371,17 +1289,6 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Combined coverage: sum of exon read spans from both mates
-    let combined_n_match: u32 = t1
-        .exons
-        .iter()
-        .map(|e| (e.read_end - e.read_start) as u32)
-        .sum::<u32>()
-        + t2.exons
-            .iter()
-            .map(|e| (e.read_end - e.read_start) as u32)
-            .sum::<u32>();
-
     let is_proper_pair = check_proper_pair(t1, t2, params);
     let insert_size = calculate_insert_size(t1, t2);
 
@@ -1393,7 +1300,6 @@ fn try_pair_transcripts(
         is_proper_pair,
         insert_size,
         combined_wt_score,
-        combined_n_match,
     })
 }
 
@@ -1447,14 +1353,24 @@ pub(crate) fn calculate_insert_size(mate1_trans: &Transcript, mate2_trans: &Tran
 
 /// Filter paired transcripts by quality thresholds.
 /// STAR's mappedFilter applies ALL quality checks to trBest (the highest-scoring transcript).
-fn filter_paired_transcripts(paired_alns: &mut Vec<PairedAlignment>, params: &Parameters) {
+fn filter_paired_transcripts(
+    paired_alns: &mut Vec<PairedAlignment>,
+    mate1_seq: &[u8],
+    mate2_seq: &[u8],
+    genome: &crate::genome::Genome,
+    params: &Parameters,
+) -> Option<UnmappedReason> {
     // STAR's mappedFilter (ReadAlign_mappedFilter.cpp) applies ALL quality thresholds to trBest
     // (the highest-scoring transcript), NOT to each individual transcript. If trBest passes,
     // all transcripts in the score window are included (they affect NH/MAPQ). If trBest fails,
     // the read is unmapped.
     //
-    // Step 1: find the best pair and check quality thresholds on it.
-    let best_pa = paired_alns.iter().max_by_key(|pa| pa.combined_wt_score);
+    // Returns why the read is unmapped when the best pair fails, in STAR's
+    // order: too short (score or matched bases), then too many mismatches.
+    // The pairs arrive sorted by score (and shuffled among ties under
+    // `--outMultimapperOrder Random`), so the first is the primary, as in SE.
+    // `max_by_key` would return the *last* of tied pairs.
+    let best_pa = paired_alns.first();
     if let Some(best) = best_pa {
         let mate1_len = (best.mate1_region.1 - best.mate1_region.0) as f64;
         let mate2_len = (best.mate2_region.1 - best.mate2_region.0) as f64;
@@ -1466,29 +1382,35 @@ fn filter_paired_transcripts(paired_alns: &mut Vec<PairedAlignment>, params: &Pa
             || combined_score < (params.out_filter_score_min_over_lread * combined_lread_m1) as i32
         {
             paired_alns.clear();
-            return;
+            return Some(UnmappedReason::TooShort);
         }
 
-        let combined_match = best.combined_n_match;
+        // STAR's `nMatch` (read == genome) and `rLength` (aligned bases) of the
+        // combined transcript: the mismatch ratio is over `rLength`, not the
+        // read length (`ReadAlign_mappedFilter.cpp`).
+        let combined_match = star_n_match(&best.mate1_transcript, mate1_seq, genome)
+            + star_n_match(&best.mate2_transcript, mate2_seq, genome);
+        let combined_r_length =
+            star_r_length(&best.mate1_transcript) + star_r_length(&best.mate2_transcript);
         if combined_match < params.out_filter_match_nmin
             || combined_match < (params.out_filter_match_nmin_over_lread * combined_lread_m1) as u32
         {
             paired_alns.clear();
-            return;
+            return Some(UnmappedReason::TooShort);
         }
 
         if combined_nm > params.out_filter_mismatch_nmax
-            || (combined_nm as f64)
-                > params.out_filter_mismatch_nover_lmax * (mate1_len + mate2_len)
+            || f64::from(combined_nm) / f64::from(combined_r_length.max(1))
+                > params.out_filter_mismatch_nover_lmax
         {
             paired_alns.clear();
-            return;
+            return Some(UnmappedReason::TooManyMismatches);
         }
     }
-
-    if paired_alns.len() > params.out_filter_multimap_nmax as usize {
-        paired_alns.clear();
-    }
+    // Too many loci is the caller's to decide, after these gates and with the
+    // loci count intact; clearing here made it unreachable and turned those
+    // reads into "too short" (STAR: unmapType 3 vs 1).
+    None
 }
 
 /// Extract splice junctions from a Transcript's CIGAR as (donor, acceptor) pairs.
@@ -1555,6 +1477,9 @@ pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::align::score::SpliceMotif;
+    use crate::params::IntronMotifFilter;
+
     use crate::genome::Genome;
     use crate::index::packed_array::PackedArray;
     use crate::index::sa_index::SaIndex;
@@ -1641,7 +1566,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![],
         };
         let pair = PairedAlignment {
             mate1_transcript: make_tr(1000, 1100, 0, 100),
@@ -1651,7 +1575,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 400,
             combined_wt_score: 200,
-            combined_n_match: 200,
         };
         let combined = pair.combined_transcript_for_projection();
         assert_eq!(combined.exons.len(), 2);
@@ -1704,45 +1627,120 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_unmapped_reason_mismatch_classification() {
-        // Verify the filter_reasons logic used to derive unmapped_reason.
-        // mismatch-only → TooManyMismatches; anything else (or mixed) → TooShort.
-        let classify = |reasons: &[&str]| -> UnmappedReason {
-            let filter_reasons: std::collections::HashMap<&str, i32> =
-                reasons.iter().map(|k| (*k, 1)).collect();
-            let has_mismatch = filter_reasons.contains_key("mismatch_max")
-                || filter_reasons.contains_key("mismatch_rate");
-            let has_other = filter_reasons
-                .keys()
-                .any(|k| *k != "mismatch_max" && *k != "mismatch_rate");
-            if has_mismatch && !has_other {
-                UnmappedReason::TooManyMismatches
-            } else {
-                UnmappedReason::TooShort
-            }
-        };
+    /// A gapless forward or reverse transcript over the test genome.
+    fn tx_at(start: u64, len: usize, is_reverse: bool) -> Transcript {
+        Transcript {
+            chr_idx: 0,
+            genome_start: start,
+            genome_end: start + len as u64,
+            is_reverse,
+            exons: vec![Exon {
+                genome_start: start,
+                genome_end: start + len as u64,
+                read_start: 0,
+                read_end: len,
+                i_frag: 0,
+            }],
+            cigar: vec![cigar::Op::new(cigar::op::Kind::Match, len)],
+            score: len as i32,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: Vec::new(),
+            junction_annotated: Vec::new(),
+        }
+    }
 
+    /// STAR's `nMatch` counts read == genome only; `rLength` is the aligned
+    /// length. They differ by the mismatches and by `N` on either side, which
+    /// is what makes `--outFilterMatchNminOverLread` stricter than counting
+    /// the `M` operations.
+    #[test]
+    fn star_n_match_counts_only_bases_that_match() {
+        let index = make_test_index(); // genome ACGTACGTNN
+        let exact = vec![0, 1, 2, 3, 0, 1, 2, 3];
+        let t = tx_at(0, 8, false);
+        assert_eq!(star_n_match(&t, &exact, &index.genome), 8);
+        assert_eq!(star_r_length(&t), 8);
+
+        let mut one_mm = exact.clone();
+        one_mm[2] = 0; // G -> A
+        assert_eq!(star_n_match(&t, &one_mm, &index.genome), 7);
+        assert_eq!(star_r_length(&t), 8, "rLength still counts the mismatch");
+
+        let mut read_n = exact.clone();
+        read_n[5] = 4;
+        assert_eq!(star_n_match(&t, &read_n, &index.genome), 7, "read N");
+
+        // The genome's trailing NN: aligned, but neither match nor mismatch.
+        let over_n = vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 0];
         assert_eq!(
-            classify(&["mismatch_max"]),
-            UnmappedReason::TooManyMismatches
+            star_n_match(&tx_at(0, 10, false), &over_n, &index.genome),
+            8
         );
+    }
+
+    /// A reverse transcript's CIGAR walks the reverse complement of the read
+    /// as sequenced.
+    #[test]
+    fn star_n_match_reverse_strand_uses_the_reverse_complement() {
+        let index = make_test_index();
+        let sequenced = vec![0, 1, 2, 3, 0, 1, 2, 3]; // RC of ACGTACGT is ACGTACGT
         assert_eq!(
-            classify(&["mismatch_rate"]),
-            UnmappedReason::TooManyMismatches
+            star_n_match(&tx_at(0, 8, true), &sequenced, &index.genome),
+            8
         );
+        let sequenced = vec![3, 3, 3, 3, 3, 3, 3, 3]; // RC is all A: matches A at 0 and 4
         assert_eq!(
-            classify(&["mismatch_max", "mismatch_rate"]),
-            UnmappedReason::TooManyMismatches
+            star_n_match(&tx_at(0, 8, true), &sequenced, &index.genome),
+            2
         );
-        // Mixed with score filter → TooShort
-        assert_eq!(
-            classify(&["mismatch_max", "score_min"]),
-            UnmappedReason::TooShort
+    }
+
+    #[test]
+    fn intron_filters_follow_star() {
+        use crate::align::score::IntronFilter;
+        let check =
+            |m: &[SpliceMotif], a: &[bool], f: &IntronFilter| f.passes(m.iter().zip(a.iter()));
+        let f = AlignmentScorer::from_params(&default_params()).intron_filter;
+        assert!(check(
+            &[SpliceMotif::GtAg, SpliceMotif::GcAg],
+            &[false, false],
+            &f
+        ));
+        assert!(
+            !check(&[SpliceMotif::GtAg, SpliceMotif::CtAc], &[false, false], &f),
+            "+ and - junctions in one transcript"
         );
-        // Score-only → TooShort
-        assert_eq!(classify(&["score_min"]), UnmappedReason::TooShort);
-        assert_eq!(classify(&["match_min"]), UnmappedReason::TooShort);
+        // Non-canonical junctions carry no strand.
+        assert!(check(
+            &[SpliceMotif::GtAg, SpliceMotif::NonCanonical],
+            &[false, false],
+            &f
+        ));
+
+        let mut p = default_params();
+        p.out_filter_intron_motifs = IntronMotifFilter::RemoveNoncanonicalUnannotated;
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[false], &f));
+        assert!(check(&[SpliceMotif::NonCanonical], &[true], &f));
+        p.out_filter_intron_motifs = IntronMotifFilter::RemoveNoncanonical;
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[true], &f));
+
+        // `--outSAMstrandField intronMotif` also drops a spliced transcript
+        // whose strand is undefined (`sjN>0 && sjMotifStrand==0`), but not an
+        // unspliced one.
+        let mut p = default_params();
+        p.out_sam_strand_field = "intronMotif".into();
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        assert!(!check(&[SpliceMotif::NonCanonical], &[false], &f));
+        assert!(check(
+            &[SpliceMotif::NonCanonical, SpliceMotif::GtAg],
+            &[false, false],
+            &f
+        ));
+        assert!(check(&[], &[], &f));
     }
 
     #[test]
@@ -1803,7 +1801,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let t2 = Transcript {
@@ -1825,7 +1822,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Distance = 300bp, within default limit (auto mode = unlimited)
@@ -1859,7 +1855,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let t2 = Transcript {
@@ -1881,7 +1876,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Distance = 400bp, exceeds limit of 100bp
@@ -1913,7 +1907,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let t2 = Transcript {
@@ -1935,7 +1928,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -1968,7 +1960,6 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Create a transcript with consistent strand motifs (all + strand)
@@ -1991,7 +1982,6 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::GcAg], // both + strand
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Note: STAR's RemoveInconsistentStrands filters transcripts where
@@ -2070,7 +2060,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let t2 = Transcript {
@@ -2092,7 +2081,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2133,7 +2121,6 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Case 1: NonCanonical + unannotated → should be filtered
@@ -2219,7 +2206,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Test BothMapped variant
@@ -2231,7 +2217,6 @@ mod tests {
             is_proper_pair: true,
             insert_size: 200,
             combined_wt_score: 0,
-            combined_n_match: 200,
         }));
         assert!(matches!(both, PairedAlignmentResult::BothMapped(_)));
 

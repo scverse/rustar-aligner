@@ -29,8 +29,6 @@ pub struct Transcript {
     pub junction_motifs: Vec<crate::align::score::SpliceMotif>,
     /// Whether each junction is annotated in the GTF (for jM +20 offset)
     pub junction_annotated: Vec<bool>,
-    /// Original read sequence
-    pub read_seq: Vec<u8>,
 }
 
 /// An exon segment in a transcript.
@@ -182,7 +180,6 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![],
         };
 
         assert_eq!(transcript.cigar_string(), "50M100N50M");
@@ -230,7 +227,6 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![0; 100],
         };
 
         // Query: 45 + 3 + 2 + 50 = 100
@@ -279,7 +275,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();
@@ -303,7 +298,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();
@@ -327,7 +321,6 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
-            read_seq: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();

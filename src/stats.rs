@@ -136,6 +136,15 @@ impl AlignmentStats {
         }
     }
 
+    /// Count an input read without placing it in any mapping category.
+    ///
+    /// For a read whose chimera is written into the BAM: STAR skips
+    /// `outputAlignments` for it (`ReadAlign_oneRead.cpp:99`), which is where
+    /// the uniquely/multi-mapped counts are kept, but still counts it as input.
+    pub fn record_input_read(&self) {
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the length of an input read (for average input read length)
     pub fn record_read_bases(&self, len: u64) {
         self.read_bases.fetch_add(len, Ordering::Relaxed);
@@ -797,7 +806,6 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![true],
-            read_seq: vec![0; 110],
         };
 
         stats.record_transcript_stats(&transcript);
@@ -918,7 +926,6 @@ mod tests {
                 SpliceMotif::NonCanonical, // motif[0]
             ],
             junction_annotated: vec![true, false, true, false],
-            read_seq: vec![0; 100],
         };
 
         stats.record_transcript_stats(&transcript);

@@ -11,7 +11,148 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Other changes
+
+- noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
+  direct `noodles-bgzf` dependency exists only to enable its `libdeflate`
+  feature; bumping one without the other puts two copies in the tree, and
+  noodles then writes BAM through the copy without libdeflate. BAM output is
+  byte-identical before and after. (0.117 needs Rust 1.91, above the 1.89 MSRV.)
+
+- Production genome indexing now enables caps-sa 0.7's bounded geometric LCP
+  memoization through its stable policy API. On the complete ruSTAR-shaped
+  GRCh38 plus GENCODE v50 fixture (6.56 billion symbols, 6.18 billion retained
+  suffixes, 1.40 million segments, 32 physical cores), the final caps-sa 0.7
+  implementation built the SA in 172.953 s versus 267.592 s for its original
+  0.7 baseline: 35.4% faster, with peak RSS reduced from 10,512,408 to
+  9,169,892 KiB. The complete output hash was unchanged.
+
+- The splice-junction sorts that produce `SJ.out.tab`, the `SJ` solo-feature
+  rows and the `BySJout` survivor set now order on the whole key (chromosome,
+  start, end, strand, motif) rather than on coordinates alone. The counts come
+  from a `DashMap`, whose iteration order varies with hashing and with
+  concurrent insertion, so a tie left to that order would have been a file
+  that differs between runs or thread counts. `tests/determinism.rs` locks it:
+  the same reads at one and at eight threads, and two runs at eight threads,
+  produce byte-identical output in single-pass and two-pass mode. Answers #210.
+
+- `cluster_seeds` reuses its window-bin map across reads on a thread instead
+  of rebuilding it per read. Merging two windows re-keys every bin in the
+  merged span, so the per-read pre-sizing was only a floor and the map
+  rehashed; profiling a human 10x run put that rehash at 2.1% of on-CPU time.
+  Output-neutral, verified by an empty diff on 20 M read pairs.
+
 ### Features
+
+- **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
+  surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
+
+  - Implemented: `--outSAMmode` (`Full`/`NoQS`/`None`), `--outSJtype None`,
+    `--outSJfilterReads Unique`, `--outSAMheaderHD`, `--outSAMheaderPG`,
+    `--outSAMheaderCommentFile`, `--readFilesPrefix`, `--readNameSeparator`,
+    `--readQualityScoreBase`, `--outQSconversionAdd`.
+  - Refused loudly rather than accepted and ignored:
+    `--outSAMfilter KeepOnlyAddedReferences` / `KeepAllAddedReferences` and
+    `--readFilesType SAM`, both of which need machinery this aligner does not
+    have.
+  - Accepted and documented as output-neutral: the `--limit*` family,
+    `--outTmpDir`, `--outTmpKeep`, `--runDirPerm`, `--genomeFileSizes`,
+    `--outBAMsorting*`, `--readMatesLengthsIn`.
+
+  `tests/parameter_surface.rs` now checks every STAR 2.7.11b parameter name
+  against the CLI, so the coverage figure is machine-checked and surface drift
+  fails a test.
+
+### Bug fixes
+
+- **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
+  `alignBAM`). The chimera now replaces the read's normal alignment, as in
+  STAR: one segment as a normal record and the other as a supplementary
+  (`0x800`), hard-clipped on the junction side unless `SoftClip`, with `SA`
+  tags built from the other record's final CIGAR. The representative segment
+  is chosen as STAR chooses it; paired segments covering both mates are
+  written as pairs, and mates on either side of the junction as two normal
+  records. Records carry STAR's flags, MAPQ, mate fields, qualities and
+  `NH`/`HI`/`AS`/`nM`/`NM`. Previously the normal alignment was kept and two
+  incomplete records were appended, so no chimeric read matched STAR's
+  output; on yeast 10k every chimeric read now does, apart from known ties.
+  As in STAR, such reads are not counted as mapped in `Log.final.out` and
+  feed neither `SJ.out.tab` nor gene counts.
+  - `WithinBAM` requires `--outSAMtype BAM` and adds `NM` to the output
+    attributes, as STAR does.
+  - `--chimOutType` accepts up to three values (e.g. `Junctions WithinBAM
+    HardClip`) and rejects unknown ones. `SeparateSAMold` is refused rather
+    than silently ignored; it is not implemented.
+
+- **Paired-end `nM` is the pair's mismatch count on both mates**, as STAR
+  writes it (`trOut.nMM`, like `AS`). We wrote each mate's own count, which
+  differed from STAR on 42% of yeast PE pairs; no comparison script checked
+  tags.
+
+- **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
+  both ends of a single match block** (e.g. `1S97M2S`). With the default
+  `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
+  right clip was dropped when folding clips into the CIGAR, the record came out
+  shorter than its sequence, and BAM encoding failed with "read
+  length-sequence length mismatch", ending the run. Seen on human chr21
+  paired-end data. From #283.
+
+- **Unknown `--quantMode` values are rejected**, as STAR does
+  (`Parameters.cpp:898-936`): only `TranscriptomeSAM`, `GeneCounts` or `-`. A
+  typo such as `Genecounts` used to be ignored silently, producing no counts
+  and no error. From #283.
+
+- **`mappedFilter` ported as STAR has it** (`ReadAlign_mappedFilter.cpp`).
+  The read is judged on its best alignment alone, in STAR's order: too short
+  (score or matched bases), then too many mismatches, then too many loci; the
+  whole set is kept or dropped together. Single-end filtered each alignment
+  separately, so a secondary could be dropped on its own numbers.
+  - Matched bases are STAR's `nMatch` (read equals genome), not the aligned
+    length, which counted mismatches and `N` as matches and made
+    `--outFilterMatchNminOverLread` looser than STAR's.
+  - `--outFilterMismatchNoverLmax` divides by the mapped length (`rLength`),
+    not the read length, in single-end and paired-end.
+  - `--outFilterIntronMotifs` / `--outFilterIntronStrands` apply when a
+    transcript is finalized and before the window's dedup, as in
+    `stitchWindowAligns`, so a rejected transcript cannot evict one it covers,
+    set the score range or become a chimeric segment. Paired-end did not apply
+    them at all. `--outSAMstrandField intronMotif` also drops a spliced
+    transcript whose strand is undefined, as STAR does.
+  - Paired-end reads with more than `--outFilterMultimapNmax` loci are reported
+    as "too many loci"; they were cleared inside the filter and fell through to
+    "too short". A failing best pair now reports its own reason, and a pair
+    with no transcript in any window is "other", as in single-end.
+
+  Yeast 10k: alignments unchanged; PE unmapped types now match STAR read for
+  read (`too many loci` 0 → 21, STAR 21). Human chr21 SE: multi / too many
+  loci / too short 6051 / 221 / 2008 → 6114 / 234 / 1956 (STAR 6116 / 232 /
+  1955). Supersedes #169 and #252.
+
+- **Multi-member gzip input is no longer truncated.** Compressed input was
+  decoded with `flate2::read::GzDecoder`, which stops at the end of the first
+  gzip member; a `.gz` made of several concatenated members (bcl2fastq output,
+  `cat a.fq.gz b.fq.gz`, any BGZF file) was read partially with no error and no
+  warning. All four read paths now use `MultiGzDecoder`: FASTQ input, the solo
+  barcode whitelist, solo counting, and the `emptydrops` binary.
+
+- `Log.final.out` splits unmapped paired-end reads between `too short` and
+  `other` again. STAR calls a read `other` when no good window was found at
+  all and `too short` only when a window existed whose best transcript failed
+  the score or length thresholds (`ReadAlign_mappedFilter.cpp`); the
+  paired-end path reported every unmapped pair as `too short`, so the `other`
+  bucket was permanently zero. On the nf-core/rnaseq test data (50 000 pairs,
+  yeast chrI + GFP) this moves rustar from `too short 7374 / other 0` to
+  `too short 3778 / other 3596`, against STAR's `3766 / 3609`. Closes #48.
+
+- `--soloBarcodeMate 1` no longer runs without clipping. The flag says the
+  barcode lives inside mate 1, and nothing else says how many bases that is,
+  so STAR refuses the run unless the mate is clipped
+  (`ParametersSolo.cpp:145-150`). Without the check the CB+UMI prefix was
+  aligned as if it were cDNA (28 bases of it for 10x v3) and the run reported
+  nothing. Closes #227.
+
+- Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
+  read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
@@ -97,7 +238,78 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
+- **`--soloCellReadStats CB`** writes `Solo.out/<feature>/CellReads.stats`:
+  one row per cell barcode with fifteen counters describing what
+  happened to its reads — barcode match quality, unique or multi
+  genomic mapping, feature assignment, exonic/intronic and their
+  antisense counterparts, mitochondrial, and whether the read reached
+  the matrix — plus the per-cell UMI and gene totals. Reads whose
+  barcode never resolved are summed into a `CBnotInPasslist` row rather
+  than dropped, so the columns account for the whole input.
+  `--genomeChrSetMitochondrial` names the chromosomes behind the `mito`
+  column.
+- **`--runMode soloCellFiltering <raw dir> <output prefix>`** cell-calls
+  an existing raw count matrix without aligning anything. Cell calling
+  is a decision about a matrix, not about reads: re-calling with
+  different `--soloCellFilter` parameters should not mean re-aligning,
+  and a matrix produced elsewhere should be callable too. It streams
+  the matrix into the same form the align path produces, so the filters
+  are the identical code rather than a second implementation.
+- **`--soloCellFilter EmptyDrops_CR` now uses CellRanger's actual
+  statistics.** The ambient profile is smoothed with Simple Good-Turing,
+  as CellRanger and STAR do, instead of an approximation that reserved
+  unseen mass from the singleton rate and spread the remainder in
+  proportion to raw counts. The Monte-Carlo null is drawn with libc++'s
+  `std::mt19937` and `std::discrete_distribution`, seeded
+  `19760110 * (isim + 1)` per simulation as STAR seeds it, replacing a
+  SplitMix64 stream that could not agree with STAR's over an arbitrary
+  number of draws. Cell calls move as a result.
+
+- **`--soloFeatures Transcript3p`** quantifies transcripts rather than
+  genes, using how far each read's 3' end sits from each transcript's.
+  In a 3'-biased assay that distance discriminates between isoforms: a
+  read 200 bases from the end of one and 4000 from the end of another
+  is evidence for the first. The distance distribution is estimated
+  from the data, then used as the likelihood in an EM over UMIs. Output
+  is per *cluster* rather than per cell — `--soloClusterCBfile` (new,
+  and required for this feature) says which cell is in which cluster,
+  because one cell has too few UMIs to resolve isoforms. Reads sharing
+  a UMI contribute the intersection of their transcript sets, not the
+  union: they came from one molecule. Writes `matrix.mtx`,
+  `features.tsv` and `transcriptEndDistanceDistribution.txt` under
+  `Solo.out/Transcript3p/raw/`.
+- **Chimeric multimapping detection (`--chimMultimapNmax`)**, STAR's
+  newer enumeration path. Instead of pinning the best transcript and
+  looking for one partner, it walks every transcript pair, keeps those
+  within `--chimMultimapScoreRange` of the best chimeric score, and
+  reports them all. A read whose fusion partner maps equally well to two
+  places yields two junctions rather than an arbitrary one.
+  `--chimNonchimScoreDropMin` gates the search on the linear alignment
+  leaving enough of the read unexplained, and a read with more surviving
+  loci than the cap reports none at all, as STAR does. The default of 0
+  keeps the old single-best path.
+
+- **`--chimFilter banGenomicN`** (STAR's default) drops a chimeric
+  junction whose flanking genomic bases are not real bases: sequence
+  around an assembly gap yields junctions that look clean by score and
+  mean nothing. `--chimFilter None` keeps everything.
+
 ### Bug fixes
+
+- `--runThreadN 1` ran on every logical core instead of on one. The
+  rayon pool was configured only above 1, and skipping it leaves rayon's
+  default of one worker per core. Output is unchanged; the run now uses
+  the thread count asked for.
+- `--soloUMIfiltering MultiGeneUMI_CR` kept every gene tied at the
+  highest read count; CellRanger gives a tied UMI to no gene at all.
+  Since one read per gene is the ordinary shape of a multi-gene UMI, the
+  flag removed nothing in practice. On a 20k-read 10x fixture the count
+  matrix moves from 16 465 to 15 414 against STAR's 15 423.
+- `--soloUMIfiltering MultiGeneUMI_All` was aliased to `MultiGeneUMI`,
+  which is neither STAR's behaviour nor the documented one: in STAR
+  2.7.11b the variant is a no-op. It now removes a UMI seen in two or
+  more genes from **all** of them, the behaviour the option name
+  describes. Recorded in `DIVERGENCE.md` (closes #144).
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block
@@ -110,6 +322,22 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - **STARsolo `features.tsv` column 2 now emits the GTF `gene_name`**
   (symbol), with the STAR gene_id fallback, instead of duplicating the
   gene_id.
+- **`--outSAMtype BAM SortedByCoordinate` no longer buffers the whole
+  output in RAM.** The coordinate sort is now external: it fills a
+  `--limitBAMsortRAM` buffer, spills sorted runs beside the output, and
+  k-way merges them on finish. Peak memory is flat in output size
+  (measured: 610 MB at a 64 MiB budget for 300 k through 2.4 M records,
+  versus 648 MB → 2,132 MB before, a growth of 723 B/record that
+  extrapolated to ~116 GB for a 160 M-record human sample). Output is
+  byte-identical to the previous in-memory sort — coordinate ties still
+  resolve to input order, since runs merge with the run index as
+  tiebreak (verified at 2.4 M records through a 219-run multi-pass
+  merge). `--limitBAMsortRAM N` now spills above `N` rather than
+  aborting the run, and `--limitBAMsortRAM 0` means 512 MiB instead of
+  "unlimited". Runs beyond 64 are merged in balanced passes so a small
+  budget on a large run cannot exhaust file descriptors. Spill runs go to
+  `--outTmpDir` when given (previously accepted and ignored), otherwise beside
+  the output, and are always removed. See DIVERGENCE.md §4.3.
 
 ### Bumps
 
@@ -129,5 +357,17 @@ Sections commonly used: Features, Bug fixes, Other changes.
   run-mode dispatcher. The in-memory `GenomeIndex::build` +
   `GenomeIndex::write` flow remains for tests and any caller that
   needs random access to the SA in RAM.
+
+- Removed `Transcript::read_seq`, a public field that was filled with a
+  copy of the read at every finalised alignment and never read. **API
+  removal.** Output is unchanged.
+
+- The splice-motif check in the junction scan carries a sliding window
+  and looks the motif up in a table, instead of re-reading four genome
+  bases and matching on them at every position. Consecutive junction
+  positions share two of the four bases, so the scan does two genome
+  reads per position rather than four. Output is unchanged (SAM
+  byte-identical on 200k reads); about 2.8% off the wall clock on a
+  2M-read run, measured with `test/bench_ab.sh`.
 
 Initial release of Rust rewrite of STAR.

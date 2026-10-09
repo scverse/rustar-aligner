@@ -102,7 +102,12 @@ fn build_index(fasta: &Path, genome_dir: &Path, sa_nbases: &str, gtf: Option<&Pa
         .arg("--genomeFastaFiles")
         .arg(fasta)
         .arg("--genomeSAindexNbases")
-        .arg(sa_nbases);
+        .arg(sa_nbases)
+        // Per-test prefix: genomeGenerate writes `<prefix>Log.out`, and the
+        // default `./` prefix would make concurrently running test
+        // processes share one file in the crate directory.
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"));
     if let Some(g) = gtf {
         cmd.arg("--sjdbGTFfile")
             .arg(g)
@@ -2198,5 +2203,472 @@ fn test_wasp_samtag() {
     assert_eq!(
         vw1, 10,
         "all 10 unique reads overlapping the het SNV should pass WASP (vW:i:1)"
+    );
+}
+// ---------------------------------------------------------------------------
+// Coordinate-sort spilling (--limitBAMsortRAM)
+// ---------------------------------------------------------------------------
+
+/// A low `--limitBAMsortRAM` must spill sorted runs to disk and merge them into
+/// a BAM identical to the unbounded in-memory sort — same records, same order.
+#[test]
+fn test_sorted_bam_spills_to_disk_and_matches_unbounded_sort() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // 2000 reads across the genome, emitted in an order that does not match
+    // coordinate order so the sort is actually doing work.
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for i in 0..2000usize {
+            let start = (i * 7919) % (genome.len() - 60);
+            let seq = &genome[start..start + 50];
+            writeln!(f, "@read{i}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let run = |label: &str, limit: &str| -> (PathBuf, PathBuf) {
+        let output_dir = tmpdir.path().join(label);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        cargo_bin_cmd!("rustar-aligner")
+            .args([
+                "--runMode",
+                "alignReads",
+                "--genomeDir",
+                genome_dir.to_str().unwrap(),
+                "--readFilesIn",
+                fastq_path.to_str().unwrap(),
+                "--outSAMtype",
+                "BAM",
+                "SortedByCoordinate",
+                "--limitBAMsortRAM",
+                limit,
+                "--outFileNamePrefix",
+                &prefix,
+            ])
+            .assert()
+            .success();
+        (output_dir.join("Aligned.sortedByCoord.out.bam"), output_dir)
+    };
+
+    // 64 KiB forces many spill runs; 1 GiB holds everything in memory.
+    let (spilled_bam, spilled_dir) = run("out_sort_spill", "65536");
+    let (memory_bam, _) = run("out_sort_memory", "1G");
+
+    let read_bam = |path: &PathBuf| -> Vec<(String, Option<usize>, Option<usize>, String)> {
+        let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+        reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|record| {
+                let record = record.unwrap();
+                (
+                    String::from_utf8(record.name().unwrap().to_vec()).unwrap(),
+                    record.reference_sequence_id().transpose().unwrap(),
+                    record
+                        .alignment_start()
+                        .transpose()
+                        .unwrap()
+                        .map(|p| p.get()),
+                    format!("{:?}", record.cigar().iter().collect::<Vec<_>>()),
+                )
+            })
+            .collect()
+    };
+
+    let spilled = read_bam(&spilled_bam);
+    let in_memory = read_bam(&memory_bam);
+
+    assert!(!spilled.is_empty(), "expected alignments");
+    assert_eq!(
+        spilled, in_memory,
+        "spill+merge output must equal the unbounded in-memory sort"
+    );
+
+    // Coordinate-sorted, and no spill scratch left behind.
+    let keys: Vec<_> = spilled
+        .iter()
+        .map(|(_, chr, pos, _)| (chr.unwrap_or(usize::MAX), pos.unwrap_or(0)))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] <= w[1]),
+        "output must be non-decreasing by (chr, pos)"
+    );
+    let leftover: Vec<_> = fs::read_dir(&spilled_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("rustar-bamsort-"))
+        .collect();
+    assert!(leftover.is_empty(), "spill files left behind: {leftover:?}");
+}
+
+// ---------------------------------------------------------------------------
+// --runMode soloCellFiltering
+// ---------------------------------------------------------------------------
+
+/// Cell calling is a decision about a matrix, not about reads: the mode takes
+/// an existing raw matrix and writes the called subset, with no genome and no
+/// FASTQ involved.
+#[test]
+fn test_run_mode_solo_cell_filtering_calls_cells_from_a_raw_matrix() {
+    let tmpdir = TempDir::new().unwrap();
+    let raw = tmpdir.path().join("raw");
+    fs::create_dir_all(&raw).unwrap();
+
+    // 20 barcodes: five real cells with 1000 UMIs each, fifteen with 2.
+    let n_features = 50usize;
+    let n_cells = 20usize;
+    let mut entries: Vec<(usize, usize, u64)> = Vec::new();
+    for cb in 1..=n_cells {
+        let per_gene = if cb <= 5 { 100 } else { 1 };
+        let n_genes = if cb <= 5 { 10 } else { 2 };
+        for gene in 1..=n_genes {
+            entries.push((gene, cb, per_gene));
+        }
+    }
+    {
+        let mut f = fs::File::create(raw.join("matrix.mtx")).unwrap();
+        writeln!(f, "%%MatrixMarket matrix coordinate integer general").unwrap();
+        writeln!(f, "%").unwrap();
+        writeln!(f, "{} {} {}", n_features, n_cells, entries.len()).unwrap();
+        for (g, c, v) in &entries {
+            writeln!(f, "{g} {c} {v}").unwrap();
+        }
+    }
+    {
+        let mut f = fs::File::create(raw.join("barcodes.tsv")).unwrap();
+        for cb in 0..n_cells {
+            writeln!(f, "{:016b}", cb).unwrap();
+        }
+    }
+    {
+        let mut f = fs::File::create(raw.join("features.tsv")).unwrap();
+        for g in 0..n_features {
+            writeln!(f, "gene{g}\tGENE{g}\tGene Expression").unwrap();
+        }
+    }
+
+    let out = tmpdir.path().join("filtered/");
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            raw.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--soloCellFilter",
+            "TopCells",
+            "5",
+        ])
+        .assert()
+        .success();
+
+    let barcodes = fs::read_to_string(out.join("barcodes.tsv")).unwrap();
+    assert_eq!(
+        barcodes.lines().count(),
+        5,
+        "the five deep barcodes are the called cells"
+    );
+
+    let matrix = fs::read_to_string(out.join("matrix.mtx")).unwrap();
+    let header = matrix.lines().nth(2).unwrap();
+    let fields: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(fields[0], "50", "features are carried through");
+    assert_eq!(fields[1], "5", "columns are the called cells");
+    assert_eq!(fields[2], "50", "10 genes × 5 cells");
+
+    assert!(
+        out.join("features.tsv").exists(),
+        "the feature list travels with the matrix"
+    );
+}
+
+/// The mode needs both paths; asking for it without them is refused rather
+/// than run against a guess.
+#[test]
+fn test_run_mode_solo_cell_filtering_requires_its_paths() {
+    cargo_bin_cmd!("rustar-aligner")
+        .args(["--runMode", "soloCellFiltering"])
+        .assert()
+        .failure();
+}
+
+// ---------------------------------------------------------------------------
+// Test — --readNameSeparator cuts the QNAME, and only where asked
+//
+// STAR's default separator is `/` and it cuts the read name there; before #147
+// this codebase kept the whole name. That is the one output change #147 makes
+// at default settings, and the only coverage was a unit test on the paired
+// FASTQ reader plus a parse-level check that the flag reaches Parameters --
+// nothing asserted the QNAME that actually reaches the SAM. This does, in both
+// directions, so neither a regression nor a hardcoded `/` can pass.
+//
+// The bundled yeast tier cannot exercise this: there the `/1` sits in the FASTQ
+// comment, after whitespace, so the QNAME never contains a separator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_read_name_separator_cuts_the_qname_and_is_configurable() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // Exon2 (chr1:10251-10300), so every read aligns and emits a record.
+    let exon2 = String::from_utf8(genome[10250..10300].to_vec()).unwrap();
+    let reads_path = tmpdir.path().join("slashed.fq");
+    {
+        let mut f = fs::File::create(&reads_path).unwrap();
+        for i in 0..4 {
+            // The separator is inside the QNAME, not in a trailing comment.
+            writeln!(f, "@read{i}/1\n{exon2}\n+\n{}", "I".repeat(exon2.len())).unwrap();
+        }
+    }
+
+    let run = |name: &str, extra: &[&str]| -> Vec<String> {
+        let out = tmpdir.path().join(name);
+        fs::create_dir_all(&out).unwrap();
+        let prefix = format!("{}/", out.display());
+        let mut args: Vec<String> = vec![
+            "--runMode".into(),
+            "alignReads".into(),
+            "--genomeDir".into(),
+            genome_dir.to_str().unwrap().into(),
+            "--readFilesIn".into(),
+            reads_path.to_str().unwrap().into(),
+            "--outSAMtype".into(),
+            "SAM".into(),
+            "--outFileNamePrefix".into(),
+            prefix.clone(),
+        ];
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        cargo_bin_cmd!("rustar-aligner")
+            .args(&args)
+            .assert()
+            .success();
+
+        fs::read_to_string(out.join("Aligned.out.sam"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('@'))
+            .map(|l| l.split('\t').next().unwrap().to_string())
+            .collect()
+    };
+
+    // Default: STAR's `/` separator, so the `/1` is cut away.
+    let defaulted = run("out_default", &[]);
+    assert!(!defaulted.is_empty(), "no records were emitted");
+    for qname in &defaulted {
+        assert!(
+            !qname.contains('/'),
+            "default --readNameSeparator should cut at '/', got {qname}"
+        );
+        assert!(qname.starts_with("read"), "unexpected QNAME shape: {qname}");
+    }
+
+    // `-` disables separators, so the same reads keep their full names. This is
+    // what stops the cut being hardcoded rather than driven by the flag.
+    let disabled = run("out_disabled", &["--readNameSeparator", "-"]);
+    assert_eq!(
+        disabled.len(),
+        defaulted.len(),
+        "the same reads should align either way"
+    );
+    for qname in &disabled {
+        assert!(
+            qname.ends_with("/1"),
+            "--readNameSeparator - should keep the whole name, got {qname}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test — qualitySplit / --seedSplitMin
+// ---------------------------------------------------------------------------
+
+/// Read (QNAME, FLAG, CIGAR, AS) for each record in an Aligned.out.sam.
+fn sam_flags_by_name(sam_path: &Path) -> Vec<(String, u16, String, i32)> {
+    fs::read_to_string(sam_path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let score = f
+                .iter()
+                .find_map(|t| t.strip_prefix("AS:i:"))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            (
+                f[0].to_string(),
+                f[1].parse().unwrap(),
+                f[5].to_string(),
+                score,
+            )
+        })
+        .collect()
+}
+
+/// A seed must not be allowed to run through a genomic `N`, and a read whose
+/// only run of real bases is shorter than `--seedSplitMin` must not be seeded.
+///
+/// Both sides encode `N` as 4, so an MMP comparing bases for equality will
+/// happily match a read `N` against an assembly gap. STAR forecloses that by
+/// splitting the read on `N` before the search
+/// (`qualitySplit`, `SequenceFuns.cpp:411`) and skipping runs below
+/// `seedSplitMin`; a read left with no run at all is reported `uT:A:0`.
+///
+/// The genome here carries a planted 60 bp `N` run, and the reads carry the
+/// *original* bases at those coordinates — so the read is real sequence while
+/// the genome is a gap. That separates this from a read that merely contains
+/// `N`, which is unmappable for the ordinary reason.
+#[test]
+fn test_seed_split_min_bans_seeds_that_span_genomic_n() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut genome = build_genome();
+
+    // A 50 bp gap, with the read's real bases drawn from just *past* it. Both
+    // halves of the read then have something to match: the 50 `N` match the gap
+    // base for base (4 == 4 on both sides) and the 10-base tail matches real
+    // sequence. Drawing the tail from inside the gap instead leaves it with no
+    // real genome to align to, and the read is rejected for an unrelated reason.
+    let gap_start = 5000usize;
+    let gap_len = 50usize;
+    let tail: Vec<u8> = genome[gap_start + gap_len..gap_start + gap_len + 10].to_vec();
+    genome[gap_start..gap_start + gap_len].fill(b'N');
+
+    // A second, narrower gap with 30 real bases either side, for a read that
+    // spans it with a good run on both flanks.
+    let span_gap_start = 4000usize;
+    let span_left: Vec<u8> = genome[span_gap_start - 30..span_gap_start].to_vec();
+    let span_right: Vec<u8> = genome[span_gap_start + 20..span_gap_start + 50].to_vec();
+    genome[span_gap_start..span_gap_start + 20].fill(b'N');
+
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let fastq_path = tmpdir.path().join("gap_reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        let mut emit = |name: &str, seq: &[u8]| {
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "+").unwrap();
+            writeln!(f, "{}", "I".repeat(seq.len())).unwrap();
+        };
+
+        // 50 read-`N` then the 10 real bases. The genome is `N` under the first
+        // 50, so a base-equality MMP matches all 60 and maps this as
+        // `chr1:5001 60M AS:i:59`; the 10-base tail on its own is below
+        // seedSplitMin=12, so STAR seeds nothing and reports `uT:A:0`.
+        let mut over_gap = vec![b'N'; gap_len];
+        over_gap.extend_from_slice(&tail);
+        emit("over_gap", &over_gap);
+
+        // Control: ordinary read from clean sequence, must still map.
+        emit("clean", &genome[8000..8060]);
+
+        // 10 read-`N` then 50 real bases off clean sequence. The `N` run is
+        // below seedSplitMin and skipped, but the 50-base run clears it, so the
+        // read must still map — the split skips bad runs, it does not give up
+        // on a read for containing `N`.
+        let mut n_prefix = vec![b'N'; 10];
+        n_prefix.extend_from_slice(&genome[8200..8250]);
+        emit("n_prefix_long", &n_prefix);
+
+        // 30 real | 20 N | 30 real, straddling the narrower gap. Both flanks
+        // clear seedSplitMin, so this maps either way — but the MMP must stop
+        // at the edge of each good run. Let it run on and the seed swallows the
+        // 20 `N`, which then score as matches.
+        let mut span = span_left.clone();
+        span.extend(std::iter::repeat_n(b'N', 20));
+        span.extend_from_slice(&span_right);
+        emit("span_gap", &span);
+    }
+
+    let run = |args: &[&str], out: &str| -> PathBuf {
+        let output_dir = tmpdir.path().join(out);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        let mut cmd = cargo_bin_cmd!("rustar-aligner");
+        cmd.args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "SAM",
+            "--outSAMunmapped",
+            "Within",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .args(args)
+        .assert()
+        .success();
+        output_dir.join("Aligned.out.sam")
+    };
+
+    let flags = sam_flags_by_name(&run(&[], "out_default"));
+    let rec_of = |name: &str, recs: &[(String, u16, String, i32)]| -> (u16, String, i32) {
+        recs.iter()
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, f, c, s)| (*f, c.clone(), *s))
+            .unwrap_or_else(|| panic!("{name} missing from SAM; got {recs:?}"))
+    };
+    let flag_of = |name: &str, recs: &[(String, u16, String, i32)]| -> u16 { rec_of(name, recs).0 };
+
+    assert_eq!(
+        flag_of("over_gap", &flags) & 0x4,
+        0x4,
+        "a read whose only real run is 10 bases must not be seeded across the \
+         genomic N run — this is the case that mapped as full-length 60M before \
+         qualitySplit existed"
+    );
+    assert_eq!(
+        flag_of("clean", &flags) & 0x4,
+        0,
+        "a read from clean sequence must still map"
+    );
+
+    assert_eq!(
+        flag_of("n_prefix_long", &flags) & 0x4,
+        0,
+        "a read with a short leading N run but a 50-base good run must still map"
+    );
+
+    // Verified against STAR 2.7.11b on this same synthetic genome: it reports
+    // `80M AS:i:58`. The 20 `N` contribute nothing (`if (G<4 && R<4)`), so an
+    // MMP allowed to run past the end of a good run scores them as matches and
+    // lands on AS:i:78 instead.
+    let (span_flag, span_cigar, span_score) = rec_of("span_gap", &flags);
+    assert_eq!(span_flag & 0x4, 0, "span_gap must map");
+    assert_eq!(span_cigar, "80M");
+    assert_eq!(
+        span_score, 58,
+        "the MMP must stop at the edge of each good run, so the 20 N score \
+         nothing; AS:i:78 means the seed ran through the gap"
+    );
+
+    // The threshold is the flag, not a constant: raising it past the good run
+    // unmaps reads that map at the default, which rules out the gate being
+    // hardcoded to the N case.
+    let flags_high = sam_flags_by_name(&run(&["--seedSplitMin", "61"], "out_high"));
+    assert_eq!(
+        flag_of("clean", &flags_high) & 0x4,
+        0x4,
+        "--seedSplitMin 61 leaves no qualifying run in a 60-base read"
     );
 }

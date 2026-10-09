@@ -10,9 +10,13 @@
 //! `--readFilesIn cDNA_read barcode_read`). It is never aligned — only parsed.
 
 pub mod adata;
+pub mod cell_reads;
 pub mod count;
 pub mod gene;
+pub mod libcxx_rng;
+pub mod sgt;
 pub mod smartseq;
+pub mod transcript3p;
 pub mod whitelist;
 
 pub use adata::OutputFormat;
@@ -566,6 +570,18 @@ pub struct SoloContext {
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
     pub want_multi: bool,
+    /// `--soloCellReadStats CB`: the per-cell read summary, or `None` when the
+    /// flag is off. Behind a mutex like the other per-read collections; the
+    /// lock is only taken when the flag asks for the file.
+    pub cell_read_stats: Option<Mutex<crate::solo::cell_reads::CellReadStats>>,
+    /// Chromosome indices named by `--genomeChrSetMitochondrial`, for the
+    /// `mito` column.
+    pub mito_chr: std::collections::HashSet<usize>,
+    /// `--soloFeatures Transcript3p`: the transcriptome to assign reads to, and
+    /// the accumulated per-read records. Both `None`/absent unless asked for,
+    /// since building the transcriptome costs a GTF pass.
+    pub transcriptome: Option<crate::quant::transcriptome::TranscriptomeIndex>,
+    pub transcript3p: Option<Mutex<crate::solo::transcript3p::Transcript3pAcc>>,
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -679,6 +695,7 @@ impl SoloContext {
         let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
         let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
         let velocyto_enabled = params.solo_features.iter().any(|f| f == "Velocyto");
+        let transcript3p = params.solo_features.iter().any(|f| f == "Transcript3p");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
         Ok(Self {
@@ -697,6 +714,28 @@ impl SoloContext {
             velocyto_enabled,
             velocyto_records: Mutex::new(Vec::new()),
             want_multi,
+            cell_read_stats: (params.solo_cell_read_stats == "CB")
+                .then(|| Mutex::new(crate::solo::cell_reads::CellReadStats::new())),
+            mito_chr: params
+                .genome_chr_set_mitochondrial
+                .iter()
+                .filter(|n| n.as_str() != "-")
+                .filter_map(|n| genome.chr_name.iter().position(|c| c == n))
+                .collect(),
+            transcriptome: transcript3p
+                .then(|| {
+                    crate::quant::transcriptome::TranscriptomeIndex::from_gtf_exons_configured(
+                        &exons,
+                        genome,
+                        &params.sjdb_gtf_tag_exon_parent_transcript,
+                        &params.sjdb_gtf_tag_exon_parent_gene,
+                        &params.sjdb_gtf_tag_exon_parent_gene_name,
+                        &params.sjdb_gtf_tag_exon_parent_gene_type,
+                    )
+                })
+                .transpose()?,
+            transcript3p: transcript3p
+                .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
         })
     }
 
@@ -873,7 +912,83 @@ impl SoloContext {
                 fo
             })
             .collect();
+
+        self.record_cell_read(
+            cb_resolved,
+            &cb_match,
+            n_loci,
+            &class,
+            cdna_transcripts,
+            &out,
+        );
+        // Transcript3p: every transcript this read is concordant with, and how
+        // far its 3' end sits from each transcript's. Uniquely-mapped reads
+        // only — a read at several genomic loci says nothing about isoforms.
+        if let (Some(acc), Some(tx), Some(cb)) =
+            (&self.transcript3p, &self.transcriptome, cb_resolved)
+            && n_loci == 1
+            && let Some(align) = cdna_transcripts.first()
+        {
+            let hits = crate::solo::transcript3p::concordant_transcripts(
+                align,
+                tx,
+                align.read_length() as u32,
+            );
+            if !hits.is_empty() {
+                acc.lock().unwrap().add(cb, umi, hits);
+            }
+        }
+
         out
+    }
+
+    /// Fold one read into `CellReads.stats`, when `--soloCellReadStats CB`
+    /// asked for it.
+    ///
+    /// Called at the end of read processing so the counted flags reflect what
+    /// the read actually produced, rather than what it looked eligible for.
+    #[allow(clippy::too_many_arguments)]
+    fn record_cell_read(
+        &self,
+        cb_resolved: Option<u32>,
+        cb_match: &CbMatch,
+        n_loci: usize,
+        class: &crate::solo::gene::ReadClass,
+        transcripts: &[Transcript],
+        out: &SoloReadOutcome,
+    ) {
+        let Some(stats) = &self.cell_read_stats else {
+            return;
+        };
+        let counted_u = out.per_feature.iter().any(|f| f.record.is_some());
+        let counted_m = out.per_feature.iter().any(|f| f.multi_gene.is_some());
+        let feature_u = counted_u || out.per_feature.iter().any(|f| f.multi.is_some());
+        let flag = crate::solo::cell_reads::CellReadFlag {
+            cb_perfect: matches!(cb_match, CbMatch::Exact(_)),
+            cb_mm_unique: matches!(cb_match, CbMatch::Corrected(_)),
+            cb_mm_multiple: matches!(cb_match, CbMatch::Multi(_)),
+            genome_u: n_loci == 1,
+            genome_m: n_loci > 1,
+            feature_u,
+            feature_m: counted_m,
+            // The region columns split by strand: STAR reports an antisense
+            // read under `exonicAS`/`intronicAS`, not under `exonic`/`intronic`.
+            exonic: !class.antisense && class.region == Some(Region::Exonic),
+            intronic: !class.antisense && class.region == Some(Region::Intronic),
+            exonic_as: class.antisense && class.region == Some(Region::Exonic),
+            intronic_as: class.antisense && class.region == Some(Region::Intronic),
+            mito: !self.mito_chr.is_empty()
+                && transcripts
+                    .iter()
+                    .any(|t| self.mito_chr.contains(&t.chr_idx)),
+            counted_u,
+            counted_m,
+        };
+        let mut stats = stats.lock().unwrap();
+        match cb_resolved {
+            Some(cb) => stats.add_cell(cb, &flag),
+            None => stats.add_no_cb(&flag),
+        }
     }
 
     /// Process one 5' paired-end solo read (`--soloBarcodeMate 1`): the barcode is

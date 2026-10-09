@@ -3,6 +3,46 @@
 use crate::align::transcript::cigar_to_string;
 use noodles::sam::alignment::record::cigar;
 
+/// Genome and read span of one exon, as STAR's `exons[i]` row.
+///
+/// The chimeric junction scan works on a *single* exon, not the whole segment:
+/// STAR picks `e0 = Str==1 ? 0 : nExons-1` for the read-leading segment and
+/// `e1 = Str==0 ? 0 : nExons-1` for the trailing one, then reads `EX_G`, `EX_L`
+/// and `EX_R` from it. For a single-exon segment that is the segment itself,
+/// but a spliced or indel-carrying segment has `genome_end - genome_start !=
+/// read_end - read_start`, and the scan must not use the wider span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExonSpan {
+    pub genome_start: u64,
+    pub genome_end: u64,
+    pub read_start: usize,
+    pub read_end: usize,
+}
+
+/// Run-level context STAR reports alongside each chimera under
+/// `--chimMultimapNmax > 0`.
+///
+/// The multimap file carries six extra columns and a header line
+/// (`ParametersChimeric_initialize.cpp:48-71`,
+/// `ChimericAlign_chimericJunctionOutput.cpp:14-19`). They describe the read as
+/// a whole, not the individual junction, so they are attached when the
+/// enumerating path produces the alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultimapInfo {
+    /// `num_chim_aln` — chimeras reported for this read.
+    pub chim_n: usize,
+    /// `max_poss_aln_score` — STAR uses the (paired) read length.
+    pub max_possible_score: i32,
+    /// `non_chim_aln_score` — best linear alignment score for this read.
+    pub max_non_chim_score: i32,
+    /// `this_chim_aln_score` — this alignment's score.
+    pub chim_score: i32,
+    /// `bestall_chim_aln_score` — best score among this read's chimeras.
+    pub best_chim_score: i32,
+    /// `PEmerged_bool` — whether the mates were merged before detection.
+    pub pe_merged: bool,
+}
+
 /// A single segment of a chimeric alignment
 #[derive(Debug, Clone)]
 pub struct ChimericSegment {
@@ -15,9 +55,32 @@ pub struct ChimericSegment {
     pub cigar: Vec<cigar::Op>,
     pub score: i32,
     pub n_mismatch: u32,
+    /// This segment's first and last exon. Equal to the segment span when the
+    /// segment is a single gapless block; see [`ExonSpan`].
+    pub first_exon: ExonSpan,
+    pub last_exon: ExonSpan,
 }
 
 impl ChimericSegment {
+    /// The exon STAR scans for this segment, by strand and position in the pair.
+    ///
+    /// `leading` is true for the segment that comes first in the *read*
+    /// (STAR's `trChim[0]`, after it orders the pair by `roStart`). STAR then
+    /// takes `e0 = Str==1 ? 0 : nExons-1` and `e1 = Str==0 ? 0 : nExons-1`, i.e.
+    /// in both cases the exon on the junction side.
+    pub fn junction_exon(&self, leading: bool) -> ExonSpan {
+        let take_first = if leading {
+            self.is_reverse
+        } else {
+            !self.is_reverse
+        };
+        if take_first {
+            self.first_exon
+        } else {
+            self.last_exon
+        }
+    }
+
     /// Get segment length in read coordinates
     pub fn read_length(&self) -> usize {
         self.read_end - self.read_start
@@ -39,6 +102,31 @@ impl ChimericSegment {
     }
 }
 
+/// A chimera's junction line exactly as STAR writes it.
+///
+/// STAR's segments are whole window transcripts, and for a paired read one of
+/// them often covers both mates, so its start and CIGAR (with the `p` gap
+/// between mates) are not those of any single-mate segment. The detector fills
+/// this in and the junction writer prints it as it stands. Positions are
+/// genome-absolute and 0-based; the writer makes them per-chromosome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JunctionLine {
+    pub donor_chr: usize,
+    /// STAR's `chimJ0`.
+    pub donor_break: u64,
+    pub donor_reverse: bool,
+    pub acceptor_chr: usize,
+    /// STAR's `chimJ1`.
+    pub acceptor_break: u64,
+    pub acceptor_reverse: bool,
+    /// `trChim[0].exons[0][EX_G]`.
+    pub donor_start: u64,
+    pub donor_cigar: String,
+    /// `trChim[1].exons[0][EX_G]`.
+    pub acceptor_start: u64,
+    pub acceptor_cigar: String,
+}
+
 /// A chimeric alignment consisting of two segments
 #[derive(Debug, Clone)]
 pub struct ChimericAlignment {
@@ -50,6 +138,13 @@ pub struct ChimericAlignment {
     pub total_score: i32,
     pub read_seq: Vec<u8>,
     pub read_name: String,
+    /// Present only for chimeras from the `--chimMultimapNmax` path, which
+    /// writes a wider file. `None` selects the 14-column format.
+    pub multimap: Option<MultimapInfo>,
+    /// The junction line, set by the STAR detector; see [`JunctionLine`].
+    pub junction_line: Option<JunctionLine>,
+    /// What `--chimOutType WithinBAM` writes from; see [`crate::chimeric::ChimBam`].
+    pub bam: Option<Box<crate::chimeric::ChimBam>>,
 }
 
 impl ChimericAlignment {
@@ -73,7 +168,17 @@ impl ChimericAlignment {
             total_score,
             read_seq,
             read_name,
+            multimap: None,
+            junction_line: None,
+            bam: None,
         }
+    }
+
+    /// Attach the multimap context, selecting STAR's wider output format.
+    #[must_use]
+    pub fn with_multimap(mut self, info: MultimapInfo) -> Self {
+        self.multimap = Some(info);
+        self
     }
 
     /// Check if both segments meet minimum length requirement
@@ -88,19 +193,27 @@ impl ChimericAlignment {
 
     /// Get the breakpoint position on the donor chromosome (1-based)
     pub fn donor_breakpoint(&self) -> u64 {
+        // STAR's `chimJ0`: the first base *past* the donor's block, printed as
+        // `chimJ0 - chrStart + 1` (`ReadAlign_chimericDetectionOld.cpp:244-248`,
+        // `chimericJunctionOutput.cpp:6`). Forward that is `genome_end`;
+        // reverse it is `genome_start - 1`. The `+ 1` for 1-based output is
+        // folded in here, since the writer only subtracts `chrStart`.
         if self.donor.is_reverse {
-            self.donor.genome_start + 1
+            self.donor.genome_start
         } else {
-            self.donor.genome_end
+            self.donor.genome_end + 1
         }
     }
 
     /// Get the breakpoint position on the acceptor chromosome (1-based)
     pub fn acceptor_breakpoint(&self) -> u64 {
+        // STAR's `chimJ1`: the base *before* the acceptor's block (`:254-257`).
+        // Forward `genome_start - 1`, reverse `genome_end`, again with the
+        // 1-based `+ 1` folded in.
         if self.acceptor.is_reverse {
-            self.acceptor.genome_end
+            self.acceptor.genome_end + 1
         } else {
-            self.acceptor.genome_start + 1
+            self.acceptor.genome_start
         }
     }
 
@@ -137,6 +250,18 @@ mod tests {
             cigar: vec![Op::new(Kind::Match, 50)],
             score: 100,
             n_mismatch: 2,
+            first_exon: ExonSpan {
+                genome_start,
+                genome_end,
+                read_start,
+                read_end,
+            },
+            last_exon: ExonSpan {
+                genome_start,
+                genome_end,
+                read_start,
+                read_end,
+            },
         }
     }
 
@@ -226,8 +351,10 @@ mod tests {
             "READ_001".to_string(),
         );
 
-        assert_eq!(chim.donor_breakpoint(), 1050); // end position (1-based)
-        assert_eq!(chim.acceptor_breakpoint(), 2001); // start position + 1 (1-based)
+        // STAR's chimJ0/chimJ1 with the 1-based `+1` folded in: the first base
+        // past the donor's block, and the base before the acceptor's.
+        assert_eq!(chim.donor_breakpoint(), 1051);
+        assert_eq!(chim.acceptor_breakpoint(), 2000);
     }
 
     #[test]

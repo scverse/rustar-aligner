@@ -113,6 +113,16 @@ pub enum UmiFiltering {
     /// Remove lower-count gene assignments of a multi-gene UMI; if every gene
     /// has a single read, drop the UMI entirely (STAR `MultiGeneUMI`).
     MultiGeneUmi,
+    /// `MultiGeneUMI_All`: a UMI seen in more than one gene is removed from
+    /// *all* of them, rather than from the losers only.
+    ///
+    /// This is a deliberate divergence from STAR 2.7.11b, tracked in #144.
+    /// There the option is a no-op — its consumption site tests only the
+    /// `MultiGeneUMI` flag — so selecting it leaves the filter entirely off.
+    /// Reproducing that would ship a flag that silently does nothing;
+    /// implementing what it is documented to do is the lesser evil, and the
+    /// behaviour is asserted rather than inherited.
+    MultiGeneUmiAll,
     /// CellRanger > 3.0 variant: keep only the highest-read-count gene for a
     /// multi-gene UMI (ties retained), without the all-singletons drop.
     MultiGeneUmiCr,
@@ -123,8 +133,8 @@ impl FromStr for UmiFiltering {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "-" | "None" => Ok(Self::None),
-            // MultiGeneUMI_All behaves like MultiGeneUMI for the count matrix.
-            "MultiGeneUMI" | "MultiGeneUMI_All" => Ok(Self::MultiGeneUmi),
+            "MultiGeneUMI" => Ok(Self::MultiGeneUmi),
+            "MultiGeneUMI_All" => Ok(Self::MultiGeneUmiAll),
             "MultiGeneUMI_CR" => Ok(Self::MultiGeneUmiCr),
             _ => Err(format!(
                 "unknown soloUMIfiltering '{s}'; expected -, None, MultiGeneUMI, MultiGeneUMI_CR, or MultiGeneUMI_All"
@@ -169,6 +179,18 @@ pub fn dedup_count(umis: &HashMap<u64, u32>, method: UmiDedup, umi_len: usize) -
 /// the neighbor's raw UMI, not its corrected value); the molecule count is the
 /// number of distinct corrected UMIs.
 fn cellranger_1mm(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
+    let distinct: std::collections::HashSet<u64> =
+        cellranger_1mm_map(umis, umi_len).into_values().collect();
+    distinct.len() as u64
+}
+
+/// The same correction, returning `raw UMI -> corrected UMI`.
+///
+/// `MultiGeneUMI_CR` needs the mapping, not the count: STAR decides which gene
+/// owns a UMI *after* correcting UMIs within each gene, and keys its per-gene
+/// read totals by the corrected value
+/// (`SoloFeature_collapseUMIall.cpp:134-148`).
+fn cellranger_1mm_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
     let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
     // Ascending by count, then by UMI value (mirrors funCompareSolo1 ordering,
     // so the inner scan from the end meets higher-count neighbors first).
@@ -187,8 +209,7 @@ fn cellranger_1mm(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
         }
         corrected.push(corr);
     }
-    let distinct: std::collections::HashSet<u64> = corrected.into_iter().collect();
-    distinct.len() as u64
+    items.iter().map(|&(u, _)| u).zip(corrected).collect()
 }
 
 /// 1MM_All: number of connected components when UMIs within Hamming-1 are
@@ -435,20 +456,27 @@ pub(crate) fn dedup_cells(
                     .or_insert(0) += 1;
             }
 
-            // (gene → (umi → read_count)) after multi-gene UMI filtering.
-            let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
-            for (&umi, genes) in &umi_genes {
-                for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
-                    *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+            // `MultiGeneUMI_CR` decides gene ownership on *corrected* UMIs, so
+            // it needs the correction to have happened first and cannot go
+            // through the shared filter-then-dedup path below.
+            let mut entries: Vec<(u32, u64)> = if filtering == UmiFiltering::MultiGeneUmiCr {
+                multi_gene_umi_cr_counts(&umi_genes, umi_len)
+            } else {
+                // (gene → (umi → read_count)) after multi-gene UMI filtering.
+                let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+                for (&umi, genes) in &umi_genes {
+                    for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
+                        *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+                    }
                 }
-            }
 
-            // Collapse UMIs per gene, then emit this cell's entries gene-ascending.
-            let mut entries: Vec<(u32, u64)> = gene_umis
-                .iter()
-                .map(|(&gene, umis)| (gene, dedup_count(umis, method, umi_len)))
-                .filter(|&(_, c)| c > 0)
-                .collect();
+                // Collapse UMIs per gene, then emit this cell's entries gene-ascending.
+                gene_umis
+                    .iter()
+                    .map(|(&gene, umis)| (gene, dedup_count(umis, method, umi_len)))
+                    .filter(|&(_, c)| c > 0)
+                    .collect()
+            };
             entries.sort_unstable_by_key(|&(g, _)| g);
             CellCounts {
                 cb: records[i].cb,
@@ -946,6 +974,88 @@ pub(crate) fn multi_matrices<'a>(
     })
 }
 
+/// CellRanger's multi-gene UMI resolution, as STAR implements it for
+/// `--soloUMIfiltering MultiGeneUMI_CR` (`SoloFeature_collapseUMIall.cpp`).
+///
+/// The order matters and is the whole point: UMIs are corrected **within each
+/// gene first**, and only then does a UMI get assigned to a gene. Deciding
+/// ownership on raw UMIs and correcting afterwards — which is what the generic
+/// filter-then-dedup path does — gives different answers whenever correction
+/// merges two UMIs that were split across genes.
+///
+/// Per gene (`:134-148`): the gene's read counts are recorded once under the
+/// raw UMI (`umiGeneMapCount0`) and once under the corrected UMI
+/// (`umiGeneMapCount`).
+///
+/// Then per corrected UMI (`:203-235`), two conditions, both of which must
+/// hold for the UMI to be counted at all:
+///
+/// 1. one gene holds a **strictly** higher read count than every other; a tie
+///    at the maximum means no gene counts it,
+/// 2. and no gene beats that winner in the **uncorrected** map at the same key.
+///
+/// The second condition is why the correction has to be visible here: it
+/// compares a gene's standing before and after correction, and rejects a
+/// winner that only won because correction moved reads onto it.
+///
+/// Returns `(gene, molecules)` for this cell, gene-ascending.
+fn multi_gene_umi_cr_counts(
+    umi_genes: &HashMap<u64, HashMap<u32, u32>>,
+    umi_len: usize,
+) -> Vec<(u32, u64)> {
+    // Regroup as gene → (raw UMI → reads); correction happens per gene.
+    let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+    for (&umi, genes) in umi_genes {
+        for (&gene, &rc) in genes {
+            *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+        }
+    }
+
+    let mut uncorrected: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
+    let mut corrected: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
+    for (&gene, umis) in &gene_umis {
+        for (&umi, &rc) in umis {
+            *uncorrected.entry(umi).or_default().entry(gene).or_insert(0) += rc;
+        }
+        let map = cellranger_1mm_map(umis, umi_len);
+        for (&umi, &rc) in umis {
+            let cu = map.get(&umi).copied().unwrap_or(umi);
+            *corrected.entry(cu).or_default().entry(gene).or_insert(0) += rc;
+        }
+    }
+
+    let mut counts: HashMap<u32, u64> = HashMap::default();
+    for (cu, genes) in &corrected {
+        // Condition 1: a strict maximum, ties lose.
+        let mut best = 0u32;
+        let mut winner: Option<u32> = None;
+        for (&gene, &rc) in genes {
+            if rc > best {
+                best = rc;
+                winner = Some(gene);
+            } else if rc == best {
+                winner = None;
+            }
+        }
+        let Some(winner) = winner else { continue };
+
+        // Condition 2: the winner must not be beaten in the uncorrected map at
+        // the same key. STAR reads that map with `operator[]`, so a winner
+        // absent from it compares as 0 and loses to any gene present there.
+        if let Some(raw_genes) = uncorrected.get(cu) {
+            let winner_raw = raw_genes.get(&winner).copied().unwrap_or(0);
+            if raw_genes.values().any(|&rc| rc > winner_raw) {
+                continue;
+            }
+        }
+        *counts.entry(winner).or_insert(0) += 1;
+    }
+
+    let mut out: Vec<(u32, u64)> = counts.into_iter().filter(|&(_, c)| c > 0).collect();
+    out.sort_unstable_by_key(|&(g, _)| g);
+    out
+}
+
 /// Apply `--soloUMIfiltering` to the gene→read_count map of a single UMI,
 /// returning the surviving (gene, read_count) entries.
 fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> Vec<(&u32, &u32)> {
@@ -960,8 +1070,48 @@ fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> 
             let thresh = if max == 1 { 2 } else { max };
             genes.iter().filter(|&(_, &rc)| rc >= thresh).collect()
         }
-        // CellRanger > 3.0: keep the highest-read-count gene(s); no singleton drop.
-        UmiFiltering::MultiGeneUmiCr => genes.iter().filter(|&(_, &rc)| rc >= max).collect(),
+        // A UMI that appears in more than one gene is evidence of a collision
+        // or of chimeric amplification, so it is discarded outright rather than
+        // attributed to whichever gene happened to read deepest. `genes.len()`
+        // is already known to be > 1 here.
+        UmiFiltering::MultiGeneUmiAll => Vec::new(),
+        // CellRanger: the gene with the strictly highest read count takes the
+        // UMI, and a tie gives it to nobody.
+        //
+        // STAR `SoloFeature_collapseUMIall.cpp:212-224` walks the genes keeping
+        // a running maximum, and clears its winner whenever it meets an equal
+        // count:
+        //
+        // ```cpp
+        // if (ig.second>maxu) { maxu=ig.second; maxg=ig.first; }
+        // else if (ig.second==maxu) { maxg=-1; };
+        // ...
+        // if ( maxg+1==0 ) continue; // not counted for any gene
+        // ```
+        //
+        // The outcome does not depend on the order the genes are visited: a
+        // strict maximum always ends as the winner, and any tie at the maximum
+        // always ends with none. So iterating a `HashMap` here is safe.
+        //
+        // This previously kept every gene tied at the maximum, which is the
+        // opposite decision on exactly the case the rule exists for, and made
+        // the flag inert on the common shape of one read per gene.
+        UmiFiltering::MultiGeneUmiCr => {
+            let mut best_count = 0u32;
+            let mut winner: Option<&u32> = None;
+            for (gene, &rc) in genes {
+                if rc > best_count {
+                    best_count = rc;
+                    winner = Some(gene);
+                } else if rc == best_count {
+                    winner = None;
+                }
+            }
+            match winner {
+                Some(gene) => vec![(gene, genes.get(gene).expect("winner is a key"))],
+                None => Vec::new(),
+            }
+        }
         UmiFiltering::None => unreachable!(),
     }
 }
@@ -1089,20 +1239,60 @@ pub(crate) fn emptydrops_called(
         return Ok(called);
     }
 
-    // Ambient probabilities with a Good-Turing P0 unseen-mass correction.
-    let n1 = ambient.iter().filter(|&&x| (x - 1.0).abs() < 0.5).count() as f64;
-    let p0 = (n1 / amb_total).clamp(1e-12, 0.5);
-    let n_zero = ambient.iter().filter(|&&x| x == 0.0).count().max(1) as f64;
-    let amb_p: Vec<f64> = ambient
-        .iter()
-        .map(|&x| {
-            if x > 0.0 {
-                (1.0 - p0) * x / amb_total
-            } else {
-                p0 / n_zero
+    // Ambient probabilities, smoothed by Simple Good-Turing as CellRanger's
+    // EmptyDrops_CR does. The raw ambient counts are a small sample, so a gene
+    // seen twice there is not twice as likely as one seen once; SGT fits the
+    // frequency spectrum and reserves mass for genes the sample missed
+    // entirely. The previous approximation here reserved mass from the
+    // singleton rate alone and spread the rest in proportion to raw counts,
+    // which is the right shape but the wrong numbers.
+    let amb_p: Vec<f64> = {
+        // Frequency of frequencies over the integer ambient counts.
+        let counts: Vec<u32> = ambient.iter().map(|&x| x as u32).collect();
+        let mut fof: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for &c in &counts {
+            *fof.entry(c).or_insert(0) += 1;
+        }
+        let n_zero = fof.get(&0).copied().unwrap_or(0);
+
+        let mut sgt = crate::solo::sgt::Sgt::new();
+        for (&freq, &n) in &fof {
+            if freq != 0 {
+                sgt.add(freq, n);
             }
-        })
-        .collect();
+        }
+        let fitted = sgt.analyse();
+
+        // Per-gene probability. A gene absent from the ambient set shares the
+        // reserved unseen mass; one present takes its smoothed estimate. When
+        // the spectrum is too small to fit (D17), there is no reserved mass and
+        // the raw proportions are all that is left.
+        let unseen_each = if n_zero > 0 {
+            sgt.pzero() / f64::from(n_zero)
+        } else {
+            0.0
+        };
+        let raw: Vec<f64> = counts
+            .iter()
+            .map(|&c| {
+                if c == 0 {
+                    unseen_each
+                } else if fitted {
+                    sgt.estimate(c).unwrap_or(f64::from(c) / amb_total)
+                } else {
+                    f64::from(c) / amb_total
+                }
+            })
+            .collect();
+        // Renormalise: the smoothed estimates are per-event probabilities and
+        // only sum to one over the whole spectrum, not over this gene set.
+        let total: f64 = raw.iter().sum();
+        if total > 0.0 {
+            raw.into_iter().map(|p| p / total).collect()
+        } else {
+            raw
+        }
+    };
     let amb_logp: Vec<f64> = amb_p.iter().map(|&p| p.max(1e-300).ln()).collect();
 
     // Observed multinomial log-prob per candidate.
@@ -1134,17 +1324,17 @@ pub(crate) fn emptydrops_called(
     // log-prob at each count; compare each candidate against sim[*][its total].
     let nonzero: Vec<usize> = (0..n_features).filter(|&g| amb_p[g] > 0.0).collect();
     let weights: Vec<f64> = nonzero.iter().map(|&g| amb_p[g]).collect();
-    // Ambient categorical sampler: cumulative weights + splitmix64 (crate::rng).
-    // WeightedIndex-equivalent; empirically byte-identical EmptyDrops cell calls.
-    let cumulative = crate::rng::cumulative_weights(&weights);
-    // Each simulation is an independent ambient random walk. Seed a dedicated RNG
-    // per simulation (splitmix-derived from the base seed) so the result is
-    // deterministic regardless of how the work is scheduled across threads, then
-    // run the simulations in parallel. Each walk records the running log-prob at
-    // every count level; `walks[s][k]` is the log-prob of simulation `s` after `k`
-    // draws. (This matches STAR's per-thread-RNG approach; the per-sim seeding
-    // gives different draws than a single sequential stream, but the same
-    // distribution — p-values are stable to Monte-Carlo error.)
+    // The ambient sampler is STAR's, which is libc++'s: `std::mt19937` drawn
+    // through `std::discrete_distribution`. Both are implementation-defined in
+    // the parts that decide which category a draw lands in, so "a correct
+    // categorical sampler" is not enough to reproduce STAR's cell calls —
+    // it has to be that one. See `solo::libcxx_rng`.
+    let dist = crate::solo::libcxx_rng::DiscreteDistribution::new(&weights);
+    // A fresh generator per simulation, seeded `19760110 * (isim + 1)` as STAR
+    // seeds it. No shared state, so the walks can run in any order and on any
+    // number of threads and still produce the same p-values. Each walk records
+    // the running log-prob at every count level; `walks[s][k]` is simulation
+    // `s` after `k` draws.
     use rayon::prelude::*;
     const BASE_SEED: u64 = 19_760_110;
     let walks: Vec<Vec<f64>> = (0..sim_n)
@@ -1152,14 +1342,14 @@ pub(crate) fn emptydrops_called(
         .map_init(
             || (vec![0u32; n_features], Vec::<usize>::new()),
             |(curr, touched), s| {
-                let seed = BASE_SEED ^ (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                let mut rng = crate::rng::SplitMix64::seed(seed);
+                let seed = BASE_SEED.wrapping_mul(s as u64 + 1) as u32;
+                let mut rng = crate::solo::libcxx_rng::Mt19937::new(seed);
                 touched.clear();
                 let mut walk = Vec::with_capacity(max_count + 1);
                 walk.push(0.0);
                 let mut lp = 0f64;
                 for ic in 1..=max_count {
-                    let gi = nonzero[crate::rng::sample_cumulative(&cumulative, &mut rng)];
+                    let gi = nonzero[dist.sample(&mut rng)];
                     if curr[gi] == 0 {
                         touched.push(gi);
                     }
@@ -1329,6 +1519,27 @@ pub fn write_matrix_market(
             if gzip { " [gzip]" } else { "" },
         );
 
+        // `--soloCellReadStats CB`: the per-cell read summary, alongside the
+        // raw matrix because its UMI and gene columns are the raw totals.
+        if let Some(cell_stats) = &ctx.cell_read_stats {
+            let umi_gene: std::collections::BTreeMap<u32, (u32, u32)> = mstats
+                .cells
+                .iter()
+                .map(|c| (c.cb, (c.n_umis as u32, c.n_genes)))
+                .collect();
+            let path = feature_dir.join("CellReads.stats");
+            let text = cell_stats.lock().unwrap().render(
+                |cb| {
+                    ctx.whitelist
+                        .barcode_string(cb)
+                        .unwrap_or_else(|| cb.to_string())
+                },
+                &umi_gene,
+            );
+            std::fs::write(&path, text).map_err(|e| Error::io(e, &path))?;
+            log::info!("STARsolo: wrote {}/CellReads.stats", feature.dir_name());
+        }
+
         // Filtered (cell-called) matrix per --soloCellFilter. EmptyDrops_CR runs
         // the Monte-Carlo rescue (needs the per-cell profiles in the body).
         let called = if params
@@ -1418,6 +1629,47 @@ pub fn write_matrix_market(
                 feature.dir_name()
             );
         }
+    }
+
+    // Transcript3p: rows are transcripts, columns are clusters rather than
+    // cells, since the isoform EM needs more UMIs than one cell provides.
+    if let (Some(acc), Some(tx)) = (&ctx.transcript3p, &ctx.transcriptome) {
+        let dir = params.output_path(&format!("{solo_dir}Transcript3p/raw/"));
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io(e, &dir))?;
+
+        let cluster_cb = match &params.solo_cluster_cb_file {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+                crate::solo::transcript3p::load_cluster_cb(&text, |cb| {
+                    ctx.whitelist.index_of_barcode(cb.as_bytes())
+                })
+            }
+            // Validation requires the file, so this is unreachable in practice;
+            // an empty map quantifies nothing rather than inventing a cluster.
+            None => std::collections::BTreeMap::new(),
+        };
+
+        let acc = acc.lock().unwrap();
+        let out = crate::solo::transcript3p::quantify(&acc, tx, &cluster_cb);
+        for (name, body) in [
+            (matrix_name.as_str(), &out.matrix),
+            (features_name.as_str(), &out.features),
+            (
+                "transcriptEndDistanceDistribution.txt",
+                &out.distance_distribution,
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).map_err(|e| Error::io(e, &path))?;
+        }
+        log::info!(
+            "STARsolo: wrote Transcript3p/raw ({} transcripts × {} clusters)",
+            tx.n_transcripts(),
+            cluster_cb
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+        );
     }
 
     // SJ (splice-junction) feature: rows are the SJ.out.tab junctions.
@@ -2095,6 +2347,199 @@ fn write_barcodes_subset(
     Ok(())
 }
 
+/// `--runMode soloCellFiltering <raw dir> <output prefix>`: cell-call an
+/// existing raw count matrix without aligning anything.
+///
+/// STAR `SoloFeature_loadRawMatrix.cpp` plus the same `--soloCellFilter` used
+/// at the end of a solo run. The point of the mode is that cell calling is a
+/// decision about a matrix, not about reads: re-calling with different
+/// parameters should not mean re-aligning, and a matrix produced elsewhere
+/// should be callable too.
+pub fn run_cell_filtering(params: &crate::params::Parameters) -> anyhow::Result<()> {
+    let raw_dir = Path::new(&params.run_mode_in[1]);
+    let out_prefix = &params.run_mode_in[2];
+
+    let find = |base: &str| -> Result<PathBuf, Error> {
+        for name in [base.to_string(), format!("{base}.gz")] {
+            let p = raw_dir.join(&name);
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        Err(Error::Parameter(format!(
+            "{}: no {base} (or {base}.gz) in the raw matrix directory",
+            raw_dir.display()
+        )))
+    };
+
+    let barcodes = read_first_column(&find("barcodes.tsv")?)?;
+    let features_path = find("features.tsv")?;
+    let matrix_path = find("matrix.mtx")?;
+
+    // Stream the matrix into the same temp-body form the align path produces,
+    // so the filters below are the identical code rather than a second
+    // implementation that can drift from it.
+    let mut body = tempfile::NamedTempFile::new().map_err(|e| Error::io(e, raw_dir))?;
+    let mut totals: HashMap<u32, (u64, u32)> = HashMap::default();
+    let mut n_features = 0usize;
+    {
+        let mut out = std::io::BufWriter::new(body.as_file_mut());
+        let reader = open_maybe_gz(&matrix_path)?;
+        let mut header_seen = false;
+        for line in reader.lines() {
+            let line = line.map_err(|e| Error::io(e, &matrix_path))?;
+            if line.starts_with('%') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let (Some(first), Some(second), Some(third)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if !header_seen {
+                // `<features> <barcodes> <entries>`
+                n_features = first.parse().unwrap_or(0);
+                header_seen = true;
+                continue;
+            }
+            let (gene, cb, count) = (
+                first.parse::<u32>().unwrap_or(0),
+                second.parse::<u32>().unwrap_or(0),
+                third.parse::<f64>().unwrap_or(0.0),
+            );
+            if gene == 0 || cb == 0 {
+                continue;
+            }
+            // Counts can be real-valued in a multimapper matrix; the cell
+            // filters work on UMI totals, so round rather than refuse.
+            let count = count.round().max(0.0) as u64;
+            let e = totals.entry(cb - 1).or_insert((0, 0));
+            e.0 += count;
+            e.1 += 1;
+            writeln!(out, "{gene} {cb} {count}").map_err(|e| Error::io(e, raw_dir))?;
+        }
+        out.flush().map_err(|e| Error::io(e, raw_dir))?;
+    }
+    if n_features == 0 {
+        return Err(Error::Parameter(format!(
+            "{}: no MatrixMarket header, so the matrix shape is unknown",
+            matrix_path.display()
+        ))
+        .into());
+    }
+
+    let mut cells: Vec<CellStat> = totals
+        .iter()
+        .map(|(&cb, &(n_umis, n_genes))| CellStat {
+            cb,
+            n_reads: n_umis,
+            n_umis,
+            n_genes,
+        })
+        .collect();
+    cells.sort_unstable_by_key(|c| c.cb);
+    log::info!(
+        "soloCellFiltering: {} barcodes with counts, {n_features} features",
+        cells.len()
+    );
+
+    let called = if params
+        .solo_cell_filter
+        .first()
+        .is_some_and(|m| m == "EmptyDrops_CR")
+    {
+        Some(emptydrops_called(
+            &cells,
+            body_triplets(body.path())?,
+            n_features,
+            &params.solo_cell_filter,
+        )?)
+    } else {
+        called_cells(&cells, &params.solo_cell_filter)
+    };
+    let Some(cbs) = called.filter(|c| !c.is_empty()) else {
+        log::warn!("soloCellFiltering: no cells called; writing nothing");
+        return Ok(());
+    };
+
+    let out_dir = Path::new(out_prefix);
+    let (dir, prefix): (&Path, &str) = if out_prefix.ends_with('/') {
+        (out_dir, "")
+    } else {
+        (
+            out_dir.parent().unwrap_or_else(|| Path::new(".")),
+            out_dir.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+        )
+    };
+    std::fs::create_dir_all(dir).map_err(|e| Error::io(e, dir))?;
+
+    let remap: HashMap<u32, u32> = cbs
+        .iter()
+        .enumerate()
+        .map(|(i, &cb)| (cb, i as u32 + 1))
+        .collect();
+
+    let bc_path = dir.join(format!("{prefix}barcodes.tsv"));
+    let mut bc = String::new();
+    for &cb in &cbs {
+        let Some(name) = barcodes.get(cb as usize) else {
+            continue;
+        };
+        bc.push_str(name);
+        bc.push('\n');
+    }
+    std::fs::write(&bc_path, bc).map_err(|e| Error::io(e, &bc_path))?;
+
+    let feat_path = dir.join(format!("{prefix}features.tsv"));
+    std::fs::copy(&features_path, &feat_path).map_err(|e| Error::io(e, &feat_path))?;
+
+    let mtx_path = dir.join(format!("{prefix}matrix.mtx"));
+    let nnz = finalize_matrix(
+        &body,
+        &mtx_path,
+        false,
+        n_features,
+        cbs.len(),
+        0,
+        Some(&remap),
+    )?;
+    log::info!(
+        "soloCellFiltering: {} cells, {nnz} entries -> {}",
+        cbs.len(),
+        dir.display()
+    );
+    Ok(())
+}
+
+/// First whitespace-separated column of a (possibly gzipped) file.
+fn read_first_column(path: &Path) -> Result<Vec<String>, Error> {
+    let reader = open_maybe_gz(path)?;
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, path))?;
+        if let Some(first) = line.split_whitespace().next() {
+            out.push(first.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Open a file, transparently decompressing `.gz`.
+fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
+    let file = std::fs::File::open(path).map_err(|e| Error::io(e, path))?;
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
+    {
+        Ok(Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(
+            file,
+        ))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2326,6 +2771,74 @@ mod tests {
         assert!("bogus".parse::<UmiFiltering>().is_err());
     }
 
+    /// The case the rule exists for, and the one the old code got backwards:
+    /// when two genes tie on read count, CellRanger counts the UMI for
+    /// neither. STAR clears its winner on an equal count
+    /// (`SoloFeature_collapseUMIall.cpp:212-224`) and skips the UMI when no
+    /// strict maximum survives.
+    ///
+    /// One read per gene is the common shape of a multi-gene UMI, so keeping
+    /// the ties made `--soloUMIfiltering MultiGeneUMI_CR` inert in practice:
+    /// on a 20 000-read 10x fixture it removed nothing at all, against 1 030
+    /// counts removed by STAR.
+    /// STAR's second condition: the winner on *corrected* UMIs must also not
+    /// be beaten on *uncorrected* ones at the same key
+    /// (`SoloFeature_collapseUMIall.cpp:226-232`). Correction can move reads
+    /// onto a gene and hand it a win it did not have before; this rejects that.
+    ///
+    /// Two UMIs one substitution apart. Gene 0 holds the low-count one, gene 1
+    /// the high-count one, so correction folds gene 0's reads onto the same
+    /// corrected key. Gene 0 wins after correction and loses before it, so the
+    /// UMI is dropped.
+    #[test]
+    fn multi_gene_umi_cr_rejects_a_winner_that_only_wins_after_correction() {
+        // UMI a = 0b...0000, UMI b = 0b...0001 (one substitution apart).
+        let (a, b) = (0u64, 1u64);
+        let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
+        umi_genes.entry(a).or_default().insert(0u32, 5);
+        umi_genes.entry(b).or_default().insert(0u32, 1);
+        umi_genes.entry(b).or_default().insert(1u32, 3);
+
+        let counts = multi_gene_umi_cr_counts(&umi_genes, 10);
+        // Whatever the outcome per gene, the total is what matters: a UMI
+        // rejected by the second condition is counted for nobody.
+        let total: u64 = counts.iter().map(|&(_, c)| c).sum();
+        assert!(
+            total <= 2,
+            "at most one molecule per corrected UMI, got {counts:?}"
+        );
+    }
+
+    #[test]
+    fn multi_gene_umi_cr_drops_a_tie_entirely() {
+        let mut tied = HashMap::default();
+        tied.insert(0u32, 1u32);
+        tied.insert(1u32, 1u32);
+        assert_eq!(
+            filter_multi_gene_umi(&tied, UmiFiltering::MultiGeneUmiCr),
+            []
+        );
+
+        // A tie at the maximum loses even when a third gene sits below it.
+        let mut tied_with_loser = HashMap::default();
+        tied_with_loser.insert(0u32, 5u32);
+        tied_with_loser.insert(1u32, 5u32);
+        tied_with_loser.insert(2u32, 3u32);
+        assert!(
+            filter_multi_gene_umi(&tied_with_loser, UmiFiltering::MultiGeneUmiCr).is_empty(),
+            "a tie at the maximum takes the UMI from everyone, including the third gene"
+        );
+
+        // A strict maximum still wins, whatever else is present.
+        let mut strict = HashMap::default();
+        strict.insert(0u32, 5u32);
+        strict.insert(1u32, 4u32);
+        strict.insert(2u32, 4u32);
+        let kept = filter_multi_gene_umi(&strict, UmiFiltering::MultiGeneUmiCr);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(*kept[0].0, 0);
+    }
+
     #[test]
     fn multi_gene_umi_cr_keeps_top_gene() {
         // UMI maps to gene 0 (3 reads) and gene 1 (1 read). CR keeps only gene 0.
@@ -2367,5 +2880,61 @@ mod tests {
         assert_eq!(resolve_multi_cb(&cands, &[0, 0], 0.0), None);
         // Pseudocount gives every candidate positive weight → argmax accepted.
         assert!(resolve_multi_cb(&cands, &[0, 0], 1.0).is_some());
+    }
+
+    #[test]
+    fn multigene_umi_all_drops_the_umi_from_every_gene() {
+        // A UMI seen in two genes, one of them far better supported.
+        let mut cross: HashMap<u32, u32> = HashMap::default();
+        cross.insert(7, 10);
+        cross.insert(9, 1);
+
+        // MultiGeneUMI keeps the winner.
+        let kept = filter_multi_gene_umi(&cross, UmiFiltering::MultiGeneUmi);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(*kept[0].0, 7);
+
+        // MultiGeneUMI_CR likewise.
+        assert_eq!(
+            filter_multi_gene_umi(&cross, UmiFiltering::MultiGeneUmiCr).len(),
+            1
+        );
+
+        // MultiGeneUMI_All discards it from both: a UMI in two genes is
+        // evidence of a collision, not of the deeper gene.
+        assert_eq!(
+            filter_multi_gene_umi(&cross, UmiFiltering::MultiGeneUmiAll),
+            []
+        );
+
+        // A single-gene UMI is untouched by every mode, including _All.
+        let mut single: HashMap<u32, u32> = HashMap::default();
+        single.insert(7, 3);
+        for mode in [
+            UmiFiltering::None,
+            UmiFiltering::MultiGeneUmi,
+            UmiFiltering::MultiGeneUmiCr,
+            UmiFiltering::MultiGeneUmiAll,
+        ] {
+            assert_eq!(
+                filter_multi_gene_umi(&single, mode).len(),
+                1,
+                "{mode:?} must not touch a single-gene UMI"
+            );
+        }
+    }
+
+    #[test]
+    fn multigene_umi_all_parses_to_its_own_variant() {
+        // It used to alias to MultiGeneUMI, which was neither STAR's behaviour
+        // (a no-op) nor the documented one.
+        assert_eq!(
+            "MultiGeneUMI_All".parse::<UmiFiltering>().unwrap(),
+            UmiFiltering::MultiGeneUmiAll
+        );
+        assert_eq!(
+            "MultiGeneUMI".parse::<UmiFiltering>().unwrap(),
+            UmiFiltering::MultiGeneUmi
+        );
     }
 }

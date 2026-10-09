@@ -314,7 +314,12 @@ fn collapse_group(recs: &mut [DedupRec], group: &[usize], mate2_bases_n: u32) ->
             .then_with(|| (ra.flag & 0x80).cmp(&(rb.flag & 0x80)))
     });
     // Pairs of adjacent (mate1, mate2) indices.
-    let mut pairs: Vec<(usize, usize)> = sorted.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+    let mut pairs: Vec<(usize, usize)> = sorted
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[m1, m2]| (m1, m2))
+        .collect();
     // Sort pairs by the coordinate/flag/CIGAR key.
     pairs.sort_by(|&(a1, a2), &(b1, b2)| {
         cmp_pair(&recs[a1], &recs[a2], &recs[b1], &recs[b2], mate2_bases_n)
