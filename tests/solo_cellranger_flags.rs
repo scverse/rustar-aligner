@@ -155,6 +155,10 @@ fn run_solo(
         gtf.to_str().unwrap(),
         "--outFileNamePrefix",
         &prefix,
+        // This geometry is 10x's, which turns on CellRanger's output layout by
+        // default; these tests read STARsolo's Solo.out/ tree.
+        "--soloOutLayout",
+        "STARsolo",
     ]);
     cmd.args(extra);
     cmd.assert().success();
