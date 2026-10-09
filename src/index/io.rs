@@ -34,7 +34,8 @@ impl GenomeIndex {
         log::info!("Loaded suffix array: {} entries", suffix_array.len());
 
         // Load SAindex file
-        let sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        let mut sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        sa_index.sparse_d = read_sa_params(genome_dir, params).0.max(1);
         log::info!(
             "Loaded SA index: nbases={}, {} indices",
             sa_index.nbases,
@@ -355,6 +356,7 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
         data,
         word_length,
         gstrand_bit,
+        sparse_d: 1,
     })
 }
 
