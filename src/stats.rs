@@ -18,6 +18,19 @@ pub enum UnmappedReason {
     TooManyMismatches,
     /// Too many multi-mapping loci (nTr > outFilterMultimapNmax)
     TooManyLoci,
+    /// One mate of a paired read is mapped (STAR's `unmapType` 4); only the
+    /// unmapped mate's record carries it.
+    HalfMapped,
+}
+
+/// STAR's `trBest` score and mismatch count (`maxScore`, `nMM`), written as `AS`
+/// and `nM` on the unmapped records of a read that had a best transcript
+/// (`ReadAlign_outputTranscriptSAM.cpp`, unmapped branch). Zero when the read had
+/// no transcript at all (`trInit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BestTr {
+    pub score: i32,
+    pub n_mm: u32,
 }
 
 /// Tracks alignment statistics for a read mapping run
@@ -194,8 +207,9 @@ impl AlignmentStats {
             UnmappedReason::TooShort => {
                 self.unmapped_short.fetch_add(1, Ordering::Relaxed);
             }
-            UnmappedReason::TooManyLoci => {
-                // Tracked via record_alignment's too_many_loci path, not here
+            UnmappedReason::TooManyLoci | UnmappedReason::HalfMapped => {
+                // Too many loci: tracked via record_alignment's too_many_loci path.
+                // Half mapped: counted as mapped, the pair has a mapped mate.
             }
             UnmappedReason::Other => {
                 self.unmapped_other.fetch_add(1, Ordering::Relaxed);

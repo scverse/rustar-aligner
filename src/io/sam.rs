@@ -7,7 +7,7 @@ use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
 use crate::params::{Parameters, SamAttributes};
-use crate::stats::UnmappedReason;
+use crate::stats::{BestTr, UnmappedReason};
 use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
@@ -88,17 +88,26 @@ pub fn order_record_tags(record: &mut RecordBuf, attrs: &SamAttributes) {
 /// `NH:i:0 HI:i:0 AS:i nM:i uT:A` and then `RG:Z` when a read group is set, in
 /// that fixed order and regardless of `--outSAMattributes`
 /// (ReadAlign_outputTranscriptSAM.cpp unmapped branch, ReadAlign_alignBAM.cpp).
-fn insert_unmapped_tags(record: &mut RecordBuf, rg_id: Option<&str>, reason: UnmappedReason) {
+/// `AS` and `nM` are the best transcript's (`trOut.maxScore`, `trOut.nMM`).
+fn insert_unmapped_tags(
+    record: &mut RecordBuf,
+    rg_id: Option<&str>,
+    reason: UnmappedReason,
+    best: BestTr,
+) {
+    // STAR writes MAPQ 0 on every unmapped record.
+    *record.mapping_quality_mut() = MappingQuality::new(0);
     let data = record.data_mut();
     data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(0i32));
     data.insert(Tag::HIT_INDEX, Value::from(0i32));
-    data.insert(Tag::ALIGNMENT_SCORE, Value::from(0i32));
-    data.insert(Tag::new(b'n', b'M'), Value::from(0i32));
+    data.insert(Tag::ALIGNMENT_SCORE, Value::from(best.score));
+    data.insert(Tag::new(b'n', b'M'), Value::from(best.n_mm as i32));
     let ut = match reason {
         UnmappedReason::Other => b'0',
         UnmappedReason::TooShort => b'1',
         UnmappedReason::TooManyMismatches => b'2',
         UnmappedReason::TooManyLoci => b'3',
+        UnmappedReason::HalfMapped => b'4',
     };
     data.insert(Tag::new(b'u', b'T'), Value::Character(ut));
     maybe_insert_rg_tag(record, rg_id);
@@ -235,12 +244,14 @@ impl SamWriter {
     /// * `read_qual` - Quality scores
     /// * `params` - Parameters (used for attribute gating and RG tag)
     /// * `unmapped_reason` - Why the read was not mapped (drives `uT:A:` tag)
+    /// * `best` - STAR's `trBest` score and mismatches (`AS`, `nM` tags)
     pub fn build_unmapped_record(
         read_name: &str,
         read_seq: &[u8],
         read_qual: &[u8],
         params: &Parameters,
         unmapped_reason: UnmappedReason,
+        best: BestTr,
     ) -> Result<RecordBuf, Error> {
         let mut record = RecordBuf::default();
 
@@ -258,7 +269,7 @@ impl SamWriter {
         *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
 
         let rg_id_owned = params.primary_rg_id()?;
-        insert_unmapped_tags(&mut record, rg_id_owned.as_deref(), unmapped_reason);
+        insert_unmapped_tags(&mut record, rg_id_owned.as_deref(), unmapped_reason, best);
 
         Ok(record)
     }
@@ -385,6 +396,7 @@ impl SamWriter {
                 mate2_qual,
                 params,
                 UnmappedReason::Other,
+                BestTr::default(),
             );
         }
 
@@ -484,10 +496,10 @@ impl SamWriter {
     /// Returns 2 records: mate1 first, mate2 second (regardless of which is mapped).
     ///
     /// **Mapped mate:** Normal alignment with FLAG 0x8 (mate unmapped).
-    ///   RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate).
+    ///   RNEXT `*`, PNEXT 0, as STAR.
     ///
-    /// **Unmapped mate:** FLAG 0x4, co-located at mapped mate's position.
-    ///   SEQ/QUAL in forward orientation (no RC).
+    /// **Unmapped mate:** FLAG 0x4, uT:A:4, MAPQ 0, RNAME `*`, POS 0, RNEXT/PNEXT
+    ///   at the mapped mate. SEQ/QUAL in forward orientation (no RC).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn build_half_mapped_records(
@@ -561,12 +573,8 @@ impl SamWriter {
         *mapped_rec.mapping_quality_mut() = MappingQuality::new(mapq);
         *mapped_rec.cigar_mut() = mapped_transcript.cigar.iter().copied().collect();
 
-        // RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate)
-        *mapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.mate_alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
-            })?);
+        // RNEXT `*`, PNEXT 0: STAR passes no mate to the mapped mate of a
+        // one-mate alignment (mateChr = -1, ReadAlign_outputTranscriptSAM.cpp).
         *mapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL (core from the aligned slice; apply_read_clips restores full read)
@@ -674,15 +682,10 @@ impl SamWriter {
         }
         *unmapped_rec.flags_mut() = unmapped_flags;
 
-        // Co-locate unmapped mate at mapped mate's position
-        *unmapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.alignment_start_mut() = Some(
-            mapped_pos
-                .try_into()
-                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
-        );
-        *unmapped_rec.mapping_quality_mut() = MappingQuality::new(0);
-        // CIGAR = * (default empty cigar)
+        // STAR leaves the unmapped mate without a position (RNAME `*`, POS 0)
+        // and points RNEXT/PNEXT at the mapped mate
+        // (ReadAlign_outputTranscriptSAM.cpp, ReadAlign_alignBAM.cpp).
+        // CIGAR = * (default empty cigar), MAPQ 0 (insert_unmapped_tags)
         // RNEXT = mapped mate's chr
         *unmapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *unmapped_rec.mate_alignment_start_mut() =
@@ -696,7 +699,16 @@ impl SamWriter {
         *unmapped_rec.sequence_mut() = Sequence::from(unmapped_seq_bytes);
         *unmapped_rec.quality_scores_mut() =
             QualityScores::from(fastq_qual_to_phred(unmapped_qual));
-        insert_unmapped_tags(&mut unmapped_rec, rg_id, UnmappedReason::Other);
+        // uT:4 (one-mate alignment of a paired read), AS/nM of trBest (the mapped mate).
+        insert_unmapped_tags(
+            &mut unmapped_rec,
+            rg_id,
+            UnmappedReason::HalfMapped,
+            BestTr {
+                score: mapped_transcript.score,
+                n_mm: mapped_transcript.n_mismatch,
+            },
+        );
 
         // Order: mate1 first, mate2 second
         if mate1_is_mapped {
@@ -815,6 +827,7 @@ impl SamWriter {
     }
 
     /// Build unmapped paired records (both mates unmapped)
+    #[allow(clippy::too_many_arguments)]
     pub fn build_paired_unmapped_records(
         read_name: &str,
         mate1_seq: &[u8],
@@ -823,6 +836,7 @@ impl SamWriter {
         mate2_qual: &[u8],
         params: &Parameters,
         unmapped_reason: UnmappedReason,
+        best: BestTr,
     ) -> Result<Vec<RecordBuf>, Error> {
         let mut records = Vec::with_capacity(2);
         let rg_id_owned = params.primary_rg_id()?;
@@ -842,7 +856,7 @@ impl SamWriter {
         let seq1_bytes: Vec<u8> = mate1_seq.iter().map(|&b| decode_base(b)).collect();
         *rec1.sequence_mut() = Sequence::from(seq1_bytes);
         *rec1.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate1_qual));
-        insert_unmapped_tags(&mut rec1, rg_id, unmapped_reason);
+        insert_unmapped_tags(&mut rec1, rg_id, unmapped_reason, best);
         records.push(rec1);
 
         // Mate2 record
@@ -859,7 +873,7 @@ impl SamWriter {
         let seq2_bytes: Vec<u8> = mate2_seq.iter().map(|&b| decode_base(b)).collect();
         *rec2.sequence_mut() = Sequence::from(seq2_bytes);
         *rec2.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate2_qual));
-        insert_unmapped_tags(&mut rec2, rg_id, unmapped_reason);
+        insert_unmapped_tags(&mut rec2, rg_id, unmapped_reason, best);
         records.push(rec2);
 
         Ok(records)
@@ -1954,6 +1968,7 @@ mod tests {
             read_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -1975,6 +1990,7 @@ mod tests {
             read_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -1993,11 +2009,24 @@ mod tests {
             (UnmappedReason::TooShort, b'1'),
             (UnmappedReason::TooManyMismatches, b'2'),
             (UnmappedReason::TooManyLoci, b'3'),
+            (UnmappedReason::HalfMapped, b'4'),
         ] {
+            let best = BestTr { score: 29, n_mm: 2 };
             let record =
-                SamWriter::build_unmapped_record("r", &read_seq, read_qual, &params, reason)
+                SamWriter::build_unmapped_record("r", &read_seq, read_qual, &params, reason, best)
                     .unwrap();
+            // STAR writes MAPQ 0 on unmapped records.
+            assert_eq!(
+                record.mapping_quality().map(u8::from),
+                Some(0),
+                "MAPQ 0 for {reason:?}"
+            );
             let data = record.data();
+            assert_eq!(
+                data.get(&Tag::new(b'n', b'M')),
+                Some(&Value::from(2i32)),
+                "nM of trBest for {reason:?}"
+            );
             // NH/HI/AS present (Standard attrs enabled by default)
             assert_eq!(
                 data.get(&Tag::ALIGNMENT_HIT_COUNT),
@@ -2011,8 +2040,8 @@ mod tests {
             );
             assert_eq!(
                 data.get(&Tag::ALIGNMENT_SCORE),
-                Some(&Value::from(0i32)),
-                "AS:i:0 missing for {reason:?}"
+                Some(&Value::from(29i32)),
+                "AS of trBest for {reason:?}"
             );
             // uT:A: always emitted with correct value
             assert_eq!(
@@ -2194,6 +2223,7 @@ mod tests {
             &mate2_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -4637,24 +4667,27 @@ mod tests {
             mapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
-        // RNEXT and PNEXT should point to own position (STAR convention)
-        assert_eq!(mapped.mate_reference_sequence_id(), Some(0));
-        assert_eq!(
-            mapped.mate_alignment_start().map(usize::from),
-            Some(expected_pos)
-        );
+        // STAR gives the mapped mate of a one-mate alignment no RNEXT/PNEXT (`*`, 0)
+        assert_eq!(mapped.mate_reference_sequence_id(), None);
+        assert_eq!(mapped.mate_alignment_start(), None);
 
-        // Unmapped mate: co-located at mapped mate's position
+        // Unmapped mate: RNAME `*`, POS 0; RNEXT/PNEXT at the mapped mate
         let unmapped = &records[1];
-        assert_eq!(unmapped.reference_sequence_id(), Some(0));
-        assert_eq!(
-            unmapped.alignment_start().map(usize::from),
-            Some(expected_pos)
-        );
+        assert_eq!(unmapped.reference_sequence_id(), None);
+        assert_eq!(unmapped.alignment_start(), None);
         assert_eq!(unmapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
             unmapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
+        );
+        // uT:A:4 with the mapped mate's AS and nM (trBest)
+        assert_eq!(
+            unmapped.data().get(&Tag::new(b'u', b'T')),
+            Some(&Value::Character(b'4'))
+        );
+        assert_eq!(
+            unmapped.data().get(&Tag::ALIGNMENT_SCORE),
+            Some(&Value::from(100i32))
         );
         // MAPQ = 0 for unmapped
         assert_eq!(unmapped.mapping_quality().map(u8::from), Some(0));
@@ -4985,6 +5018,7 @@ mod tests {
             &[30, 30, 30, 30],
             &params,
             UnmappedReason::TooShort,
+            BestTr::default(),
         )
         .unwrap();
         assert_eq!(tag_names(&rec), ["NH", "HI", "AS", "nM", "uT", "RG"]);
