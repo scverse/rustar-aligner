@@ -2,6 +2,7 @@
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::io::bgzf_writer::BgzfWriter;
+use crate::io::encode::{RecordEncoder, RecordFormat, bam_record_spans};
 use crate::params::Parameters;
 use crate::quant::transcriptome::TranscriptomeIndex;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -81,44 +82,6 @@ pub struct BamWriter {
     header: sam::Header,
 }
 
-/// Sort key for coordinate-sorted output. Unmapped records (no reference or no
-/// position) sort to the end, matching STAR.
-fn sort_key(record: &RecordBuf) -> (usize, usize) {
-    match (record.reference_sequence_id(), record.alignment_start()) {
-        (Some(chr), Some(pos)) => (chr, pos.get()),
-        _ => (usize::MAX, 0),
-    }
-}
-
-/// Estimate of the heap bytes a buffered `RecordBuf` occupies.
-///
-/// Counts the variable-length fields plus a fixed allowance for the struct, its
-/// five `Vec`/`BString` headers, and per-allocation allocator slack. Calibrated
-/// against measured RSS growth: an unbounded sort of 100 bp single-end records
-/// with the default `NH HI AS nM` tags grows at 723 B/record, and the constants
-/// below yield 768 B for that shape, so the estimate sits just above actual.
-///
-/// Erring high is the safe direction — the sorter spills once the running total
-/// crosses the budget, so over-counting spills early. Note that the *realized*
-/// sort footprint is about 1.4x the configured budget rather than 1.0x, because
-/// the batch being copied in, the spill compressor, and the merge readers all sit
-/// outside this accounting.
-fn estimated_record_bytes(record: &RecordBuf) -> u64 {
-    /// `RecordBuf` itself, its `Vec`/`BString` headers, and allocator slack.
-    const FIXED_OVERHEAD: u64 = 320;
-    /// `record_buf::Cigar` holds `Vec<Op>`; `Op` is a (Kind, usize) pair.
-    const CIGAR_OP_BYTES: u64 = 16;
-    /// A tag/value pair in the data map, averaged over the tags STAR emits.
-    const DATA_FIELD_BYTES: u64 = 56;
-
-    FIXED_OVERHEAD
-        + record.name().map_or(0, |name| name.len() as u64)
-        + record.sequence().len() as u64
-        + record.quality_scores().len() as u64
-        + record.cigar().as_ref().len() as u64 * CIGAR_OP_BYTES
-        + record.data().len() as u64 * DATA_FIELD_BYTES
-}
-
 /// Coordinate-sort RAM budget when `--limitBAMsortRAM` is 0.
 ///
 /// `0` previously meant "unlimited", so the default configuration buffered the
@@ -171,20 +134,45 @@ fn sort_temp_dir(params: &Parameters) -> std::path::PathBuf {
     }
 }
 
+/// One buffered record: `(sort key, offset into the byte buffer, length)`.
+type SortEntry = ((usize, usize), usize, usize);
+
+/// Coordinate sort key of one BAM record (including its `block_size` prefix):
+/// `(reference id, 1-based start)`, with records lacking either sorted last,
+/// matching STAR.
+fn bam_sort_key(rec: &[u8]) -> (usize, usize) {
+    // After block_size: refID (i32), pos (i32, 0-based, -1 = none).
+    let ref_id = i32::from_le_bytes(rec[4..8].try_into().unwrap());
+    let pos = i32::from_le_bytes(rec[8..12].try_into().unwrap());
+    if ref_id >= 0 && pos >= 0 {
+        (ref_id as usize, pos as usize + 1)
+    } else {
+        (usize::MAX, 0)
+    }
+}
+
 /// External coordinate sorter with bounded memory.
 ///
-/// Records accumulate in memory until the RAM budget is reached, at which point
-/// the buffer is sorted and written to a spill run (a headerless BGZF stream of
-/// BAM records) beside the output. `write_sorted` merges every run plus the
+/// Records arrive BAM-encoded (serialized on the align workers, #223) and stay
+/// encoded: the buffer is one byte vector plus a small index of
+/// `(key, offset, length)`, so sorting moves index entries and writing is a
+/// plain copy. Once the buffered bytes plus index reach the RAM budget the
+/// buffer is sorted and written to a spill run (a headerless BGZF stream of BAM
+/// records) beside the output. `write_sorted` merges every run plus the
 /// in-memory tail with a k-way merge, so peak memory is the budget rather than
 /// the whole output.
 ///
 /// Ordering is identical to a single in-memory sort: runs are created in input
-/// order, `sort_by_key` is stable within a run, and the merge breaks ties on run
+/// order, the sort is stable within a run, and the merge breaks ties on run
 /// index, so records sharing a coordinate keep their input order.
+///
+/// The budget counts the real encoded bytes and the index entries. The realized
+/// footprint is somewhat above the budget because the vectors grow by doubling
+/// and the spill compressor and merge readers sit outside this accounting.
 struct CoordinateSorter {
-    records: Vec<RecordBuf>,
-    buffered_bytes: u64,
+    encoder: RecordEncoder,
+    bytes: Vec<u8>,
+    index: Vec<SortEntry>,
     runs: Vec<tempfile::TempPath>,
     header: sam::Header,
     compression: i32,
@@ -197,8 +185,9 @@ struct CoordinateSorter {
 impl CoordinateSorter {
     fn new(header: sam::Header, params: &Parameters) -> Self {
         Self {
-            records: Vec::new(),
-            buffered_bytes: 0,
+            encoder: RecordEncoder::new(RecordFormat::Bam, &header),
+            bytes: Vec::new(),
+            index: Vec::new(),
             runs: Vec::new(),
             header,
             compression: params.out_bam_compression,
@@ -209,14 +198,27 @@ impl CoordinateSorter {
         }
     }
 
+    /// Bytes the in-memory buffer accounts against the budget.
+    fn buffered_bytes(&self) -> u64 {
+        (self.bytes.len() + self.index.len() * std::mem::size_of::<SortEntry>()) as u64
+    }
+
     fn push_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        self.records.reserve(batch.len());
-        for record in batch {
-            self.buffered_bytes += estimated_record_bytes(record);
-            self.records.push(record.clone());
+        let mut buf = Vec::new();
+        self.encoder.encode(batch, &mut buf)?;
+        self.push_encoded(&buf)
+    }
+
+    /// Buffer records serialized by `self.encoder`, spilling once over budget.
+    fn push_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let base = self.bytes.len();
+        for (off, len) in bam_record_spans(bytes)? {
+            let key = bam_sort_key(&bytes[off..off + len]);
+            self.index.push((key, base + off, len));
+            self.n_records += 1;
         }
-        self.n_records += batch.len() as u64;
-        if self.buffered_bytes >= self.ram_limit {
+        self.bytes.extend_from_slice(bytes);
+        if self.buffered_bytes() >= self.ram_limit {
             self.spill()?;
         }
         Ok(())
@@ -235,40 +237,43 @@ impl CoordinateSorter {
             .map_err(|source| Error::io(source, &self.temp_dir))
     }
 
+    /// Stable-sort the buffered records by coordinate and write them to `out`.
+    fn write_buffered<W: Write>(&mut self, out: &mut W) -> Result<(), Error> {
+        self.index.sort_by_key(|&(key, _, _)| key);
+        for &(_, off, len) in &self.index {
+            out.write_all(&self.bytes[off..off + len])?;
+        }
+        Ok(())
+    }
+
     /// Sort the in-memory buffer and append it as a spill run.
     fn spill(&mut self) -> Result<(), Error> {
-        if self.records.is_empty() {
+        if self.index.is_empty() {
             return Ok(());
         }
-        self.records.sort_by_key(sort_key);
-
         let temp = self.new_run()?;
-        // Headerless: `Reader::read_record_buf` ignores the header entirely, so
-        // runs carry only record blocks and never re-parse reference names.
-        let mut writer = bam::io::Writer::from(make_bgzf_writer(
+        // Headerless: runs carry only record blocks and never re-parse
+        // reference names.
+        let mut writer = make_bgzf_writer(
             BufWriter::new(temp.as_file().try_clone()?),
             self.compression,
             self.threads,
-        )?);
-        for record in &self.records {
-            writer.write_alignment_record(&self.header, record)?;
-        }
+        )?;
+        self.write_buffered(&mut writer)?;
         // Finish and flush explicitly rather than on drop, so a failure to write
         // the run surfaces here instead of being swallowed and read back short.
-        writer.get_mut().finish()?.flush()?;
+        writer.finish()?.flush()?;
         log::debug!(
             "Coordinate sort: spilled run {} ({} records, ~{} MiB)",
             self.runs.len(),
-            self.records.len(),
-            self.buffered_bytes >> 20
+            self.index.len(),
+            self.buffered_bytes() >> 20
         );
         self.runs.push(temp.into_temp_path());
         // Keep the capacity: it is the budget, so holding one stable allocation
-        // for the whole run is both correct and cheaper than releasing it and
-        // growing back from zero (which leaves a doubling series of abandoned
-        // blocks behind on every spill).
-        self.records.clear();
-        self.buffered_bytes = 0;
+        // for the whole run is cheaper than releasing it and growing back.
+        self.bytes.clear();
+        self.index.clear();
         Ok(())
     }
 
@@ -280,25 +285,22 @@ impl CoordinateSorter {
     ) -> Result<(), Error> {
         let spilled_runs = self.runs.len();
         self.reduce_runs()?;
-        self.records.sort_by_key(sort_key);
+        self.index.sort_by_key(|&(key, _, _)| key);
 
         let mut bgzf = make_bgzf_writer(out, self.compression, self.threads)?;
         write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
-        let mut writer = bam::io::Writer::from(bgzf);
 
         let written = if self.runs.is_empty() {
             // Nothing spilled: identical to the previous in-memory-only path.
-            for record in &self.records {
-                writer.write_alignment_record(&self.header, record)?;
-            }
-            self.records.len() as u64
+            self.write_buffered(&mut bgzf)?;
+            self.index.len() as u64
         } else {
             let runs = std::mem::take(&mut self.runs);
-            let written = self.merge(&runs, Some(&self.records), &mut writer)?;
+            let written = self.merge(&runs, true, &mut bgzf)?;
             drop(runs);
             written
         };
-        writer.get_mut().finish()?.flush()?;
+        bgzf.finish()?.flush()?;
 
         if written != self.n_records {
             return Err(Error::Alignment(format!(
@@ -333,13 +335,13 @@ impl CoordinateSorter {
                     continue;
                 }
                 let temp = self.new_run()?;
-                let mut writer = bam::io::Writer::from(make_bgzf_writer(
+                let mut writer = make_bgzf_writer(
                     BufWriter::new(temp.as_file().try_clone()?),
                     self.compression,
                     self.threads,
-                )?);
-                self.merge(&group, None, &mut writer)?;
-                writer.get_mut().finish()?.flush()?;
+                )?;
+                self.merge(&group, false, &mut writer)?;
+                writer.finish()?.flush()?;
                 // Dropping `group` here deletes the consumed runs, so scratch use
                 // does not grow across passes.
                 drop(group);
@@ -354,13 +356,13 @@ impl CoordinateSorter {
         Ok(())
     }
 
-    /// K-way merge `runs` (and optionally an in-memory `tail`, which sorts last on
-    /// ties) into `writer`. Returns the number of records written.
-    fn merge<W: Write + Send + 'static>(
+    /// K-way merge `runs` (and, if `with_tail`, the sorted in-memory buffer, which
+    /// sorts last on ties) into `out`. Returns the number of records written.
+    fn merge<W: Write>(
         &self,
         runs: &[tempfile::TempPath],
-        tail: Option<&[RecordBuf]>,
-        writer: &mut bam::io::Writer<BgzfWriter<W>>,
+        with_tail: bool,
+        out: &mut W,
     ) -> Result<u64, Error> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
@@ -368,46 +370,57 @@ impl CoordinateSorter {
         let mut readers = Vec::with_capacity(runs.len());
         for path in runs {
             let file = File::open(path).map_err(|source| Error::io(source, path))?;
-            readers.push(bam::io::Reader::new(BufReader::new(file)));
+            readers.push(bgzf::io::Reader::new(BufReader::new(file)));
         }
         // The unspilled tail is the last run, so it keeps the highest run index
         // and therefore loses coordinate ties to everything written before it.
         let tail_run = readers.len();
-        let mut tail = tail.unwrap_or(&[]).iter();
-        // Hoisted: noodles' BAM record decoder ignores this argument, so it must
-        // not be rebuilt per record.
-        let decode_header = sam::Header::default();
+        let mut tail = if with_tail {
+            self.index.as_slice()
+        } else {
+            &[]
+        }
+        .iter();
 
-        let mut heads: Vec<Option<RecordBuf>> = Vec::with_capacity(tail_run + 1);
+        let mut heads: Vec<Option<Vec<u8>>> = Vec::with_capacity(tail_run + 1);
         let mut heap: BinaryHeap<Reverse<((usize, usize), usize)>> = BinaryHeap::new();
         for (run, (reader, path)) in readers.iter_mut().zip(runs).enumerate() {
-            let record = read_run_record(reader, path, &decode_header)?;
+            let record = read_run_record(reader, path)?;
             if let Some(record) = &record {
-                heap.push(Reverse((sort_key(record), run)));
+                heap.push(Reverse((bam_sort_key(record), run)));
             }
             heads.push(record);
         }
-        let tail_head = tail.next().cloned();
-        if let Some(record) = &tail_head {
-            heap.push(Reverse((sort_key(record), tail_run)));
+        let tail_head = tail.next().map(|&(key, off, len)| (key, off, len));
+        if let Some((key, _, _)) = tail_head {
+            heap.push(Reverse((key, tail_run)));
         }
-        heads.push(tail_head);
+        heads.push(None);
+        let mut tail_head = tail_head;
 
         let mut written = 0u64;
         while let Some(Reverse((_, run))) = heap.pop() {
-            let record = heads[run]
-                .take()
-                .ok_or_else(|| Error::Alignment("BAM sort merge lost a record".to_string()))?;
-            writer.write_alignment_record(&self.header, &record)?;
-            written += 1;
-
             let next = if run == tail_run {
-                tail.next().cloned()
+                let (_, off, len) = tail_head
+                    .take()
+                    .ok_or_else(|| Error::Alignment("BAM sort merge lost a record".to_string()))?;
+                out.write_all(&self.bytes[off..off + len])?;
+                tail_head = tail.next().copied();
+                if let Some((key, _, _)) = tail_head {
+                    heap.push(Reverse((key, run)));
+                }
+                written += 1;
+                continue;
             } else {
-                read_run_record(&mut readers[run], &runs[run], &decode_header)?
+                let record = heads[run]
+                    .take()
+                    .ok_or_else(|| Error::Alignment("BAM sort merge lost a record".to_string()))?;
+                out.write_all(&record)?;
+                read_run_record(&mut readers[run], &runs[run])?
             };
+            written += 1;
             if let Some(record) = &next {
-                heap.push(Reverse((sort_key(record), run)));
+                heap.push(Reverse((bam_sort_key(record), run)));
             }
             heads[run] = next;
         }
@@ -415,23 +428,37 @@ impl CoordinateSorter {
     }
 }
 
-/// Read the next record from a spill run, or `None` at end of run.
-///
-/// `header` is passed through to noodles, which ignores it — reference sequence
-/// ids are plain indices, so runs need no reference list.
+/// Read the next BAM record (with its `block_size` prefix) from a spill run, or
+/// `None` at end of run.
 fn read_run_record<R: std::io::Read>(
-    reader: &mut bam::io::Reader<bgzf::io::Reader<R>>,
+    reader: &mut bgzf::io::Reader<R>,
     path: &Path,
-    header: &sam::Header,
-) -> Result<Option<RecordBuf>, Error> {
-    let mut record = RecordBuf::default();
-    match reader
-        .read_record_buf(header, &mut record)
-        .map_err(|source| Error::io(source, path))?
-    {
-        0 => Ok(None),
-        _ => Ok(Some(record)),
+) -> Result<Option<Vec<u8>>, Error> {
+    use std::io::Read as _;
+    let mut size = [0u8; 4];
+    let mut got = 0;
+    while got < size.len() {
+        match reader
+            .read(&mut size[got..])
+            .map_err(|source| Error::io(source, path))?
+        {
+            0 if got == 0 => return Ok(None),
+            0 => {
+                return Err(Error::Alignment(format!(
+                    "truncated BAM sort spill run {}",
+                    path.display()
+                )));
+            }
+            n => got += n,
+        }
     }
+    let len = u32::from_le_bytes(size) as usize;
+    let mut record = vec![0u8; 4 + len];
+    record[..4].copy_from_slice(&size);
+    reader
+        .read_exact(&mut record[4..])
+        .map_err(|source| Error::io(source, path))?;
+    Ok(Some(record))
 }
 
 /// BAM file writer that sorts records by coordinate with bounded memory,
@@ -506,6 +533,29 @@ impl BamWriter {
         Ok(())
     }
 
+    /// Encoder producing exactly what [`BamWriter::write_batch`] writes.
+    pub fn encoder(&self) -> RecordEncoder {
+        RecordEncoder::new(RecordFormat::Bam, &self.header)
+    }
+
+    /// Append records serialized by [`BamWriter::encoder`].
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.writer.get_mut().write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Write `encoded` if the records were pre-serialized, else `records`.
+    pub fn write_encoded_or(
+        &mut self,
+        encoded: Option<&[u8]>,
+        records: &[RecordBuf],
+    ) -> Result<(), Error> {
+        match encoded {
+            Some(bytes) => self.write_encoded(bytes),
+            None => self.write_batch(records),
+        }
+    }
+
     /// Flush and close BAM file
     pub fn finish(&mut self) -> Result<(), Error> {
         self.writer.get_mut().finish()?;
@@ -532,6 +582,16 @@ impl SortedBamWriter {
     /// Buffer records, spilling a sorted run when the RAM budget is reached.
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
         self.sorter.push_batch(batch)
+    }
+
+    /// Encoder whose output `write_encoded` accepts.
+    pub fn encoder(&self) -> RecordEncoder {
+        self.sorter.encoder.clone()
+    }
+
+    /// Buffer records serialized by `encoder`, spilling once over budget.
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.sorter.push_encoded(bytes)
     }
 
     /// Merge every run plus the in-memory tail into a coordinate-sorted BAM.
@@ -705,6 +765,17 @@ impl BamStdoutWriter {
         Ok(())
     }
 
+    /// Encoder producing exactly what [`BamStdoutWriter::write_batch`] writes.
+    pub fn encoder(&self) -> RecordEncoder {
+        RecordEncoder::new(RecordFormat::Bam, &self.header)
+    }
+
+    /// Append records serialized by [`BamStdoutWriter::encoder`].
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.writer.get_mut().write_all(bytes)?;
+        Ok(())
+    }
+
     pub fn finish(&mut self) -> Result<(), Error> {
         self.writer.get_mut().finish()?;
         Ok(())
@@ -727,6 +798,16 @@ impl SortedBamStdoutWriter {
 
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
         self.sorter.push_batch(batch)
+    }
+
+    /// Encoder whose output `write_encoded` accepts.
+    pub fn encoder(&self) -> RecordEncoder {
+        self.sorter.encoder.clone()
+    }
+
+    /// Buffer records serialized by `encoder`, spilling once over budget.
+    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.sorter.push_encoded(bytes)
     }
 
     pub fn finish(&mut self) -> Result<(), Error> {
@@ -1163,16 +1244,114 @@ mod tests {
     }
 
     #[test]
-    fn test_record_size_estimate_tracks_record_contents() {
+    fn test_sort_budget_accounts_real_record_size() {
+        let params = default_params();
+        let mut small_sorter = CoordinateSorter::new(two_ref_header(), &params);
+        let mut large_sorter = CoordinateSorter::new(two_ref_header(), &params);
         let small = placed_record("r", Some(0), Some(1));
         let mut large = placed_record("r", Some(0), Some(1));
         *large.sequence_mut() =
             noodles::sam::alignment::record_buf::Sequence::from(vec![b'A'; 150]);
         *large.quality_scores_mut() =
             noodles::sam::alignment::record_buf::QualityScores::from(vec![30u8; 150]);
+        small_sorter.push_batch(&[small]).unwrap();
+        large_sorter.push_batch(&[large]).unwrap();
         assert!(
-            estimated_record_bytes(&large) >= estimated_record_bytes(&small) + 300,
-            "estimate must account for SEQ and QUAL"
+            large_sorter.buffered_bytes() >= small_sorter.buffered_bytes() + 150,
+            "budget must account for SEQ and QUAL"
         );
+    }
+
+    /// Records covering every sort-key case: two references, ties, a record
+    /// with a reference but no position, and fully unmapped records.
+    fn sort_fixture() -> Vec<RecordBuf> {
+        let mk = |name: &str, r: Option<usize>, p: Option<usize>| {
+            let mut b = RecordBuf::builder().set_name(name);
+            if let Some(r) = r {
+                b = b.set_reference_sequence_id(r);
+            }
+            if let Some(p) = p {
+                b = b.set_alignment_start(p.try_into().unwrap());
+            }
+            b.build()
+        };
+        vec![
+            mk("u1", None, None),
+            mk("a", Some(1), Some(5)),
+            mk("b", Some(0), Some(7)),
+            mk("rnopos", Some(0), None),
+            mk("c", Some(0), Some(7)),
+            mk("d", Some(0), Some(1)),
+            mk("u2", None, None),
+            mk("e", Some(1), Some(1)),
+        ]
+    }
+
+    fn two_ref_header() -> sam::Header {
+        use noodles::sam::header::record::value::{Map, map::ReferenceSequence};
+        use std::num::NonZeroUsize;
+        sam::Header::builder()
+            .add_reference_sequence(
+                "chr1",
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(100).unwrap()),
+            )
+            .add_reference_sequence(
+                "chr2",
+                Map::<ReferenceSequence>::new(NonZeroUsize::new(100).unwrap()),
+            )
+            .build()
+    }
+
+    #[test]
+    fn sorter_matches_recordbuf_sort() {
+        let header = two_ref_header();
+        let records = sort_fixture();
+
+        // Reference: the RecordBuf-level stable sort the writers used before.
+        let mut expected_records = records.clone();
+        expected_records.sort_by_key(|r| match (r.reference_sequence_id(), r.alignment_start()) {
+            (Some(chr), Some(pos)) => (chr, pos.get()),
+            _ => (usize::MAX, 0),
+        });
+        let mut expected = bam::io::Writer::from(Vec::new());
+        for r in &expected_records {
+            expected.write_alignment_record(&header, r).unwrap();
+        }
+
+        // Fed half as records, half pre-encoded, as the pipelines may.
+        let mut sorter = CoordinateSorter::new(header, &default_params());
+        sorter.push_batch(&records[..3]).unwrap();
+        let mut enc = Vec::new();
+        sorter.encoder.encode(&records[3..], &mut enc).unwrap();
+        sorter.push_encoded(&enc).unwrap();
+        assert_eq!(sorter.index.len(), records.len());
+        let mut got = Vec::new();
+        sorter.write_buffered(&mut got).unwrap();
+        assert_eq!(got, expected.into_inner());
+    }
+
+    #[test]
+    fn encoder_matches_writer_bytes() {
+        let header = two_ref_header();
+        let records = sort_fixture();
+        let mut direct = bam::io::Writer::from(Vec::new());
+        for r in &records {
+            direct.write_alignment_record(&header, r).unwrap();
+        }
+        let mut enc = Vec::new();
+        RecordEncoder::new(RecordFormat::Bam, &header)
+            .encode(&records, &mut enc)
+            .unwrap();
+        assert_eq!(enc, direct.into_inner());
+
+        let mut direct = sam::io::Writer::new(Vec::new());
+        for r in &records {
+            direct.write_alignment_record(&header, r).unwrap();
+        }
+        let mut enc = Vec::new();
+        RecordEncoder::new(RecordFormat::Sam, &header)
+            .encode(&records, &mut enc)
+            .unwrap();
+        assert_eq!(enc, direct.into_inner());
     }
 }

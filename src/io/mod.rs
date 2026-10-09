@@ -2,6 +2,7 @@
 
 pub mod bam;
 pub mod bgzf_writer;
+pub mod encode;
 pub mod fastq;
 pub mod log;
 pub mod sam;

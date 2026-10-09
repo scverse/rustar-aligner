@@ -179,6 +179,40 @@ trait AlignmentWriter: Send {
     fn finish(&mut self) -> Result<(), error::Error> {
         Ok(())
     }
+    /// Serializer the align workers can run ahead of time so this writer only
+    /// appends bytes (#223). `None`: records are passed as `RecordBuf`s.
+    fn encoder(&self) -> Option<crate::io::encode::RecordEncoder> {
+        None
+    }
+    /// Append records serialized by [`AlignmentWriter::encoder`].
+    fn write_encoded(&mut self, _bytes: &[u8]) -> Result<(), error::Error> {
+        Err(error::Error::Alignment(
+            "writer does not accept pre-encoded records".into(),
+        ))
+    }
+    /// Write a read's records, pre-encoded or not.
+    fn write_buffered(
+        &mut self,
+        buf: &crate::io::sam::BufferedSamRecords,
+    ) -> Result<(), error::Error> {
+        match &buf.encoded {
+            Some(bytes) => self.write_encoded(bytes),
+            None => self.write_batch(&buf.records),
+        }
+    }
+}
+
+/// Forwards [`AlignmentWriter::encoder`] / `write_encoded` to the writer's
+/// inherent methods of the same name.
+macro_rules! forward_encoded {
+    () => {
+        fn encoder(&self) -> Option<crate::io::encode::RecordEncoder> {
+            Some(self.encoder())
+        }
+        fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), error::Error> {
+            self.write_encoded(bytes)
+        }
+    };
 }
 
 /// Drops quality strings on the way to the real writer (`--outSAMmode NoQS`).
@@ -204,6 +238,16 @@ impl AlignmentWriter for NoQsWriter {
     fn finish(&mut self) -> Result<(), error::Error> {
         self.0.finish()
     }
+
+    fn encoder(&self) -> Option<crate::io::encode::RecordEncoder> {
+        self.0
+            .encoder()
+            .map(crate::io::encode::RecordEncoder::without_quality)
+    }
+
+    fn write_encoded(&mut self, bytes: &[u8]) -> Result<(), error::Error> {
+        self.0.write_encoded(bytes)
+    }
 }
 
 /// Null writer that discards all output (for two-pass mode pass 1)
@@ -225,6 +269,7 @@ impl AlignmentWriter for crate::io::sam::SamWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
 }
 
 impl AlignmentWriter for crate::io::bam::BamWriter {
@@ -234,6 +279,7 @@ impl AlignmentWriter for crate::io::bam::BamWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
@@ -246,6 +292,7 @@ impl AlignmentWriter for crate::io::bam::SortedBamWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
@@ -258,6 +305,7 @@ impl AlignmentWriter for crate::io::sam::SamStdoutWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
 }
 
 impl AlignmentWriter for crate::io::bam::BamStdoutWriter {
@@ -267,6 +315,7 @@ impl AlignmentWriter for crate::io::bam::BamStdoutWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
@@ -279,6 +328,7 @@ impl AlignmentWriter for crate::io::bam::SortedBamStdoutWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    forward_encoded!();
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
@@ -1180,6 +1230,132 @@ where
     Ok(())
 }
 
+/// Output serializers handed to the align workers (#223), so the writer thread
+/// only appends bytes instead of encoding every SAM/BAM record itself.
+struct PreEncoder {
+    /// Main output (`Aligned.out.{sam,bam}`, `--outStd`), if it takes bytes.
+    main: Option<crate::io::encode::RecordEncoder>,
+    /// `Aligned.toTranscriptome.out.bam`, if enabled.
+    transcriptome: Option<crate::io::encode::RecordEncoder>,
+}
+
+impl PreEncoder {
+    /// `None` when records should stay `RecordBuf`s and be encoded on the
+    /// writer thread. Output bytes are the same either way; only where the
+    /// encoding CPU is spent changes.
+    ///
+    /// * BySJout: records are filtered and re-read from its temp file later.
+    /// * Spare cores: the decode, writer and BGZF threads run beside the align
+    ///   pool, so while `--runThreadN` leaves a few cores idle, encoding on
+    ///   the writer thread is free and moving it onto the workers only slows
+    ///   alignment. Once the pool covers (nearly) every core, the writer
+    ///   thread is the bottleneck and the workers must share the encoding.
+    ///   SAM text is costlier to format than BAM (and has no BGZF pool to
+    ///   hand work to), so its writer saturates earlier. Measured on 16
+    ///   cores, 2 M SE reads, median wall, writer-thread vs worker encoding:
+    ///
+    ///   | threads | BAM           | SAM           |
+    ///   |---------|---------------|---------------|
+    ///   | 1       | 13.79 / 14.32 | 13.28 / 14.37 |
+    ///   | 8       |  2.99 /  3.20 |  3.04 /  3.19 |
+    ///   | 12      |  2.51 /  2.55 |  2.97 /  2.48 |
+    ///   | 14      |  2.53 /  2.44 |    -  /  2.49 |
+    ///   | 16      |  2.69 /  2.55 |    -  /  2.41 |
+    ///
+    /// `RUSTAR_PRE_ENCODE=1` / `=0` forces it on / off (parity tests).
+    fn new<W: AlignmentWriter + ?Sized>(
+        writer: &W,
+        tr_writer: Option<&crate::io::bam::BamWriter>,
+        params: &Parameters,
+    ) -> Option<std::sync::Arc<Self>> {
+        if params.out_filter_type == crate::params::OutFilterType::BySJout {
+            return None;
+        }
+        let main = writer.encoder();
+        let enabled = match std::env::var("RUSTAR_PRE_ENCODE").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => {
+                use crate::io::encode::RecordFormat;
+                // Cores that must stay idle for writer-thread encoding to win.
+                let spare = match main.as_ref().map(crate::io::encode::RecordEncoder::format) {
+                    Some(RecordFormat::Sam) => 6,
+                    _ => 4,
+                };
+                let cores = std::thread::available_parallelism().map_or(1, usize::from);
+                params.run_thread_n.get() + spare > cores
+            }
+        };
+        if !enabled {
+            return None;
+        }
+        let transcriptome = tr_writer.map(crate::io::bam::BamWriter::encoder);
+        (main.is_some() || transcriptome.is_some()).then(|| {
+            std::sync::Arc::new(Self {
+                main,
+                transcriptome,
+            })
+        })
+    }
+
+    /// Serialize one read's records into `buf.encoded`, emptying `records`.
+    fn encode_main(
+        &self,
+        buf: &mut crate::io::sam::BufferedSamRecords,
+    ) -> Result<(), error::Error> {
+        let Some(enc) = &self.main else {
+            return Ok(());
+        };
+        let mut bytes = Vec::new();
+        enc.encode(&buf.records, &mut bytes)?;
+        buf.records.clear();
+        buf.encoded = Some(bytes);
+        Ok(())
+    }
+}
+
+/// A per-read pipeline product whose output records can be pre-encoded.
+trait PreEncode {
+    fn pre_encode(&mut self, enc: &PreEncoder) -> Result<(), error::Error>;
+}
+
+impl PreEncode for AlignmentBatchResults {
+    fn pre_encode(&mut self, enc: &PreEncoder) -> Result<(), error::Error> {
+        enc.encode_main(&mut self.sam_records)?;
+        if let Some(tr_enc) = &enc.transcriptome {
+            let mut bytes = Vec::new();
+            tr_enc.encode(&self.transcriptome_records, &mut bytes)?;
+            self.transcriptome_records.clear();
+            self.sam_records.encoded_transcriptome = Some(bytes);
+        }
+        Ok(())
+    }
+}
+
+/// Wrap a batch `align` closure so each finished batch is also serialized for
+/// the output writers, in parallel on the rayon pool, before it is handed on.
+fn with_pre_encode<In, Out: PreEncode + Send>(
+    align: impl Fn(u64, Vec<In>) -> BatchOut<Out> + Clone + Send + 'static,
+    enc: Option<std::sync::Arc<PreEncoder>>,
+) -> impl Fn(u64, Vec<In>) -> BatchOut<Out> + Clone + Send + 'static {
+    move |base, batch| {
+        use rayon::prelude::*;
+        let mut out = align(base, batch);
+        if let Some(enc) = &enc {
+            out.par_iter_mut().for_each(|result| {
+                let encoded = match result {
+                    Ok(product) => product.pre_encode(enc),
+                    Err(_) => Ok(()),
+                };
+                if let Err(e) = encoded {
+                    *result = Err(e);
+                }
+            });
+        }
+        out
+    }
+}
+
 /// Build transcriptome-space records for a single-end read.  Projects every
 /// surviving genome-space alignment onto all compatible transcripts, picks one
 /// projected alignment at random as the primary (seeded by `per_read_seed`),
@@ -1535,6 +1711,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let index_writer = Arc::clone(index);
     // Shared, 'static parameters for the per-batch aligner tasks spawned below.
     let params_arc = Arc::new(params.clone());
+    let pre_encoder = PreEncoder::new(&*writer, tr_writer.as_deref(), params);
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let (read_tx, read_rx) = std::sync::mpsc::sync_channel::<
             Result<Vec<crate::io::fastq::EncodedRead>, error::Error>,
@@ -1651,11 +1828,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         }
 
                         // Write SAM/BAM records
-                        writer.write_batch(&batch.sam_records.records)?;
+                        writer.write_buffered(&batch.sam_records)?;
 
                         // Write transcriptome-space records (if enabled)
                         if let Some(ref mut tw) = tr_writer {
-                            tw.write_batch(&batch.transcriptome_records)?;
+                            tw.write_encoded_or(
+                                batch.sam_records.encoded_transcriptome.as_deref(),
+                                &batch.transcriptome_records,
+                            )?;
                         }
 
                         // Write chimeric alignments
@@ -2096,7 +2276,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         info!("Processed {n} reads...");
                     }
                 },
-                align,
+                with_pre_encode(align, pre_encoder.clone()),
                 |done| Ok(res_tx.send(done).is_ok()),
             )
         };
@@ -2165,6 +2345,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
     // Shared, 'static parameters for the per-batch aligner tasks spawned below.
     let params_arc = Arc::new(params.clone());
+    let pre_encoder = PreEncoder::new(&*writer, None, params);
 
     /// Per-read result for the solo loop (one outcome per quantified feature).
     struct SoloReadProduct {
@@ -2172,6 +2353,11 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: Vec<crate::solo::SjCountRecord>,
         velocyto: Option<crate::solo::VelocytoRecord>,
+    }
+    impl PreEncode for SoloReadProduct {
+        fn pre_encode(&mut self, enc: &PreEncoder) -> Result<(), error::Error> {
+            enc.encode_main(&mut self.sam_records)
+        }
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -2222,7 +2408,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
                 for result in products {
                     let product = result?;
-                    writer.write_batch(&product.sam_records.records)?;
+                    writer.write_buffered(&product.sam_records)?;
                     for (fi, fo) in product.per_feature.into_iter().enumerate() {
                         if let Some(r) = fo.record {
                             feat_records[fi].push(r);
@@ -2421,7 +2607,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                         info!("STARsolo: processed {n} reads...");
                     }
                 },
-                align,
+                with_pre_encode(align, pre_encoder.clone()),
                 consume,
             )
         }
@@ -2479,12 +2665,18 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     let emit_sam = params.emits_alignments();
     let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
     let params_arc = Arc::new(params.clone());
+    let pre_encoder = PreEncoder::new(&*writer, None, params);
 
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: Vec<crate::solo::SjCountRecord>,
         velocyto: Option<crate::solo::VelocytoRecord>,
+    }
+    impl PreEncode for SoloReadProduct {
+        fn pre_encode(&mut self, enc: &PreEncoder) -> Result<(), error::Error> {
+            enc.encode_main(&mut self.sam_records)
+        }
     }
 
     info!("STARsolo: aligning 5' paired-end reads and quantifying barcodes...");
@@ -2523,7 +2715,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
                 for result in products {
                     let product = result?;
-                    writer.write_batch(&product.sam_records.records)?;
+                    writer.write_buffered(&product.sam_records)?;
                     for (fi, fo) in product.per_feature.into_iter().enumerate() {
                         if let Some(r) = fo.record {
                             feat_records[fi].push(r);
@@ -2796,7 +2988,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                         info!("STARsolo: processed {n} read pairs...");
                     }
                 },
-                align,
+                with_pre_encode(align, pre_encoder.clone()),
                 consume,
             )
         }
@@ -2903,6 +3095,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let index_writer = Arc::clone(index);
     // Shared, 'static parameters for the per-batch aligner tasks spawned below.
     let params_arc = Arc::new(params.clone());
+    let pre_encoder = PreEncoder::new(&*writer, tr_writer.as_deref(), params);
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let (read_tx, read_rx) = std::sync::mpsc::sync_channel::<
             Result<Vec<crate::io::fastq::PairedRead>, error::Error>,
@@ -3018,9 +3211,12 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 );
                             }
                         }
-                        writer.write_batch(&batch.sam_records.records)?;
+                        writer.write_buffered(&batch.sam_records)?;
                         if let Some(ref mut tw) = tr_writer {
-                            tw.write_batch(&batch.transcriptome_records)?;
+                            tw.write_encoded_or(
+                                batch.sam_records.encoded_transcriptome.as_deref(),
+                                &batch.transcriptome_records,
+                            )?;
                         }
                         // Chimeric.out.junction. The writer was created and
                         // flushed here but never written to, so a PE run reported
@@ -3626,7 +3822,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         info!("Processed {n} pairs...");
                     }
                 },
-                align,
+                with_pre_encode(align, pre_encoder.clone()),
                 |done| Ok(res_tx.send(done).is_ok()),
             )
         };
