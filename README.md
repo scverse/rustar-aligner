@@ -257,6 +257,26 @@ cargo clippy --all-targets  # Lint
 cargo fmt                   # Format
 ```
 
+### Optional feature: `rapidgzip`
+
+```bash
+cargo build --release --features rapidgzip
+```
+
+Decodes gzipped `--readFilesIn` with [rapidgzip-core](https://crates.io/crates/rapidgzip-core), a
+pure-Rust parallel gzip decoder, instead of a single `flate2` thread. It pulls in no C toolchain:
+its inflate backend is zlib-rs, the same one `flate2` already uses here.
+
+**Off by default, and inert even when compiled in** until `RUSTAR_GZ_DECODE_THREADS` is set to a
+worker count (`0` keeps `flate2`). The decoder is fast (3356 MB/s on 8 threads against 1552 MB/s for
+one `flate2` thread on the same file), but this aligner consumes decompressed FASTQ at only
+~140 MB/s, so decode already runs at under a tenth of its capacity. Enabling it measured slightly
+slower and used ~360 MB more memory. It is worth turning on when the consumer is fast enough to
+drain a single inflate thread, roughly 7 M reads/s for a 100 bp library.
+
+The portable alternative needs no feature and no rebuild: pipe an external decompressor with
+`--readFilesCommand` (`gzcat`, `gunzip -c`, `igzip -dc`, `rapidgzip-rust -dc`).
+
 ## Development
 
 The majority of rustar-aligner's code was written by [Claude Code](https://claude.ai/code) (Anthropic's AI coding assistant), with technical direction, architecture decisions, and validation by the project maintainer.

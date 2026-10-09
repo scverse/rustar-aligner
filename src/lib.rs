@@ -76,6 +76,10 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         .num_threads(params.run_thread_n.into())
         .build_global();
 
+    // Decide the gzip-decode policy once, from the same thread budget. No-op
+    // unless the `rapidgzip` feature is compiled in.
+    crate::io::fastq::set_gz_decode_threads(params.run_thread_n.get() as u32);
+
     match params.run_mode() {
         RunMode::GenomeGenerate => genome_generate(params),
         RunMode::AlignReads => align_reads(params),

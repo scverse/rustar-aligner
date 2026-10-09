@@ -64,6 +64,17 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
+# Parallel gzip/BGZF/zlib decoder for `--readFilesIn *.gz`. Pure Rust: its only
+# dependencies are `bon`, `crossbeam-deque` and `libz-rs-sys` (zlib-rs), which is
+# the same inflate backend `flate2` already uses here, so it adds no C toolchain
+# requirement. Behind a feature only until the dependency discussion in #224
+# settles. See `set_gz_decode_threads` for the measurements.
+rapidgzip-core = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Parallel gzip input decoding (pure Rust).
+rapidgzip = ["dep:rapidgzip-core"]
 
 [dev-dependencies]
 assert_cmd = "2"

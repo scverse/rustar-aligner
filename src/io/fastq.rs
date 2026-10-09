@@ -69,6 +69,66 @@ pub struct PairedRead {
     pub mate2: EncodedRead,
 }
 
+/// Worker count handed to `rapidgzip-core` for gzip input, or 0 for the
+/// single-threaded `flate2` path. Set once per run by
+/// [`set_gz_decode_threads`]; read by every `FastqReader::open`.
+///
+/// A process-wide value rather than a parameter because `FastqReader::open` is
+/// called from a dozen places (both mates, solo cDNA/barcode files, SmartSeq
+/// manifests) that have no business each deciding a decompression policy.
+#[cfg(feature = "rapidgzip")]
+static GZ_DECODE_THREADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Decide how many threads gzip decode may use. **Off unless
+/// `RUSTAR_GZ_DECODE_THREADS` asks for it**, because at this aligner's current
+/// consumption rate parallel decode has nothing to win.
+///
+/// `rapidgzip-core` decodes a gzip stream in parallel with the marker/window
+/// algorithm: blocks are decoded speculatively before their back-references are
+/// known, then patched once they are. Its inflate backend is `libz-rs-sys`
+/// (zlib-rs), the same one `flate2` uses here, so unlike an FFI decoder it costs
+/// nothing at one thread. Decoding a 73 MB level-6 `.fq.gz` (427 MB out) on 16
+/// logical cores, median of three:
+///
+/// | decoder | throughput |
+/// |---------|------------|
+/// | `flate2` + `zlib-rs`, 1 thread | 1552 MB/s |
+/// | `rapidgzip-core`, 1 thread | 1581 MB/s |
+/// | `rapidgzip-core`, 4 threads | 1872 MB/s |
+/// | `rapidgzip-core`, 8 threads | 3356 MB/s |
+/// | `rapidgzip-core`, 12 threads | 4051 MB/s |
+///
+/// The reason it is still off by default is arithmetic, not doubt about the
+/// decoder. Aligning those 2 M reads takes ~3.0 s at `--runThreadN 8`, i.e. we
+/// consume 427 MB of decompressed FASTQ at ~140 MB/s. One `flate2` thread
+/// supplies ~1550 MB/s, so decode runs at under a tenth of its capacity and is
+/// nowhere near the critical path; turning it on measured *slower* (3.15 s vs
+/// 3.03 s) and ~360 MB more resident, which is what you would expect from
+/// spending threads on a stage that was already idle.
+///
+/// It becomes the right call when the consumer gets fast enough to drain a
+/// single inflate thread, which for this file shape means roughly 7 M reads/s.
+/// That is the regime tools like piscem/salmon are in, and it is why they pair
+/// a parallel decoder with a broker that splits one thread budget by measured
+/// busy time on each side rather than by a fixed ratio.
+#[cfg(feature = "rapidgzip")]
+pub fn set_gz_decode_threads(_run_thread_n: u32) {
+    let threads = std::env::var("RUSTAR_GZ_DECODE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    GZ_DECODE_THREADS.store(threads, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// No-op when the feature is off, so callers need no `cfg`.
+#[cfg(not(feature = "rapidgzip"))]
+pub fn set_gz_decode_threads(_run_thread_n: u32) {}
+
+#[cfg(feature = "rapidgzip")]
+fn gz_decode_threads() -> u32 {
+    GZ_DECODE_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FASTQ reader that handles decompression and base encoding
 pub struct FastqReader {
     inner: fastq::io::Reader<Box<dyn BufRead + Send>>,
@@ -105,21 +165,24 @@ impl FastqReader {
             let path_str = path.to_string_lossy();
             let is_gzipped = path_str.ends_with(".gz") || path_str.ends_with(".gzip");
 
-            let file = File::open(path).map_err(|e| Error::io(e, path))?;
-
             // Larger-than-default (8 KiB) buffers cut read syscalls on the decode
             // hot path. Feed the inflater from a big buffered file, and hand the
             // decoded stream to noodles through a big BufReader.
             const DECODE_BUF: usize = 1 << 19; // 512 KiB
             if is_gzipped {
-                // Gzipped file
-                let buffered = BufReader::with_capacity(DECODE_BUF, file);
-                Box::new(BufReader::with_capacity(
-                    DECODE_BUF,
-                    MultiGzDecoder::new(buffered),
-                ))
+                if let Some(reader) = Self::open_gz_parallel(path) {
+                    reader
+                } else {
+                    let file = File::open(path).map_err(|e| Error::io(e, path))?;
+                    let buffered = BufReader::with_capacity(DECODE_BUF, file);
+                    Box::new(BufReader::with_capacity(
+                        DECODE_BUF,
+                        MultiGzDecoder::new(buffered),
+                    ))
+                }
             } else {
                 // Plain text FASTQ
+                let file = File::open(path).map_err(|e| Error::io(e, path))?;
                 Box::new(BufReader::with_capacity(DECODE_BUF, file))
             }
         };
@@ -150,6 +213,57 @@ impl FastqReader {
             .filter_map(|s| s.as_bytes().first().copied())
             .collect();
         self
+    }
+
+    /// Parallel gzip/BGZF decode via `rapidgzip`, or `None` to use the
+    /// single-threaded `flate2` path.
+    ///
+    /// Returns `None` unless the `rapidgzip` feature is compiled in **and**
+    /// [`gz_decode_threads`] resolves to at least 2. Any failure to open the
+    /// file through the native decoder also returns `None`, so a run degrades
+    /// to the `flate2` path rather than failing: this is an optimisation, never
+    /// a requirement.
+    #[cfg(feature = "rapidgzip")]
+    fn open_gz_parallel(path: &Path) -> Option<Box<dyn BufRead + Send>> {
+        let threads = gz_decode_threads();
+        if threads < 2 {
+            return None;
+        }
+        // `Decoder::open` owns the file and returns a `Read + Send` stream, so it
+        // drops straight into the `Box<dyn BufRead + Send>` the parser wants.
+        // Reaching EOF verifies every member footer, which the `flate2` path
+        // does too, so error behaviour on a corrupt file is not weakened.
+        let decoder = match rapidgzip_core::Decoder::builder()
+            .decoder_threads(threads as usize)
+            .build()
+        {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("rapidgzip-core could not be configured: {e}; using flate2");
+                return None;
+            }
+        };
+        match decoder.open(path) {
+            Ok(reader) => {
+                log::info!(
+                    "decompressing {} with rapidgzip-core on {threads} threads",
+                    path.display()
+                );
+                Some(Box::new(BufReader::with_capacity(1 << 19, reader)))
+            }
+            Err(e) => {
+                log::warn!(
+                    "rapidgzip-core could not open {}: {e}; falling back to flate2",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rapidgzip"))]
+    fn open_gz_parallel(_path: &Path) -> Option<Box<dyn BufRead + Send>> {
+        None
     }
 
     /// Open FASTQ file using external decompression command
@@ -615,6 +729,52 @@ mod tests {
         assert_eq!(read2.sequence, vec![3, 2, 1, 0]); // TGCA
 
         assert!(reader.next_encoded().unwrap().is_none());
+    }
+
+    /// The parallel decoder must produce exactly what the `flate2` path
+    /// produces, including across gzip member boundaries — the case that used
+    /// to truncate. Reads the same file twice, once down each path.
+    #[cfg(feature = "rapidgzip")]
+    #[test]
+    fn test_rapidgzip_decodes_identically_to_flate2() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::sync::atomic::Ordering;
+
+        let mut tmpfile = tempfile::Builder::new()
+            .suffix(".fastq.gz")
+            .tempfile()
+            .unwrap();
+        // Two members, several reads each, so the parallel decoder has both a
+        // member boundary and enough data to split on.
+        for member in 0..2 {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            for i in 0..64 {
+                writeln!(encoder, "@m{member}_read{i}").unwrap();
+                writeln!(encoder, "ACGTACGTNN").unwrap();
+                writeln!(encoder, "+").unwrap();
+                writeln!(encoder, "IIIIIIIIII").unwrap();
+            }
+            tmpfile.write_all(&encoder.finish().unwrap()).unwrap();
+        }
+        tmpfile.flush().unwrap();
+
+        let collect = |threads: u32| {
+            GZ_DECODE_THREADS.store(threads, Ordering::Relaxed);
+            let mut reader = FastqReader::open(tmpfile.path(), None).unwrap();
+            let mut out = Vec::new();
+            while let Some(read) = reader.next_encoded().unwrap() {
+                out.push((read.name, read.sequence, read.quality));
+            }
+            out
+        };
+
+        let via_flate2 = collect(0);
+        let via_rapidgzip = collect(4);
+        GZ_DECODE_THREADS.store(0, Ordering::Relaxed);
+
+        assert_eq!(via_flate2.len(), 128, "both members must be decoded");
+        assert_eq!(via_rapidgzip, via_flate2);
     }
 
     #[test]
