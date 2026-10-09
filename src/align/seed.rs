@@ -49,6 +49,22 @@ impl Seed {
         params: &Parameters,
         debug_name: &str,
     ) -> Result<Vec<Seed>, Error> {
+        Self::find_seeds_at(read_seq, 0, index, min_seed_length, params, debug_name)
+    }
+
+    /// [`Self::find_seeds`] for a fragment that starts at `frag_offset` in
+    /// STAR's combined read (`mate1 + MARK + RC(mate2)`): 0 for single-end
+    /// reads and mate 1, `len1 + 1` for mate 2. The offset only matters for
+    /// STAR's `flagDirMap` test, which compares `splitR[0][ip] + L` (the piece
+    /// start in the combined read) with the piece length.
+    pub fn find_seeds_at(
+        read_seq: &[u8],
+        frag_offset: usize,
+        index: &GenomeIndex,
+        min_seed_length: usize,
+        params: &Parameters,
+        debug_name: &str,
+    ) -> Result<Vec<Seed>, Error> {
         let mut seeds = Vec::new();
         let read_len = read_seq.len();
 
@@ -68,6 +84,8 @@ impl Seed {
             return Ok(seeds);
         }
 
+        let mut flag_dir_map = vec![true; pieces.len()];
+
         // Search L→R (forward direction on read): sparse chain search
         search_direction_sparse(
             read_seq,
@@ -78,6 +96,8 @@ impl Seed {
             params,
             false,
             debug_name,
+            frag_offset,
+            &mut flag_dir_map,
             &mut seeds,
         );
 
@@ -105,6 +125,8 @@ impl Seed {
             params,
             true,
             debug_name,
+            frag_offset,
+            &mut flag_dir_map,
             &mut seeds,
         );
 
@@ -138,7 +160,6 @@ impl Seed {
                 );
             seeds.retain(|s| seen.insert((s.read_pos, s.length)));
         }
-
         Ok(seeds)
     }
 
@@ -172,7 +193,14 @@ impl Seed {
 
         // Find seeds from mate2 (tag with mate_id = 1)
         // IMPORTANT: read_pos is relative to mate2 start (will be adjusted during stitching)
-        let mut seeds2 = Self::find_seeds(mate2_seq, index, min_seed_length, params, "")?;
+        let mut seeds2 = Self::find_seeds_at(
+            mate2_seq,
+            mate1_seq.len() + 1,
+            index,
+            min_seed_length,
+            params,
+            "",
+        )?;
         for seed in &mut seeds2 {
             seed.mate_id = 1;
         }
@@ -300,9 +328,12 @@ fn search_direction_sparse(
     params: &Parameters,
     is_rc: bool,
     debug_name: &str,
+    frag_offset: usize,
+    flag_dir_map: &mut [bool],
     seeds: &mut Vec<Seed>,
 ) {
     let read_len = read_seq.len();
+    let n_pieces = pieces.len();
 
     // STAR (ReadAlign_mapOneRead.cpp lines 41-42):
     //   seedSearchStartLmax = min(P.seedSearchStartLmax, seedSearchStartLmaxOverLread*(Lread-1))
@@ -319,7 +350,10 @@ fn search_direction_sparse(
     // STAR's `for (uint ip=0; ip<Nsplit; ip++)` (`:43`). A read with no `N` has
     // exactly one piece spanning it, so this reduces to the previous whole-read
     // search.
-    for &(piece_start, piece_len) in pieces {
+    for (ip_dir, &(piece_start, piece_len)) in pieces.iter().enumerate() {
+        // `flagDirMap` is per piece (original piece order), shared by both
+        // directions; the reverse pass walks the mirrored pieces.
+        let ip = if is_rc { n_pieces - 1 - ip_dir } else { ip_dir };
         // STAR (line 47): Nstart = seedSearchStartLmax>0 && seedSearchStartLmax<splitR[1][ip]
         //                          ? splitR[1][ip]/seedSearchStartLmax + 1 : 1
         // Measured against the *piece* length, not the read's.
@@ -338,6 +372,12 @@ fn search_direction_sparse(
         let piece_seq = &read_seq[..piece_end];
 
         for istart in 0..nstart {
+            // STAR (mapOneRead): `if (flagDirMap || istart>0)`: the first
+            // start in the reverse direction is skipped when the forward pass
+            // mapped the whole piece from its first base.
+            if is_rc && istart == 0 && !flag_dir_map[ip] {
+                continue;
+            }
             let start_pos = piece_start + (istart * lstart).min(piece_len);
             let mut pos = start_pos;
 
@@ -358,12 +398,11 @@ fn search_direction_sparse(
                     break;
                 }
 
-                let result =
-                    find_seed_at_position(piece_seq, pos, index, min_seed_length, false, params);
+                let result = find_seeds_sparse_sa(piece_seq, pos, piece_end - pos, index, params);
 
                 if !debug_name.is_empty() {
                     let dir = if is_rc { "RC" } else { "FWD" };
-                    let seed_info = match &result.seed {
+                    let seed_info = match result.seeds.first() {
                         Some(s) => {
                             format!("seed(len={} sa={}-{})", s.length, s.sa_start, s.sa_end)
                         }
@@ -382,7 +421,7 @@ fn search_direction_sparse(
                     );
                 }
 
-                if let Some(mut seed) = result.seed {
+                for mut seed in result.seeds {
                     // Apply seedSearchLmax cap
                     if params.seed_search_lmax > 0 && seed.length > params.seed_search_lmax {
                         seed.length = params.seed_search_lmax;
@@ -402,10 +441,76 @@ fn search_direction_sparse(
                     }
                 }
 
+                // STAR: `iDir==0 && istart==0 && Lmapped==0 && Shift+L == splitR[1][ip]`
+                // (sic: Shift is the piece start, compared to the piece length).
+                if !is_rc
+                    && istart == 0
+                    && pos == piece_start
+                    && frag_offset + piece_start + result.advance == piece_len
+                {
+                    flag_dir_map[ip] = false;
+                }
+
                 pos += result.advance; // Always advance by MMP length (matches STAR)
                 // Remaining-length check at loop top: stop when < seedMapMin bases remain
             }
         }
+    }
+}
+
+/// Seeds stored by one `maxMappableLength2strands` call, and the length to
+/// advance the chain by.
+struct SparseMmp {
+    seeds: Vec<Seed>,
+    advance: usize,
+}
+
+/// STAR's `maxMappableLength2strands`: the MMP search at `pos`, repeated for
+/// the `min(pieceLength, genomeSAsparseD)` shifted starts `pos + iDist` that a
+/// sparse suffix array needs (only every `sparse_d`-th genome position is a
+/// suffix, so a read start that falls between two stored suffixes is found by
+/// starting a few bases later). Only the starts whose `maxL + iDist` is the
+/// largest are stored, and the chain advances by that `maxLbest`.
+///
+/// With a dense SA (`sparse_d == 1`) this is one plain `find_seed_at_position`.
+fn find_seeds_sparse_sa(
+    read_seq: &[u8],
+    pos: usize,
+    piece_len: usize,
+    index: &GenomeIndex,
+    params: &Parameters,
+) -> SparseMmp {
+    // STAR's storeAligns has no minimum seed length: every MMP that maps at
+    // most seedMultimapNmax times is stored, however short (only the chain
+    // loop stops when fewer than seedMapMin bases remain).
+    let min_seed_length = 1;
+    let sparse_d = index.sa_index.sparse_d.max(1) as usize;
+    if sparse_d == 1 {
+        let r = find_seed_at_position(read_seq, pos, index, min_seed_length, false, params);
+        return SparseMmp {
+            seeds: r.seed.into_iter().collect(),
+            advance: r.advance,
+        };
+    }
+    let n_dist = piece_len.min(sparse_d);
+    let results: Vec<MmpResult> = (0..n_dist)
+        .map(|d| find_seed_at_position(read_seq, pos + d, index, min_seed_length, false, params))
+        .collect();
+    let best = results
+        .iter()
+        .enumerate()
+        .map(|(d, r)| r.advance + d)
+        .max()
+        .unwrap_or(1);
+    let seeds = results
+        .into_iter()
+        .enumerate()
+        .filter(|(d, r)| r.advance + d == best)
+        .filter_map(|(_, r)| r.seed)
+        .collect();
+    SparseMmp {
+        seeds,
+        advance: best,
     }
 }
 
@@ -977,13 +1082,15 @@ mod tests {
 
     #[test]
     fn no_match() {
-        let index = make_test_index("ACAC");
-        let read = encode_sequence("GGGG");
+        let index = make_test_index("AAAA");
+        let read = encode_sequence("CCCC");
         let params = params(&[]);
 
         let seeds = Seed::find_seeds(&read, &index, 2, &params, "").unwrap();
 
-        // No seeds should be found (GGGG not in ACAC or its reverse complement GTGT)
+        // No seeds should be found (no C or G in AAAA or its reverse complement TTTT). A
+        // seed shorter than seedMapMin is stored when it exists (STAR's storeAligns has
+        // no minimum length), so the read must not share even one base with the genome.
         assert!(seeds.is_empty());
     }
 
@@ -1203,6 +1310,8 @@ mod tests {
             &params,
             true,
             "",
+            0,
+            &mut [true],
             &mut rc_seeds,
         );
 
@@ -1408,6 +1517,8 @@ mod tests {
             &params,
             false,
             "",
+            0,
+            &mut [true],
             &mut seeds,
         );
         assert!(seeds.iter().any(|s| s.read_pos == 0 && s.length == 25));

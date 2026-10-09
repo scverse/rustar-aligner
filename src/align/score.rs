@@ -616,9 +616,9 @@ impl AlignmentScorer {
                 jj_r += jj_l;
                 jj_l = 0;
             }
-            // STAR: if (int(EX_L)+jR<1) return -1000005;
-            // Clamp: don't let exon A become zero-length (STAR rejects, we clamp)
-            best_jr = best_jr.max(1 - prev_exon_len as i32);
+            // STAR: `if (int(EX_L)+jR<1) return -1000005;` The caller rejects the
+            // stitch when the flush leaves no base in the exon that shrinks
+            // (clamping here would build a junction STAR never considers).
             // Re-check motif at flushed position
             if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
                 let donor_sa = (g_a_end_inc as i64 + best_jr as i64 + 1) as u64;

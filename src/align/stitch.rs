@@ -1428,6 +1428,20 @@ fn stitch_align_to_transcript(
             )
         };
 
+        // STAR -1000005: the non-canonical / deletion flush to the left must
+        // leave at least one base in the exon that shrinks (A in the forward
+        // scan, B in the reverse-strand scan space).
+        if sjdb_junction.is_none() {
+            let shrunk_len = if cluster.is_reverse {
+                (eff_length + shared) as i32 - jr_shift
+            } else {
+                (last_exon.read_end - last_exon.read_start) as i32 + jr_shift
+            };
+            if shrunk_len < 1 {
+                return None;
+            }
+        }
+
         // Clamp shift: jr_shift = STAR's jR. Lower bound: can't consume entire exon A.
         // Upper bound: scan already limited to < shared+eff_length but clamp for safety.
         let prev_match_len = (last_exon.read_end - last_exon.read_start) as i32;
@@ -1824,6 +1838,7 @@ pub fn stitch_seeds_with_jdb(
     max_transcripts_per_window: usize,
 ) -> Vec<Transcript> {
     stitch_seeds_with_jdb_debug(
+        &mut WindowRecord::new(1, false),
         cluster,
         read_seq,
         index,
@@ -2515,6 +2530,28 @@ fn passes_finalization_filters(
     true
 }
 
+/// Per-read state STAR's `stitchWindowAligns` records transcripts against: the
+/// best score seen so far for each mate (`maxScoreMate`, shared by all windows
+/// of a read) and the settings of the recording test.
+pub(crate) struct WindowRecord {
+    /// `outFilterMultimapScoreRange`
+    pub score_range: i32,
+    /// `chimSegmentMin > 0`: every transcript is recorded
+    pub record_all: bool,
+    /// STAR's `maxScoreMate`
+    pub max_score_mate: [i32; 2],
+}
+
+impl WindowRecord {
+    pub(crate) fn new(score_range: i32, record_all: bool) -> Self {
+        Self {
+            score_range,
+            record_all,
+            max_score_mate: [0; 2],
+        }
+    }
+}
+
 /// Recursive include/exclude stitcher (STAR's stitchWindowAligns).
 ///
 /// For each WA entry: try including it (call stitch_align_to_transcript to fill gap),
@@ -2526,6 +2563,7 @@ fn passes_finalization_filters(
 /// the exclude branch is always explored, matching STAR exactly.
 #[allow(clippy::too_many_arguments)]
 fn stitch_recurse(
+    rec: &mut WindowRecord,
     i_a: usize,
     wt: WorkingTranscript,
     wa_entries: &[WindowAlignment],
@@ -2721,6 +2759,26 @@ fn stitch_recurse(
             // contains an older one replaces it whatever their scores: only a
             // contained transcript scoring lower than its container is dropped.
             let wt_score = wt_final_score(&wt, scorer);
+            // STAR (`stitchWindowAligns.cpp:231-249`): a single-mate transcript
+            // raises the read's best score for that mate, and a transcript is
+            // only recorded if it is within `outFilterMultimapScoreRange` of the
+            // window's best or of the best for its mate (or always, with
+            // chimeric detection on). A transcript that is not recorded cannot
+            // evict a contained one.
+            let frag = match (wt.exons.first(), wt.exons.last()) {
+                (Some(f), Some(l)) if f.mate_id == l.mate_id => Some(usize::from(f.mate_id == 1)),
+                _ => None,
+            };
+            if let Some(f) = frag {
+                rec.max_score_mate[f] = rec.max_score_mate[f].max(wt_score);
+            }
+            let window_best = transcripts.first().map_or(0, |t| wt_final_score(t, scorer));
+            let in_range = wt_score + rec.score_range >= window_best
+                || frag.is_some_and(|f| wt_score + rec.score_range >= rec.max_score_mate[f])
+                || rec.record_all;
+            if !in_range {
+                return;
+            }
             let wt_len = wt_mapped_length(&wt);
             let mut dominated = false;
             let mut idx = 0;
@@ -2788,6 +2846,7 @@ fn stitch_recurse(
         }
 
         stitch_recurse(
+            rec,
             i_a + 1,
             new_wt,
             wa_entries,
@@ -2819,6 +2878,7 @@ fn stitch_recurse(
             debug_name,
         ) {
             stitch_recurse(
+                rec,
                 i_a + 1,
                 new_wt,
                 wa_entries,
@@ -2850,6 +2910,7 @@ fn stitch_recurse(
     // the highest-indexed anchor's inclusion, which STAR does not do and which
     // could suppress alignments STAR explores.)
     stitch_recurse(
+        rec,
         i_a + 1,
         wt,
         wa_entries,
@@ -3083,7 +3144,9 @@ pub(crate) fn split_combined_wt(
 /// Uses STAR's recursive combinatorial stitcher (stitchWindowAligns) instead of
 /// forward DP. For each seed, explores include/exclude branches, allowing the
 /// algorithm to skip spurious short seeds that would create false splices.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stitch_seeds_with_jdb_debug(
+    rec: &mut WindowRecord,
     cluster: &SeedCluster,
     read_seq: &[u8],
     index: &GenomeIndex,
@@ -3093,6 +3156,7 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
     debug_read_name: &str,
 ) -> Vec<Transcript> {
     let (working_transcripts, stitch_cluster, stitch_is_reverse, stitch_read) = stitch_seeds_core(
+        rec,
         cluster,
         read_seq,
         index,
@@ -3186,6 +3250,7 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
 /// Shared core: preprocessing + recursive stitcher, returns working transcripts + context.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stitch_seeds_core(
+    rec: &mut WindowRecord,
     cluster: &SeedCluster,
     read_seq: &[u8],
     index: &GenomeIndex,
@@ -3438,6 +3503,7 @@ pub(crate) fn stitch_seeds_core(
     let mut jcache = crate::align::score::JunctionScanCache::new();
 
     stitch_recurse(
+        rec,
         0,
         WorkingTranscript::new(),
         &wa_entries,
@@ -3603,6 +3669,7 @@ mod tests {
             genome_sa_index_start: vec![0],
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         };
 
         GenomeIndex {
@@ -3726,6 +3793,7 @@ mod tests {
             genome_sa_index_start: vec![0],
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         };
 
         GenomeIndex {
