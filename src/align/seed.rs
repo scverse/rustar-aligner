@@ -354,7 +354,7 @@ fn search_direction_sparse(
                 // seedSearchStartLmax (50). This allows chains to reach terminal small
                 // exons (e.g. 9M after intron) near the read end. Measured to the
                 // end of the piece, since that is where this chain must stop.
-                if piece_end - pos < min_seed_length {
+                if piece_end - pos <= min_seed_length {
                     break;
                 }
 
@@ -950,12 +950,12 @@ mod tests {
         let read = encode_sequence("ACGT");
         let params = params(&["--runMode", "alignReads"]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
 
         // Should find at least one seed
         assert!(!seeds.is_empty());
 
-        // First seed should be at position 0 with length 4
+        // First seed should be at position 0 with length 4 (STAR searches a chain only while more than seedMapMin bases remain, hence the lower minimum above)
         assert_eq!(seeds[0].read_pos, 0);
         assert_eq!(seeds[0].length, 4);
     }
@@ -993,7 +993,7 @@ mod tests {
         let read = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
         assert!(!seeds.is_empty());
 
         // Get positions for first seed
@@ -1012,7 +1012,7 @@ mod tests {
         let read = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
         assert!(!seeds.is_empty());
 
         // Single-end seeds should have mate_id = 2
@@ -1028,7 +1028,7 @@ mod tests {
         let mate2 = encode_sequence("TTGG");
         let params = params(&[]);
 
-        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
+        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 3, &params).unwrap();
 
         // Should have seeds from both mates
         let mate1_seeds: Vec<_> = seeds.iter().filter(|s| s.mate_id == 0).collect();
@@ -1055,7 +1055,7 @@ mod tests {
         let mate2 = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
+        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 3, &params).unwrap();
 
         // Should have roughly double the seeds (one set from each mate)
         let mate1_count = seeds.iter().filter(|s| s.mate_id == 0).count();
@@ -1337,5 +1337,87 @@ mod tests {
             }
         }
         assert!(checked > 100);
+    }
+
+    /// STAR's SAindex flags a prefix whose range holds a suffix that runs into an
+    /// `N` or padding within the first `gSAindexNbases` bases (`iSA1noN`). Such a
+    /// range cannot start the binary search after the shared prefix, since the
+    /// flagged suffix does not share it: the search has to compare from base 0
+    /// (`maxMappableLength2strands.cpp`). Reads over genomes with scattered `N`s
+    /// must give the true MMP.
+    #[test]
+    fn mmp_is_exact_when_the_sa_index_range_holds_a_padded_suffix() {
+        let params = params(&[]);
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0;
+        for _ in 0..30 {
+            // Mostly two letters keep the 2-base SAindex ranges long, so the binary
+            // search has room to be misled by an N-flagged suffix at the end of one.
+            let genome: String = (0..160)
+                .map(|_| match next() % 12 {
+                    0 => "G",
+                    1 => "N",
+                    r => ["A", "T"][(r % 2) as usize],
+                })
+                .collect();
+            let index = make_test_index(&genome);
+            for start in 0..genome.len() - 8 {
+                for len in 6..=(genome.len() - start).min(30) {
+                    let mut read = encode_sequence(&genome[start..start + len]);
+                    // STAR splits a read on `N` before seeding, so seeds never hold one.
+                    if read.contains(&4) {
+                        continue;
+                    }
+                    let last = read.len() - 1;
+                    read[last] = (read[last] + 1) % 4;
+                    let want = brute_force_mmp(&read, 0, &index);
+                    let got = find_seed_at_position(&read, 0, &index, 1, false, &params).advance;
+                    assert_eq!(got, want, "genome {genome} read {start}+{len}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1000);
+    }
+
+    /// STAR keeps searching a piece only while MORE than `seedMapMin` bases are left
+    /// (`istart*Lstart + Lmapped + seedMapMin < splitR[1][ip]`, a strict
+    /// inequality), so exactly `seedMapMin` bases at the end of a chain are never
+    /// searched. Here the read is 25 genomic bases plus five that match elsewhere.
+    #[test]
+    fn forward_chain_stops_when_exactly_seed_map_min_bases_remain() {
+        let head = "ACGGATCCGTTAGCACTGACGTAGC";
+        let genome = format!("{head}GGGGGACACACACACACACACACACTTTTTAGAGAGAGAGAGAGAGAG");
+        let index = make_test_index(&genome);
+        let params = params(&[]);
+        let read = encode_sequence(&format!("{head}TTTTT"));
+        let pieces = [(0usize, read.len())];
+        let mut seeds = Vec::new();
+        search_direction_sparse(
+            &read,
+            read.len(),
+            &pieces,
+            &index,
+            5,
+            &params,
+            false,
+            "",
+            &mut seeds,
+        );
+        assert!(seeds.iter().any(|s| s.read_pos == 0 && s.length == 25));
+        assert!(
+            seeds.iter().all(|s| s.read_pos < 25),
+            "a seed starts in the last seedMapMin bases: {:?}",
+            seeds
+                .iter()
+                .map(|s| (s.read_pos, s.length))
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -762,8 +762,9 @@ impl SaIndex {
     ///   - sa_start: first SA index in range
     ///   - sa_end_exclusive: past-the-end SA index
     ///   - matched_level: how many bases the SAindex resolved
-    ///   - bounds_tight: both bounds came from present SAindex entries
-    ///     (safe to skip first matched_level bases in binary search)
+    ///   - bounds_tight: STAR's `iSA2good && iSA1noN`: the upper bound came from
+    ///     a present SAindex entry and the range holds no N-flagged suffix (safe
+    ///     to skip first matched_level bases in binary search)
     ///
     /// Returns None if no prefix exists in the index (all levels absent).
     pub fn hierarchical_lookup(

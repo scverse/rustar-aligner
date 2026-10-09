@@ -810,8 +810,13 @@ pub fn align_paired_read(
                     t2.is_reverse = true;
                 }
 
-                let combined_span =
-                    t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
+                // STAR's genomic-length penalty spans the first exon's start to the LAST
+                // exon's end (`stitchWindowAligns.cpp:301-304`). When the mates overlap
+                // and the second one ends before the first, that is not the pair's extent.
+                let combined_span = match (wt.exons.first(), wt.exons.last()) {
+                    (Some(first), Some(last)) => last.genome_end - first.genome_start,
+                    _ => t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start),
+                };
                 let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
 
                 let pair = try_pair_transcripts(
