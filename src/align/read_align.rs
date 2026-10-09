@@ -164,6 +164,7 @@ impl PairedAlignment {
             n_junction: m1.n_junction + m2.n_junction,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            junction_strand: vec![],
         }
     }
 }
@@ -1650,6 +1651,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
         let pair = PairedAlignment {
             mate1_transcript: make_tr(1000, 1100, 0, 100),
@@ -1755,6 +1757,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            junction_strand: vec![],
         }
     }
 
@@ -1807,8 +1810,20 @@ mod tests {
     #[test]
     fn intron_filters_follow_star() {
         use crate::align::score::IntronFilter;
-        let check =
-            |m: &[SpliceMotif], a: &[bool], f: &IntronFilter| f.passes(m.iter().zip(a.iter()));
+        let strand = |m: &SpliceMotif| match m.implied_strand() {
+            Some('+') => 1u8,
+            Some('-') => 2,
+            _ => 0,
+        };
+        let check = |m: &[SpliceMotif], a: &[bool], f: &IntronFilter| {
+            let s: Vec<u8> = m.iter().map(strand).collect();
+            f.passes(
+                m.iter()
+                    .zip(a.iter())
+                    .zip(s.iter())
+                    .map(|((m, a), s)| (m, a, s)),
+            )
+        };
         let f = AlignmentScorer::from_params(&default_params()).intron_filter;
         assert!(check(
             &[SpliceMotif::GtAg, SpliceMotif::GcAg],
@@ -1834,6 +1849,19 @@ mod tests {
         p.out_filter_intron_motifs = IntronMotifFilter::RemoveNoncanonical;
         let f = AlignmentScorer::from_params(&p).intron_filter;
         assert!(!check(&[SpliceMotif::NonCanonical], &[true], &f));
+
+        // STAR's sjStr is the annotated strand for an sjdb junction: an
+        // annotated non-canonical junction with a defined strand keeps a spliced
+        // transcript under intronMotif, and two annotated junctions on opposite
+        // strands are inconsistent whatever their motifs.
+        let mut p = default_params();
+        p.out_sam_strand_field = "intronMotif".into();
+        let f = AlignmentScorer::from_params(&p).intron_filter;
+        let nc = SpliceMotif::NonCanonical;
+        assert!(f.passes([(&nc, &true, &1u8)].into_iter()));
+        assert!(!f.passes([(&nc, &true, &0u8)].into_iter()));
+        let f = AlignmentScorer::from_params(&default_params()).intron_filter;
+        assert!(!f.passes([(&nc, &true, &1u8), (&nc, &true, &2u8)].into_iter()));
 
         // `--outSAMstrandField intronMotif` also drops a spliced transcript
         // whose strand is undefined (`sjN>0 && sjMotifStrand==0`), but not an
@@ -1908,6 +1936,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
@@ -1929,6 +1958,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Distance = 300bp, within default limit (auto mode = unlimited)
@@ -1962,6 +1992,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
@@ -1983,6 +2014,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Distance = 400bp, exceeds limit of 100bp
@@ -2014,6 +2046,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
@@ -2035,6 +2068,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2067,6 +2101,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Create a transcript with consistent strand motifs (all + strand)
@@ -2089,6 +2124,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::GcAg], // both + strand
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Note: STAR's RemoveInconsistentStrands filters transcripts where
@@ -2167,6 +2203,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
@@ -2188,6 +2225,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2228,6 +2266,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Case 1: NonCanonical + unannotated → should be filtered
@@ -2313,6 +2352,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Test BothMapped variant
@@ -2417,6 +2457,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         }
     }
 

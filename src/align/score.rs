@@ -83,17 +83,17 @@ impl IntronFilter {
     /// Whether a transcript with these junctions (motif, annotated) survives.
     pub fn passes<'a>(
         &self,
-        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
+        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool, &'a u8)> + Clone,
     ) -> bool {
         use crate::params::{IntronMotifFilter, IntronStrandFilter};
-        // `intronMotifs[sjStr]` counts: STAR's sjStr is 0 for a non-canonical
-        // junction, else the motif's strand.
+        // `intronMotifs[sjStr]` counts: STAR's sjStr is the annotated strand of
+        // an sjdb junction, else the motif's strand (0 for non-canonical).
         let (mut n_junctions, mut plus, mut minus) = (0u32, 0u32, 0u32);
-        for (m, _) in junctions.clone() {
+        for (_, _, s) in junctions.clone() {
             n_junctions += 1;
-            match m.implied_strand() {
-                Some('+') => plus += 1,
-                Some('-') => minus += 1,
+            match s {
+                1 => plus += 1,
+                2 => minus += 1,
                 _ => {}
             }
         }
@@ -109,10 +109,10 @@ impl IntronFilter {
             IntronMotifFilter::None => true,
             IntronMotifFilter::RemoveNoncanonical => !junctions
                 .into_iter()
-                .any(|(m, _)| *m == SpliceMotif::NonCanonical),
+                .any(|(m, _, _)| *m == SpliceMotif::NonCanonical),
             IntronMotifFilter::RemoveNoncanonicalUnannotated => !junctions
                 .into_iter()
-                .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated),
+                .any(|(m, annotated, _)| *m == SpliceMotif::NonCanonical && !annotated),
         }
     }
 }

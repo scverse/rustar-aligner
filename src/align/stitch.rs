@@ -1111,6 +1111,7 @@ pub(crate) struct WorkingTranscript {
     pub(crate) n_junction: u32,
     pub(crate) junction_motifs: Vec<crate::align::score::SpliceMotif>,
     pub(crate) junction_annotated: Vec<bool>,
+    pub(crate) junction_strand: Vec<u8>,
     /// Per-junction repeat lengths (jjL, jjR) for overhang check at finalization.
     /// STAR's shiftSJ[isj][0] and shiftSJ[isj][1].
     pub(crate) junction_shifts: Vec<(u32, u32)>,
@@ -1132,6 +1133,7 @@ impl WorkingTranscript {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            junction_strand: vec![],
             junction_shifts: Vec::new(),
             n_anchor: 0,
             read_start: 0,
@@ -1523,16 +1525,19 @@ fn stitch_align_to_transcript(
                 return None;
             }
 
-            let is_annotated = sjdb_junction.is_some()
-                || junction_db.is_some_and(|db| {
-                    let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
-                    let donor_fwd =
-                        index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-                    let acceptor_fwd = donor_fwd + del as u64 - 1;
-                    db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
-                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
-                        || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
-                });
+            // Annotated strand of a database hit (STAR `sjdbStrand`); the sjdb
+            // entry found below takes precedence over the GTF-derived lookup.
+            let db_strand = junction_db.and_then(|db| {
+                let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
+                let donor_fwd =
+                    index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
+                let acceptor_fwd = donor_fwd + del as u64 - 1;
+                [1u8, 2, 0]
+                    .into_iter()
+                    .find(|&s| db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, s))
+            });
+            let is_annotated = sjdb_junction.is_some() || db_strand.is_some();
+            let mut annotated_strand = sjdb_junction.map(|pj| pj.strand).or(db_strand);
 
             // STAR stitchAlignToTranscript.cpp:155-172: the scan flushes a
             // non-canonical junction to the left, where sjdbStart keeps it; an
@@ -1555,6 +1560,10 @@ fn stitch_align_to_transcript(
                     })
                     .ok()
                     .map(|k| &prepared[k]);
+                if let Some(pj) = hit {
+                    // STAR's sjStr is `sjdbStrand` of this very entry.
+                    annotated_strand = Some(pj.strand);
+                }
                 if let Some(pj) = hit.filter(|pj| pj.motif == 0) {
                     let sl = pj.shift_left as usize;
                     let prev_len = last_exon.read_end - last_exon.read_start;
@@ -1576,6 +1585,17 @@ fn stitch_align_to_transcript(
                     jj_r = u32::from(pj.shift_right);
                 }
             }
+            // STAR `sjStr`: the annotated strand, else (undefined or novel) the
+            // motif's strand.
+            let motif_strand = match motif.implied_strand() {
+                Some('+') => 1u8,
+                Some('-') => 2,
+                _ => 0,
+            };
+            let sj_strand = match annotated_strand {
+                Some(s) if s > 0 => s,
+                _ => motif_strand,
+            };
 
             if is_annotated {
                 d_score += scorer.sjdb_score;
@@ -1586,6 +1606,7 @@ fn stitch_align_to_transcript(
             new_wt.n_junction += 1;
             new_wt.junction_motifs.push(motif);
             new_wt.junction_annotated.push(is_annotated);
+            new_wt.junction_strand.push(sj_strand);
             new_wt.junction_shifts.push((jj_l, jj_r));
         } else {
             // Deletion gap scoring
@@ -2301,6 +2322,7 @@ pub(crate) fn finalize_transcript(
         n_junction: wt.n_junction,
         junction_motifs: wt.junction_motifs.clone(),
         junction_annotated: wt.junction_annotated.clone(),
+        junction_strand: wt.junction_strand.clone(),
     })
 }
 
@@ -2668,10 +2690,13 @@ fn stitch_recurse(
             // window's dedup (`stitchWindowAligns.cpp:146-180` vs `:337-381`): a
             // rejected transcript must not evict one it covers. For a pair the
             // junctions of both mates are on this one transcript.
-            if !scorer
-                .intron_filter
-                .passes(wt.junction_motifs.iter().zip(wt.junction_annotated.iter()))
-            {
+            if !scorer.intron_filter.passes(
+                wt.junction_motifs
+                    .iter()
+                    .zip(wt.junction_annotated.iter())
+                    .zip(wt.junction_strand.iter())
+                    .map(|((m, a), s)| (m, a, s)),
+            ) {
                 return;
             }
 
@@ -2917,6 +2942,8 @@ pub(crate) fn split_combined_wt(
     let mut m2_exons: Vec<ExonBlock> = Vec::new();
     let mut m1_jm: Vec<crate::align::score::SpliceMotif> = Vec::new();
     let mut m1_ja: Vec<bool> = Vec::new();
+    let mut m1_js_strand: Vec<u8> = Vec::new();
+    let mut m2_js_strand: Vec<u8> = Vec::new();
     let mut m1_js: Vec<(u32, u32)> = Vec::new();
     let mut m2_jm: Vec<crate::align::score::SpliceMotif> = Vec::new();
     let mut m2_ja: Vec<bool> = Vec::new();
@@ -2952,10 +2979,12 @@ pub(crate) fn split_combined_wt(
                     if ex.mate_id == 0 {
                         m1_jm.push(wt.junction_motifs[junction_idx]);
                         m1_ja.push(wt.junction_annotated[junction_idx]);
+                        m1_js_strand.push(wt.junction_strand[junction_idx]);
                         m1_js.push(wt.junction_shifts[junction_idx]);
                     } else if ex.mate_id == 1 {
                         m2_jm.push(wt.junction_motifs[junction_idx]);
                         m2_ja.push(wt.junction_annotated[junction_idx]);
+                        m2_js_strand.push(wt.junction_strand[junction_idx]);
                         m2_js.push(wt.junction_shifts[junction_idx]);
                     }
                     junction_idx += 1;
@@ -3018,6 +3047,7 @@ pub(crate) fn split_combined_wt(
             n_junction: m1_jm.len() as u32,
             junction_motifs: m1_jm,
             junction_annotated: m1_ja,
+            junction_strand: m1_js_strand,
             junction_shifts: m1_js,
             n_anchor: 0,
             read_start: m1_read_start,
@@ -3033,6 +3063,7 @@ pub(crate) fn split_combined_wt(
             n_junction: m2_jm.len() as u32,
             junction_motifs: m2_jm,
             junction_annotated: m2_ja,
+            junction_strand: m2_js_strand,
             junction_shifts: m2_js,
             n_anchor: 0,
             read_start: m2_read_start,

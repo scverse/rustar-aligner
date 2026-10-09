@@ -1394,6 +1394,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         }
     }
 
