@@ -68,9 +68,9 @@ pub fn order_record_tags(record: &mut RecordBuf, attrs: &SamAttributes) {
         return;
     }
     // `Data::remove` is a swap-remove, so lift every listed tag out first and
-    // append them back in order; no heap allocation (at most 15 tags).
+    // append them back in order; no heap allocation (at most 17 tags).
     let data = record.data_mut();
-    let mut lifted: [Option<(Tag, Value)>; 15] = std::array::from_fn(|_| None);
+    let mut lifted: [Option<(Tag, Value)>; 17] = std::array::from_fn(|_| None);
     let mut n = 0;
     for attr in attrs.iter() {
         let [a, b] = attr.tag();
@@ -79,7 +79,9 @@ pub fn order_record_tags(record: &mut RecordBuf, attrs: &SamAttributes) {
             n += 1;
         }
     }
-    for (tag, value) in lifted.into_iter().flatten() {
+    // The chimeric SA tag is written after all the attributes (chimericBAMoutput).
+    let sa = data.remove(&Tag::new(b'S', b'A'));
+    for (tag, value) in lifted.into_iter().flatten().chain(sa) {
         data.insert(tag, value);
     }
 }
@@ -102,6 +104,19 @@ fn insert_unmapped_tags(record: &mut RecordBuf, rg_id: Option<&str>, reason: Unm
     };
     data.insert(Tag::new(b'u', b'T'), Value::Character(ut));
     maybe_insert_rg_tag(record, rg_id);
+}
+
+/// `MC:Z` on both records of a pair whose mates are both aligned: each carries
+/// the other's CIGAR, soft clips included (ReadAlign_calcCIGAR.cpp, used when
+/// `nMates>1` in ReadAlign_outputTranscriptSAM.cpp / ReadAlign_alignBAM.cpp).
+fn insert_mate_cigar_tags(rec1: &mut RecordBuf, rec2: &mut RecordBuf) {
+    let c1 = cigar_to_string(rec1.cigar().as_ref());
+    let c2 = cigar_to_string(rec2.cigar().as_ref());
+    let tag = Tag::new(b'M', b'C');
+    rec1.data_mut()
+        .insert(tag, Value::String(BString::from(c2)));
+    rec2.data_mut()
+        .insert(tag, Value::String(BString::from(c1)));
 }
 
 /// SAM file writer
@@ -442,7 +457,6 @@ impl SamWriter {
             maybe_insert_rg_tag(&mut rec1, rg_id);
             apply_sam_flag_or_and(&mut rec1, params);
             apply_primary_flag(&mut rec1, combined_score, best_score, params);
-            records.push(rec1);
 
             // Create record for mate2 (this=mate2, mate=mate1)
             let mut rec2 = build_paired_mate_record(
@@ -473,6 +487,10 @@ impl SamWriter {
             maybe_insert_rg_tag(&mut rec2, rg_id);
             apply_sam_flag_or_and(&mut rec2, params);
             apply_primary_flag(&mut rec2, combined_score, best_score, params);
+            if attrs.contains(SamAttributes::MC) {
+                insert_mate_cigar_tags(&mut rec1, &mut rec2);
+            }
+            records.push(rec1);
             records.push(rec2);
         }
 
@@ -4311,6 +4329,67 @@ mod tests {
     }
 
     #[test]
+    fn test_all_preset_order_has_mc_and_ch() {
+        let tags: Vec<[u8; 2]> = SamAttributes::ALL.iter().map(SamAttr::tag).collect();
+        let want: Vec<[u8; 2]> = [
+            "NH", "HI", "AS", "nM", "NM", "MD", "jM", "jI", "MC", "ch", "XS",
+        ]
+        .iter()
+        .map(|t| [t.as_bytes()[0], t.as_bytes()[1]])
+        .collect();
+        assert_eq!(tags, want);
+    }
+
+    #[test]
+    fn test_ch_requires_bam_output() {
+        use crate::params::Parameters;
+        let args = [
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+        ];
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["All"])).is_err());
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["NH", "ch"])).is_err());
+        assert!(
+            Parameters::try_parse_from(args.iter().copied().chain([
+                "NH",
+                "ch",
+                "--outSAMtype",
+                "BAM",
+                "Unsorted"
+            ]))
+            .is_ok()
+        );
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["NH", "MC"])).is_ok());
+    }
+
+    #[test]
+    fn test_mate_cigar_tags_swap_cigars() {
+        let mut r1 = RecordBuf::default();
+        let mut r2 = RecordBuf::default();
+        *r1.cigar_mut() = [cigar::Op::new(cigar::op::Kind::Match, 50)]
+            .into_iter()
+            .collect();
+        *r2.cigar_mut() = [
+            cigar::Op::new(cigar::op::Kind::SoftClip, 3),
+            cigar::Op::new(cigar::op::Kind::Match, 47),
+        ]
+        .into_iter()
+        .collect();
+        insert_mate_cigar_tags(&mut r1, &mut r2);
+        let mc = Tag::new(b'M', b'C');
+        assert_eq!(
+            r1.data().get(&mc),
+            Some(&Value::String(BString::from("3S47M")))
+        );
+        assert_eq!(
+            r2.data().get(&mc),
+            Some(&Value::String(BString::from("50M")))
+        );
+    }
+
+    #[test]
     fn test_sam_attribute_set_expansion() {
         use crate::params::Parameters;
 
@@ -4326,6 +4405,9 @@ mod tests {
             "r.fq",
             "--outSAMattributes",
             "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ]);
         assert_eq!(p.out_sam_attributes, SamAttributes::ALL - SamAttributes::XS);
 
@@ -4336,6 +4418,9 @@ mod tests {
             "r.fq",
             "--outSAMattributes",
             "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
             "--outSAMstrandField",
             "intronMotif",
         ]);

@@ -32,6 +32,11 @@ pub enum SamAttr {
     VW = 12,
     VA = 13,
     VG = 14,
+    /// `MC:Z`: the mate's CIGAR, on paired-end records with both mates aligned.
+    MC = 15,
+    /// `ch:A:1`: marks chimeric alignments in `--chimOutType WithinBAM` output
+    /// (BAM only).
+    CH = 16,
 }
 
 impl SamAttr {
@@ -53,11 +58,13 @@ impl SamAttr {
             Self::VW => *b"vW",
             Self::VA => *b"vA",
             Self::VG => *b"vG",
+            Self::MC => *b"MC",
+            Self::CH => *b"ch",
         }
     }
 }
 
-const MAX_ATTRS: usize = 15;
+const MAX_ATTRS: usize = 17;
 
 /// Ordered set of optional SAM tags (`--outSAMattributes`).
 ///
@@ -71,7 +78,7 @@ const MAX_ATTRS: usize = 15;
 /// bitflags value; `PartialEq` compares the order too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SamAttributes {
-    mask: u16,
+    mask: u32,
     len: u8,
     order: [SamAttr; MAX_ATTRS],
 }
@@ -98,10 +105,12 @@ impl SamAttributes {
     pub const VW: Self = Self::of(&[SamAttr::VW]);
     pub const VA: Self = Self::of(&[SamAttr::VA]);
     pub const VG: Self = Self::of(&[SamAttr::VG]);
+    pub const MC: Self = Self::of(&[SamAttr::MC]);
+    pub const CH: Self = Self::of(&[SamAttr::CH]);
 
     /// STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
     pub const STANDARD: Self = Self::of(&[SamAttr::NH, SamAttr::HI, SamAttr::AS, SamAttr::NMM]);
-    /// STAR `All` = NH HI AS nM NM MD jM jI (MC and ch are not implemented),
+    /// STAR `All` = NH HI AS nM NM MD jM jI MC ch (ch needs BAM output),
     /// followed here by XS, which the parameter fold keeps only under
     /// `--outSAMstrandField intronMotif`.
     pub const ALL: Self = Self::of(&[
@@ -113,6 +122,8 @@ impl SamAttributes {
         SamAttr::MD,
         SamAttr::JM,
         SamAttr::JI,
+        SamAttr::MC,
+        SamAttr::CH,
         SamAttr::XS,
     ]);
 
@@ -140,7 +151,7 @@ impl SamAttributes {
     /// Append one attribute if absent.
     #[must_use]
     pub const fn with(mut self, a: SamAttr) -> Self {
-        let bit = 1u16 << (a as u8);
+        let bit = 1u32 << (a as u8);
         if self.mask & bit == 0 {
             self.mask |= bit;
             self.order[self.len as usize] = a;
@@ -173,7 +184,7 @@ impl SamAttributes {
     pub fn remove(&mut self, other: Self) {
         let mut out = Self::empty();
         for a in self.iter() {
-            if other.mask & (1u16 << (a as u8)) == 0 {
+            if other.mask & (1u32 << (a as u8)) == 0 {
                 out = out.with(a);
             }
         }
@@ -232,6 +243,8 @@ impl FromStr for SamAttributes {
             "vW" => Self::VW,
             "vA" => Self::VA,
             "vG" => Self::VG,
+            "MC" => Self::MC,
+            "ch" => Self::CH,
             other => return Err(format!("unknown --outSAMattributes token '{other}'")),
         })
     }
@@ -277,7 +290,7 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI XS RG vW vA vG.",
+                     NH HI AS NM nM MD jM jI MC ch XS RG vW vA vG.",
                 ),
         )
     }

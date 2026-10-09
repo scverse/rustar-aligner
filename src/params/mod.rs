@@ -2181,6 +2181,19 @@ impl Parameters {
             }
         }
 
+        // STAR's samAttrRequiresBAM: the ch tag exists only in BAM output.
+        if params.run_mode() == RunMode::AlignReads
+            && params.out_sam_attributes.contains(SamAttributes::CH)
+            && params.out_sam_type.format != OutSamFormat::Bam
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--outSAMattributes contains ch tag, which requires BAM output. \
+                 Re-run with --outSAMtype BAM Unsorted (and/or SortedByCoordinate), \
+                 or without the ch tag in --outSAMattributes",
+            ));
+        }
+
         // WASP SAMtag mode requires a VCF of heterozygous SNVs; fold the vW bit
         // into out_sam_attributes so the writer emits it (vA/vG stay opt-in).
         if params.wasp_output_mode == WaspOutputMode::SAMtag {
@@ -3244,7 +3257,16 @@ mod tests {
     #[test]
     fn xs_stripped_from_all_preset_without_intron_motif() {
         // "All" includes XS but it is stripped unless intronMotif is also set.
-        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
     }

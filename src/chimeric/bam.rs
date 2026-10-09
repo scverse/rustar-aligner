@@ -13,7 +13,9 @@ use crate::chimeric::{ChimBam, ChimericAlignment};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::io::fastq::{complement_base, decode_base};
-use crate::io::sam::{apply_sam_flag_or_and, fastq_qual_to_phred, maybe_insert_rg_tag};
+use crate::io::sam::{
+    apply_sam_flag_or_and, fastq_qual_to_phred, maybe_insert_rg_tag, order_record_tags,
+};
 use crate::params::{Parameters, SamAttributes};
 use bstr::BString;
 use noodles::sam;
@@ -510,9 +512,41 @@ fn align_bam(
         if attrs.contains(SamAttributes::MD) {
             data.insert(Tag::new(b'M', b'D'), Value::String(md.into()));
         }
+        if attrs.contains(SamAttributes::CH) {
+            // alignType<=-10 is every chimeric record (ATTR_ch).
+            data.insert(Tag::new(b'c', b'h'), Value::Character(b'1'));
+        }
         maybe_insert_rg_tag(&mut rec, rg_owned.as_deref());
         apply_sam_flag_or_and(&mut rec, params);
         out.push(rec);
+    }
+    if attrs.contains(SamAttributes::MC) && out.len() == 2 {
+        // MC:Z is the mate's CIGAR from calcCIGAR, which never hard-clips.
+        let soft = |r: &RecordBuf| {
+            use std::fmt::Write as _;
+            let mut out = String::new();
+            for op in r.cigar().as_ref() {
+                let c = match op.kind() {
+                    Kind::HardClip | Kind::SoftClip => 'S',
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::Skip => 'N',
+                    Kind::Pad => 'P',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                };
+                let _ = write!(out, "{}{c}", op.len());
+            }
+            out
+        };
+        let (c0, c1) = (soft(&out[0]), soft(&out[1]));
+        let mc = Tag::new(b'M', b'C');
+        out[0].data_mut().insert(mc, Value::String(c1.into()));
+        out[1].data_mut().insert(mc, Value::String(c0.into()));
+    }
+    for rec in &mut out {
+        order_record_tags(rec, &attrs);
     }
     Ok(out)
 }
