@@ -136,6 +136,15 @@ impl AlignmentStats {
         }
     }
 
+    /// Count an input read without placing it in any mapping category.
+    ///
+    /// For a read whose chimera is written into the BAM: STAR skips
+    /// `outputAlignments` for it (`ReadAlign_oneRead.cpp:99`), which is where
+    /// the uniquely/multi-mapped counts are kept, but still counts it as input.
+    pub fn record_input_read(&self) {
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record the length of an input read (for average input read length)
     pub fn record_read_bases(&self, len: u64) {
         self.read_bases.fetch_add(len, Ordering::Relaxed);

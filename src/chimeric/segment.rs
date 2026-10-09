@@ -143,6 +143,8 @@ pub struct ChimericAlignment {
     pub multimap: Option<MultimapInfo>,
     /// The junction line, set by the STAR detector; see [`JunctionLine`].
     pub junction_line: Option<JunctionLine>,
+    /// What `--chimOutType WithinBAM` writes from; see [`crate::chimeric::ChimBam`].
+    pub bam: Option<Box<crate::chimeric::ChimBam>>,
 }
 
 impl ChimericAlignment {
@@ -168,6 +170,7 @@ impl ChimericAlignment {
             read_name,
             multimap: None,
             junction_line: None,
+            bam: None,
         }
     }
 
