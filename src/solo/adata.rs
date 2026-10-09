@@ -30,12 +30,6 @@
 //! `filtered/` directory is that same boolean, materialized. And **`gex` has no
 //! `X`**: no gene feature is privileged as *the* matrix, so every one of them is
 //! a named layer and the caller picks (`sj` has a single matrix, so it keeps `X`).
-//!
-//! Unlike the MatrixMarket writer, which streams each feature through a temp
-//! file, `set_layers` takes materialized arrays — so every layer is held in
-//! memory at once. If that becomes the ceiling on a big run, the fix is to add
-//! the layers one at a time through `AxisArraysOp::add` and drop each matrix
-//! after it is written.
 
 /// Container format for the solo count matrices (`--soloOutputFormat`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,8 +79,7 @@ mod zarr {
     use anndata::backend::{AttributeOp, Value};
     use anndata::data::{DataFrameIndex, Mapping};
     use anndata::{
-        AnnData, AnnDataOp, AxisArraysOp, Backend, ElemCollectionOp, backend::GroupOp,
-        data::ArrayData, data::Data,
+        AnnData, AnnDataOp, AxisArraysOp, Backend, ElemCollectionOp, backend::GroupOp, data::Data,
     };
     use anndata_zarr::Zarr;
     use polars::prelude::{Column, DataFrame};
@@ -158,59 +151,60 @@ mod zarr {
         );
 
         // -- gex: every gene-indexed output type shares one cells × genes axis --
-        // One (layer, obsm frame, uns summary) per output type, unzipped into the
-        // three collections the AnnData setters take.
-        let per_feature = ctx
-            .features
-            .iter()
-            .zip(&ctx.recorders)
-            .map(|(feature, recorder)| {
-                let name = feature.dir_name().to_string();
-                let cells = crate::solo::count::dedup_cells(ctx, recorder, &opts);
-                let stats: Vec<CellStat> = cells
-                    .iter()
-                    .map(CellCounts::stat)
-                    .filter(|s| s.n_umis > 0)
-                    .collect();
-                let matrix = cells_to_csr(&cells, n_obs, n_genes)?;
-                let called = call_cells(&stats, &matrix, n_genes, params)?;
+        // `features` is never empty (it defaults to Gene), so gex always exists.
+        let gex_path = if mudata {
+            path.join("mod").join("gex")
+        } else {
+            path.clone()
+        };
+        let gex = AnnData::<Zarr>::new(&gex_path).map_err(zarr_err)?;
+        gex.set_var(gene_frame(&ctx.gene_ann.gene_names)?)
+            .map_err(zarr_err)?;
+        gex.set_var_names(DataFrameIndex::from(ctx.gene_ann.gene_ids.clone()))
+            .map_err(zarr_err)?;
+        gex.set_obs_names(obs_index.clone()).map_err(zarr_err)?;
 
-                // UniqueAndMult-<method> variants share the layer axis, so they
-                // ride along as extra layers of this feature.
-                let mg = recorder.multi_gene.lock().unwrap();
-                let mut layers: Vec<(String, ArrayData)> = Vec::new();
-                for m in multi_matrices(&matrix, &mg, &multi_methods) {
-                    let (method, mat) = m?;
-                    layers.push((
-                        format!("{name}_UniqueAndMult-{}", method.name()),
-                        mat.into(),
-                    ));
-                }
-                drop(mg);
+        // Each layer is written as soon as it is built and dropped right after,
+        // so at most a feature's matrix plus one derived matrix is in memory.
+        let mut summaries: Vec<(String, Mapping)> = Vec::new();
+        for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
+            let name = feature.dir_name().to_string();
+            let cells = crate::solo::count::dedup_cells(ctx, recorder, &opts);
+            let stats: Vec<CellStat> = cells
+                .iter()
+                .map(CellCounts::stat)
+                .filter(|s| s.n_umis > 0)
+                .collect();
+            let matrix = cells_to_csr(&cells, n_obs, n_genes)?;
+            drop(cells);
+            let called = call_cells(&stats, &matrix, n_genes, params)?;
 
-                let summary = crate::solo::count::feature_summary(
-                    &stats,
-                    detected(&matrix, n_genes),
-                    &funnel,
-                    crate::solo::count::feature_reads(ctx, *feature),
-                );
-                // The feature's own counts lead, ahead of its multimapper variants.
-                layers.insert(0, (name.clone(), matrix.into()));
-                Ok((
-                    layers,
-                    (
-                        (
-                            format!("stats_{name}"),
-                            stats_frame(&stats, &called, n_obs)?,
-                        ),
-                        (name, summary_map(&summary)),
-                    ),
-                ))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let (layer_groups, (obsm, summaries)): (Vec<_>, (Vec<_>, Vec<_>)) =
-            per_feature.into_iter().unzip();
-        let mut layers: Vec<(String, ArrayData)> = layer_groups.into_iter().flatten().collect();
+            // UniqueAndMult-<method> variants share the layer axis, so they
+            // ride along as extra layers of this feature.
+            let mg = recorder.multi_gene.lock().unwrap();
+            for m in multi_matrices(&matrix, &mg, &multi_methods) {
+                let (method, mat) = m?;
+                gex.layers()
+                    .add(&format!("{name}_UniqueAndMult-{}", method.name()), mat)
+                    .map_err(zarr_err)?;
+            }
+            drop(mg);
+
+            let summary = crate::solo::count::feature_summary(
+                &stats,
+                detected(&matrix, n_genes),
+                &funnel,
+                crate::solo::count::feature_reads(ctx, *feature),
+            );
+            gex.layers().add(&name, matrix).map_err(zarr_err)?;
+            gex.obsm()
+                .add(
+                    &format!("stats_{name}"),
+                    stats_frame(&stats, &called, n_obs)?,
+                )
+                .map_err(zarr_err)?;
+            summaries.push((name, summary_map(&summary)));
+        }
 
         // Velocyto: three more layers on the same gene axis, no separate stats.
         if ctx.velocyto_enabled {
@@ -231,10 +225,9 @@ mod zarr {
                 .take(if keep_ambiguous { 3 } else { 2 })
             {
                 let per_cat: Vec<CellCounts> = cells.iter().map(|c| c[k].clone()).collect();
-                layers.push((
-                    (*name).to_string(),
-                    cells_to_csr(&per_cat, n_obs, n_genes)?.into(),
-                ));
+                gex.layers()
+                    .add(name, cells_to_csr(&per_cat, n_obs, n_genes)?)
+                    .map_err(zarr_err)?;
             }
         }
 
@@ -255,41 +248,17 @@ mod zarr {
         }
         uns.insert("run_info".to_string(), run_info().into());
 
-        let mut modalities: Vec<&str> = Vec::new();
-        if layers.is_empty() {
-            log::warn!(
-                "STARsolo: no gene-indexed features to write to {}",
-                path.display()
-            );
-        } else {
-            // All layers are output as-is with keys in Layers.
-            let gex_path = if mudata {
-                path.join("mod").join("gex")
-            } else {
-                path.clone()
-            };
-            let gex = AnnData::<Zarr>::new(&gex_path).map_err(zarr_err)?;
-            gex.set_var(gene_frame(&ctx.gene_ann.gene_names)?)
-                .map_err(zarr_err)?;
-            gex.set_var_names(DataFrameIndex::from(ctx.gene_ann.gene_ids.clone()))
-                .map_err(zarr_err)?;
-            gex.set_obs_names(obs_index.clone()).map_err(zarr_err)?;
-            gex.set_layers(layers).map_err(zarr_err)?;
-            for (name, df) in obsm {
-                gex.obsm().add(&name, df).map_err(zarr_err)?;
+        if !mudata {
+            for (k, v) in uns.drain() {
+                gex.uns().add(&k, v).map_err(zarr_err)?;
             }
-            if !mudata {
-                for (k, v) in uns.drain() {
-                    gex.uns().add(&k, v).map_err(zarr_err)?;
-                }
-            }
-            gex.close().map_err(zarr_err)?;
-            modalities.push("gex");
-            log::info!(
-                "STARsolo: wrote {} ({n_obs} barcodes × {n_genes} genes)",
-                gex_path.display(),
-            );
         }
+        gex.close().map_err(zarr_err)?;
+        let mut modalities: Vec<&str> = vec!["gex"];
+        log::info!(
+            "STARsolo: wrote {} ({n_obs} barcodes × {n_genes} genes)",
+            gex_path.display(),
+        );
         if !mudata {
             // AnnData does not tag its own root; mudata's `mod/*` get this below.
             let mut root = store.open_group("/").map_err(zarr_err)?;
