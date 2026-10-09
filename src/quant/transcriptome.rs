@@ -1065,6 +1065,8 @@ fn align_to_one_transcript(
     let g1 = first_block.genome_start;
 
     let mut ex = find_containing_exon(tr_exons, g1)?;
+    let gaps = block_gaps(align);
+    let is_junction_before = |iab: usize| iab > 0 && gaps.get(iab - 1) == Some(&BlockGap::Junction);
 
     // Build projected exons (in t-space) as we walk the alignment blocks.
     let mut proj_exons: Vec<Exon> = Vec::new();
@@ -1090,10 +1092,10 @@ fn align_to_one_transcript(
             return None;
         }
 
-        // STAR starts a new projected exon on the first block, after a
-        // preceding canonSJ junction (>= 0), or at a mate boundary;
-        // insertions coalesce into the previous block.
-        let start_new = iab == 0 || crossed_mate_boundary || is_splice_boundary_before(align, iab);
+        // STAR starts a new projected block on the first block and after a
+        // deletion, insertion or mate gap (`canonSJ < 0`); the two sides of
+        // a junction (`canonSJ >= 0`) become one block in transcript space.
+        let start_new = iab == 0 || crossed_mate_boundary || !is_junction_before(iab);
 
         if start_new {
             // t-space position = ex_len_cum + (block_start - exon_start)
@@ -1121,7 +1123,7 @@ fn align_to_one_transcript(
         // are handled above at the start of the next iteration).
         if iab + 1 < align.exons.len()
             && align.exons[iab + 1].i_frag == block.i_frag
-            && is_splice_boundary_before(align, iab + 1)
+            && is_junction_before(iab + 1)
         {
             // Require the junction to match a transcript junction.
             let next_block = &align.exons[iab + 1];
@@ -1164,12 +1166,19 @@ fn align_to_one_transcript(
 
     // Build projected CIGAR: drop N operations (splices collapse in t-space);
     // for reverse-strand transcripts, reverse the resulting op sequence.
-    let mut proj_cigar: Vec<cigar::Op> = align
+    // Blocks on both sides of a junction become one block in transcript space,
+    // so the M operations either side of an N merge (`25M125M` -> `150M`).
+    let mut proj_cigar: Vec<cigar::Op> = Vec::with_capacity(align.cigar.len());
+    for op in align
         .cigar
         .iter()
         .filter(|op| op.kind() != cigar::op::Kind::Skip)
-        .copied()
-        .collect();
+    {
+        match proj_cigar.last_mut() {
+            Some(last) if last.kind() == op.kind() => *last = last.add_len(op.len()),
+            _ => proj_cigar.push(*op),
+        }
+    }
     if tr_strand == 2 {
         proj_cigar.reverse();
     }
@@ -1216,20 +1225,103 @@ pub fn filter_and_project(
     mode: QuantTranscriptomeSAMoutput,
     params: &Parameters,
 ) -> Vec<Transcript> {
-    if !mode.allow_indels() && align.n_gap > 0 {
+    let Some((prepared, extra_mm)) =
+        prepare_for_projection(align, read_bases_align_orientation, genome, mode)
+    else {
+        return Vec::new();
+    };
+    // STAR: `Lread` is the read length (+1 mark for a pair) and the budget
+    // is min(outFilterMismatchNmaxTotal, outFilterMismatchNoverLmax*(Lread-1)).
+    if !within_mismatch_budget(align.n_mismatch + extra_mm, lread, lread, params) {
         return Vec::new();
     }
+    align_to_transcripts(&prepared, idx, lread)
+}
 
-    let align_for_projection = if mode.allow_softclip() || !has_soft_clip(align) {
-        align.clone()
-    } else {
-        match extend_softclips(align, read_bases_align_orientation, genome, lread, params) {
-            Some(extended) => extended,
-            None => return Vec::new(),
-        }
+/// Paired-end version of [`filter_and_project`]. STAR applies the indel ban,
+/// the soft-clip extension and its mismatch budget to the whole pair: the
+/// mismatches of the extended clips of both mates and the pair's `nMM` are
+/// summed and compared with `min(outFilterMismatchNmaxTotal,
+/// outFilterMismatchNoverLmax*(Lread-1))`, where `Lread-1` is the sum of the
+/// mate lengths (`ReadAlign_quantTranscriptome.cpp`). Returns the surviving
+/// (mate1, mate2) projections on each transcript both mates fit, in STAR's
+/// order (transcripts from the highest start downwards).
+#[allow(clippy::too_many_arguments)]
+pub fn filter_and_project_pair(
+    m1: &Transcript,
+    m2: &Transcript,
+    bases1: &[u8],
+    bases2: &[u8],
+    genome: &Genome,
+    idx: &TranscriptomeIndex,
+    lread1: u32,
+    lread2: u32,
+    mode: QuantTranscriptomeSAMoutput,
+    params: &Parameters,
+) -> Vec<(Transcript, Transcript)> {
+    let Some((p1, extra1)) = prepare_for_projection(m1, bases1, genome, mode) else {
+        return Vec::new();
     };
+    let Some((p2, extra2)) = prepare_for_projection(m2, bases2, genome, mode) else {
+        return Vec::new();
+    };
+    let total_mm = m1.n_mismatch + m2.n_mismatch + extra1 + extra2;
+    if !within_mismatch_budget(total_mm, lread1 + lread2, lread1 + lread2 + 1, params) {
+        return Vec::new();
+    }
+    let proj1 = align_to_transcripts(&p1, idx, lread1);
+    let proj2 = align_to_transcripts(&p2, idx, lread2);
+    let mut out = Vec::new();
+    for q2 in &proj2 {
+        for q1 in proj1.iter().filter(|q| q.chr_idx == q2.chr_idx) {
+            out.push((q1.clone(), q2.clone()));
+        }
+    }
+    out
+}
 
-    align_to_transcripts(&align_for_projection, idx, lread)
+/// Indel ban and soft-clip extension of one mate or read. Returns the
+/// transcript to project and the mismatches the extension added, or `None`
+/// when indels are banned and present.
+fn prepare_for_projection(
+    align: &Transcript,
+    read_bases_align_orientation: &[u8],
+    genome: &Genome,
+    mode: QuantTranscriptomeSAMoutput,
+) -> Option<(Transcript, u32)> {
+    if !mode.allow_indels() && has_indel(align) {
+        return None;
+    }
+    if mode.allow_softclip() || !has_soft_clip(align) {
+        return Some((align.clone(), 0));
+    }
+    Some(extend_softclips(
+        align,
+        read_bases_align_orientation,
+        genome,
+    ))
+}
+
+/// STAR's `(nMM + nMM1) > min(outFilterMismatchNmaxTotal,
+/// outFilterMismatchNoverLmax*(Lread-1))` test; `lread` is STAR's `Lread`.
+fn within_mismatch_budget(n_mm: u32, read_len_sum: u32, lread: u32, params: &Parameters) -> bool {
+    // `outFilterMismatchNmaxTotal = min(outFilterMismatchNmax,
+    // outFilterMismatchNoverReadLmax*(readLength[0]+readLength[1]))`, ratio 1.
+    let nmax_total = params.out_filter_mismatch_nmax.min(read_len_sum);
+    let rel =
+        (params.out_filter_mismatch_nover_lmax * f64::from(lread.saturating_sub(1))).floor() as u32;
+    n_mm <= nmax_total.min(rel)
+}
+
+/// STAR's `nDel>0 || nIns>0`, read off the CIGAR (`n_gap` does not always
+/// count the insertions of a stitched pair).
+fn has_indel(align: &Transcript) -> bool {
+    use cigar::op::Kind;
+    align.n_gap > 0
+        || align
+            .cigar
+            .iter()
+            .any(|op| matches!(op.kind(), Kind::Insertion | Kind::Deletion))
 }
 
 fn has_soft_clip(align: &Transcript) -> bool {
@@ -1241,14 +1333,12 @@ fn has_soft_clip(align: &Transcript) -> bool {
 }
 
 /// Extend the 5'/3' soft-clips of `align` back into matched bases, counting
-/// mismatches.  Returns `None` if the extension exceeds the mismatch budget.
+/// mismatches (the caller applies the budget).
 fn extend_softclips(
     align: &Transcript,
     read_bases_align_orientation: &[u8],
     genome: &Genome,
-    lread: u32,
-    params: &Parameters,
-) -> Option<Transcript> {
+) -> (Transcript, u32) {
     // Determine left / right clip sizes from the CIGAR.
     let [left_clip, right_clip] = align.count_soft_clips();
 
@@ -1300,19 +1390,9 @@ fn extend_softclips(
         }
     }
 
-    // Apply STAR's mismatch budget.
-    let mismatch_nmax_abs = params.out_filter_mismatch_nmax;
-    let mismatch_nmax_rel =
-        ((params.out_filter_mismatch_nover_lmax * (lread.saturating_sub(1) as f64)).floor()) as u32;
-    let budget = mismatch_nmax_abs.min(mismatch_nmax_rel);
-    if align.n_mismatch.saturating_add(n_mm_extra) > budget {
-        return None;
-    }
-
     // Construct the extended alignment: remove the soft-clip CIGAR ops and
     // extend the leading/trailing match blocks.
     let mut ext = align.clone();
-    ext.n_mismatch = ext.n_mismatch.saturating_add(n_mm_extra);
     if left_clip > 0
         && let Some(first) = ext.exons.first_mut()
     {
@@ -1336,7 +1416,7 @@ fn extend_softclips(
     if let Some(last) = ext.exons.last() {
         ext.genome_end = last.genome_end;
     }
-    Some(ext)
+    (ext, n_mm_extra)
 }
 
 /// Strip the leading/trailing `SoftClip` ops and fold their lengths into the
@@ -1400,34 +1480,59 @@ fn find_containing_exon(tr_exons: &[TrExon], pos: u64) -> Option<usize> {
     }
 }
 
-/// Return true if the boundary between `align.exons[iab-1]` and
-/// `align.exons[iab]` is a splice (`RefSkip`) rather than an indel.
-///
-/// rustar-aligner's `Transcript.exons` is a list of read-contiguous match blocks;
-/// splices / insertions / deletions all create block boundaries.  We
-/// discriminate based on the read-side gap:
-///   * `read_end_prev == read_start_curr` AND `genome gap` → deletion OR splice.
-///     We call it a splice — the caller verifies the boundary matches a
-///     transcript junction and rejects the alignment if it does not.
-///   * read gap (insertion) → not a splice (coalesce).
-///   * Pure deletion (read contiguous, small genome gap that does NOT match a
-///     transcript junction) → handled by the caller rejecting the alignment
-///     when the junction check fails.  In practice rustar-aligner produces `Del` ops
-///     inside a single exon (no block split for pure deletions because the
-///     stitch merge coalesces across Del), so this branch rarely fires.
-fn is_splice_boundary_before(align: &Transcript, iab: usize) -> bool {
-    if iab == 0 {
-        return false;
+/// What separates `align.exons[i]` from `align.exons[i + 1]`, read off the
+/// CIGAR (STAR's `canonSJ`: `>= 0` junction, `-1` deletion, `-2` insertion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockGap {
+    Junction,
+    Deletion,
+    Insertion,
+}
+
+/// One entry per boundary between consecutive exon blocks. Blocks are the
+/// runs of aligned bases; the gap operations between two runs decide the
+/// kind: an `N` makes a junction, else a `D` a deletion, else an `I` an
+/// insertion. Falls back to a geometric guess if the CIGAR does not match the
+/// exon list (an alignment built without a CIGAR).
+fn block_gaps(align: &Transcript) -> Vec<BlockGap> {
+    use cigar::op::Kind;
+    let n_gaps = align.exons.len().saturating_sub(1);
+    let mut gaps: Vec<BlockGap> = Vec::with_capacity(n_gaps);
+    let mut pending: Option<BlockGap> = None;
+    let mut seen_match = false;
+    for op in &align.cigar {
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                if seen_match && let Some(g) = pending.take() {
+                    gaps.push(g);
+                }
+                pending = None;
+                seen_match = true;
+            }
+            Kind::Skip => pending = Some(BlockGap::Junction),
+            Kind::Deletion => {
+                if pending != Some(BlockGap::Junction) {
+                    pending = Some(BlockGap::Deletion);
+                }
+            }
+            Kind::Insertion if pending.is_none() => pending = Some(BlockGap::Insertion),
+            _ => {}
+        }
     }
-    let prev = &align.exons[iab - 1];
-    let cur = &align.exons[iab];
-    // Insertion: read gap between blocks with no genome gap → coalesce.
-    if prev.read_end < cur.read_start && prev.genome_end == cur.genome_start {
-        return false;
+    if gaps.len() == n_gaps {
+        return gaps;
     }
-    // Splice / large gap on the genome side, with read-contiguous: treat as
-    // potential splice junction (caller validates).
-    prev.genome_end < cur.genome_start
+    (1..align.exons.len())
+        .map(|iab| {
+            let prev = &align.exons[iab - 1];
+            let cur = &align.exons[iab];
+            if prev.read_end < cur.read_start && prev.genome_end == cur.genome_start {
+                BlockGap::Insertion
+            } else {
+                BlockGap::Junction
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2184,17 +2289,90 @@ mod tests {
         let results = align_to_transcripts(&align, &idx, 100);
         assert_eq!(results.len(), 1);
         let r = &results[0];
-        // Two t-space exons, no N in CIGAR.
-        assert_eq!(r.exons.len(), 2);
-        // First exon: t-space [50, 100)
+        // The two sides of the junction are one block in t-space (STAR merges
+        // blocks across canonSJ >= 0): t-space [50, 150), CIGAR 100M.
+        assert_eq!(r.exons.len(), 1);
         assert_eq!(r.exons[0].genome_start, 50);
-        assert_eq!(r.exons[0].genome_end, 100);
-        // Second exon: t-space [100, 150) — starts right after prev (splice collapsed)
-        assert_eq!(r.exons[1].genome_start, 100);
-        assert_eq!(r.exons[1].genome_end, 150);
-        // CIGAR: no N
-        assert!(r.cigar.iter().all(|op| op.kind() != Kind::Skip));
-        assert_eq!(r.cigar.len(), 2);
+        assert_eq!(r.exons[0].genome_end, 150);
+        assert_eq!(r.cigar.len(), 1);
+        assert_eq!(r.cigar[0], Op::new(Kind::Match, 100));
+    }
+
+    #[test]
+    fn project_deletion_stays_in_one_exon_and_keeps_the_cigar() {
+        use cigar::op::{Kind, Op};
+        let genome = make_genome();
+        let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
+        // 30M2D20M inside the exon: a deletion is not a junction, so it does
+        // not have to match a transcript junction.
+        let align = make_align(
+            0,
+            false,
+            vec![(120, 150, 0, 30), (152, 172, 30, 50)],
+            vec![
+                Op::new(Kind::Match, 30),
+                Op::new(Kind::Deletion, 2),
+                Op::new(Kind::Match, 20),
+            ],
+        );
+        let results = align_to_transcripts(&align, &idx, 50);
+        assert_eq!(results.len(), 1);
+        let ops: Vec<_> = results[0]
+            .cigar
+            .iter()
+            .map(|o| (o.kind(), o.len()))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![(Kind::Match, 30), (Kind::Deletion, 2), (Kind::Match, 20)]
+        );
+    }
+
+    #[test]
+    fn pair_softclip_extension_shares_one_mismatch_budget() {
+        use cigar::op::{Kind, Op};
+        // Each mate's extended clip adds 6 mismatches (the read is all A, the
+        // genome all C); alone each is within the budget of 10, the
+        // pair is not.
+        let mut genome = make_genome();
+        genome.sequence = vec![1u8; 3000].into();
+        let gtf = vec![make_exon("chr1", 101, 900, '+', "G1", "T1")];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
+        let clipped = |start: u64, rev: bool| {
+            make_align(
+                0,
+                rev,
+                vec![(start, start + 50, 6, 56)],
+                vec![Op::new(Kind::SoftClip, 6), Op::new(Kind::Match, 50)],
+            )
+        };
+        let read = vec![0u8; 56];
+        let params = default_params();
+        let mode = QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip;
+        let one = filter_and_project(
+            &clipped(200, false),
+            &read,
+            &genome,
+            &idx,
+            56,
+            mode,
+            &params,
+        );
+        assert_eq!(one.len(), 1);
+        let pair = filter_and_project_pair(
+            &clipped(200, false),
+            &clipped(400, true),
+            &read,
+            &read,
+            &genome,
+            &idx,
+            56,
+            56,
+            mode,
+            &params,
+        );
+        assert!(pair.is_empty());
     }
 
     #[test]
@@ -2284,22 +2462,17 @@ mod tests {
 
         // Strand flips (tr_strand == 2, align.is_reverse == false → projected true).
         assert!(r.is_reverse);
-        assert_eq!(r.exons.len(), 2);
-        // Pre-flip t-space exons: [50,100) r[0,50) and [100,150) r[50,100).
-        // Flip (tr_len=200, lread=100) then reverse exon order:
-        //   old exon1 [100,150) → g 200-(100+50)=50 → [50,100),  r 100-(50+50)=0 → [0,50)
-        //   old exon0 [50,100)  → g 200-(50+50)=100 → [100,150), r 100-(0+50)=50 → [50,100)
+        // The junction collapses to one t-space block [50,150), read [0,100);
+        // the flip (tr_len=200, lread=100) maps it to g 200-(50+100)=50 and
+        // r 100-(0+100)=0.
+        assert_eq!(r.exons.len(), 1);
         assert_eq!(r.exons[0].genome_start, 50);
-        assert_eq!(r.exons[0].genome_end, 100);
+        assert_eq!(r.exons[0].genome_end, 150);
         assert_eq!(r.exons[0].read_start, 0);
-        assert_eq!(r.exons[0].read_end, 50);
-        assert_eq!(r.exons[1].genome_start, 100);
-        assert_eq!(r.exons[1].genome_end, 150);
-        assert_eq!(r.exons[1].read_start, 50);
-        assert_eq!(r.exons[1].read_end, 100);
-        // N stripped, two M blocks remain.
+        assert_eq!(r.exons[0].read_end, 100);
+        // N stripped and the M blocks merged.
         assert!(r.cigar.iter().all(|op| op.kind() != Kind::Skip));
-        assert_eq!(r.cigar.len(), 2);
+        assert_eq!(r.cigar.len(), 1);
     }
 
     #[test]
@@ -2328,13 +2501,11 @@ mod tests {
         let results = align_to_transcripts(&align, &idx, 100);
         assert_eq!(results.len(), 1);
         let r = &results[0];
-        assert_eq!(r.exons.len(), 2);
-        // First t-space exon: ex_len_cum[1]=100, offset within exon = 350-300=50 → t-space start 150
+        // One t-space block: ex_len_cum[1]=100, offset within exon 350-300=50
+        // gives start 150; the junction collapses, so it spans [150, 250).
+        assert_eq!(r.exons.len(), 1);
         assert_eq!(r.exons[0].genome_start, 150);
-        assert_eq!(r.exons[0].genome_end, 200);
-        // Second t-space exon: ex_len_cum[2]=200, offset = 500-500=0 → t-space start 200
-        assert_eq!(r.exons[1].genome_start, 200);
-        assert_eq!(r.exons[1].genome_end, 250);
+        assert_eq!(r.exons[0].genome_end, 250);
     }
 
     #[test]
