@@ -561,6 +561,8 @@ fn build_matrix_body(
             /// `CB`/`UB` SAM tags asked for STAR's readInfo.
             read_info: Vec<(u32, crate::solo::ReadInfo)>,
         }
+        let read_order_guard = ctx.read_order.lock().unwrap();
+        let read_order: &[u64] = &read_order_guard;
         let cell_outs: Vec<CellOut> = bounds
             .par_iter()
             .map(|&(i, j)| {
@@ -603,6 +605,11 @@ fn build_matrix_body(
                 };
                 cell_entries.sort_unstable_by_key(|&(g, _)| g);
 
+                // CellRanger: whether each read's molecule was dropped (low
+                // support) and which read stands for it.
+                let cr_owners = (ctx.cr_model.is_some()
+                    && filtering == UmiFiltering::MultiGeneUmiCr)
+                    .then(|| multi_gene_umi_cr_owners(&umi_genes, umi_len));
                 // STAR's readInfo: every read counted for this cell records the
                 // cell it landed in and the UMI it collapsed onto
                 // (`SoloFeature_collapseUMIall.cpp:250-265`).
@@ -619,6 +626,23 @@ fn build_matrix_body(
                         .map(|(&gene, umis)| (gene, umi_correction_map(umis, method, umi_len)))
                         .collect();
                     read_info.reserve(j - i);
+                    // The representative is the first read in CellRanger's order.
+                    let key_of = |ri: u32| read_order.get(ri as usize).copied().unwrap_or(u64::from(ri));
+                    let mut rep: HashMap<(u64, u32), u32> = HashMap::default();
+                    if let Some(o) = &cr_owners {
+                        for r in &records[i..j] {
+                            if r.read_index == crate::solo::NO_READ_INDEX {
+                                continue;
+                            }
+                            let cu = o.corrected.get(&(r.gene, r.umi)).copied().unwrap_or(r.umi);
+                            if o.owner.get(&cu) == Some(&Some(r.gene)) {
+                                let e = rep.entry((cu, r.gene)).or_insert(r.read_index);
+                                if (key_of(r.read_index), r.read_index) < (key_of(*e), *e) {
+                                    *e = r.read_index;
+                                }
+                            }
+                        }
+                    }
                     for r in &records[i..j] {
                         if r.read_index == crate::solo::NO_READ_INDEX {
                             continue;
@@ -628,11 +652,38 @@ fn build_matrix_body(
                             .and_then(|m| m.get(&r.umi))
                             .copied()
                             .unwrap_or(r.umi);
-                        read_info.push((r.read_index, crate::solo::ReadInfo { cb, umi }));
+                        let (xf, dup) = match &cr_owners {
+                            None => (0, false),
+                            Some(o) => {
+                                let cu =
+                                    o.corrected.get(&(r.gene, r.umi)).copied().unwrap_or(r.umi);
+                                if o.owner.get(&cu) == Some(&Some(r.gene)) {
+                                    if rep.get(&(cu, r.gene)) == Some(&r.read_index) {
+                                        (8, false)
+                                    } else {
+                                        (0, true)
+                                    }
+                                } else {
+                                    (2, false)
+                                }
+                            }
+                        };
+                        read_info.push((r.read_index, crate::solo::ReadInfo { cb, umi, xf, dup }));
                     }
                 }
 
-                let n_reads = (j - i) as u64;
+                // CellRanger's per-barcode read count leaves out the reads of
+                // low-support molecules, which it never counts.
+                let n_low_support = cr_owners.as_ref().map_or(0, |o| {
+                    records[i..j]
+                        .iter()
+                        .filter(|r| {
+                            let cu = o.corrected.get(&(r.gene, r.umi)).copied().unwrap_or(r.umi);
+                            o.owner.get(&cu) != Some(&Some(r.gene))
+                        })
+                        .count()
+                });
+                let n_reads = (j - i - n_low_support) as u64;
                 let n_genes = cell_entries.len() as u32;
                 let mut n_umis = 0u64;
                 let mut cbody: Vec<u8> = Vec::new();
@@ -691,6 +742,28 @@ fn build_matrix_body(
             genes_detected,
         },
     ))
+}
+
+/// Number of distinct genes with a count in any of the `called` cells (sorted
+/// whitelist indices), read off the streamed matrix body.
+fn genes_in_cells(body: &tempfile::NamedTempFile, called: &[u32]) -> Result<u64, Error> {
+    if called.is_empty() {
+        return Ok(0);
+    }
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    let mut genes: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        let mut it = line.split(' ');
+        if let (Some(g), Some(c)) = (it.next(), it.next())
+            && let (Ok(g), Ok(c)) = (g.parse::<u32>(), c.parse::<u32>())
+            && called.binary_search(&c.saturating_sub(1)).is_ok()
+        {
+            genes.insert(g);
+        }
+    }
+    Ok(genes.len() as u64)
 }
 
 /// The whitelist indices that actually appear as a column in the streamed
@@ -1075,6 +1148,30 @@ fn multi_gene_umi_cr_counts(
     umi_genes: &HashMap<u64, HashMap<u32, u32>>,
     umi_len: usize,
 ) -> Vec<(u32, u64)> {
+    let owners = multi_gene_umi_cr_owners(umi_genes, umi_len);
+    let mut counts: HashMap<u32, u64> = HashMap::default();
+    for winner in owners.owner.into_values().flatten() {
+        *counts.entry(winner).or_insert(0) += 1;
+    }
+    let mut out: Vec<(u32, u64)> = counts.into_iter().filter(|&(_, c)| c > 0).collect();
+    out.sort_unstable_by_key(|&(g, _)| g);
+    out
+}
+
+/// The outcome of `MultiGeneUMI_CR` for one cell: how each `(gene, raw UMI)`
+/// was corrected, and which gene (if any) owns each corrected UMI.
+pub(crate) struct CrUmiOwners {
+    /// `(gene, raw UMI) -> corrected UMI`.
+    pub corrected: HashMap<(u32, u64), u64>,
+    /// `corrected UMI -> owning gene`; `None` when the UMI is dropped (a tie, or
+    /// outvoted on the uncorrected reads).
+    pub owner: HashMap<u64, Option<u32>>,
+}
+
+pub(crate) fn multi_gene_umi_cr_owners(
+    umi_genes: &HashMap<u64, HashMap<u32, u32>>,
+    umi_len: usize,
+) -> CrUmiOwners {
     // Regroup as gene → (raw UMI → reads); correction happens per gene.
     let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
     for (&umi, genes) in umi_genes {
@@ -1085,6 +1182,7 @@ fn multi_gene_umi_cr_counts(
 
     let mut uncorrected: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
     let mut corrected: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
+    let mut corrected_of: HashMap<(u32, u64), u64> = HashMap::default();
     for (&gene, umis) in &gene_umis {
         for (&umi, &rc) in umis {
             *uncorrected.entry(umi).or_default().entry(gene).or_insert(0) += rc;
@@ -1092,11 +1190,12 @@ fn multi_gene_umi_cr_counts(
         let map = cellranger_1mm_map(umis, umi_len);
         for (&umi, &rc) in umis {
             let cu = map.get(&umi).copied().unwrap_or(umi);
+            corrected_of.insert((gene, umi), cu);
             *corrected.entry(cu).or_default().entry(gene).or_insert(0) += rc;
         }
     }
 
-    let mut counts: HashMap<u32, u64> = HashMap::default();
+    let mut owner: HashMap<u64, Option<u32>> = HashMap::default();
     for (cu, genes) in &corrected {
         // Condition 1: a strict maximum, ties lose.
         let mut best = 0u32;
@@ -1109,23 +1208,24 @@ fn multi_gene_umi_cr_counts(
                 winner = None;
             }
         }
-        let Some(winner) = winner else { continue };
 
         // Condition 2: the winner must not be beaten in the uncorrected map at
         // the same key. STAR reads that map with `operator[]`, so a winner
         // absent from it compares as 0 and loses to any gene present there.
-        if let Some(raw_genes) = uncorrected.get(cu) {
-            let winner_raw = raw_genes.get(&winner).copied().unwrap_or(0);
+        if let Some(w) = winner
+            && let Some(raw_genes) = uncorrected.get(cu)
+        {
+            let winner_raw = raw_genes.get(&w).copied().unwrap_or(0);
             if raw_genes.values().any(|&rc| rc > winner_raw) {
-                continue;
+                winner = None;
             }
         }
-        *counts.entry(winner).or_insert(0) += 1;
+        owner.insert(*cu, winner);
     }
-
-    let mut out: Vec<(u32, u64)> = counts.into_iter().filter(|&(_, c)| c > 0).collect();
-    out.sort_unstable_by_key(|&(g, _)| g);
-    out
+    CrUmiOwners {
+        corrected: corrected_of,
+        owner,
+    }
 }
 
 /// Apply `--soloUMIfiltering` to the gene→read_count map of a single UMI,
@@ -1627,9 +1727,28 @@ pub fn write_gene_matrix(
     let total_reads = align_stats.total_reads.load(Ordering::Relaxed);
     let mapped_unique = align_stats.uniquely_mapped.load(Ordering::Relaxed);
     let mapped_multi = align_stats.multi_mapped.load(Ordering::Relaxed);
-    let valid_barcodes = ctx.stats.yes_exact.load(Ordering::Relaxed)
-        + ctx.stats.yes_one_mm.load(Ordering::Relaxed)
-        + ctx.stats.yes_mult_mm.load(Ordering::Relaxed);
+    let mut valid_barcodes = ctx.stats.yes_exact.load(Ordering::Relaxed)
+        + ctx.stats.yes_one_mm.load(Ordering::Relaxed);
+    if ctx.cr_model.is_some() {
+        // CellRanger counts a barcode as valid once it is corrected, so a read
+        // matching several whitelist entries is valid only when the posterior
+        // picks one. The same pick names its cell in the BAM.
+        let exact_counts = ctx.whitelist.exact_count_snapshot();
+        let one_exact = ctx.match_type.one_exact();
+        let cands = std::mem::take(&mut *ctx.cb_multi.lock().unwrap());
+        let mut resolved: HashMap<u32, u32> = HashMap::default();
+        for (read_index, c) in cands {
+            if let Some(cb) = resolve_multi_cb(&c, &exact_counts, pseudocount)
+                && cb_passes_one_exact(one_exact, &exact_counts, cb)
+            {
+                resolved.insert(read_index, cb);
+            }
+        }
+        valid_barcodes += resolved.len() as u64;
+        *ctx.cb_multi_resolved.lock().unwrap() = resolved.into_iter().collect();
+    } else {
+        valid_barcodes += ctx.stats.yes_mult_mm.load(Ordering::Relaxed);
+    }
     let reads_of = |f: crate::solo::SoloFeature| -> u64 {
         ctx.features
             .iter()
@@ -1795,7 +1914,7 @@ pub fn write_gene_matrix(
         } else {
             called_cells(&mstats.cells, &params.solo_cell_filter)
         };
-        if let Some(cbs) = called
+        if let Some(cbs) = called.as_ref()
             && !cbs.is_empty()
         {
             let filt_dir = feature_dir.join(filt_name);
@@ -1814,7 +1933,7 @@ pub fn write_gene_matrix(
             write_barcodes_subset(
                 &filt_dir.join(&barcodes_name),
                 &ctx.whitelist,
-                &cbs,
+                cbs,
                 gzip,
                 cb_suffix,
             )?;
@@ -1873,6 +1992,26 @@ pub fn write_gene_matrix(
         if cr_layout && let Some(r) = region {
             let invalid_umis = ctx.stats.n_in_umi.load(Ordering::Relaxed)
                 + ctx.stats.umi_homopolymer.load(Ordering::Relaxed);
+            // With CellRanger's own annotation the funnel is already in its
+            // terms: reads with any alignment, and the confident ones.
+            let (conf, multi, txome) = if ctx.cr_model.is_some() {
+                let rs = &ctx.region_stats;
+                let any = rs.mapped.load(Ordering::Relaxed);
+                let conf = r.exonic + r.intronic + r.intergenic;
+                (
+                    conf,
+                    any.saturating_sub(conf),
+                    rs.txome.load(Ordering::Relaxed),
+                )
+            } else {
+                (
+                    mapped_unique,
+                    mapped_multi,
+                    reads_of(crate::solo::SoloFeature::Gene),
+                )
+            };
+            let called_cbs: &[u32] = called.as_deref().unwrap_or(&[]);
+            let genes_in_cells = genes_in_cells(&body, called_cbs)?;
             write_metrics_summary(
                 &feature_dir.join("metrics_summary.csv"),
                 &mstats,
@@ -1880,10 +2019,15 @@ pub fn write_gene_matrix(
                 total_reads,
                 valid_barcodes,
                 invalid_umis,
-                mapped_unique,
-                mapped_multi,
-                reads_of(crate::solo::SoloFeature::Gene),
+                conf,
+                multi,
+                txome,
                 r,
+                called_cbs,
+                genes_in_cells,
+                ctx.cr_model
+                    .is_some()
+                    .then(|| ctx.region_stats.umi_invalid.load(Ordering::Relaxed)),
             )?;
             log::info!(
                 "STARsolo: wrote {}",
@@ -2322,15 +2466,27 @@ fn write_metrics_summary(
     mapped_multi: u64,
     transcriptome_reads: u64,
     region: RegionFunnel,
+    called: &[u32],
+    genes_in_cells: u64,
+    umi_invalid_all: Option<u64>,
 ) -> Result<(), Error> {
     use std::sync::atomic::Ordering;
 
-    // Cell calling: the same CR2.2 knee `Summary.csv` uses, so the two files
-    // never disagree about how many cells there are.
-    let mut umis_desc: Vec<u64> = mstats.cells.iter().map(|c| c.n_umis).collect();
-    umis_desc.sort_unstable_by(|a, b| b.cmp(a));
-    let thr = knee_cr22(&umis_desc, 3000, 0.99, 10.0);
-    let cells: Vec<&CellStat> = mstats.cells.iter().filter(|c| c.n_umis >= thr).collect();
+    // The cells are the ones the filtered matrix holds, so the two never
+    // disagree about how many cells there are. Without a cell call (no filtered
+    // matrix) fall back to the CR2.2 knee.
+    let cells: Vec<&CellStat> = if called.is_empty() {
+        let mut umis_desc: Vec<u64> = mstats.cells.iter().map(|c| c.n_umis).collect();
+        umis_desc.sort_unstable_by(|a, b| b.cmp(a));
+        let thr = knee_cr22(&umis_desc, 3000, 0.99, 10.0);
+        mstats.cells.iter().filter(|c| c.n_umis >= thr).collect()
+    } else {
+        mstats
+            .cells
+            .iter()
+            .filter(|c| called.binary_search(&c.cb).is_ok())
+            .collect()
+    };
     let n_cells = cells.len() as u64;
 
     let reads_counted: u64 = mstats.cells.iter().map(|c| c.n_reads).sum();
@@ -2351,7 +2507,7 @@ fn write_metrics_summary(
         // CellRanger divides total reads by cells, not reads-in-cells.
         (
             "Mean Reads per Cell",
-            metric_int(total_reads.checked_div(n_cells).unwrap_or(0)),
+            metric_int(((total_reads as f64) / (n_cells.max(1) as f64)).round() as u64),
         ),
         (
             "Median Genes per Cell",
@@ -2362,9 +2518,14 @@ fn write_metrics_summary(
         // Of the reads that got as far as the UMI check, i.e. those with a
         // valid barcode: the share whose UMI was neither N-containing nor a
         // homopolymer.
+        // CellRanger counts invalid UMIs (an `N` or a homopolymer) over all
+        // reads, whatever became of their barcode.
         (
             "Valid UMI Sequences",
-            metric_pct(valid_barcodes.saturating_sub(invalid_umis), valid_barcodes),
+            match umi_invalid_all {
+                Some(bad) => metric_pct(total_reads.saturating_sub(bad), total_reads),
+                None => metric_pct(valid_barcodes.saturating_sub(invalid_umis), valid_barcodes),
+            },
         ),
         (
             "Sequencing Saturation",
@@ -2420,7 +2581,13 @@ fn write_metrics_summary(
         ),
         (
             "Total Genes Detected",
-            metric_int(mstats.genes_detected.into()),
+            // Genes seen in the called cells (CellRanger reports it for the
+            // filtered matrix), not in every barcode.
+            metric_int(if called.is_empty() {
+                mstats.genes_detected.into()
+            } else {
+                genes_in_cells
+            }),
         ),
         (
             "Median UMI Counts per Cell",

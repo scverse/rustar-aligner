@@ -11,6 +11,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- `--soloOutLayout CellRanger` annotates reads the way `cellranger count` 10.0.0
+  does, from the transcriptome in the index. Each alignment is classified as
+  exonic (compatible with a transcript's exons and junctions, or at least half in
+  the exons of a gene it lies in), intronic or intergenic; a multi-mapped read is
+  rescued to MAPQ 255 when its transcriptomic alignments all belong to one gene;
+  and a read counts for a gene when its confident alignment names exactly one.
+  The sorted BAM carries CellRanger's `RE`, `TX`, `AN`, `GX`, `GN`, `fx` and `xf`
+  tags (one record per read, MAPQ 255 for confident reads, the duplicate flag on
+  all but one read per molecule), and `CB`/`UB` on every read that has a valid
+  barcode and UMI. `metrics_summary.csv` is computed from this annotation:
+  `Reads Mapped Confidently to Transcriptome` no longer prints 0.0%, `Total Genes
+  Detected` and `Valid UMI Sequences` use CellRanger's definitions, and the cells
+  are the filtered matrix's. A 10x run now also defaults to `--soloCellFilter
+  EmptyDrops_CR`, CellRanger's cell call.
+
 ### Bug fixes
 
 - Window formation and per-window dedup follow STAR (long splices with the default

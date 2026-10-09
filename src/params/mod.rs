@@ -2560,7 +2560,7 @@ impl Parameters {
 
 /// The flags STAR documents for matching CellRanger 4.x/5.x
 /// (`docs/STARsolo.md`), applied by default when the run is a 10x one.
-const CELLRANGER_DEFAULTS: [(&str, &str); 7] = [
+const CELLRANGER_DEFAULTS: [(&str, &str); 8] = [
     ("clip_adapter_type", "CellRanger4"),
     ("out_filter_score_min", "30"),
     ("solo_cb_match_wl_type", "1MM_multi_Nbase_pseudocounts"),
@@ -2573,6 +2573,7 @@ const CELLRANGER_DEFAULTS: [(&str, &str); 7] = [
     // STARsolo's `Gene` is exonic-only, which on human data is 30% below
     // CellRanger; `GeneFull` is the equivalent of its default.
     ("solo_features", "GeneFull"),
+    ("solo_cell_filter", "EmptyDrops_CR"),
 ];
 
 /// Does this look like a 10x Chromium run?
@@ -2637,6 +2638,26 @@ fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::Arg
             "solo_umi_dedup" => params.solo_umi_dedup = vec![value.to_string()],
             "solo_out_layout" => params.solo_out_layout = value.to_string(),
             "solo_features" => params.solo_features = vec![value.to_string()],
+            // CellRanger 10's cell call is OrdMag plus the EmptyDrops-style
+            // rescue of non-ambient barcodes, which is `EmptyDrops_CR`; the
+            // arguments are STAR's documented ones for CellRanger >= 3.
+            "solo_cell_filter" => {
+                params.solo_cell_filter = [
+                    "EmptyDrops_CR",
+                    "3000",
+                    "0.99",
+                    "10",
+                    "45000",
+                    "90000",
+                    "500",
+                    "0.01",
+                    "20000",
+                    "0.01",
+                    "10000",
+                ]
+                .map(String::from)
+                .to_vec();
+            }
             _ => continue,
         }
         applied.push(value);
@@ -2718,6 +2739,10 @@ mod tests {
         assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
         assert_eq!(p.solo_out_layout, "CellRanger");
         assert_eq!(p.solo_features, vec!["GeneFull".to_string()]);
+        assert_eq!(
+            p.solo_cell_filter.first().map(String::as_str),
+            Some("EmptyDrops_CR")
+        );
     }
 
     /// `--soloFeatures` given explicitly wins, so a user who wants STARsolo's

@@ -11,6 +11,7 @@
 
 pub mod cell_reads;
 pub mod count;
+pub mod cr_annot;
 pub mod gene;
 pub mod h5;
 pub mod libcxx_rng;
@@ -960,6 +961,17 @@ pub struct SoloContext {
     /// `--soloOutLayout CellRanger`: write `metrics_summary.csv`, which needs
     /// the Q30 tallies and the full positional funnel.
     pub want_metrics: bool,
+    /// CellRanger's transcriptome annotation, built when `want_metrics` and the
+    /// index carries a transcriptome.
+    pub cr_model: Option<cr_annot::CrModel>,
+    /// Reads whose barcode matched several whitelist entries, with their
+    /// candidates, and (after counting) the barcode each resolved to. Only kept
+    /// under CellRanger's annotation, for the `CB` tag and `Valid Barcodes`.
+    pub cb_multi: Mutex<Vec<(u32, Vec<CbCandidate>)>>,
+    /// Per input read, the key CellRanger orders reads by when it picks the
+    /// representative of a molecule; indexed by read index.
+    pub read_order: Mutex<Vec<u64>>,
+    pub cb_multi_resolved: Mutex<std::collections::HashMap<u32, u32>>,
     /// Base-quality tallies for the three `Q30 Bases in ...` metrics.
     pub q30: Q30Stats,
     /// STAR's `readInfo` (`ParametersSolo.cpp:418-435`): the cell and corrected
@@ -1013,6 +1025,12 @@ impl Q30Stats {
 pub struct ReadInfo {
     pub cb: u32,
     pub umi: u64,
+    /// CellRanger's `xf` bits this read earns when counting runs: 2 for a
+    /// low-support UMI, 8 for the molecule's representative read.
+    pub xf: u8,
+    /// A counted read that is not its molecule's representative: CellRanger
+    /// flags it as a duplicate (0x400).
+    pub dup: bool,
 }
 
 impl Default for ReadInfo {
@@ -1020,8 +1038,33 @@ impl Default for ReadInfo {
         Self {
             cb: u32::MAX,
             umi: u64::MAX,
+            xf: 0,
+            dup: false,
         }
     }
+}
+
+/// The key CellRanger orders reads by when it picks the one that stands for a
+/// molecule (the others are marked as duplicates): the numeric
+/// `lane, tile, x, y` of an Illumina read name. On the `pbmc_1k_v3` BAM this is
+/// the representative for 95% of molecules, against 62% for input order. Names
+/// that do not look like that fall back to input order.
+pub fn read_order_key(name: &str, read_index: u64) -> u64 {
+    let fields: Vec<&str> = name.split([' ', '/']).next().unwrap_or(name).split(':').collect();
+    if fields.len() >= 7 {
+        let n = fields.len();
+        let p = |i: usize| fields[i].parse::<u64>().ok();
+        if let (Some(lane), Some(tile), Some(x), Some(y)) =
+            (p(n - 4), p(n - 3), p(n - 2), p(n - 1))
+            && lane < 256
+            && tile < 65_536
+            && x < 65_536
+            && y < 65_536
+        {
+            return lane << 48 | tile << 32 | x << 16 | y;
+        }
+    }
+    read_index
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -1032,6 +1075,14 @@ pub struct RegionStats {
     pub intronic: AtomicU64,
     pub intergenic: AtomicU64,
     pub antisense: AtomicU64,
+    /// CellRanger annotation only: reads with at least one alignment.
+    pub mapped: AtomicU64,
+    /// CellRanger annotation only: reads counted for exactly one gene
+    /// (`Reads Mapped Confidently to Transcriptome`).
+    pub txome: AtomicU64,
+    /// Reads whose UMI is invalid (an `N`, or a homopolymer), whatever their
+    /// barcode did: CellRanger's `Valid UMI Sequences` is over all reads.
+    pub umi_invalid: AtomicU64,
 }
 
 /// What happened to one solo read — one `(record, multi)` per quantified
@@ -1047,6 +1098,13 @@ pub struct SoloReadOutcome {
     /// Barcode facts for the per-read SAM tags. `None` when the barcode read was
     /// too short to extract a CB+UMI at all.
     pub barcode: Option<SoloBarcodeTags>,
+    /// CellRanger's annotation of the read (`--soloOutLayout CellRanger` with a
+    /// transcriptome), for the `RE`/`TX`/`AN`/`GX`/`xf` tags.
+    pub cr: Option<cr_annot::ReadAnnot>,
+    /// The candidates of a barcode that matched several whitelist entries, kept
+    /// (under CellRanger's annotation) so that every such read, counted or not,
+    /// can be given its barcode once the whole run's counts are known.
+    pub cb_multi: Option<Vec<CbCandidate>>,
 }
 
 impl SoloReadOutcome {
@@ -1219,6 +1277,15 @@ impl SoloContext {
             transcript3p: transcript3p
                 .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
             want_metrics,
+            cr_model: if want_metrics && !params.solo_barcode_on_mate1() {
+                transcriptome
+                    .map(|t| cr_annot::CrModel::from_transcriptome(t, genome.chr_name.len()))
+            } else {
+                None
+            },
+            cb_multi: Mutex::new(Vec::new()),
+            read_order: Mutex::new(Vec::new()),
+            cb_multi_resolved: Mutex::new(std::collections::HashMap::new()),
             q30: Q30Stats::default(),
             // Sized once the read count is known (`reserve_read_info`).
             read_info: params
@@ -1393,6 +1460,27 @@ impl SoloContext {
         junctions: &[(u64, u64)],
         rna_qual: &[u8],
     ) -> SoloReadOutcome {
+        self.process_read_impl(
+            cdna_transcripts,
+            n_loci,
+            barcode,
+            junctions,
+            rna_qual,
+            self.cr_model.is_some(),
+        )
+    }
+
+    /// `process_read`, with CellRanger's annotation switched on or off. It is
+    /// off for pairs, whose alignments the annotation does not describe.
+    fn process_read_impl(
+        &self,
+        cdna_transcripts: &[Transcript],
+        n_loci: usize,
+        barcode: Option<&CellBarcode>,
+        junctions: &[(u64, u64)],
+        rna_qual: &[u8],
+        use_cr: bool,
+    ) -> SoloReadOutcome {
         let mut out = SoloReadOutcome::default();
 
         // Base qualities for `metrics_summary.csv`. Tallied before any early
@@ -1411,20 +1499,65 @@ impl SoloContext {
         let want_body = self.features.contains(&SoloFeature::GeneFull)
             || self.velocyto_enabled
             || self.want_metrics;
-        let class = classify_read(
-            cdna_transcripts,
-            &self.gene_ann,
-            self.strand,
-            want_exon,
-            want_body,
-            self.want_multi,
-        );
+        // CellRanger annotates against the transcriptome itself (its own notion
+        // of exonic / intronic and of which alignment is confident), so with a
+        // transcriptome the STARsolo classification is replaced by that one.
+        out.cr = self
+            .cr_model
+            .as_ref()
+            .filter(|_| use_cr)
+            .and_then(|m| m.annotate_read(cdna_transcripts));
+        let class = if use_cr {
+            let assignment = match &out.cr {
+                None => GeneAssignment::Unmapped,
+                Some(cr) => cr
+                    .gene
+                    .map_or(GeneAssignment::NoFeature, GeneAssignment::Gene),
+            };
+            gene::ReadClass {
+                gene: assignment,
+                gene_full: assignment,
+                region: out.cr.as_ref().map(|cr| match cr.primary_region() {
+                    cr_annot::CrRegion::Exonic => Region::Exonic,
+                    cr_annot::CrRegion::Intronic => Region::Intronic,
+                    cr_annot::CrRegion::Intergenic => Region::Intergenic,
+                }),
+                antisense: out.cr.as_ref().is_some_and(cr_annot::ReadAnnot::antisense),
+                gene_multi: Vec::new(),
+                gene_full_multi: Vec::new(),
+            }
+        } else {
+            classify_read(
+                cdna_transcripts,
+                &self.gene_ann,
+                self.strand,
+                want_exon,
+                want_body,
+                self.want_multi,
+            )
+        };
 
-        // Mapping funnel: count uniquely-mapped reads by region (CellRanger's
-        // "confidently mapped" = MAPQ 255 ≈ a single alignment), independent of
-        // barcode validity. `n_loci` is the number of genomic loci the read (or
-        // pair) maps to — for SE this equals `cdna_transcripts.len()`.
-        if n_loci == 1 {
+        // Mapping funnel. STARsolo-style: uniquely-mapped reads by region.
+        // CellRanger-style: confidently mapped reads (unique, or rescued to the
+        // one gene their transcriptomic alignments share) by the region of the
+        // confident alignment. Independent of barcode validity either way.
+        if let Some(cr) = &out.cr {
+            self.region_stats.mapped.fetch_add(1, Ordering::Relaxed);
+            if cr.conf {
+                let counter = match cr.primary_region() {
+                    cr_annot::CrRegion::Exonic => &self.region_stats.exonic,
+                    cr_annot::CrRegion::Intronic => &self.region_stats.intronic,
+                    cr_annot::CrRegion::Intergenic => &self.region_stats.intergenic,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                if cr.antisense() {
+                    self.region_stats.antisense.fetch_add(1, Ordering::Relaxed);
+                }
+                if cr.gene.is_some() {
+                    self.region_stats.txome.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if !use_cr && n_loci == 1 {
             match class.region {
                 Some(Region::Exonic) => {
                     self.region_stats.exonic.fetch_add(1, Ordering::Relaxed);
@@ -1452,11 +1585,19 @@ impl SoloContext {
             .whitelist
             .match_cb(&bc.cb_seq, &bc.cb_qual, self.match_type);
         self.stats.record_cb(&cb_match);
+        if use_cr && let CbMatch::Multi(cands) = &cb_match {
+            out.cb_multi = Some(cands.clone());
+        }
 
         // Per-read SAM-tag facts, recorded before any early return so that a
         // rejected barcode still tags its alignments. STAR reports a UMI
         // rejection in place of the CB code (`getCBandUMI.cpp:304`).
         let umi_status = check_umi(&bc.umi_seq);
+        if !matches!(umi_status, UmiCheck::Ok(_)) {
+            self.region_stats
+                .umi_invalid
+                .fetch_add(1, Ordering::Relaxed);
+        }
         out.barcode = Some(SoloBarcodeTags {
             cb_match: umi_status
                 .star_code()
@@ -1676,7 +1817,7 @@ impl SoloContext {
             eff.push((*m1).clone());
             eff.push(m2c);
         }
-        self.process_read(&eff, pairs.len(), barcode, junctions, rna_qual)
+        self.process_read_impl(&eff, pairs.len(), barcode, junctions, rna_qual, false)
     }
 }
 
