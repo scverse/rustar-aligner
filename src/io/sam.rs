@@ -1838,7 +1838,7 @@ mod tests {
             .get(&program_tag::COMMAND_LINE)
             .expect("CL field must be present even when command_line is None")
             .as_ref();
-        assert_ne!(cl, []);
+        assert_ne!(cl, [] as [u8; 0]);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 /// - Junction statistics collection for SJ.out.tab output
 pub(crate) mod chr_start_end;
 pub(crate) mod gtf;
-mod sj_output;
+pub(crate) mod sj_output;
 pub mod sjdb_insert;
 
 pub use sj_output::SpliceJunctionStats;

@@ -9,6 +9,7 @@
 //! The barcode read is the SECOND `--readFilesIn` file (STAR convention:
 //! `--readFilesIn cDNA_read barcode_read`). It is never aligned — only parsed.
 
+pub mod adata;
 pub mod cell_reads;
 pub mod count;
 pub mod gene;
@@ -18,7 +19,8 @@ pub mod smartseq;
 pub mod transcript3p;
 pub mod whitelist;
 
-pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
+pub use adata::OutputFormat;
+pub use count::{UmiDedup, UmiFiltering, write_matrix_market};
 pub use gene::{
     GeneAssignment, Region, SoloFeature, SoloStrand, VelocytoCategory, assign_gene_se,
     classify_read, velocyto_category,

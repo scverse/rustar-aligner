@@ -453,7 +453,7 @@ mod tests {
         let tr_len = vec![5000u32; 4];
         let (normalised, log_dist, _) = dist_function(&counts, &tr_len);
 
-        assert_ne!(normalised, []);
+        assert_ne!(normalised, [] as [f64; 0]);
         assert!(
             normalised.len() < DIST_COUNT_LEN,
             "must be cut, not full length"

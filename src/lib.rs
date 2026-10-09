@@ -490,7 +490,29 @@ fn write_solo_output(
             recorder.n_multi_records(),
         );
     }
-    crate::solo::write_gene_matrix(sctx, params, stats, Some(&**sj_stats), &index.genome)?;
+    // Validated in `Parameters::validate`, so an unknown/unavailable format
+    // never reaches here.
+    match crate::solo::OutputFormat::parse(&params.solo_output_format) {
+        #[cfg(feature = "anndata-out")]
+        Some(crate::solo::OutputFormat::Zarr) => {
+            crate::solo::adata::write_mudata(
+                sctx,
+                params,
+                stats,
+                Some(&**sj_stats),
+                &index.genome,
+            )?;
+        }
+        _ => {
+            crate::solo::write_matrix_market(
+                sctx,
+                params,
+                stats,
+                Some(&**sj_stats),
+                &index.genome,
+            )?;
+        }
+    }
     Ok(())
 }
 

@@ -1123,6 +1123,215 @@ fn test_starsolo_summary_split() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9a2 — STARsolo --soloOutputFormat Zarr (MuData store)
+//
+// The same spliced reads as test 9b, but with every feature on and the counts
+// written as one MuData store instead of MatrixMarket: a `gex` modality with
+// Gene as X and GeneFull/spliced/unspliced/ambiguous as layers, a
+// junction-indexed `sj` modality, and the MuData scaffolding around them.
+// ---------------------------------------------------------------------------
+#[test]
+#[cfg(feature = "anndata-out")]
+fn test_starsolo_output_format_zarr() {
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"]);
+    let solo = store.parent().unwrap();
+    assert!(store.is_dir(), "no MuData store at {}", store.display());
+    assert!(!solo.join("Gene").join("raw").join("matrix.mtx").exists());
+
+    // MuData scaffolding: root + `mod` group metadata written by hand.
+    let root: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(root["attributes"]["encoding-type"], "MuData");
+    assert_eq!(root["node_type"], "group");
+    let mods: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("mod/zarr.json")).unwrap()).unwrap();
+    assert_eq!(
+        mods["attributes"]["mod-order"],
+        serde_json::json!(["gex", "sj"])
+    );
+
+    // Both modalities are AnnData groups with the expected arrays.
+    for m in ["gex", "sj"] {
+        let g: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(store.join(format!("mod/{m}/zarr.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(g["attributes"]["encoding-type"], "anndata", "modality {m}");
+        for elem in ["obs", "var"] {
+            assert!(
+                store.join(format!("mod/{m}/{elem}")).exists(),
+                "modality {m} is missing {elem}"
+            );
+        }
+    }
+    // No gene feature is privileged as X: every one of them is a named layer.
+    // (SJ has a single matrix, so it keeps X.)
+    assert!(
+        !store.join("mod/gex/X").exists(),
+        "gex must not have an X — the features are layers"
+    );
+    assert!(store.join("mod/sj/X").exists(), "sj is missing X");
+    for layer in ["Gene", "GeneFull", "spliced", "unspliced", "ambiguous"] {
+        assert!(
+            store.join(format!("mod/gex/layers/{layer}")).exists(),
+            "missing gex layer {layer}"
+        );
+    }
+    for feature in ["Gene", "GeneFull"] {
+        assert!(
+            store.join(format!("mod/gex/obsm/stats_{feature}")).exists(),
+            "missing obsm/stats_{feature}"
+        );
+        assert!(
+            store.join(format!("uns/summary/{feature}")).exists()
+                || store
+                    .join(format!("uns/summary/{feature}/zarr.json"))
+                    .exists(),
+            "missing uns/summary/{feature}"
+        );
+    }
+    assert!(store.join("mod/sj/obsm/stats_SJ").exists());
+
+    // Every obsm frame is indexed by the barcodes — a polars DataFrame carries no
+    // index of its own, and Python AnnData rejects the frame if it does not match
+    // obs_names.
+    for (m, frame) in [
+        ("gex", "stats_Gene"),
+        ("gex", "stats_GeneFull"),
+        ("sj", "stats_SJ"),
+    ] {
+        let (obs, obsm) = obs_and_obsm_index(&store.join("mod").join(m), frame);
+        assert!(
+            obs.len() == 3 && obs[0] == cb,
+            "unexpected obs_names: {obs:?}"
+        );
+        assert_eq!(
+            obsm, obs,
+            "mod/{m}/obsm/{frame} is not indexed by obs_names"
+        );
+    }
+}
+
+/// Run STARsolo with `--soloOutputFormat Zarr` on six spliced reads of one
+/// whitelisted barcode; returns the tempdir guard, the store path and the barcode.
+#[cfg(feature = "anndata-out")]
+fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi = "ACGTACGTAC";
+    // Spliced read: 25 bp from the end of Exon1 + 25 bp from the start of Exon2.
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..6 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(&spliced).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_zarr");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+        ])
+        .args(features)
+        .args([
+            "--soloStrand",
+            "Forward",
+            "--soloOutputFormat",
+            "Zarr",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let store = output_dir.join("Solo.out").join("matrix.zarr");
+    (tmpdir, store, cb)
+}
+
+// Without SJ there is one modality, so the store is plain AnnData at the root.
+#[test]
+#[cfg(feature = "anndata-out")]
+fn test_starsolo_output_format_zarr_no_sj() {
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"]);
+    let root: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(root["attributes"]["encoding-type"], "anndata");
+    assert!(
+        !store.join("mod").exists(),
+        "no MuData scaffolding without SJ"
+    );
+    for layer in ["Gene", "GeneFull"] {
+        assert!(
+            store.join(format!("layers/{layer}")).exists(),
+            "missing layer {layer}"
+        );
+        assert!(store.join(format!("uns/summary/{layer}")).exists());
+    }
+    let (obs, obsm) = obs_and_obsm_index(&store, "stats_Gene");
+    assert!(
+        obs.len() == 3 && obs[0] == cb,
+        "unexpected obs_names: {obs:?}"
+    );
+    assert_eq!(obsm, obs);
+}
+
+/// `(obs_names, index of obsm/<key>)` of one modality, read back from disk.
+#[cfg(feature = "anndata-out")]
+fn obs_and_obsm_index(modality: &std::path::Path, key: &str) -> (Vec<String>, Vec<String>) {
+    use anndata::Backend;
+    use anndata::backend::{DataContainer, GroupOp};
+    use anndata::container::DataFrameElem;
+    use anndata_zarr::Zarr;
+
+    let index = |c| {
+        DataFrameElem::<Zarr>::try_from(c)
+            .unwrap()
+            .inner()
+            .index
+            .clone()
+            .into_vec()
+    };
+    let store = Zarr::open(modality).unwrap();
+    let obsm = store.open_group("obsm").unwrap();
+    (
+        index(DataContainer::open(&store, "obs").unwrap()),
+        index(DataContainer::open(&obsm, key).unwrap()),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Test 9b — STARsolo SJ (splice-junction) feature
 //
 // Spliced cDNA reads (last 25 bp of Exon1 + first 25 bp of Exon2) cross the

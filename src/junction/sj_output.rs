@@ -35,6 +35,15 @@ pub(crate) struct SjKey {
     pub motif: u8, // Encoded motif value
 }
 
+/// One junction's `SJ.out.tab` count columns, snapshotted out of [`SjCounts`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SjRowCounts {
+    pub annotated: bool,
+    pub unique: u32,
+    pub multi: u32,
+    pub max_overhang: u32,
+}
+
 /// Counts for a single junction
 #[derive(Debug)]
 pub(crate) struct SjCounts {
@@ -278,19 +287,60 @@ impl SpliceJunctionStats {
     /// solo-feature matrix. Returns the (intron_start, intron_end) absolute-coord
     /// keys so the SJ recorder can be mapped to matrix rows.
     pub(crate) fn sj_feature_order(&self, params: &Parameters) -> Vec<(u64, u64)> {
+        self.sorted_junctions(params)
+            .into_iter()
+            .map(|(k, _)| (k.intron_start, k.intron_end))
+            .collect()
+    }
+
+    /// The surviving junctions in `SJ.out.tab` order (chromosome, then intron
+    /// start/end), each with its `(annotated, unique, multi, max_overhang)`
+    /// counts. The single source of row order for `SJ.out.tab`, the SJ feature's
+    /// `features.tsv`/`var`, and the SJ matrix rows.
+    pub(crate) fn sorted_junctions(&self, params: &Parameters) -> Vec<(SjKey, SjRowCounts)> {
         let surviving = self.compute_surviving_junctions(params);
-        let mut keys: Vec<(usize, u64, u64, u8, u8)> = self
+        let mut rows: Vec<(SjKey, SjRowCounts)> = self
             .junctions
             .iter()
-            .filter(|e| surviving.contains(e.key()))
-            .map(|e| {
-                let k = e.key();
-                (k.chr_idx, k.intron_start, k.intron_end, k.strand, k.motif)
+            .filter(|entry| surviving.contains(entry.key()))
+            .map(|entry| {
+                let counts = entry.value();
+                (
+                    entry.key().clone(),
+                    SjRowCounts {
+                        annotated: counts.annotated,
+                        unique: counts.unique_count.load(Ordering::Relaxed),
+                        multi: counts.multi_count.load(Ordering::Relaxed),
+                        max_overhang: counts.max_overhang.load(Ordering::Relaxed),
+                    },
+                )
             })
             .collect();
-        // Total key again: these are the SJ matrix row positions (#210).
-        keys.sort_unstable();
-        keys.into_iter().map(|(_, s, e, _, _)| (s, e)).collect()
+        rows.sort_by(|a, b| {
+            a.0.chr_idx
+                .cmp(&b.0.chr_idx)
+                .then(a.0.intron_start.cmp(&b.0.intron_start))
+                .then(a.0.intron_end.cmp(&b.0.intron_end))
+                // Total order: a tie broken by `DashMap` iteration order would
+                // make SJ.out.tab differ between runs (#210).
+                .then(a.0.strand.cmp(&b.0.strand))
+                .then(a.0.motif.cmp(&b.0.motif))
+        });
+        rows
+    }
+
+    /// `(chromosome name, 1-based intron start, 1-based intron end)` for a junction.
+    pub(crate) fn locus<'g>(key: &SjKey, genome: &'g Genome) -> Result<(&'g str, u64, u64), Error> {
+        let chr_name = genome
+            .chr_name
+            .get(key.chr_idx)
+            .ok_or_else(|| Error::Index("Invalid chromosome index in junction".to_string()))?;
+        let chr_start_pos = genome.chr_start[key.chr_idx];
+        Ok((
+            chr_name,
+            key.intron_start - chr_start_pos + 1,
+            key.intron_end - chr_start_pos + 1,
+        ))
     }
 
     /// Write the 9-column `SJ.out.tab` lines (sorted) to `writer`; returns the
@@ -302,58 +352,21 @@ impl SpliceJunctionStats {
         genome: &Genome,
         params: &Parameters,
     ) -> Result<u32, Error> {
-        let surviving = self.compute_surviving_junctions(params);
-        let mut output_junctions: Vec<_> = self
-            .junctions
-            .iter()
-            .filter(|entry| surviving.contains(entry.key()))
-            .map(|entry| {
-                let key = entry.key().clone();
-                let counts = entry.value();
-                let multi = counts.multi_count.load(Ordering::Relaxed);
-                (
-                    key,
-                    counts.annotated,
-                    counts.unique_count.load(Ordering::Relaxed),
-                    multi,
-                    counts.max_overhang.load(Ordering::Relaxed),
-                )
-            })
-            .collect();
-
-        // Total order, for the same reason as `compute_surviving_junctions`:
-        // these rows are the bytes of SJ.out.tab, so a tie broken by `DashMap`
-        // iteration order would be a file that differs between runs (#210).
-        output_junctions.sort_by(|a, b| {
-            a.0.chr_idx
-                .cmp(&b.0.chr_idx)
-                .then(a.0.intron_start.cmp(&b.0.intron_start))
-                .then(a.0.intron_end.cmp(&b.0.intron_end))
-                .then(a.0.strand.cmp(&b.0.strand))
-                .then(a.0.motif.cmp(&b.0.motif))
-        });
-
         let mut written = 0u32;
-        for (key, annotated, unique, multi, max_overhang) in &output_junctions {
-            let chr_name = genome
-                .chr_name
-                .get(key.chr_idx)
-                .ok_or_else(|| Error::Index("Invalid chromosome index in junction".to_string()))?;
-            let chr_start_pos = genome.chr_start[key.chr_idx];
-            let chr_pos_start = key.intron_start - chr_start_pos + 1;
-            let chr_pos_end = key.intron_end - chr_start_pos + 1;
+        for (key, c) in self.sorted_junctions(params) {
+            let (chr_name, start, end) = Self::locus(&key, genome)?;
             writeln!(
                 writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 chr_name,
-                chr_pos_start,
-                chr_pos_end,
+                start,
+                end,
                 key.strand,
                 key.motif,
-                i32::from(*annotated),
-                unique,
-                multi,
-                max_overhang
+                i32::from(c.annotated),
+                c.unique,
+                c.multi,
+                c.max_overhang
             )
             .map_err(|e| Error::Index(format!("SJ write: {e}")))?;
             written += 1;
