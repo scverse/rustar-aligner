@@ -108,6 +108,8 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
     }
 
+    let time_start = chrono::Local::now();
+
     info!("Building genome index (streaming SA + on-the-fly SAindex)...");
     // Streaming path: opens SA file early, packs each caps-sa emit
     // directly to disk + into the SAindex builder, never holding the
@@ -136,6 +138,29 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
         GenomeIndex::generate_streaming(&orig_params)?;
     }
+
+    // STAR writes `Log.out` to `<outFileNamePrefix>` during genomeGenerate
+    // and copies it into the genome directory at the end, so a STAR-built
+    // index directory always contains one; mirror that. The genomeDir copy
+    // is a second independent write, not `fs::copy` from the prefix file:
+    // concurrent genomeGenerate processes sharing a working directory (the
+    // integration-test harness does this) race on `<prefix>Log.out`, and on
+    // Windows `CopyFileEx` opens its source without write sharing, turning
+    // that race into a sharing-violation error (os error 32). Two plain
+    // creates use share-all flags and cannot collide.
+    let time_finish = chrono::Local::now();
+    crate::io::log::write_genome_generate_log(
+        &params.output_path("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
+    crate::io::log::write_genome_generate_log(
+        &params.genome_dir.join("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
 
     info!("Genome generation complete!");
     Ok(())
@@ -1032,6 +1057,35 @@ struct AlignmentBatchResults {
     signal_n_tr: usize,
 }
 
+/// Reads per alignment batch, chosen so a batch's result vector stays an
+/// ordinary-sized allocation.
+///
+/// [`run_batch_pipeline`] allocates a fresh `Vec<Result<T, Error>>` for every
+/// batch and drops it once consumed. mimalloc serves anything past its
+/// large-object threshold from the arena path rather than a thread-local page,
+/// so once that vector crosses roughly 512 KB each batch pays a fresh mapping
+/// and — with `arena_eager_commit` off, which `main` sets deliberately to keep
+/// RSS down — faults every page back in. At the previous fixed 10,000 reads the
+/// vector was 1.7 MB and that path accounted for ~38% of the samples in a solo
+/// run.
+///
+/// The ceiling is the measured one. Sweeping batch size on a 2M-read solo run
+/// (8 threads) put the optimum on a plateau from roughly 1000 to 2000 reads:
+/// 10,000 took 3.46s, 3000 2.29s, 2000 2.15s, 1500 2.13s, 1000 2.17s, 250 2.58s.
+/// Below the plateau per-batch dispatch starts to dominate, which is what the
+/// floor guards. Some of the per-batch cost tracks the read count rather than
+/// the result vector — sizing purely by bytes picked 4096 for the solo product
+/// and left time on the table — so the count is capped as well.
+///
+/// The byte rule still earns its place as the other half: it keeps the
+/// allocation under the threshold if the result struct grows later, rather than
+/// leaving a tuned constant to rot.
+fn batch_size_for<T>() -> usize {
+    const TARGET_BYTES: usize = 384 * 1024;
+    const MAX_READS: usize = 2048;
+    (TARGET_BYTES / std::mem::size_of::<Result<T, error::Error>>().max(1)).clamp(512, MAX_READS)
+}
+
 /// One `Result` per read/pair in an aligned batch.
 type BatchOut<T> = Vec<Result<T, error::Error>>;
 
@@ -1424,7 +1478,10 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -1437,7 +1494,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();
@@ -1607,15 +1664,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 chim_writer.write_alignment(
                                     chim_aln,
                                     &index.genome.chr_name,
+                                    &index.genome.chr_start,
                                     &chim_aln.read_name,
                                 )?;
-                            }
-                        }
-                        if params.chim_out_within_bam() {
-                            use crate::chimeric::build_within_bam_records;
-                            for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                writer.write_batch(&supp)?;
                             }
                         }
 
@@ -1673,16 +1724,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     chim_writer.write_alignment(
                                         chim_aln,
                                         &index.genome.chr_name,
+                                        &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
-                                }
-                            }
-                            if params.chim_out_within_bam() {
-                                use crate::chimeric::build_within_bam_records;
-                                for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                    writer.write_batch(&supp)?;
                                 }
                             }
                         } else {
@@ -1858,6 +1902,47 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             if !chimeric_alns.is_empty() {
                                 stats.record_chimeric();
                             }
+                        }
+
+                        // --chimOutType WithinBAM: STAR writes the chimera in place of
+                        // the read's alignments and returns before outputAlignments
+                        // (`ReadAlign_oneRead.cpp:99`), so the read gets none of the
+                        // mapped-read accounting: no mapped stats, junctions, counts,
+                        // transcriptome or unmapped output. Unmapped reasons were
+                        // already counted by mappedFilter, which runs first.
+                        if params.chim_out_within_bam() && !chimeric_alns.is_empty() {
+                            if transcripts.is_empty() {
+                                stats.record_alignment(n_for_mapq, max_multimaps);
+                                if let Some(reason) = unmapped_reason {
+                                    stats.record_unmapped_reason(reason);
+                                }
+                            } else {
+                                stats.record_input_read();
+                            }
+                            let input = crate::chimeric::ChimReadInput {
+                                name: &out_read_name,
+                                seq: [&read.sequence, &[]],
+                                qual: [&read.quality, &[]],
+                                clip: [[clip5p, clip3p], [0, 0]],
+                            };
+                            for record in crate::chimeric::build_chimeric_bam_records(
+                                &chimeric_alns,
+                                &input,
+                                &index.genome,
+                                params,
+                            )? {
+                                buffer.push(record);
+                            }
+                            return Ok(AlignmentBatchResults {
+                                sam_records: buffer,
+                                chimeric_alns,
+                                primary_junction_keys: Vec::new(),
+                                transcriptome_records: Vec::new(),
+                                unmapped_mate1: Vec::new(),
+                                unmapped_mate2: Vec::new(),
+                                signal_contrib: Vec::new(),
+                                signal_n_tr: 0,
+                            });
                         }
 
                         // Record stats (atomic, lock-free)
@@ -2069,7 +2154,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     let clip5p = params.clip5p(0);
     let clip3p = params.clip3p(0);
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
@@ -2384,7 +2469,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     // Per-mate clip: mate 1 (--clip5pNbases[0], e.g. 39 to strip the 5' barcode
     // region) and mate 2 ([1], e.g. 0). CellRanger4 adapter clipping is not used
     // by the cellgeni 5' path (it uses clip5pNbases instead), so it is not applied.
@@ -2764,7 +2849,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -2777,7 +2865,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();
@@ -2934,11 +3022,18 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         if let Some(ref mut tw) = tr_writer {
                             tw.write_batch(&batch.transcriptome_records)?;
                         }
-                        if params.chim_out_within_bam() {
-                            use crate::chimeric::build_within_bam_records;
+                        // Chimeric.out.junction. The writer was created and
+                        // flushed here but never written to, so a PE run reported
+                        // chimeric reads in Log.final.out and left the junction
+                        // file empty.
+                        if let Some(ref mut chim_writer) = chimeric_writer {
                             for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                writer.write_batch(&supp)?;
+                                chim_writer.write_alignment(
+                                    chim_aln,
+                                    &index.genome.chr_name,
+                                    &index.genome.chr_start,
+                                    &chim_aln.read_name,
+                                )?;
                             }
                         }
                         if let Some(ref mut uw1) = unmapped_writer1 {
@@ -2994,12 +3089,14 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             if let Some(ref mut tw) = tr_writer {
                                 tw.write_batch(&meta.transcriptome_records)?;
                             }
-                            if params.chim_out_within_bam() {
-                                use crate::chimeric::build_within_bam_records;
+                            if let Some(ref mut chim_writer) = chimeric_writer {
                                 for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                    writer.write_batch(&supp)?;
+                                    chim_writer.write_alignment(
+                                        chim_aln,
+                                        &index.genome.chr_name,
+                                        &index.genome.chr_start,
+                                        &chim_aln.read_name,
+                                    )?;
                                 }
                             }
                         } else {
@@ -3203,6 +3300,45 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         // Align paired read (CPU-intensive)
                         let (results, pe_chimeric, n_for_mapq, unmapped_reason) =
                             align_paired_read(&m1_seq, &m2_seq, &paired_read.name, &index, params)?;
+
+                        // --chimOutType WithinBAM: the chimera replaces the read's
+                        // alignments and STAR returns before outputAlignments
+                        // (`ReadAlign_oneRead.cpp:99`); see the single-end path.
+                        if params.chim_out_within_bam() && !pe_chimeric.is_empty() {
+                            stats.record_chimeric();
+                            if results.is_empty() {
+                                stats.record_alignment(n_for_mapq, max_multimaps);
+                                stats.record_unmapped_reason(
+                                    unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                );
+                            } else {
+                                stats.record_input_read();
+                            }
+                            let input = crate::chimeric::ChimReadInput {
+                                name: &out_read_name,
+                                seq: [&paired_read.mate1.sequence, &paired_read.mate2.sequence],
+                                qual: [&paired_read.mate1.quality, &paired_read.mate2.quality],
+                                clip: [[m1_clip5p, m1_clip3p], [m2_clip5p, m2_clip3p]],
+                            };
+                            for record in crate::chimeric::build_chimeric_bam_records(
+                                &pe_chimeric,
+                                &input,
+                                &index.genome,
+                                params,
+                            )? {
+                                buffer.push(record);
+                            }
+                            return Ok(AlignmentBatchResults {
+                                sam_records: buffer,
+                                chimeric_alns: pe_chimeric,
+                                primary_junction_keys: Vec::new(),
+                                transcriptome_records: Vec::new(),
+                                unmapped_mate1: Vec::new(),
+                                unmapped_mate2: Vec::new(),
+                                signal_contrib: Vec::new(),
+                                signal_n_tr: 0,
+                            });
+                        }
 
                         // Classify the result for stats and SAM output
                         let has_half_mapped = results

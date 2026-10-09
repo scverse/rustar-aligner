@@ -103,14 +103,11 @@ impl GenomeIndex {
     ///    `gsj` to the genome.
     /// 2. Write genome files (`Genome`, `chrInfo`, `genomeParameters.txt`,
     ///    etc.) immediately — no dependency on the SA.
-    /// 3. Open `genome_dir/SA` through a [`PackedStreamWriter`]; build
-    ///    a [`SaIndexBuilder`][sa_index::SaIndexBuilder]. The caps-sa
-    ///    emit callback feeds each entry to **both**, so the SA file
-    ///    grows as construction progresses and the SAindex is built
-    ///    on the fly. Total peak RSS during this phase ≈
-    ///    `genome.sequence` + caps-sa scratch + `SaIndex.data` —
-    ///    ~5 GB on the human genome vs the ~47 GB the in-memory
-    ///    path peaked at.
+    /// 3. Open `genome_dir/SA` through a [`PackedStreamWriter`]; the
+    ///    caps-sa emit callback bit-packs each entry straight into
+    ///    the SA file, so the SA file grows as construction
+    ///    progresses and the ~25 GB SA `PackedArray` never has to be
+    ///    materialised in RAM.
     /// 4. Finalise the SA writer (flush partial-byte + padding).
     /// 5. **Build the SAindex in parallel** from the on-disk SA via
     ///    mmap + [`SaIndex::build_parallel`]. caps-sa's phase-4
@@ -139,7 +136,12 @@ impl GenomeIndex {
         }
 
         log::info!("Writing genome files to {}...", dir.display());
-        genome.write_index_files(dir, params)?;
+        let effective_sjdb_overhang = if prepared_junctions.is_empty() {
+            0
+        } else {
+            params.sjdb_overhang
+        };
+        genome.write_index_files(dir, params, effective_sjdb_overhang)?;
 
         let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
         let gstrand_mask = (1u64 << gstrand_bit) - 1;
@@ -402,7 +404,8 @@ impl GenomeIndex {
     /// Write index files to directory.
     pub fn write(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
         // Write genome files
-        self.genome.write_index_files(dir, params)?;
+        self.genome
+            .write_index_files(dir, params, self.sjdb_overhang)?;
 
         // Write SA file
         let sa_path = dir.join("SA");
