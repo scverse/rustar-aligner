@@ -698,13 +698,11 @@ fn test_bysj_filtering() {
     let log_path = output_dir.join("Log.final.out");
     assert!(log_path.exists(), "Log.final.out not found");
 
-    // Verify the BySJout disk-buffering message was logged
+    // Verify the second stage of BySJout ran (held reads mapped again)
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(
-            "outFilterType=BySJout: disk-buffering reads for post-alignment junction filtering"
-        ),
-        "expected BySJout disk-buffering log message in stderr; got:\n{stderr}"
+        stderr.contains("held reads again"),
+        "expected the BySJout second-stage log message in stderr; got:\n{stderr}"
     );
 }
 
