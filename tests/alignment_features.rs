@@ -1133,70 +1133,8 @@ fn test_starsolo_summary_split() {
 #[test]
 #[cfg(feature = "anndata-out")]
 fn test_starsolo_output_format_zarr() {
-    let tmpdir = TempDir::new().unwrap();
-    let genome = build_genome();
-    let fasta = write_fasta(&tmpdir, &genome);
-    let gtf = write_gtf(&tmpdir);
-    let genome_dir = tmpdir.path().join("genome");
-    build_index(&fasta, &genome_dir, "7", Some(&gtf));
-
-    let cdna_path = tmpdir.path().join("cdna.fq");
-    let barcode_path = tmpdir.path().join("barcode.fq");
-    let wl_path = tmpdir.path().join("whitelist.txt");
-    let cb = "AAAACCCCGGGGTTTT";
-    let umi = "ACGTACGTAC";
-    // Spliced read: 25 bp from the end of Exon1 + 25 bp from the start of Exon2.
-    let mut spliced = genome[10025..10050].to_vec();
-    spliced.extend_from_slice(&genome[10250..10275]);
-    {
-        let mut cf = fs::File::create(&cdna_path).unwrap();
-        let mut bf = fs::File::create(&barcode_path).unwrap();
-        for i in 0..6 {
-            writeln!(cf, "@r{i}").unwrap();
-            cf.write_all(&spliced).unwrap();
-            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
-            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
-        }
-        let mut wf = fs::File::create(&wl_path).unwrap();
-        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
-    }
-
-    let output_dir = tmpdir.path().join("out_zarr");
-    fs::create_dir_all(&output_dir).unwrap();
-    let prefix = format!("{}/", output_dir.display());
-    cargo_bin_cmd!("rustar-aligner")
-        .args([
-            "--runMode",
-            "alignReads",
-            "--genomeDir",
-            genome_dir.to_str().unwrap(),
-            "--readFilesIn",
-            cdna_path.to_str().unwrap(),
-            barcode_path.to_str().unwrap(),
-            "--soloType",
-            "CB_UMI_Simple",
-            "--soloCBwhitelist",
-            wl_path.to_str().unwrap(),
-            "--soloFeatures",
-            "Gene",
-            "GeneFull",
-            "SJ",
-            "Velocyto",
-            "--soloStrand",
-            "Forward",
-            "--soloOutputFormat",
-            "Zarr",
-            "--sjdbGTFfile",
-            gtf.to_str().unwrap(),
-            "--outFileNamePrefix",
-            &prefix,
-        ])
-        .assert()
-        .success();
-
-    // Zarr replaces MatrixMarket, so the per-feature .mtx directories are absent.
-    let solo = output_dir.join("Solo.out");
-    let store = solo.join("matrix.zarr");
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"]);
+    let solo = store.parent().unwrap();
     assert!(store.is_dir(), "no MuData store at {}", store.display());
     assert!(!solo.join("Gene").join("raw").join("matrix.mtx").exists());
 
@@ -1272,6 +1210,101 @@ fn test_starsolo_output_format_zarr() {
             "mod/{m}/obsm/{frame} is not indexed by obs_names"
         );
     }
+}
+
+/// Run STARsolo with `--soloOutputFormat Zarr` on six spliced reads of one
+/// whitelisted barcode; returns the tempdir guard, the store path and the barcode.
+#[cfg(feature = "anndata-out")]
+fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi = "ACGTACGTAC";
+    // Spliced read: 25 bp from the end of Exon1 + 25 bp from the start of Exon2.
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..6 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(&spliced).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_zarr");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+        ])
+        .args(features)
+        .args([
+            "--soloStrand",
+            "Forward",
+            "--soloOutputFormat",
+            "Zarr",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let store = output_dir.join("Solo.out").join("matrix.zarr");
+    (tmpdir, store, cb)
+}
+
+// Without SJ there is one modality, so the store is plain AnnData at the root.
+#[test]
+#[cfg(feature = "anndata-out")]
+fn test_starsolo_output_format_zarr_no_sj() {
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"]);
+    let root: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(root["attributes"]["encoding-type"], "anndata");
+    assert!(
+        !store.join("mod").exists(),
+        "no MuData scaffolding without SJ"
+    );
+    for layer in ["Gene", "GeneFull"] {
+        assert!(
+            store.join(format!("layers/{layer}")).exists(),
+            "missing layer {layer}"
+        );
+        assert!(store.join(format!("uns/summary/{layer}")).exists());
+    }
+    let (obs, obsm) = obs_and_obsm_index(&store, "stats_Gene");
+    assert!(
+        obs.len() == 3 && obs[0] == cb,
+        "unexpected obs_names: {obs:?}"
+    );
+    assert_eq!(obsm, obs);
 }
 
 /// `(obs_names, index of obsm/<key>)` of one modality, read back from disk.

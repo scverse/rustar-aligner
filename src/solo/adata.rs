@@ -18,6 +18,10 @@
 //!     sj/                          cells × junctions (X only)
 //! ```
 //!
+//! Without `--soloFeatures SJ` there is no second modality to wrap, so the
+//! store is plain AnnData: `gex`'s contents (and the root `uns`) sit at
+//! `matrix.zarr/` itself, with no `mod/` and no MuData attributes.
+//!
 //! Three things are deliberate. **`obs` is the full whitelist**, identical in every
 //! matrix and both modalities — so the modalities can share one MuData `obs` and
 //! no cell-calling decision is baked into the axis. **Cell calling lives in each
@@ -81,7 +85,8 @@ mod zarr {
     use anndata::backend::{AttributeOp, Value};
     use anndata::data::{DataFrameIndex, Mapping};
     use anndata::{
-        AnnData, AnnDataOp, AxisArraysOp, Backend, backend::GroupOp, data::ArrayData, data::Data,
+        AnnData, AnnDataOp, AxisArraysOp, Backend, ElemCollectionOp, backend::GroupOp,
+        data::ArrayData, data::Data,
     };
     use anndata_zarr::Zarr;
     use polars::prelude::{Column, DataFrame};
@@ -133,9 +138,13 @@ mod zarr {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
         }
-        // The MuData root. `Zarr::new` wipes any previous store at this path.
+        // Without the sj modality there is nothing to wrap: gex is the store root.
+        let mudata = ctx.sj_enabled && sj_stats.is_some();
+        // The store root. `Zarr::new` wipes any previous store at this path.
         let store = Zarr::new(&path).map_err(zarr_err)?;
-        std::fs::create_dir_all(path.join("mod")).map_err(|e| Error::io(e, &path))?;
+        if mudata {
+            std::fs::create_dir_all(path.join("mod")).map_err(|e| Error::io(e, &path))?;
+        }
 
         // The one `obs` axis every matrix and both modalities are written against.
         let obs_index = DataFrameIndex::from(
@@ -229,6 +238,23 @@ mod zarr {
             }
         }
 
+        // Root `uns`: on the MuData root, or on gex itself when it is the root.
+        let mut uns: HashMap<String, Data> = HashMap::default();
+        uns.insert(
+            "summary".to_string(),
+            Mapping::from(
+                summaries
+                    .into_iter()
+                    .map(|(k, v)| (k, Data::from(v)))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .into(),
+        );
+        if let Some(cr) = funnel.cellranger_summary() {
+            uns.insert("cellranger_summary".to_string(), cellranger_map(&cr).into());
+        }
+        uns.insert("run_info".to_string(), run_info().into());
+
         let mut modalities: Vec<&str> = Vec::new();
         if layers.is_empty() {
             log::warn!(
@@ -237,7 +263,12 @@ mod zarr {
             );
         } else {
             // All layers are output as-is with keys in Layers.
-            let gex = AnnData::<Zarr>::new(path.join("mod").join("gex")).map_err(zarr_err)?;
+            let gex_path = if mudata {
+                path.join("mod").join("gex")
+            } else {
+                path.clone()
+            };
+            let gex = AnnData::<Zarr>::new(&gex_path).map_err(zarr_err)?;
             gex.set_var(gene_frame(&ctx.gene_ann.gene_names)?)
                 .map_err(zarr_err)?;
             gex.set_var_names(DataFrameIndex::from(ctx.gene_ann.gene_ids.clone()))
@@ -247,12 +278,22 @@ mod zarr {
             for (name, df) in obsm {
                 gex.obsm().add(&name, df).map_err(zarr_err)?;
             }
+            if !mudata {
+                for (k, v) in uns.drain() {
+                    gex.uns().add(&k, v).map_err(zarr_err)?;
+                }
+            }
             gex.close().map_err(zarr_err)?;
             modalities.push("gex");
             log::info!(
-                "STARsolo: wrote {}/mod/gex ({n_obs} barcodes × {n_genes} genes)",
-                path.display(),
+                "STARsolo: wrote {} ({n_obs} barcodes × {n_genes} genes)",
+                gex_path.display(),
             );
+        }
+        if !mudata {
+            // AnnData does not tag its own root; mudata's `mod/*` get this below.
+            let mut root = store.open_group("/").map_err(zarr_err)?;
+            return set_attrs(&mut root, "anndata", ANNDATA_VERSION);
         }
 
         // -- sj: junction-indexed, so its own modality (it cannot share `var`) --
@@ -299,21 +340,6 @@ mod zarr {
         }
 
         // -- the MuData scaffolding: root uns, group attributes, mod-order --
-        let mut uns: HashMap<String, Data> = HashMap::default();
-        uns.insert(
-            "summary".to_string(),
-            Mapping::from(
-                summaries
-                    .into_iter()
-                    .map(|(k, v)| (k, Data::from(v)))
-                    .collect::<std::collections::HashMap<_, _>>(),
-            )
-            .into(),
-        );
-        if let Some(cr) = funnel.cellranger_summary() {
-            uns.insert("cellranger_summary".to_string(), cellranger_map(&cr).into());
-        }
-        uns.insert("run_info".to_string(), run_info().into());
         anndata::data::Writable::write(
             &Mapping::from(uns.into_iter().collect::<std::collections::HashMap<_, _>>()),
             &store,
