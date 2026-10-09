@@ -963,7 +963,7 @@ pub fn cluster_seeds(
                         } else {
                             wa.read_pos
                         };
-                        wa_ps < new_ps_rstart
+                        wa_ps <= new_ps_rstart
                     });
                     window.alignments.insert(
                         insert_pos,
@@ -1023,7 +1023,9 @@ pub fn cluster_seeds(
             }
 
             // Insert in sorted order by positive-strand read start (matches
-            // STAR's assignAlignToWindow lines 107-115 sorted insertion).
+            // STAR's assignAlignToWindow lines 107-115 sorted insertion). Seeds with
+            // an equal start go AFTER the ones already there (STAR breaks on `<`),
+            // which fixes the recursion order and so the order of tied transcripts.
             window.actual_start = window.actual_start.min(forward_pos);
             window.actual_end = window.actual_end.max(forward_pos + length as u64);
             let insert_pos = window.alignments.partition_point(|wa| {
@@ -1032,7 +1034,7 @@ pub fn cluster_seeds(
                 } else {
                     wa.read_pos
                 };
-                wa_ps < new_ps_rstart
+                wa_ps <= new_ps_rstart
             });
             window.alignments.insert(
                 insert_pos,
@@ -1729,9 +1731,10 @@ fn stitch_align_to_transcript(
 
     // Mismatch limit check
     let total_mm = new_wt.n_mismatch + gap_mm;
-    let total_len = new_wt.read_end.max(eff_read_pos + eff_length) - new_wt.read_start;
-    let mm_limit = ((scorer.p_mm_max * total_len as f64) as u32).min(scorer.n_mm_max);
-    if total_mm > mm_limit {
+    // STAR (stitchAlignToTranscript.cpp:314) bounds only the absolute count,
+    // `outFilterMismatchNmaxTotal`; the mismatch ratio is applied to the final
+    // best transcript by `mappedFilter`, not while stitching.
+    if total_mm > scorer.n_mm_max {
         return None;
     }
 
@@ -2505,7 +2508,10 @@ fn stitch_recurse(
     jcache: &mut crate::align::score::JunctionScanCache,
     debug_name: &str,
 ) {
-    const MAX_RECURSION: u32 = 100_000;
+    // STAR's recursion is unbounded; this only guards pathological windows. A cap
+    // near 100k dropped include-branches of late seeds on windows with ~50 seeds
+    // (ERR12389696.25869) and with them STAR's best transcript.
+    const MAX_RECURSION: u32 = 10_000_000;
 
     if *recursion_count >= MAX_RECURSION {
         return;
