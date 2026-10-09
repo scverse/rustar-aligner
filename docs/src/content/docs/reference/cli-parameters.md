@@ -42,7 +42,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--outFileNamePrefix` | `./` | Prefix (path + filename stem) for all output files. |
 | `--outSAMtype` | `SAM` | `SAM`, `BAM Unsorted`, `BAM SortedByCoordinate`, or `None`. |
 | `--outBAMcompression` | `1` | BGZF level. `-1`/`0` = uncompressed; `1`–`8` = flate2 levels; `≥9` = max. |
-| `--limitBAMsortRAM` | `0` | Max RAM (bytes) for sorted BAM. `0` = unlimited. |
+| `--limitBAMsortRAM` | `0` | Max RAM for the coordinate sort; accepts a suffix (`8G`, `512M`). Records beyond it spill to sorted runs beside the output and are merged, so output is unaffected by this value. `0` means 512 MiB. Very small values still work but cost wall time (many spill runs plus an extra merge pass). |
 | `--outStd` | `None` | Route primary output to stdout: `None`, `SAM`, `BAM_Unsorted`, `BAM_SortedByCoordinate`. |
 
 ## Output: SAM/BAM records
@@ -173,7 +173,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--chimSegmentReadGapMax` | `0` | Max read-space gap between chimeric segments. |
 | `--chimJunctionOverhangMin` | `20` | Min overhang at chimeric junction. |
 | `--chimScoreJunctionNonGTAG` | `-1` | Score penalty for non-GT/AG chimeric junctions. |
-| `--chimOutType` | `Junctions` | `Junctions`, `WithinBAM`, or both space-separated. |
+| `--chimOutType` | `Junctions` | `Junctions` and/or `WithinBAM`, optionally followed by `HardClip` (default) or `SoftClip` for the supplementary segment. `WithinBAM` requires `--outSAMtype BAM`. |
 
 ## Debug
 

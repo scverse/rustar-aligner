@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 /// Parse a memory string into bytes. Accepts plain integers or a suffix:
 /// K/k = ×1024, M/m = ×1024², G/g = ×1024³, T/t = ×1024⁴.
@@ -658,7 +658,9 @@ pub struct Parameters {
     )]
     pub out_bam_compression: i32,
 
-    /// Maximum RAM for coordinate-sorted BAM sorting. Accepts bytes or a suffix: 8G, 512M, 1T. 0 = unlimited.
+    /// Memory budget for the coordinate sort. Accepts bytes or a suffix: 8G, 512M, 1T.
+    /// Records beyond it spill to sorted runs beside the output and are merged, so the
+    /// output does not depend on it. 0 = 512 MiB (STAR: genome + SA size; see DIVERGENCE.md §4.3).
     #[arg(long = "limitBAMsortRAM", default_value = "0", value_parser = parse_mem_bytes)]
     pub limit_bam_sort_ram: u64,
 
@@ -749,7 +751,8 @@ pub struct Parameters {
     #[arg(long = "outWigReferencesPrefix", default_value = "-")]
     pub out_wig_references_prefix: String,
 
-    /// Directory for intermediate files.
+    /// Directory for intermediate files (coordinate-sort spill runs). `-` puts
+    /// them beside the output.
     #[arg(long = "outTmpDir", default_value = "-")]
     pub out_tmp_dir: String,
 
@@ -1045,6 +1048,12 @@ pub struct Parameters {
     #[arg(long = "seedMapMin", default_value_t = 5)]
     pub seed_map_min: usize,
 
+    /// Min length of a run of ACGT bases for the seed search to consider it
+    /// (STAR default: 12). Reads are split on `N` first, and shorter pieces
+    /// are skipped entirely.
+    #[arg(long = "seedSplitMin", default_value_t = 12)]
+    pub seed_split_min: usize,
+
     /// Max number of loci anchors are allowed to map to
     #[arg(long = "winAnchorMultimapNmax", default_value_t = 50)]
     pub win_anchor_multimap_nmax: usize,
@@ -1165,6 +1174,27 @@ pub struct Parameters {
     #[arg(long = "chimScoreSeparation", default_value_t = 10)]
     pub chim_score_separation: i32,
 
+    /// Post-detection filters for chimeric junctions. `banGenomicN` (the
+    /// default) rejects a junction whose flanking genomic bases include an `N`;
+    /// `None` disables filtering.
+    #[arg(long = "chimFilter", num_args = 1.., default_values_t = vec!["banGenomicN".to_string()])]
+    pub chim_filter: Vec<String>,
+
+    /// Report up to this many chimeric alignments per read. 0 (the default)
+    /// keeps STAR's old single-best behaviour.
+    #[arg(long = "chimMultimapNmax", default_value_t = 0)]
+    pub chim_multimap_nmax: usize,
+
+    /// Score range below the best chimeric score within which multimapping
+    /// chimeras are reported.
+    #[arg(long = "chimMultimapScoreRange", default_value_t = 1)]
+    pub chim_multimap_score_range: i32,
+
+    /// Minimum drop of the best non-chimeric alignment score below the read
+    /// length required before a chimera is considered.
+    #[arg(long = "chimNonchimScoreDropMin", default_value_t = 20)]
+    pub chim_nonchim_score_drop_min: i32,
+
     /// Max multimapping of main chimeric segment
     #[arg(long = "chimMainSegmentMultNmax", default_value_t = 10)]
     pub chim_main_segment_mult_nmax: u32,
@@ -1182,7 +1212,7 @@ pub struct Parameters {
     pub chim_score_junction_non_gtag: i32,
 
     /// Chimeric output type
-    #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
+    #[arg(long = "chimOutType", num_args = 1.., default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
     // ── STARsolo (single-cell) ──────────────────────────────────────────
@@ -1352,6 +1382,21 @@ impl Parameters {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
     }
 
+    /// `--chimOutType ... HardClip|SoftClip`: whether the supplementary chimeric
+    /// segment is hard-clipped. STAR reads the values in order, so the last of
+    /// the two wins; hard clipping is the default (`ParametersChimeric_initialize.cpp:10-30`).
+    pub fn chim_out_bam_hard_clip(&self) -> bool {
+        self.chim_out_type
+            .iter()
+            .rev()
+            .find_map(|s| match s.as_str() {
+                "HardClip" => Some(true),
+                "SoftClip" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
+
     /// True if the user provided a non-default `--outSAMattrRGline`.
     pub fn rg_line_set(&self) -> bool {
         !self.out_sam_attr_rg_line.is_empty() && self.out_sam_attr_rg_line[0] != "-"
@@ -1490,11 +1535,12 @@ impl Parameters {
         args: impl IntoIterator<Item = T>,
     ) -> Self {
         Self::try_parse_from(args).unwrap_or_else(|e| {
-            if cfg!(test) {
-                panic!("{e}")
-            } else {
-                e.format(&mut <Self as CommandFactory>::command()).exit()
-            }
+            // Tests panic with the message instead of exiting the process.
+            #[cfg(test)]
+            panic!("{e}");
+            #[cfg(not(test))]
+            e.format(&mut <Self as clap::CommandFactory>::command())
+                .exit();
         })
     }
 
@@ -1669,6 +1715,62 @@ impl Parameters {
             }
         }
 
+        // --chimOutType (`ParametersChimeric_initialize.cpp`): unknown values are
+        // fatal. SeparateSAMold is a STAR value this build does not write, so it
+        // is refused rather than silently ignored.
+        if params.chim_segment_min > 0 {
+            for t in &params.chim_out_type {
+                match t.as_str() {
+                    "Junctions" | "WithinBAM" | "HardClip" | "SoftClip" => {}
+                    "SeparateSAMold" => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--chimOutType SeparateSAMold is not supported; use Junctions and/or WithinBAM",
+                        ));
+                    }
+                    other => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "unknown --chimOutType value '{other}'; allowed: Junctions, \
+                                 WithinBAM, HardClip, SoftClip"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if params.chim_out_within_bam() {
+                // WithinBAM needs BAM output (`:76-81`), and adds the NM attribute
+                // that the SA tag reads (`:99-102`).
+                if params.out_sam_type.format != OutSamFormat::Bam {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
+                         or SortedByCoordinate",
+                    ));
+                }
+                params.out_sam_attributes |= SamAttributes::NM;
+            }
+        }
+
+        // Unknown --quantMode values are fatal, as in STAR
+        // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
+        // leading "-" means none.
+        if params.quant_mode.first().is_some_and(|m| m != "-")
+            && let Some(bad) = params
+                .quant_mode
+                .iter()
+                .find(|m| !matches!(m.as_str(), "TranscriptomeSAM" | "GeneCounts"))
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "unrecognized --quantMode value '{bad}'; allowed: TranscriptomeSAM, \
+                     GeneCounts, or -"
+                ),
+            ));
+        }
+
         // quantMode GeneCounts requires a GTF file
         if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
             return Err(command.error(
@@ -1817,6 +1919,15 @@ impl Parameters {
                 ));
             }
         }
+        // Validate --chimFilter.
+        for f in &params.chim_filter {
+            if !matches!(f.as_str(), "banGenomicN" | "None") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("unknown --chimFilter '{f}'; expected banGenomicN or None"),
+                ));
+            }
+        }
 
         // ── STARsolo validation ─────────────────────────────────────────
         if params.run_mode() == RunMode::AlignReads && params.solo_enabled() {
@@ -1870,6 +1981,22 @@ impl Parameters {
                         return Err(command.error(
                             ErrorKind::InvalidValue,
                             "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
+                        ));
+                    }
+                    // The barcode region of that mate is not cDNA, and nothing
+                    // else says how many bases it spans, so STAR refuses the
+                    // run unless the mate is clipped
+                    // (`ParametersSolo.cpp:145-150`). Without this the CB+UMI
+                    // prefix is aligned as if it were sequence: 28 bases of it
+                    // for 10x v3, with no error anywhere in the run.
+                    let mate = 0; // --soloBarcodeMate 1 is mate 1
+                    if params.clip5p(mate) == 0 && params.clip3p(mate) == 0 {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--soloBarcodeMate 1 puts the barcode inside mate 1, which requires \
+                             clipping the barcode off that mate\n\
+                             SOLUTION: clip it from 5' and/or 3' with --clip5pNbases and/or \
+                             --clip3pNbases; give a value per mate, using 0 for no clipping",
                         ));
                     }
                 }
@@ -2367,8 +2494,8 @@ mod tests {
 
     #[test]
     fn solo_barcode_mate_validation() {
-        let with_mate = |mate: &str| {
-            try_parse(&[
+        let with_mate_and_clip = |mate: &str, clip: Option<(&str, &str)>| {
+            let mut args = vec![
                 "--readFilesIn",
                 "R1.fq",
                 "R2.fq",
@@ -2384,16 +2511,77 @@ mod tests {
                 "Gene",
                 "--soloBarcodeMate",
                 mate,
-            ])
+            ];
+            if let Some((flag, value)) = clip {
+                args.push(flag);
+                args.push(value);
+                args.push("0");
+            }
+            try_parse(&args)
         };
-        // Mate 1 (5' paired-end) is accepted; the helper reports it.
+        let with_mate = |mate: &str| with_mate_and_clip(mate, Some(("--clip5pNbases", "28")));
+
+        // Mate 1 (5' paired-end) with the barcode clipped off: accepted, and
+        // the helper reports it.
         let p = with_mate("1").unwrap();
         assert!(p.solo_barcode_on_mate1());
-        // Mate 0 (default) is the standard SE-solo path.
-        assert!(!with_mate("0").unwrap().solo_barcode_on_mate1());
+        // Mate 0 (default) is the standard SE-solo path; no clip is needed
+        // because the barcode has its own read.
+        assert!(
+            !with_mate_and_clip("0", None)
+                .unwrap()
+                .solo_barcode_on_mate1()
+        );
         // Mate 2 is rejected with a clear message.
         let err = with_mate("2").unwrap_err().to_string();
         assert!(err.contains("soloBarcodeMate"), "unexpected error: {err}");
+    }
+
+    /// STAR refuses `--soloBarcodeMate 1` unless the barcode is clipped off
+    /// that mate (`ParametersSolo.cpp:145-150`): the barcode region is not
+    /// cDNA, and nothing else says how long it is. Without the check the CB+UMI
+    /// prefix is aligned as sequence and the run reports nothing.
+    #[test]
+    fn solo_barcode_mate_1_requires_clipping_that_mate() {
+        let with_clip = |extra: &[&str]| {
+            let mut args = vec![
+                "--readFilesIn",
+                "R1.fq",
+                "R2.fq",
+                "--soloType",
+                "CB_UMI_Simple",
+                "--soloCBwhitelist",
+                "None",
+                "--soloCBmatchWLtype",
+                "Exact",
+                "--sjdbGTFfile",
+                "g.gtf",
+                "--soloFeatures",
+                "Gene",
+                "--soloBarcodeMate",
+                "1",
+            ];
+            args.extend_from_slice(extra);
+            try_parse(&args)
+        };
+
+        // No clip at all: refused, and the message says what to do.
+        let err = with_clip(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("clip5pNbases"),
+            "the error should name the fix: {err}"
+        );
+
+        // A clip on mate 2 only leaves mate 1's barcode in place, so it is
+        // still refused.
+        assert!(with_clip(&["--clip5pNbases", "0", "28"]).is_err());
+
+        // 5' clip on mate 1: accepted.
+        assert!(with_clip(&["--clip5pNbases", "28", "0"]).is_ok());
+        // 3' clip on mate 1: also accepted, for a barcode at the other end.
+        assert!(with_clip(&["--clip3pNbases", "28", "0"]).is_ok());
+        // A single value applies to both mates, which covers mate 1.
+        assert!(with_clip(&["--clip5pNbases", "28"]).is_ok());
     }
 
     #[test]
@@ -2493,6 +2681,46 @@ mod tests {
     }
 
     #[test]
+    fn chim_out_type_follows_star() {
+        let base = ["--readFilesIn", "r.fq", "--chimSegmentMin", "12"];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        // WithinBAM needs BAM output, and adds NM.
+        assert!(with(&["--chimOutType", "WithinBAM"]).is_err());
+        let p = with(&[
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::NM));
+        assert!(p.chim_out_bam_hard_clip());
+        // Three values, and the last of HardClip / SoftClip wins.
+        let p = with(&[
+            "--chimOutType",
+            "Junctions",
+            "WithinBAM",
+            "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.chim_out_junctions() && p.chim_out_within_bam());
+        assert!(!p.chim_out_bam_hard_clip());
+        // Unknown values, and the unimplemented SeparateSAMold, are errors.
+        assert!(with(&["--chimOutType", "Junction"]).is_err());
+        assert!(with(&["--chimOutType", "SeparateSAMold"]).is_err());
+        // Without chimeric detection the value is not checked, as in STAR.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--chimOutType", "WithinBAM"]).is_ok());
+    }
+
+    #[test]
     fn chimeric_params() {
         let p = try_parse(&[
             "--readFilesIn",
@@ -2504,6 +2732,9 @@ mod tests {
             "--chimOutType",
             "WithinBAM",
             "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ])
         .unwrap();
         assert_eq!(p.chim_segment_min, 20);
@@ -2685,6 +2916,25 @@ mod tests {
             p.quant_transcriptome_sam_output,
             QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip
         );
+    }
+
+    #[test]
+    fn unknown_quant_mode_is_rejected() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneVelocyto"]).is_err());
+        // Not a STAR value either (Parameters.cpp:898-936 allows only these two).
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneSplicing"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantMode",
+                "TranscriptomeSAM",
+                "Genecounts"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).is_ok());
     }
 
     #[test]

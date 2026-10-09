@@ -29,7 +29,12 @@ use std::io::BufWriter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-/// Buffer for SAM records built by parallel threads
+/// Per-read buffer of SAM records built by the parallel alignment workers.
+///
+/// One buffer is created for every read (or read pair), and it usually holds
+/// only 1 to a few records (primary plus any secondaries), so it starts empty
+/// and grows on demand. There is no batch-level merge: the writer consumes
+/// each read's buffer in order.
 #[derive(Default)]
 pub struct BufferedSamRecords {
     pub records: Vec<RecordBuf>,
@@ -43,13 +48,9 @@ pub struct BufferedSamRecords {
 }
 
 impl BufferedSamRecords {
-    /// Create new buffer with capacity
+    /// Create an empty per-read buffer (no up-front allocation).
     pub fn new() -> Self {
-        Self {
-            records: Vec::with_capacity(10000),
-            encoded: None,
-            encoded_transcriptome: None,
-        }
+        Self::default()
     }
 
     /// Add a record to the buffer
@@ -1123,7 +1124,7 @@ where
 /// Insert `RG:Z:<id>` on the record when an ID is set. `Parameters::try_parse_from`
 /// auto-ORs `SamAttributes::RG` into `out_sam_attributes` whenever an RG line is
 /// configured, so `rg_id.is_some()` implies the attribute is wanted.
-fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
+pub(crate) fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
     if let Some(id) = rg_id {
         record
             .data_mut()
@@ -1151,7 +1152,7 @@ pub fn add_gene_tags(records: &mut [RecordBuf], gx: &str, gn: &str, attrs: SamAt
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
 /// `(FLAG & flagAND) | flagOR`. Matches STAR/STAR-rs, which apply this only to
 /// mapped-mate records; unmapped and transcriptome-BAM records are untouched.
-fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters) {
+pub(crate) fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters) {
     let or_bits = params.out_sam_flag_or as u16;
     let and_bits = params.out_sam_flag_and.min(u16::MAX as u32) as u16;
     let bits = u16::from(record.flags());
@@ -1197,7 +1198,7 @@ fn paired_tlen(
 /// the BAM binary QUAL field, per SAM spec §4.2.3.
 ///
 /// `saturating_sub` clamps malformed bytes < 33 to 0 rather than underflowing.
-fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
+pub(crate) fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
     qual.iter().map(|&b| b.saturating_sub(33)).collect()
 }
 
@@ -1720,10 +1721,12 @@ fn build_paired_mate_record(
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(combined_score));
     }
     // nM (mismatch count) before NM (edit distance), matching STAR's tag order.
+    // nM is the whole pair's `trOut.nMM`, written on both mates (as AS is); NM
+    // below is per mate (`samAttrNM_MD` over this mate's exons).
     if attrs.contains(SamAttributes::NMM) {
         data.insert(
             Tag::new(b'n', b'M'),
-            Value::from(transcript.n_mismatch as i32),
+            Value::from((transcript.n_mismatch + mate_transcript.n_mismatch) as i32),
         );
     }
     if attrs.contains(SamAttributes::NM) {
@@ -1869,7 +1872,7 @@ mod tests {
             .get(&program_tag::COMMAND_LINE)
             .expect("CL field must be present even when command_line is None")
             .as_ref();
-        assert!(!cl.is_empty());
+        assert_ne!(cl, []);
     }
 
     #[test]
@@ -2458,7 +2461,7 @@ mod tests {
         // Check TLEN
         assert_eq!(rec.template_length(), 250);
 
-        // AS is the combined score (STAR behavior); nM is per-mate mismatches
+        // AS and nM are both the whole pair's (STAR's trOut.maxScore / trOut.nMM)
         let data = rec.data();
         assert_eq!(
             data.get(&Tag::ALIGNMENT_SCORE),
@@ -2467,8 +2470,8 @@ mod tests {
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "nM should be 0 (no mismatches in this mate)"
+            Some(&Value::from(1_i32)),
+            "nM should be the pair's mismatches (0 + 1), on both mates"
         );
     }
 
@@ -3963,11 +3966,11 @@ mod tests {
             Some(&Value::from(180_i32)),
             "Mate1 AS should be combined score (100+80=180)"
         );
-        // NM attribute maps to nM tag (mismatches only)
+        // nM is the pair's mismatch count (STAR's trOut.nMM), on both mates
         assert_eq!(
             rec1.data().get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "Mate1 nM should be 0"
+            Some(&Value::from(2_i32)),
+            "Mate1 nM should be the pair's 0 + 2"
         );
 
         // Mate2 also gets combined AS
@@ -4000,7 +4003,7 @@ mod tests {
         assert_eq!(
             rec2.data().get(&Tag::new(b'n', b'M')),
             Some(&Value::from(2_i32)),
-            "Mate2 nM should be 2 (mismatches only, not edit distance)"
+            "Mate2 nM should be the pair's 0 + 2 (mismatches only, not edit distance)"
         );
     }
 
