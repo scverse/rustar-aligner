@@ -2,8 +2,8 @@
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::stitch::{
-    PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
-    stitch_seeds_with_jdb_debug,
+    PE_SPACER_BASE, WindowRecord, cluster_seeds, finalize_transcript, split_combined_wt,
+    stitch_seeds_core, stitch_seeds_with_jdb_debug,
 };
 use crate::align::transcript::{Exon, Transcript};
 use crate::error::Error;
@@ -405,9 +405,14 @@ fn align_read_inner(
         Some(&index.junction_db)
     };
 
+    let mut window_record = WindowRecord::new(
+        params.out_filter_multimap_score_range,
+        params.chim_segment_min > 0,
+    );
     for (ci, cluster) in clusters.iter().enumerate() {
         let debug_name = if debug_read { read_name } else { "" };
         let cluster_transcripts = stitch_seeds_with_jdb_debug(
+            &mut window_record,
             cluster,
             read_seq,
             index,
@@ -708,8 +713,9 @@ pub fn align_paired_read(
         params,
         debug_name,
     )?;
-    let mut m2_seeds = Seed::find_seeds(
+    let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
+        len1 + 1,
         index,
         params.seed_map_min,
         params,
@@ -744,8 +750,10 @@ pub fn align_paired_read(
     let mut any_transcript = false;
 
     // Stitch combined clusters, split WTs by mate_id, finalize each half
+    let mut window_record = WindowRecord::new(params.out_filter_multimap_score_range, chim_on);
     for cluster in clusters.iter().take(params.align_windows_per_read_nmax) {
         let (wts, stitch_cluster, stitch_is_reverse, stitch_read) = stitch_seeds_core(
+            &mut window_record,
             cluster,
             &combined_read,
             index,
