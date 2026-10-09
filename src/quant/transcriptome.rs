@@ -1159,7 +1159,7 @@ pub fn filter_and_project(
     mode: QuantTranscriptomeSAMoutput,
     params: &Parameters,
 ) -> Vec<Transcript> {
-    if !mode.allow_indels() && align.n_gap > 0 {
+    if !mode.allow_indels() && has_indel(align) {
         return Vec::new();
     }
 
@@ -1173,6 +1173,90 @@ pub fn filter_and_project(
     };
 
     align_to_transcripts(&align_for_projection, idx, lread)
+}
+
+/// Paired-end counterpart of [`filter_and_project`]: filter one pair as a
+/// unit and return the `(mate1, mate2)` projections that land on the same
+/// transcript.
+///
+/// STAR filters the combined two-mate alignment, not each mate on its own
+/// (`ReadAlign_quantTranscriptome.cpp`): an indel in either mate drops the
+/// pair, and the soft-clip extension mismatches of both mates are added to the
+/// pair's mismatch count and checked against a single budget,
+/// `min(outFilterMismatchNmax, outFilterMismatchNoverLmax * (Lread - 1))`,
+/// where `Lread - 1` is the sum of the two mate lengths.  Checking each mate
+/// against its own budget lets pairs through that STAR drops.
+///
+/// Each mate's `n_mismatch` counts only that mate's mismatches; the pair's
+/// count is their sum.
+#[allow(clippy::too_many_arguments)]
+pub fn filter_and_project_pair(
+    mate1: &Transcript,
+    mate1_bases: &[u8],
+    mate2: &Transcript,
+    mate2_bases: &[u8],
+    genome: &Genome,
+    idx: &TranscriptomeIndex,
+    lread1: u32,
+    lread2: u32,
+    mode: QuantTranscriptomeSAMoutput,
+    params: &Parameters,
+) -> Vec<(Transcript, Transcript)> {
+    if !mode.allow_indels() && (has_indel(mate1) || has_indel(mate2)) {
+        return Vec::new();
+    }
+
+    let (m1, m2) = if mode.allow_softclip() {
+        (mate1.clone(), mate2.clone())
+    } else {
+        let mm1 = softclip_extension_mismatches(mate1, mate1_bases, genome);
+        let mm2 = softclip_extension_mismatches(mate2, mate2_bases, genome);
+        let budget = mismatch_budget(params, lread1 + lread2);
+        if mate1.n_mismatch + mate2.n_mismatch + mm1 + mm2 > budget {
+            return Vec::new();
+        }
+        let mut e1 = apply_softclip_extension(mate1);
+        let mut e2 = apply_softclip_extension(mate2);
+        e1.n_mismatch += mm1;
+        e2.n_mismatch += mm2;
+        (e1, e2)
+    };
+
+    let proj_m1 = align_to_transcripts(&m1, idx, lread1);
+    let proj_m2 = align_to_transcripts(&m2, idx, lread2);
+
+    let mut by_tr1: HashMap<usize, Vec<&Transcript>> = HashMap::new();
+    for p in &proj_m1 {
+        by_tr1.entry(p.chr_idx).or_default().push(p);
+    }
+    let mut out = Vec::new();
+    for p2 in &proj_m2 {
+        if let Some(p1s) = by_tr1.get(&p2.chr_idx) {
+            for p1 in p1s {
+                out.push(((*p1).clone(), p2.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether the alignment has an insertion or deletion.  Read from the CIGAR
+/// (STAR's `nDel > 0 || nIns > 0`): per-mate transcripts split from a pair do
+/// not carry `n_gap`.
+fn has_indel(align: &Transcript) -> bool {
+    use cigar::op::Kind;
+    align.n_gap > 0
+        || align
+            .cigar
+            .iter()
+            .any(|op| matches!(op.kind(), Kind::Insertion | Kind::Deletion) && !op.is_empty())
+}
+
+/// STAR's soft-clip extension mismatch budget for an alignment whose read
+/// length minus one is `lread_minus_1`.
+fn mismatch_budget(params: &Parameters, lread_minus_1: u32) -> u32 {
+    let rel = (params.out_filter_mismatch_nover_lmax * f64::from(lread_minus_1)).floor() as u32;
+    params.out_filter_mismatch_nmax.min(rel)
 }
 
 fn has_soft_clip(align: &Transcript) -> bool {
@@ -1192,6 +1276,23 @@ fn extend_softclips(
     lread: u32,
     params: &Parameters,
 ) -> Option<Transcript> {
+    let n_mm_extra = softclip_extension_mismatches(align, read_bases_align_orientation, genome);
+    let budget = mismatch_budget(params, lread.saturating_sub(1));
+    if align.n_mismatch.saturating_add(n_mm_extra) > budget {
+        return None;
+    }
+    let mut ext = apply_softclip_extension(align);
+    ext.n_mismatch = ext.n_mismatch.saturating_add(n_mm_extra);
+    Some(ext)
+}
+
+/// Count the mismatches the leading/trailing soft-clipped bases of `align`
+/// would add if extended back onto the genome.
+fn softclip_extension_mismatches(
+    align: &Transcript,
+    read_bases_align_orientation: &[u8],
+    genome: &Genome,
+) -> u32 {
     // Determine left / right clip sizes from the CIGAR.
     let [left_clip, right_clip] = align.count_soft_clips();
 
@@ -1243,19 +1344,16 @@ fn extend_softclips(
         }
     }
 
-    // Apply STAR's mismatch budget.
-    let mismatch_nmax_abs = params.out_filter_mismatch_nmax;
-    let mismatch_nmax_rel =
-        ((params.out_filter_mismatch_nover_lmax * (lread.saturating_sub(1) as f64)).floor()) as u32;
-    let budget = mismatch_nmax_abs.min(mismatch_nmax_rel);
-    if align.n_mismatch.saturating_add(n_mm_extra) > budget {
-        return None;
-    }
+    n_mm_extra
+}
 
+/// Remove the leading/trailing soft-clips of `align`, extending the outer
+/// blocks over the clipped bases.  `n_mismatch` is left to the caller.
+fn apply_softclip_extension(align: &Transcript) -> Transcript {
     // Construct the extended alignment: remove the soft-clip CIGAR ops and
     // extend the leading/trailing match blocks.
+    let [left_clip, right_clip] = align.count_soft_clips();
     let mut ext = align.clone();
-    ext.n_mismatch = ext.n_mismatch.saturating_add(n_mm_extra);
     if left_clip > 0
         && let Some(first) = ext.exons.first_mut()
     {
@@ -1279,7 +1377,7 @@ fn extend_softclips(
     if let Some(last) = ext.exons.last() {
         ext.genome_end = last.genome_end;
     }
-    Some(ext)
+    ext
 }
 
 /// Strip the leading/trailing `SoftClip` ops and fold their lengths into the
@@ -2404,6 +2502,93 @@ mod tests {
             &params,
         );
         assert_eq!(results.len(), 1);
+    }
+
+    /// A 40-base mate at genome `[start, start + 40)` whose first `clip`
+    /// bases are soft-clipped.
+    fn clipped_mate(start: u64, clip: usize, n_mismatch: u32) -> Transcript {
+        use cigar::op::{Kind, Op};
+        let mut cigar = Vec::new();
+        if clip > 0 {
+            cigar.push(Op::new(Kind::SoftClip, clip));
+        }
+        cigar.push(Op::new(Kind::Match, 40 - clip));
+        let mut t = make_align(
+            0,
+            false,
+            vec![(start + clip as u64, start + 40, clip, 40)],
+            cigar,
+        );
+        t.n_mismatch = n_mismatch;
+        t
+    }
+
+    #[test]
+    fn pair_filter_rejects_indel_in_either_mate() {
+        use cigar::op::{Kind, Op};
+        let genome = make_genome();
+        let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
+        let params = default_params();
+        let read = vec![0u8; 40];
+        let m1 = clipped_mate(110, 0, 0);
+        // Split mates carry no `n_gap`: the insertion is only in the CIGAR.
+        let m2 = make_align(
+            0,
+            false,
+            vec![(200, 220, 0, 20), (220, 239, 21, 40)],
+            vec![
+                Op::new(Kind::Match, 20),
+                Op::new(Kind::Insertion, 1),
+                Op::new(Kind::Match, 19),
+            ],
+        );
+        let project = |mode| {
+            filter_and_project_pair(&m1, &read, &m2, &read, &genome, &idx, 40, 40, mode, &params)
+        };
+        assert!(
+            project(QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip).is_empty()
+        );
+        assert_eq!(project(QuantTranscriptomeSAMoutput::BanSingleEnd).len(), 1);
+    }
+
+    #[test]
+    fn pair_filter_checks_softclip_mismatches_against_one_pair_budget() {
+        let genome = make_genome(); // all A
+        let gtf = vec![make_exon("chr1", 101, 300, '+', "G1", "T1")];
+        let idx = TranscriptomeIndex::from_gtf_exons(&gtf, &genome).unwrap();
+        let params = default_params(); // budget min(10, 0.3 * 80) = 10
+        // Clipped bases are T: every extended base is a mismatch.
+        let read = |clip: usize| {
+            let mut r = vec![0u8; 40];
+            r[..clip].fill(3);
+            r
+        };
+        let project = |clip: usize| {
+            let (m1, m2) = (clipped_mate(110, clip, 3), clipped_mate(200, clip, 0));
+            let (r1, r2) = (read(clip), read(clip));
+            filter_and_project_pair(
+                &m1,
+                &r1,
+                &m2,
+                &r2,
+                &genome,
+                &idx,
+                40,
+                40,
+                QuantTranscriptomeSAMoutput::BanSingleEndBanIndelsExtendSoftclip,
+                &params,
+            )
+        };
+        // 3 + 2 + 2 = 7 <= 10: kept, with both clips extended.
+        let kept = project(2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0.genome_start, 10);
+        assert_eq!(kept[0].0.n_mismatch, 5);
+        assert_eq!(kept[0].1.n_mismatch, 2);
+        // Each mate fits its own budget (3 + 5, 0 + 5) but the pair does not
+        // (3 + 5 + 5 = 13 > 10): STAR drops the pair.
+        assert!(project(5).is_empty());
     }
 
     #[test]

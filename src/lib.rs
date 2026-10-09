@@ -1236,8 +1236,9 @@ fn build_transcriptome_records_se(
 
 /// Paired-end version of `build_transcriptome_records_se`.
 ///
-/// For each `PairedAlignment`, project mate1 and mate2 onto all transcripts
-/// and keep only transcripts where both mates project successfully.  Emit one
+/// For each `PairedAlignment`, filter the pair per
+/// `--quantTranscriptomeSAMoutput` and keep only transcripts where both mates
+/// project successfully.  Emit one
 /// SAM record per projected pair per mate (2 records per projected hit, in
 /// mate1-then-mate2 order).
 #[allow(clippy::too_many_arguments)]
@@ -1257,8 +1258,7 @@ where
     I: IntoIterator<Item = &'a crate::align::read_align::PairedAlignment>,
 {
     use crate::io::sam::SamWriter;
-    use crate::quant::transcriptome::filter_and_project;
-    use std::collections::HashMap;
+    use crate::quant::transcriptome::filter_and_project_pair;
 
     if tr_idx.n_transcripts() == 0 {
         return Ok(Vec::new());
@@ -1270,8 +1270,9 @@ where
     let m1_rc = rc_encode(m1_seq);
     let m2_rc = rc_encode(m2_seq);
 
-    // For each both-mapped pair, project each mate onto transcripts and pair
-    // up projections that land on the same transcript.
+    // Filter each both-mapped pair as a unit (STAR's indel ban and soft-clip
+    // mismatch budget apply to the pair) and keep the transcripts both mates
+    // project onto.
     let mut all_projected: Vec<(
         crate::align::transcript::Transcript,
         crate::align::transcript::Transcript,
@@ -1281,20 +1282,9 @@ where
         let m2 = &pair.mate2_transcript;
         let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
         let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
-        let proj_m1 = filter_and_project(m1, m1_bases, genome, tr_idx, lread1, mode, params);
-        let proj_m2 = filter_and_project(m2, m2_bases, genome, tr_idx, lread2, mode, params);
-
-        let mut by_tr1: HashMap<usize, Vec<&crate::align::transcript::Transcript>> = HashMap::new();
-        for p in &proj_m1 {
-            by_tr1.entry(p.chr_idx).or_default().push(p);
-        }
-        for p2 in &proj_m2 {
-            if let Some(p1s) = by_tr1.get(&p2.chr_idx) {
-                for p1 in p1s {
-                    all_projected.push(((*p1).clone(), p2.clone()));
-                }
-            }
-        }
+        all_projected.extend(filter_and_project_pair(
+            m1, m1_bases, m2, m2_bases, genome, tr_idx, lread1, lread2, mode, params,
+        ));
     }
 
     if all_projected.is_empty() {

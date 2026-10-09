@@ -65,6 +65,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`--quantMode TranscriptomeSAM` filters paired-end reads like STAR**
+  (#292). With the default `BanSingleEnd_BanIndels_ExtendSoftclip`, pairs with
+  an indel were projected anyway (split mates carry no gap count, so the indel
+  ban never fired), and the soft-clip extension mismatch budget was checked per
+  mate instead of once for the pair (pair mismatches plus both mates'
+  extension mismatches against `min(outFilterMismatchNmax,
+  outFilterMismatchNoverLmax * (mate1 + mate2 length))`). On 2M GEUVADIS
+  ERR188021 pairs against chr21, rustar-aligner projected 61,086 reads to
+  STAR 2.7.11b's 50,198; it now projects 49,950, with 5 reads absent from STAR.
 - **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
   `alignBAM`). The chimera now replaces the read's normal alignment, as in
   STAR: one segment as a normal record and the other as a supplementary
