@@ -97,35 +97,24 @@ impl GenomeIndex {
             junction_db.len()
         );
 
-        // Prefer STAR-compatible transcriptInfo.tab / exonInfo.tab /
-        // geneInfo.tab over re-parsing the GTF at align time. If the files
-        // aren't present (legacy rustar-aligner index), fall back to on-the-fly
-        // construction from the GTF when one is supplied — this matches
-        // STAR's behavior in `sjdbInsertJunctions.cpp` (re-parse and regenerate).
-        let transcriptome = if genome_dir.join("transcriptInfo.tab").exists() {
+        // STAR's Transcriptome constructor: a GTF given at mapping time is always
+        // used for the transcript/gene tables (Transcriptome.cpp trInfoDir =
+        // sjdbInsert.outDir, filled by loadGTF); otherwise they are read from
+        // the index directory (transcriptInfo.tab et al.).
+        let transcriptome = if let Some(ref gtf_path) = params.sjdb_gtf_file {
+            log::info!(
+                "Building transcriptome tables from the mapping-time GTF {}",
+                gtf_path.display()
+            );
+            Some(TranscriptomeIndex::from_mapping_gtf(
+                params, gtf_path, &genome,
+            )?)
+        } else if genome_dir.join("transcriptInfo.tab").exists() {
             log::info!(
                 "Loading transcriptome index files from {}",
                 genome_dir.display()
             );
             Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
-        } else if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            log::warn!(
-                "transcriptInfo.tab not found in {}; re-parsing GTF at align time",
-                genome_dir.display()
-            );
-            let exons = crate::junction::gtf::parse_gtf_configured(
-                gtf_path,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-            )?;
-            Some(TranscriptomeIndex::from_gtf_exons_configured(
-                &exons,
-                &genome,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-                &params.sjdb_gtf_tag_exon_parent_gene_name,
-                &params.sjdb_gtf_tag_exon_parent_gene_type,
-            )?)
         } else {
             None
         };
