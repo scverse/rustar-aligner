@@ -11,6 +11,20 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- `--soloOutLayout CellRanger` writes the rest of CellRanger's `outs/` files next to the
+  matrices: `raw_feature_bc_matrix.h5` and `filtered_feature_bc_matrix.h5` in
+  CellRanger's HDF5 layout (root attributes, genome column, string widths, chunking
+  and compression), `molecule_info.h5` (file version 6: `barcode_idx`, `feature_idx`,
+  `umi`, `count`, `gem_group`, `library_idx`, `umi_type`, `barcodes`, `features/`,
+  `barcode_info/`, `library_info`, `metrics_json`), and, with
+  `--outSAMtype BAM SortedByCoordinate`, `possorted_genome_bam.bam` plus its `.bai`
+  with CellRanger's header (`@RG` per flowcell and lane, `10x_bam_to_fastq` and
+  `library_info` comments) and record tags in CellRanger's order. The `.h5` files
+  need `--soloOutH5 yes` and a `hdf5-out` build. New `--soloOutSampleID` names the
+  library in the attributes and read-group ids.
+
 ### Bug fixes
 
 - Window formation and per-window dedup follow STAR (long splices with the default
