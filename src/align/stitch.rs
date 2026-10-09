@@ -2388,7 +2388,7 @@ fn pe_mates_consistent(wt: &WorkingTranscript, read_seq: &[u8], scorer: &Alignme
     true
 }
 
-type NovelFilter = Option<std::rc::Rc<std::collections::HashSet<(u64, u64)>>>;
+type NovelFilter = Option<std::sync::Arc<std::collections::HashSet<(u64, u64)>>>;
 
 thread_local! {
     /// `--outFilterType BySJout` second stage: the novel junctions (intron
@@ -2400,10 +2400,10 @@ thread_local! {
 
 /// Run `f` with the second-stage BySJout junction filter active on this thread.
 pub(crate) fn with_bysj_novel_filter<R>(
-    novel: std::collections::HashSet<(u64, u64)>,
+    novel: std::sync::Arc<std::collections::HashSet<(u64, u64)>>,
     f: impl FnOnce() -> R,
 ) -> R {
-    BYSJ_NOVEL.with(|c| *c.borrow_mut() = Some(std::rc::Rc::new(novel)));
+    BYSJ_NOVEL.with(|c| *c.borrow_mut() = Some(novel));
     let out = f();
     BYSJ_NOVEL.with(|c| *c.borrow_mut() = None);
     out

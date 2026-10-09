@@ -897,53 +897,6 @@ pub fn build_sam_header(genome: &Genome, params: &Parameters) -> Result<sam::Hea
     )
 }
 
-/// Create a SAM writer for BySJout disk-buffering (temp file). Returns (header, writer).
-pub fn create_bysj_writer(
-    file: std::fs::File,
-    genome: &Genome,
-    params: &Parameters,
-) -> Result<(sam::Header, sam::io::Writer<BufWriter<std::fs::File>>), Error> {
-    let header = build_sam_header(genome, params)?;
-    let mut writer = sam::io::Writer::new(BufWriter::new(file));
-    writer.write_header(&header)?;
-    Ok((header, writer))
-}
-
-/// Write a slice of RecordBuf to a SAM writer (for BySJout temp file).
-pub fn bysj_write_records<W: std::io::Write>(
-    writer: &mut sam::io::Writer<W>,
-    header: &sam::Header,
-    records: &[RecordBuf],
-) -> Result<(), Error> {
-    for rec in records {
-        writer.write_alignment_record(header, rec)?;
-    }
-    Ok(())
-}
-
-/// Read exactly `n` records from a SAM reader. If `collect` is true, return them in a Vec;
-/// otherwise just advance the reader position (discard records).
-pub fn bysj_read_n_records<R: std::io::BufRead>(
-    reader: &mut sam::io::Reader<R>,
-    header: &sam::Header,
-    n: u32,
-    collect: bool,
-) -> Result<Vec<RecordBuf>, Error> {
-    let mut out = if collect {
-        Vec::with_capacity(n as usize)
-    } else {
-        Vec::new()
-    };
-    let mut buf = RecordBuf::default();
-    for _ in 0..n {
-        reader.read_record_buf(header, &mut buf)?;
-        if collect {
-            out.push(buf.clone());
-        }
-    }
-    Ok(out)
-}
-
 /// Build a SAM header from an iterator of (name, length) reference pairs.
 ///
 /// Used both for the genome header (chromosomes) and the transcriptome header
