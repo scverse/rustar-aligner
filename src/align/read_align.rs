@@ -1303,7 +1303,7 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Determine left mate (smaller genome_start) and right mate for distance/consistency checks
+    // Determine left mate (smaller genome_start) and right mate for distance checks
     let (left, right) = if t1.genome_start <= t2.genome_start {
         (t1, t2)
     } else {
@@ -1333,7 +1333,9 @@ fn try_pair_transcripts(
     }
 
     // Junction consistency in overlap region
-    if !pe_junctions_consistent(left, right) {
+    // STAR's order is the stitching frame: mate1 first on the forward strand.
+    let (first, second) = if t1.is_reverse { (t2, t1) } else { (t1, t2) };
+    if !pe_junctions_consistent(first, second) {
         return None;
     }
 
@@ -1461,63 +1463,94 @@ fn filter_paired_transcripts(
     None
 }
 
-/// Extract splice junctions from a Transcript's CIGAR as (donor, acceptor) pairs.
-/// Junction coords are in genomic space (0-based). Junctions only exist where CigarOp::RefSkip is.
-fn extract_junctions_from_cigar(t: &Transcript) -> Vec<(u64, u64)> {
-    let mut junctions = Vec::new();
+/// A transcript's exons as `(genome_start, genome_end)` runs, plus for each gap
+/// between consecutive exons whether it is a splice junction (`N`) rather than an
+/// indel. STAR's exon list splits at every gap (`canonSJ >= 0` marks junctions).
+fn exon_runs_and_gaps(t: &Transcript) -> (Vec<(u64, u64)>, Vec<bool>) {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    let mut exons: Vec<(u64, u64)> = Vec::new();
+    let mut gaps: Vec<bool> = Vec::new();
     let mut genome_pos = t.genome_start;
+    // True when the next aligned base starts a new exon (after a gap op).
+    let mut pending_gap: Option<bool> = None;
     for op in &t.cigar {
-        use noodles::sam::alignment::record::cigar::op::Kind;
         match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                match pending_gap.take() {
+                    Some(is_junction) => {
+                        gaps.push(is_junction);
+                        exons.push((genome_pos, genome_pos));
+                    }
+                    None if exons.is_empty() => exons.push((genome_pos, genome_pos)),
+                    None => {}
+                }
                 genome_pos += op.len() as u64;
+                if let Some(last) = exons.last_mut() {
+                    last.1 = genome_pos;
+                }
+            }
+            Kind::Deletion => {
+                genome_pos += op.len() as u64;
+                pending_gap = Some(pending_gap.unwrap_or(false));
             }
             Kind::Skip => {
-                let donor = genome_pos;
-                let acceptor = genome_pos + op.len() as u64;
-                junctions.push((donor, acceptor));
-                genome_pos = acceptor;
+                genome_pos += op.len() as u64;
+                pending_gap = Some(true);
             }
-            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            Kind::Insertion => {
+                pending_gap = Some(pending_gap.unwrap_or(false));
+            }
+            Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
-    junctions
+    (exons, gaps)
 }
 
-/// D5: Check junction consistency in the overlapping region of paired-end mates.
-/// When mates overlap in the genome, every splice junction in the overlap from the
-/// left mate must appear in the right mate, and vice versa.
-/// Implements STAR stitchWindowAligns.cpp check after overlap detection.
+/// Junction consistency of overlapping mates, STAR's check in
+/// `stitchWindowAligns.cpp` ("check for junctions consistency").
 ///
-/// `left` is the mate with the lower genome_start, `right` is the other mate.
-pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> bool {
-    // Overlapping region: [overlap_start, overlap_end)
-    let overlap_start = left.genome_start.max(right.genome_start);
-    let overlap_end = left.genome_end.min(right.genome_end);
-    if overlap_start >= overlap_end {
-        return true; // No overlap — nothing to check
+/// `first` is the mate that comes first in the stitching frame (mate1 on the
+/// forward strand, mate2 on the reverse strand), `second` the other. When the
+/// last exon of `first` runs past the start of `second`, the junctions of
+/// `first` from the first one that lies past the end of `second`'s first exon
+/// are compared pairwise, in order, with the junctions of `second`, and must be
+/// identical. The walk ends as soon as either mate runs out of junctions, so a
+/// junction of `first` that `second` simply reads through (an unspliced mate
+/// across the intron) is accepted, as STAR does.
+pub(crate) fn pe_junctions_consistent(first: &Transcript, second: &Transcript) -> bool {
+    let (e1, g1) = exon_runs_and_gaps(first);
+    let (e2, g2) = exon_runs_and_gaps(second);
+    let (Some(last1), Some(first2)) = (e1.last(), e2.first()) else {
+        return true;
+    };
+    // Mates do not overlap: nothing to compare.
+    if last1.1 <= first2.0 {
+        return true;
     }
-
-    let left_juncs = extract_junctions_from_cigar(left);
-    let right_juncs = extract_junctions_from_cigar(right);
-
-    // Every junction from left that falls within the overlap must be in right too
-    for (donor, acceptor) in &left_juncs {
-        if *donor >= overlap_start
-            && *acceptor <= overlap_end
-            && !right_juncs.iter().any(|(d, a)| d == donor && a == acceptor)
-        {
+    // First junction (gap) of `first` whose right exon starts past the end of
+    // `second`'s first exon.
+    let mut i1 = 1usize;
+    while i1 < e1.len() {
+        if e1[i1].0 >= first2.1 {
+            break;
+        }
+        i1 += 1;
+    }
+    let mut i2 = 1usize;
+    while i1 < e1.len() && i2 < e2.len() {
+        if !g1[i1 - 1] {
+            i1 += 1;
+            continue;
+        }
+        if !g2[i2 - 1] {
+            i2 += 1;
+            continue;
+        }
+        if e1[i1].0 != e2[i2].0 || e1[i1 - 1].1 != e2[i2 - 1].1 {
             return false;
         }
-    }
-    // Every junction from right that falls within the overlap must be in left too
-    for (donor, acceptor) in &right_juncs {
-        if *donor >= overlap_start
-            && *acceptor <= overlap_end
-            && !left_juncs.iter().any(|(d, a)| d == donor && a == acceptor)
-        {
-            return false;
-        }
+        i1 += 1;
+        i2 += 1;
     }
     true
 }
@@ -2355,5 +2388,56 @@ mod tests {
         let before = items.clone();
         shuffle_tied_prefix(&mut items, |t| t.0, 42);
         assert_eq!(items, before);
+    }
+    fn cigar_transcript(
+        start: u64,
+        ops: &[(cigar::op::Kind, usize)],
+        is_reverse: bool,
+    ) -> Transcript {
+        use cigar::op::{Kind, Op};
+        let cigar: Vec<Op> = ops.iter().map(|&(k, l)| Op::new(k, l)).collect();
+        let ref_len: u64 = ops
+            .iter()
+            .filter(|(k, _)| matches!(k, Kind::Match | Kind::Deletion | Kind::Skip))
+            .map(|&(_, l)| l as u64)
+            .sum();
+        Transcript {
+            chr_idx: 0,
+            genome_start: start,
+            genome_end: start + ref_len,
+            is_reverse,
+            exons: vec![],
+            cigar,
+            score: 100,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+        }
+    }
+
+    #[test]
+    fn pe_junction_consistency_follows_star_walk() {
+        use cigar::op::Kind::{Match, Skip, SoftClip};
+        // Mate A splices (100M 200N 50M); mate B reads straight through the
+        // intron (150M). STAR's walk ends when B has no junction left, so the
+        // pair is accepted (stitchWindowAligns.cpp, "check for junctions
+        // consistency").
+        let spliced = cigar_transcript(1000, &[(Match, 100), (Skip, 200), (Match, 50)], false);
+        let through = cigar_transcript(1040, &[(Match, 150), (SoftClip, 10)], true);
+        assert!(pe_junctions_consistent(&spliced, &through));
+
+        // Same junction in both mates: consistent.
+        let spliced_b = cigar_transcript(1040, &[(Match, 60), (Skip, 200), (Match, 50)], true);
+        assert!(pe_junctions_consistent(&spliced, &spliced_b));
+
+        // Different junction in the overlap: inconsistent.
+        let other = cigar_transcript(1040, &[(Match, 60), (Skip, 210), (Match, 50)], true);
+        assert!(!pe_junctions_consistent(&spliced, &other));
+
+        // Mates that do not overlap are never compared.
+        let far = cigar_transcript(2000, &[(Match, 60), (Skip, 210), (Match, 50)], true);
+        assert!(pe_junctions_consistent(&spliced, &far));
     }
 }
