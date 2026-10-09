@@ -391,44 +391,155 @@ pub fn open_paired_reader(params: &Parameters) -> Result<SoloPairedReader, Error
 /// under `--clipAdapterType CellRanger4`. Encoded 0=A,1=C,2=G,3=T.
 const TSO_SEQ: &[u8] = b"AAGCAGTGGTATCAACGCAGAGTACATGGG";
 
+/// Length of the read window STAR gives Opal for the CR4 5' clip
+/// (`ClipCR4::readLen`). Shorter reads are padded with `N`, longer ones are
+/// truncated, and the padding matters because it is what the tail of the TSO
+/// aligns against.
+const CR4_OPAL_READ_LEN: usize = 91;
+
+/// Opal's affine gap costs for the CR4 clip (`ClipCR4::ClipCR4`).
+const CR4_GAP_OPEN: i32 = 2;
+const CR4_GAP_EXT: i32 = 2;
+
+/// STAR's 5x5 score matrix: +1 on a match, -2 on a mismatch, and 0 for N/N.
+fn cr4_score(a: u8, b: u8) -> i32 {
+    if a == 4 && b == 4 {
+        0
+    } else if a == b {
+        1
+    } else {
+        -2
+    }
+}
+
+/// How many 5' bases the CR4 TSO clip removes from `seq`.
+///
+/// STAR aligns the TSO against the read with Opal in `OPAL_MODE_OV` (overlap:
+/// gaps before the start and after the end of either sequence are free), then
+/// keeps `endLocationTarget + 1` bases as the clip unless the alignment is too
+/// weak (`ClipMate_clipChunk.cpp`):
+///
+/// ```text
+/// L0 = S < 20 || (S == 20 && L > 26) || (S == 21 && L > 30)
+/// ```
+///
+/// A fixed-length prefix comparison is not the same rule: it misses a TSO that
+/// starts partway into the read or carries an indel, and it fires on a
+/// full-length match whose score STAR would reject. Both directions were
+/// visible as reads misplaced by a few bases (#199).
+pub fn cr4_tso_clip_len(seq: &[u8]) -> usize {
+    let query: Vec<u8> = TSO_SEQ
+        .iter()
+        .map(|&b| crate::io::fastq::encode_base(b))
+        .collect();
+
+    // The target is the read padded with N to STAR's fixed window.
+    let mut target: Vec<u8> = Vec::with_capacity(CR4_OPAL_READ_LEN);
+    target.extend(seq.iter().copied().take(CR4_OPAL_READ_LEN));
+    target.resize(CR4_OPAL_READ_LEN, 4);
+
+    let m = query.len();
+    let n = target.len();
+
+    // Affine-gap DP. Row 0 and column 0 are zero: leading gaps are free on
+    // both sequences, which is what OV mode means.
+    const NEG: i32 = i32::MIN / 4;
+    let mut h_prev = vec![0i32; n + 1];
+    let mut e_prev = vec![NEG; n + 1];
+    let mut h_cur = vec![0i32; n + 1];
+    let mut e_cur = vec![NEG; n + 1];
+
+    // Best over the last row and the last column: trailing gaps are free too.
+    let mut best_score = i32::MIN;
+    let mut best_end = 0usize;
+
+    for i in 1..=m {
+        h_cur[0] = 0;
+        e_cur[0] = NEG;
+        let mut f = NEG; // gap in the query (consuming target bases)
+        for j in 1..=n {
+            // Gap in the target (consuming query bases).
+            e_cur[j] = (h_prev[j] - CR4_GAP_OPEN).max(e_prev[j] - CR4_GAP_EXT);
+            f = (h_cur[j - 1] - CR4_GAP_OPEN).max(f - CR4_GAP_EXT);
+            let diag = h_prev[j - 1] + cr4_score(query[i - 1], target[j - 1]);
+            h_cur[j] = diag.max(e_cur[j]).max(f);
+
+            // Last column: the query may end early with a free trailing gap.
+            if j == n && h_cur[j] > best_score {
+                best_score = h_cur[j];
+                best_end = j - 1;
+            }
+        }
+        if i == m {
+            // Last row: every end position in the target is a candidate.
+            for (j, &h) in h_cur.iter().enumerate().skip(1) {
+                if h > best_score {
+                    best_score = h;
+                    best_end = j - 1;
+                }
+            }
+        }
+        std::mem::swap(&mut h_prev, &mut h_cur);
+        std::mem::swap(&mut e_prev, &mut e_cur);
+    }
+
+    let l = best_end + 1;
+    let s = best_score;
+    let too_weak = s < 20 || (s == 20 && l > 26) || (s == 21 && l > 30);
+    if too_weak { 0 } else { l.min(seq.len()) }
+}
+
+/// How many 3' bases the CR4 poly-A trim removes from `seq`.
+///
+/// Direct port of `ClipCR4::polyTail3p`: walking in from the 3' end, an `A`
+/// scores +1 and anything else -2; the longest prefix of that walk whose score
+/// is at least 70% of its length is remembered, the scan stops once the score
+/// has dropped more than 27 behind the length, and a final score below 20
+/// means no trim at all. Reads shorter than 20 bases are never trimmed.
+///
+/// A plain "trailing run of A" rule is stricter: it stops at the first
+/// non-`A`, so a tail with one sequencing error keeps ~half its length.
+pub fn cr4_polya_clip_len(seq: &[u8]) -> usize {
+    let seq_len = seq.len();
+    if seq_len < 20 {
+        return 0;
+    }
+    let mut ib1 = seq_len - 1;
+    let mut score: i32 = 0;
+    let mut score1: i32 = 0;
+    for ib in 1..=seq_len {
+        if seq[seq_len - ib] == 0 {
+            score += 1;
+            if score * 10 >= (ib as i32) * 7 {
+                ib1 = ib;
+                score1 = score;
+            }
+        } else {
+            score -= 2;
+            if (ib as i32) - score > 27 {
+                break;
+            }
+        }
+    }
+    if score1 < 20 { 0 } else { ib1 }
+}
+
 /// Clip the 10x TSO from the 5' end and trim a 3' polyA tail of the cDNA read,
 /// matching `--clipAdapterType CellRanger4`. Operates on encoded bases
-/// (0=A..3=T,4=N) with parallel quality bytes. Returns the clipped read.
+/// (0=A..3=T,4=N) with parallel quality bytes.
 ///
-/// Conservative thresholds (full-length TSO match ≤ 3 mismatches at the 5'
-/// anchor; trailing polyA run ≥ 8) keep this a no-op on adapter-free reads.
+/// Both ends follow STAR's own rules: see [`cr4_tso_clip_len`] and
+/// [`cr4_polya_clip_len`].
+///
 /// Returns `(clipped_seq, clipped_qual, clip5p, clip3p)` — the CR4-clipped read plus
 /// the bases trimmed from the 5' (TSO) and 3' (polyA) ends, so the caller can soft-clip
 /// them (STARsolo keeps them in SEQ as soft-clips, e.g. `60M30S`, not dropped).
 pub fn clip_adapter_cr4(seq: &[u8], qual: &[u8]) -> (Vec<u8>, Vec<u8>, usize, usize) {
-    let mut start = 0usize;
-    let mut end = seq.len();
-
-    // 5' TSO: compare the read prefix against the full TSO; clip on a match.
-    if seq.len() >= TSO_SEQ.len() {
-        let tso: Vec<u8> = TSO_SEQ
-            .iter()
-            .map(|&b| crate::io::fastq::encode_base(b))
-            .collect();
-        let mismatches = seq[..tso.len()]
-            .iter()
-            .zip(&tso)
-            .filter(|(a, b)| a != b)
-            .count();
-        if mismatches <= 3 {
-            start = tso.len();
-        }
-    }
-
-    // 3' polyA: trim a trailing run of A (encoded 0) of length >= 8.
-    let mut run = 0usize;
-    while end > start && seq[end - 1] == 0 {
-        run += 1;
-        end -= 1;
-    }
-    if run < 8 {
-        end += run; // not a real polyA tail; keep those bases
-    }
+    let start = cr4_tso_clip_len(seq);
+    // STAR trims the poly-A from the read that is left after the 5' clip.
+    let after5p = &seq[start..];
+    let trim3 = cr4_polya_clip_len(after5p);
+    let end = seq.len() - trim3;
 
     if start == 0 && end == seq.len() {
         return (seq.to_vec(), qual.to_vec(), 0, 0);
@@ -441,6 +552,107 @@ pub fn clip_adapter_cr4(seq: &[u8], qual: &[u8]) -> (Vec<u8>, Vec<u8>, usize, us
         start,
         seq.len() - end,
     )
+}
+
+#[cfg(test)]
+mod cr4_clip_tests {
+    use super::{TSO_SEQ, cr4_polya_clip_len, cr4_tso_clip_len};
+    use crate::io::fastq::encode_base;
+
+    fn enc(s: &[u8]) -> Vec<u8> {
+        s.iter().map(|&b| encode_base(b)).collect()
+    }
+
+    /// A read that is nothing but cDNA must not be clipped: the whole point of
+    /// the score floor is that a weak, incidental match is not an adapter.
+    #[test]
+    fn a_read_without_the_tso_is_not_clipped() {
+        let read = b"TTTTGCACTGCACGTGTCGATCGGCATCGGATCGATCGGCATTTACGCTACGTACGATCGATCGGCATCGATCGATCGTACGGCATCGAT";
+        assert_eq!(cr4_tso_clip_len(&enc(read)), 0);
+    }
+
+    /// The full TSO at the very start is clipped exactly, and nothing more.
+    #[test]
+    fn a_full_tso_prefix_is_clipped_to_its_length() {
+        let mut read = TSO_SEQ.to_vec();
+        read.extend_from_slice(b"GCACTGCACGTGTCGATCGGCATCGGATCGATCGGCATTTACGCTACGTACGATCGATCGG");
+        assert_eq!(cr4_tso_clip_len(&enc(&read)), TSO_SEQ.len());
+    }
+
+    /// A short TSO overlap scores below STAR's floor of 20, so it stays.
+    /// This is the case a fixed-prefix comparison and STAR's rule agree on,
+    /// and it is why the fix does not simply clip more.
+    #[test]
+    fn a_five_base_tso_overlap_is_below_the_score_floor() {
+        let mut read = TSO_SEQ[TSO_SEQ.len() - 5..].to_vec();
+        read.extend_from_slice(
+            b"GCACTGCACGTGTCGATCGGCATCGGATCGATCGGCATTTACGCTACGTACGATCGATCGGCATCGAT",
+        );
+        assert_eq!(cr4_tso_clip_len(&enc(&read)), 0);
+    }
+
+    /// A TSO carrying mismatches is still found, and the clip covers it: the
+    /// score is 30 - 3*3 = 21 with L == 30, which STAR keeps.
+    #[test]
+    fn a_tso_with_three_mismatches_is_still_clipped() {
+        let mut tso = TSO_SEQ.to_vec();
+        for i in [3usize, 11, 19] {
+            tso[i] = if tso[i] == b'A' { b'C' } else { b'A' };
+        }
+        let mut read = tso;
+        read.extend_from_slice(b"GCACTGCACGTGTCGATCGGCATCGGATCGATCGGCATTTACGCTACGTACGATCGATCGG");
+        assert_eq!(cr4_tso_clip_len(&enc(&read)), TSO_SEQ.len());
+    }
+
+    /// The clip is an overlap alignment, so a TSO that begins a few bases into
+    /// the read is clipped up to its end, not missed. A prefix comparison
+    /// anchored at position 0 cannot see this at all.
+    #[test]
+    fn a_tso_starting_inside_the_read_is_clipped_through_its_end() {
+        let mut read = b"GATC".to_vec();
+        read.extend_from_slice(TSO_SEQ);
+        read.extend_from_slice(b"GCACTGCACGTGTCGATCGGCATCGGATCGATCGGCATTTACGCTACGTACGATCG");
+        assert_eq!(cr4_tso_clip_len(&enc(&read)), 4 + TSO_SEQ.len());
+    }
+
+    /// Poly-A: a clean tail is trimmed, and only the tail. The cDNA before it
+    /// deliberately ends in non-`A` bases, because STAR's scan keeps walking
+    /// past the tail and will absorb an `A` a base or two upstream.
+    #[test]
+    fn a_clean_polya_tail_is_trimmed() {
+        let mut read = b"GCTCTGCTCGTGTCGCTCGGCTTCGGCTCGCTCGGCTTTTCGCTCCGTTCG".to_vec();
+        let tail = 30;
+        read.extend(std::iter::repeat_n(b'A', tail));
+        assert_eq!(cr4_polya_clip_len(&enc(&read)), tail);
+    }
+
+    /// A tail with one sequencing error keeps its full length: STAR's scan
+    /// pays -2 for the mismatch and carries on, where a "trailing run of A"
+    /// rule would stop at the error and keep half the tail in the alignment.
+    #[test]
+    fn a_polya_tail_with_one_error_is_still_trimmed_whole() {
+        let mut read = b"GCTCTGCTCGTGTCGCTCGGCTTCGGCTCGCTCGGCTTTTCGCTCCGTTCG".to_vec();
+        let mut tail = vec![b'A'; 30];
+        tail[10] = b'G';
+        read.extend_from_slice(&tail);
+        assert_eq!(cr4_polya_clip_len(&enc(&read)), 30);
+    }
+
+    /// A short run of A is ordinary sequence, not a tail: the final score has
+    /// to reach 20.
+    #[test]
+    fn a_short_a_run_is_not_a_tail() {
+        let mut read = b"GCTCTGCTCGTGTCGCTCGGCTTCGGCTCGCTCGGCTTTTCGCTCCGTTCG".to_vec();
+        read.extend_from_slice(b"AAAAAAAA");
+        assert_eq!(cr4_polya_clip_len(&enc(&read)), 0);
+    }
+
+    /// Reads under 20 bases are never trimmed (`ClipCR4::polyTail3p`).
+    #[test]
+    fn a_very_short_read_is_never_trimmed() {
+        let read = vec![b'A'; 19];
+        assert_eq!(cr4_polya_clip_len(&enc(&read)), 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
