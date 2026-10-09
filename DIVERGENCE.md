@@ -143,11 +143,13 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
 
-### 4.1 Transcriptome tables built on the fly
+### 4.1 Transcriptome tables built on the fly (GTF given at mapping time)
 
-For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exon map directly from the input GTF at run time, instead of loading STAR's persisted `transcriptInfo.tab` / `exonInfo.tab` files. The projection logic mirrors STAR's `Transcriptome_quantAlign.cpp`; the output (`Aligned.toTranscriptome.out.bam`) is intended to be equivalent.
+Like STAR, rustar-aligner loads the gene and transcript model for `--quantMode TranscriptomeSAM` / `GeneCounts` and STARsolo `Gene` / `GeneFull` / `Velocyto` / SmartSeq (and the `GX`/`GN` tags) from the annotation tables in `--genomeDir` (`transcriptInfo.tab`, `exonInfo.tab`, `geneInfo.tab`) when no `--sjdbGTFfile` is given at mapping time, and exits with STAR's "could not open ... geneInfo.tab" error when neither a GTF nor the tables exist.
 
-**Source.** `src/quant/transcriptome.rs`.
+When `--sjdbGTFfile` is given at mapping time, STAR always uses it: it re-inserts the annotated junctions on the fly, writes new tables to `_STARgenome/` and reads them from there. rustar-aligner builds the gene model for GeneCounts and solo directly from that GTF in memory (no `_STARgenome/` tables are written). For `--quantMode TranscriptomeSAM` it still reads the index tables when the index has them, and only parses the GTF if the index has none (legacy indexes); a GTF that differs from the one used at `genomeGenerate` is therefore not honoured for TranscriptomeSAM. The projection logic mirrors STAR's `Transcriptome_quantAlign.cpp`; the output (`Aligned.toTranscriptome.out.bam`) is intended to be equivalent.
+
+**Source.** `src/quant/transcriptome.rs`, `src/quant/mod.rs` (`resolve_gene_annotation`).
 
 ### 4.2 In-tree RNG generator
 
