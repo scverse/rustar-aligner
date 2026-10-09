@@ -323,20 +323,13 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     params.redefine_window_params(index.genome.n_genome);
 
     // Build gene-count context if --quantMode GeneCounts was requested.
-    // GTF requirement is already validated in params.validate().
+    // Gene model: --sjdbGTFfile if given, else the index's annotation tables.
     let quant_ctx: Option<std::sync::Arc<crate::quant::QuantContext>> =
         if params.quant_gene_counts() {
-            let gtf_path = params.sjdb_gtf_file.as_ref().unwrap();
-            info!(
-                "quantMode GeneCounts: building gene annotation from {}",
-                gtf_path.display()
-            );
             let ctx = crate::quant::QuantContext::build(
-                gtf_path,
+                &params,
                 &index.genome,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-                &params.sjdb_gtf_tag_exon_parent_gene,
+                index.transcriptome.as_ref(),
             )?;
             Some(std::sync::Arc::new(ctx))
         } else {
@@ -391,6 +384,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
         Some(std::sync::Arc::new(crate::solo::SoloContext::build(
             &params,
             &index.genome,
+            index.transcriptome.as_ref(),
         )?))
     } else {
         None
@@ -517,24 +511,9 @@ fn run_smartseq(
         manifest.display()
     );
 
-    let gtf = params.sjdb_gtf_file.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("--soloType SmartSeq Gene counting requires --sjdbGTFfile")
-    })?;
-    let exons = crate::junction::gtf::parse_gtf_configured(
-        gtf,
-        &params.sjdb_gtf_feature_exon,
-        &params.sjdb_gtf_chr_prefix,
-    )?;
-    let gene_ann = crate::quant::GeneAnnotation::from_gtf_exons_configured(
-        &exons,
-        &index.genome,
-        &params.sjdb_gtf_tag_exon_parent_gene,
-    );
-    info!(
-        "STARsolo SmartSeq: {} genes from {}",
-        gene_ann.n_genes(),
-        gtf.display()
-    );
+    let gene_ann =
+        crate::quant::resolve_gene_annotation(params, &index.genome, index.transcriptome.as_ref())?;
+    info!("STARsolo SmartSeq: {} genes", gene_ann.n_genes());
     let strand: SoloStrand = params.solo_strand.parse().unwrap_or_default();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
 

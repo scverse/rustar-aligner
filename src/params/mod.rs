@@ -1771,13 +1771,9 @@ impl Parameters {
             ));
         }
 
-        // quantMode GeneCounts requires a GTF file
-        if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
-            return Err(command.error(
-                ErrorKind::MissingRequiredArgument,
-                "--quantMode GeneCounts requires --sjdbGTFfile",
-            ));
-        }
+        // quantMode GeneCounts needs a gene model: --sjdbGTFfile here, or the
+        // annotation tables of a GTF-built index (checked when the index is
+        // loaded, as STAR's Transcriptome constructor does).
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
@@ -2036,18 +2032,8 @@ impl Parameters {
                     ));
                 }
             }
-            // Gene-level features need a gene model (SJ does not — junctions come
-            // from the alignments).
-            let needs_gtf = params
-                .solo_features
-                .iter()
-                .any(|f| f == "Gene" || f == "GeneFull" || f == "Velocyto");
-            if needs_gtf && params.sjdb_gtf_file.is_none() {
-                return Err(command.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
-                ));
-            }
+            // Gene-level features need a gene model (SJ does not), from
+            // --sjdbGTFfile or the index tables; checked when the index is loaded.
             // CB length / UMI length sanity.
             if params.solo_type == SoloType::CbUmiSimple
                 && (params.solo_cb_len == 0 || params.solo_umi_len == 0)
