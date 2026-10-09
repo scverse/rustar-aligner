@@ -49,6 +49,20 @@ impl Seed {
         params: &Parameters,
         debug_name: &str,
     ) -> Result<Vec<Seed>, Error> {
+        Self::find_seeds_at(read_seq, 0, index, min_seed_length, params, debug_name)
+    }
+
+    /// [`Seed::find_seeds`] for a fragment that starts `frag_offset` bases into STAR's
+    /// combined read (the second mate of a pair), where STAR's full-length test of the
+    /// forward search (`Shift+L == splitR[1][ip]`) uses coordinates of the combined read.
+    pub fn find_seeds_at(
+        read_seq: &[u8],
+        frag_offset: usize,
+        index: &GenomeIndex,
+        min_seed_length: usize,
+        params: &Parameters,
+        debug_name: &str,
+    ) -> Result<Vec<Seed>, Error> {
         let mut seeds = Vec::new();
         let read_len = read_seq.len();
 
@@ -68,6 +82,7 @@ impl Seed {
             return Ok(seeds);
         }
 
+        let mut full_length_forward: Vec<bool> = Vec::new();
         // Search L→R (forward direction on read): sparse chain search
         search_direction_sparse(
             read_seq,
@@ -79,6 +94,8 @@ impl Seed {
             false,
             debug_name,
             &mut seeds,
+            &mut full_length_forward,
+            frag_offset,
         );
 
         // Cap check between directions (STAR: seedPerReadNmax applies across both)
@@ -106,6 +123,8 @@ impl Seed {
             true,
             debug_name,
             &mut seeds,
+            &mut full_length_forward,
+            frag_offset,
         );
 
         // STAR's storeAligns keeps the seed array `PC[]` sorted by rStart, with
@@ -172,7 +191,14 @@ impl Seed {
 
         // Find seeds from mate2 (tag with mate_id = 1)
         // IMPORTANT: read_pos is relative to mate2 start (will be adjusted during stitching)
-        let mut seeds2 = Self::find_seeds(mate2_seq, index, min_seed_length, params, "")?;
+        let mut seeds2 = Self::find_seeds_at(
+            mate2_seq,
+            mate1_seq.len() + 1,
+            index,
+            min_seed_length,
+            params,
+            "",
+        )?;
         for seed in &mut seeds2 {
             seed.mate_id = 1;
         }
@@ -301,6 +327,8 @@ fn search_direction_sparse(
     is_rc: bool,
     debug_name: &str,
     seeds: &mut Vec<Seed>,
+    full_length_forward: &mut Vec<bool>,
+    frag_offset: usize,
 ) {
     let read_len = read_seq.len();
 
@@ -319,7 +347,17 @@ fn search_direction_sparse(
     // STAR's `for (uint ip=0; ip<Nsplit; ip++)` (`:43`). A read with no `N` has
     // exactly one piece spanning it, so this reduces to the previous whole-read
     // search.
-    for &(piece_start, piece_len) in pieces {
+    for (piece_idx, &(piece_start, piece_len)) in pieces.iter().enumerate() {
+        // STAR's `flagDirMap`: when the forward chain of a piece maps it in one go
+        // (`Shift+L == splitR[1][ip]`, tested on the first chain of the first start), the
+        // first start of the reverse direction is not searched again. With a sparse suffix
+        // array the reverse search would otherwise add shifted seeds STAR never stores.
+        // The reverse pass walks the pieces last to first, so look the flag up from the end.
+        let skip_first_reverse = is_rc
+            && full_length_forward
+                .get(full_length_forward.len().wrapping_sub(1 + piece_idx))
+                .copied()
+                .unwrap_or(false);
         // STAR (line 47): Nstart = seedSearchStartLmax>0 && seedSearchStartLmax<splitR[1][ip]
         //                          ? splitR[1][ip]/seedSearchStartLmax + 1 : 1
         // Measured against the *piece* length, not the read's.
@@ -337,7 +375,13 @@ fn search_direction_sparse(
         let piece_end = piece_start + piece_len;
         let piece_seq = &read_seq[..piece_end];
 
+        if !is_rc {
+            full_length_forward.push(false);
+        }
         for istart in 0..nstart {
+            if is_rc && istart == 0 && skip_first_reverse {
+                continue;
+            }
             let start_pos = piece_start + (istart * lstart).min(piece_len);
             let mut pos = start_pos;
 
@@ -408,6 +452,14 @@ fn search_direction_sparse(
                     }
                 }
 
+                if !is_rc
+                    && istart == 0
+                    && pos == start_pos
+                    && frag_offset + piece_start + result.advance == piece_len
+                    && let Some(last) = full_length_forward.last_mut()
+                {
+                    *last = true;
+                }
                 pos += result.advance; // Always advance by MMP length (matches STAR)
                 // Remaining-length check at loop top: stop when < seedMapMin bases remain
             }
@@ -1263,6 +1315,8 @@ mod tests {
             true,
             "",
             &mut rc_seeds,
+            &mut Vec::new(),
+            0,
         );
 
         assert!(
@@ -1283,6 +1337,78 @@ mod tests {
                 read.len()
             );
         }
+    }
+
+    #[test]
+    fn full_length_forward_chain_skips_first_reverse_start() {
+        // STAR's flagDirMap: a piece the forward search maps in one go is not searched
+        // again from its right end (the first start of the reverse direction).
+        let index = make_test_index("AACCTTGG");
+        let read = encode_sequence("AACCTTGG");
+        let params = params(&[]);
+        let pieces = quality_split(&read, 4);
+
+        let mut fwd = Vec::new();
+        let mut full_length = Vec::new();
+        search_direction_sparse(
+            &read,
+            read.len(),
+            &pieces,
+            &index,
+            4,
+            &params,
+            false,
+            "",
+            &mut fwd,
+            &mut full_length,
+            0,
+        );
+        assert_eq!(
+            full_length,
+            vec![true],
+            "forward chain maps the piece whole"
+        );
+
+        let rc_read = reverse_complement_read(&read);
+        let rc_pieces: Vec<(usize, usize)> = pieces
+            .iter()
+            .rev()
+            .map(|&(start, len)| (read.len() - start - len, len))
+            .collect();
+        let mut rc_skipped = Vec::new();
+        search_direction_sparse(
+            &rc_read,
+            read.len(),
+            &rc_pieces,
+            &index,
+            4,
+            &params,
+            true,
+            "",
+            &mut rc_skipped,
+            &mut full_length.clone(),
+            0,
+        );
+        assert!(rc_skipped.is_empty(), "first reverse start is skipped");
+
+        let mut rc_searched = Vec::new();
+        search_direction_sparse(
+            &rc_read,
+            read.len(),
+            &rc_pieces,
+            &index,
+            4,
+            &params,
+            true,
+            "",
+            &mut rc_searched,
+            &mut vec![false],
+            0,
+        );
+        assert!(
+            !rc_searched.is_empty(),
+            "without the flag the reverse start searches"
+        );
     }
 
     #[test]
@@ -1468,6 +1594,8 @@ mod tests {
             false,
             "",
             &mut seeds,
+            &mut Vec::new(),
+            0,
         );
         assert!(seeds.iter().any(|s| s.read_pos == 0 && s.length == 25));
         assert!(

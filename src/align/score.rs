@@ -5,6 +5,9 @@ use crate::params::Parameters;
 /// Alignment scorer with user-defined penalties
 #[derive(Debug, Clone)]
 pub struct AlignmentScorer {
+    /// `--soloOutLayout CellRanger`: reproduce STAR 2.7.2a, the version CellRanger links, where
+    /// it differs from 2.7.11b.
+    pub star_2_7_2a: bool,
     /// Canonical splice junction penalty (GT-AG)
     pub score_gap: i32,
     /// Non-canonical splice junction penalty
@@ -117,10 +120,15 @@ impl IntronFilter {
     }
 }
 
+/// `find_best_junction_position` result for a stitch STAR rejects (`-1000005`: the flush to the
+/// left would leave no base in the first exon).
+pub const JUNCTION_SCAN_REJECTED: i32 = i32::MIN;
+
 impl AlignmentScorer {
     /// Create a minimal scorer for motif detection only (used in junction recording)
     pub fn from_params_minimal() -> Self {
         Self {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -150,6 +158,7 @@ impl AlignmentScorer {
     /// Create scorer from parameters
     pub fn from_params(params: &Parameters) -> Self {
         Self {
+            star_2_7_2a: params.solo_out_layout == "CellRanger",
             score_gap: params.score_gap,
             score_gap_noncan: params.score_gap_noncan,
             score_gap_gcag: params.score_gap_gcag,
@@ -451,11 +460,18 @@ impl AlignmentScorer {
             let g_up = seq.base((g_up_pos as u64 + genome_offset) as usize);
             let g_dn = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-            if g_up >= 4 || g_dn >= 4 {
-                break;
-            }
-            if read_base == g_up && read_base != g_dn {
-                // Moving left costs: this base matches upstream but not downstream
+            if is_reverse {
+                // The reverse scan runs mirrored in the reverse-complement genome and keeps
+                // its guard: a genome N ends the walk.
+                if g_up >= 4 || g_dn >= 4 {
+                    break;
+                }
+                if read_base == g_up && read_base != g_dn {
+                    // Moving left costs: this base matches upstream but not downstream
+                    score1 -= 1;
+                }
+            } else if read_base != g_dn && g_dn < 4 && read_base == g_up {
+                // STAR: R[rAend+jR1]!=G[gBstart1+jR1] && G[gBstart1+jR1]<4 && R[rAend+jR1]==G[gAend+jR1]
                 score1 -= 1;
             }
 
@@ -498,12 +514,15 @@ impl AlignmentScorer {
                     let gu = seq.base((g_up_pos as u64 + genome_offset) as usize);
                     let gd = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-                    if gu < 4 && gd < 4 {
-                        if read_base == gu && read_base != gd {
-                            score1 += 1;
-                        } else if read_base != gu && read_base == gd {
-                            score1 -= 1;
-                        }
+                    // STAR scores every base here, an N in the genome included (it differs
+                    // from any read base but another N). The mirrored reverse scan keeps its
+                    // guard.
+                    if is_reverse && (gu >= 4 || gd >= 4) {
+                        // no score
+                    } else if read_base == gu && read_base != gd {
+                        score1 += 1;
+                    } else if read_base != gu && read_base == gd {
+                        score1 -= 1;
                     }
                 }
             }
@@ -618,6 +637,11 @@ impl AlignmentScorer {
             }
             // STAR: if (int(EX_L)+jR<1) return -1000005;
             // Clamp: don't let exon A become zero-length (STAR rejects, we clamp)
+            // STAR: `if (int(EX_L)+jR<1) return -1000005;` the whole stitch is rejected.
+            // (Only decided here for the forward scan; the reverse scan space clamps.)
+            if !is_reverse && prev_exon_len as i32 + best_jr < 1 {
+                return (JUNCTION_SCAN_REJECTED, best_motif, best_motif_score, 0, 0);
+            }
             best_jr = best_jr.max(1 - prev_exon_len as i32);
             // Re-check motif at flushed position
             if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
@@ -957,6 +981,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1003,6 +1028,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1048,6 +1074,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1091,6 +1118,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1127,6 +1155,7 @@ mod tests {
     fn test_score_gap_insertion() {
         let genome = make_test_genome(&[0, 1, 2, 3]);
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1161,6 +1190,7 @@ mod tests {
     fn test_score_gap_deletion() {
         let genome = make_test_genome(&[0, 1, 2, 3]);
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1203,6 +1233,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1243,6 +1274,7 @@ mod tests {
     #[test]
     fn test_annotated_junction_bonus() {
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1284,6 +1316,7 @@ mod tests {
         // These appear at minus-strand gene splice sites
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1393,6 +1426,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1474,6 +1508,7 @@ mod tests {
         let genome = make_test_genome(&seq);
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -1527,6 +1562,7 @@ mod tests {
 
     fn make_scorer_for_junction_test() -> AlignmentScorer {
         AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,

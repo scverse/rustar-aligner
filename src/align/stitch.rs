@@ -995,6 +995,14 @@ pub fn cluster_seeds(
                     .min()
                     .unwrap_or(usize::MAX);
 
+                // STAR: a full window holding nothing but anchors (WALrec stays Lread+1)
+                // abandons the read, before the new seed is even looked at
+                // (MARKER_TOO_MANY_ANCHORS_PER_WINDOW).
+                if min_non_anchor_len == usize::MAX {
+                    too_many_anchors = true;
+                    break 'outer;
+                }
+
                 // Update persistent threshold
                 window.wa_lrec = min_non_anchor_len;
 
@@ -1428,6 +1436,9 @@ fn stitch_align_to_transcript(
             )
         };
 
+        if jr_shift == crate::align::score::JUNCTION_SCAN_REJECTED {
+            return None; // STAR -1000005
+        }
         // Clamp shift: jr_shift = STAR's jR. Lower bound: can't consume entire exon A.
         // Upper bound: scan already limited to < shared+eff_length but clamp for safety.
         let prev_match_len = (last_exon.read_end - last_exon.read_start) as i32;
@@ -1568,7 +1579,9 @@ fn stitch_align_to_transcript(
                     };
                     // STAR: rAend+jR >= rBend, i.e. the shift runs past B. In the
                     // reverse scan space the roles of A and B are exchanged.
-                    if shifted >= (shared + eff_length) as i32 || prev_len as i32 + shifted < 1 {
+                    if (!scorer.star_2_7_2a && shifted >= (shared + eff_length) as i32)
+                        || prev_len as i32 + shifted < 1
+                    {
                         return None; // STAR -1000006
                     }
                     jr_exon = shifted;
@@ -3250,7 +3263,10 @@ pub(crate) fn stitch_seeds_core(
     // Sort ascending by read_pos (positive-strand coordinates after conversion).
     // STAR's WA array is sorted by aRstart (positive-strand read position, ascending).
     // With forward genome coords, gaps are computed correctly for both strands.
-    wa_entries.sort_by(|a, b| a.read_pos.cmp(&b.read_pos).then(b.length.cmp(&a.length)));
+    // Ties keep `cluster_seeds`' order, which is STAR's arrival order (`assignAlignToWindow`
+    // puts a seed after those with the same start); that order fixes which transcripts the
+    // recursion finalises first.
+    wa_entries.sort_by_key(|a| a.read_pos);
 
     // Cap entries to prevent exponential blowup in the recursive stitcher.
     // With anchor-only filtering, this limit is rarely hit, but keep as a safety net.
@@ -3782,6 +3798,7 @@ mod tests {
 
         let read_seq = enc(&format!("{e1}{e2}"));
         let scorer = crate::align::score::AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -4073,6 +4090,7 @@ mod tests {
         use crate::align::score::AlignmentScorer;
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,
@@ -4118,6 +4136,7 @@ mod tests {
         use crate::align::score::AlignmentScorer;
 
         let scorer = AlignmentScorer {
+            star_2_7_2a: false,
             score_gap: 0,
             score_gap_noncan: -8,
             score_gap_gcag: -4,

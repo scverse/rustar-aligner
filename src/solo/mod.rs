@@ -714,6 +714,162 @@ pub fn tso_clip_lens_cr4_batch(reads: &[&[u8]]) -> Vec<usize> {
         .collect()
 }
 
+/// Score of the TSO's best overlap alignment with each read's first 91 bases (the same
+/// hyalite scan as [`tso_clip_lens_cr4_batch`], before STAR's gate). It bounds what
+/// [`cr_tso_trim_len`] can reach, so reads below CellRanger's threshold skip the exact
+/// alignment.
+fn tso_overlap_scores_batch(reads: &[&[u8]]) -> Vec<i32> {
+    use rayon::prelude::*;
+
+    reads
+        .par_chunks(CR4_SCAN_CHUNK)
+        .flat_map_iter(|chunk| {
+            let targets: Vec<Vec<u8>> = chunk.iter().map(|r| cr4_target(r)).collect();
+            let db = hyalite::Database::builder()
+                .sequences(&targets)
+                .scoring(cr4_scoring().clone())
+                .mode(hyalite::Mode::Ov)
+                .search_type(hyalite::SearchType::ScoreEnd)
+                .max_query_len(TSO_SEQ.len())
+                .build();
+            let Ok(db) = db else {
+                // Cannot happen for this fixed shape; every read then gets the exact alignment.
+                return vec![i32::MAX; chunk.len()];
+            };
+            let mut scratch = hyalite::Scratch::new(&db);
+            let mut hits = Vec::with_capacity(chunk.len());
+            db.scan_all(&mut scratch, tso_query(), &mut hits);
+            chunk
+                .iter()
+                .zip(&hits)
+                .map(|(read, hit)| if read.is_empty() { 0 } else { hit.score })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// CellRanger's minimum score (`trim_tso_min_score`) for trimming the TSO.
+const CR_TSO_MIN_SCORE: i32 = 20;
+/// Most mismatches and indels per aligned base CellRanger tolerates in an adapter match.
+const CR_ADAPTER_MAX_ERROR_RATE: f64 = 0.1;
+
+/// Length of the 5' template switch oligo `cellranger count` trims from a cDNA read, 0 when
+/// it finds none (`fastq_set::adapter_trimmer`, a 5' `Anywhere` adapter).
+///
+/// The oligo is aligned end to end to the read (match +1, mismatch and each gap base -2).
+/// The read may continue past the oligo's end, and exactly one side may start inside the
+/// other: the read's first bases or the oligo's first bases can be skipped for free. The
+/// best alignment (the earliest end among equals) is the trim when it scores at least 20
+/// and has at most 10% errors per aligned column. Validated against `cellranger count`
+/// on 3.35M reads: it reproduces 3,353,831 of the 3,353,836 trim lengths.
+pub fn cr_tso_trim_len(read: &[u8]) -> usize {
+    let oligo = tso_query();
+    let (rows, cols) = (read.len(), oligo.len());
+    if rows == 0 {
+        return 0;
+    }
+    // Rows: read prefix length; columns: oligo prefix length.
+    let width = cols + 1;
+    let mut best: Option<(i32, usize, usize, usize)> = None; // score, end, errors, columns
+    let mut score_at = vec![0i32; (rows + 1) * width];
+    let mut from_at = vec![0u8; (rows + 1) * width]; // 1 match/mismatch, 2 read base only, 3 oligo base only
+    for mode in 0..3u8 {
+        // mode 1: the read's start is free, mode 2: the oligo's start is free.
+        for i in 0..=rows {
+            for j in 0..=cols {
+                let at = i * width + j;
+                if i == 0 && j == 0 {
+                    score_at[at] = 0;
+                    from_at[at] = 0;
+                } else if i == 0 {
+                    score_at[at] = if mode == 2 { 0 } else { -2 * j as i32 };
+                    from_at[at] = if mode == 2 { 0 } else { 3 };
+                } else if j == 0 {
+                    score_at[at] = if mode == 1 { 0 } else { -2 * i as i32 };
+                    from_at[at] = if mode == 1 { 0 } else { 2 };
+                } else {
+                    let diag =
+                        score_at[at - width - 1] + if read[i - 1] == oligo[j - 1] { 1 } else { -2 };
+                    let mut score = diag;
+                    let mut from = 1;
+                    let up = score_at[at - width] - 2;
+                    if up > score {
+                        score = up;
+                        from = 2;
+                    }
+                    let left = score_at[at - 1] - 2;
+                    if left > score {
+                        score = left;
+                        from = 3;
+                    }
+                    score_at[at] = score;
+                    from_at[at] = from;
+                }
+            }
+        }
+        let (mut end, mut score) = (0, i32::MIN);
+        for i in 0..=rows {
+            if score_at[i * width + cols] > score {
+                score = score_at[i * width + cols];
+                end = i;
+            }
+        }
+        if best.is_none_or(|b| score > b.0) {
+            let (mut i, mut j, mut errors, mut columns) = (end, cols, 0usize, 0usize);
+            while i > 0 || j > 0 {
+                match from_at[i * width + j] {
+                    1 => {
+                        errors += usize::from(read[i - 1] != oligo[j - 1]);
+                        columns += 1;
+                        i -= 1;
+                        j -= 1;
+                    }
+                    2 => {
+                        errors += 1;
+                        columns += 1;
+                        i -= 1;
+                    }
+                    3 => {
+                        errors += 1;
+                        columns += 1;
+                        j -= 1;
+                    }
+                    _ => break,
+                }
+            }
+            best = Some((score, end, errors, columns));
+        }
+    }
+    match best {
+        Some((score, end, errors, columns))
+            if score >= CR_TSO_MIN_SCORE
+                && errors as f64 / columns.min(cols).max(1) as f64 <= CR_ADAPTER_MAX_ERROR_RATE =>
+        {
+            end
+        }
+        _ => 0,
+    }
+}
+
+/// [`cr_tso_trim_len`] for a batch of reads, running the exact alignment only on reads whose
+/// overlap score can reach CellRanger's threshold.
+pub fn cr_tso_trim_lens_batch(reads: &[&[u8]]) -> Vec<usize> {
+    use rayon::prelude::*;
+
+    let bound = tso_overlap_scores_batch(reads);
+    reads
+        .par_iter()
+        .zip(bound.par_iter())
+        .map(|(read, &s)| {
+            if s >= CR_TSO_MIN_SCORE {
+                cr_tso_trim_len(read)
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 /// Number of 3' bases to trim as a CellRanger4 polyA tail — STAR
 /// `ClipCR4::polyTail3p`.
 ///
@@ -806,6 +962,19 @@ pub fn clip_adapter_cr4_with_tso(
         start,
         seq.len() - end,
     )
+}
+
+/// CellRanger's own trimming of a cDNA read (`cr_lib` `Trimmers::align`): the template
+/// switch oligo and the poly-A tail are searched independently on the whole read, each
+/// reports its own trimmed length (the `ts` and `pa` tags, overlapping when the read is
+/// all adapter), and what is aligned is the part both leave. Returns
+/// `(retained range, ts, pa)`.
+pub fn cr_trim_ranges(seq: &[u8], tso_len: usize) -> (std::ops::Range<usize>, usize, usize) {
+    let ts = tso_len.min(seq.len());
+    let pa = poly_tail_3p(seq);
+    let start = ts;
+    let end = (seq.len() - pa).max(start);
+    (start..end, ts, pa)
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +1872,39 @@ impl SoloContext {
 mod tests {
     use super::*;
     use crate::io::fastq::encode_base;
+
+    #[test]
+    fn cr_tso_trim_len_follows_cellranger_scoring() {
+        let enc = |s: &str| s.bytes().map(encode_base).collect::<Vec<u8>>();
+        let tso = "AAGCAGTGGTATCAACGCAGAGTACATGGG";
+        // The oligo at the start of the read, then cDNA.
+        let read = enc(&format!("{tso}CCTTGAGTCCATTGACCTAGGATCCTAGGCTTAGGAC"));
+        assert_eq!(cr_tso_trim_len(&read), 30);
+        // One mismatch inside the oligo still trims it (29 matches - 2 = 27 >= 20).
+        let read = enc("AAGCAGTGGTATCAACGCAGTGTACATGGGCCTTGAGTCCATTGACCTAGGATCC");
+        assert_eq!(cr_tso_trim_len(&read), 30);
+        // Extra bases before the oligo are skipped for free.
+        let read = enc(&format!("GTC{tso}CCTTGAGTCCATTGACCTAGGATCCTAGGCTTAGGAC"));
+        assert_eq!(cr_tso_trim_len(&read), 33);
+        // A read with no oligo is left alone.
+        let read = enc("CCTTGAGTCCATTGACCTAGGATCCTAGGCTTAGGACGGTACCATTGAGGCCTTGAAACTG");
+        assert_eq!(cr_tso_trim_len(&read), 0);
+    }
+
+    #[test]
+    fn cr_trim_ranges_report_each_adapter_on_the_whole_read() {
+        // 10 non-A bases then 30 A: the poly-A tail alone leaves the first 10.
+        let mut seq: Vec<u8> = vec![1, 2, 3, 1, 2, 3, 1, 2, 3, 1];
+        seq.extend(std::iter::repeat_n(0u8, 30));
+        let (keep, ts, pa) = cr_trim_ranges(&seq, 0);
+        assert_eq!((keep, ts, pa), (0..10, 0, 30));
+
+        // A TSO that reaches into the poly-A tail: both lengths are reported in full
+        // and nothing is left to align (CellRanger writes the read unmapped).
+        let (keep, ts, pa) = cr_trim_ranges(&seq, 20);
+        assert!(keep.is_empty());
+        assert_eq!((ts, pa), (20, 30));
+    }
 
     fn encoded_read(name: &str, seq: &str, qual: &str) -> EncodedRead {
         EncodedRead {

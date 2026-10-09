@@ -2305,6 +2305,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     // — a large saving for solo runs that only need the count matrix.
     let emit_sam = params.emits_alignments();
     let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
+    // `--soloOutLayout CellRanger`: one record per read, the transcriptome-aware
+    // primary and MAPQ, unmapped records with the whole read and MAPQ 0.
+    let cr_align = emit_sam && params.solo_out_layout == "CellRanger";
     // STARsolo barcode tags requested for this run (BAM output only, as in STAR).
     let solo_tags = if emit_sam {
         params.solo_sam_tags()
@@ -2425,7 +2428,11 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     let cr4_tso: Vec<usize> = if cr4_clip {
                         let seqs: Vec<&[u8]> =
                             batch.iter().map(|s| s.cdna.sequence.as_slice()).collect();
-                        crate::solo::tso_clip_lens_cr4_batch(&seqs)
+                        if params.solo_out_layout == "CellRanger" {
+                            crate::solo::cr_tso_trim_lens_batch(&seqs)
+                        } else {
+                            crate::solo::tso_clip_lens_cr4_batch(&seqs)
+                        }
                     } else {
                         Vec::new()
                     };
@@ -2448,7 +2455,23 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 };
                             // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
                             // the fixed clip5p/clip3p Nbases trimming.
-                            let (cr_seq, cr_qual, cr4_5p, cr4_3p) = if cr4_clip {
+                            let (cr_seq, cr_qual, cr4_5p, cr4_3p) = if cr4_clip && params.solo_out_layout == "CellRanger" {
+                                // cellranger count: both adapters on the whole read.
+                                let (keep, ts, pa) = crate::solo::cr_trim_ranges(
+                                    &read.sequence,
+                                    cr4_tso[read_idx],
+                                );
+                                if keep.is_empty() {
+                                    (Vec::new(), Vec::new(), ts, pa)
+                                } else {
+                                    (
+                                        read.sequence[keep.clone()].to_vec(),
+                                        read.quality[keep.clone()].to_vec(),
+                                        keep.start,
+                                        read.sequence.len() - keep.end,
+                                    )
+                                }
+                            } else if cr4_clip {
                                 crate::solo::clip_adapter_cr4_with_tso(
                                     &read.sequence,
                                     &read.quality,
@@ -2477,6 +2500,51 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                     &[],
                                     &read.quality,
                                 );
+                                // CellRanger writes a read trimmed away entirely
+                                // (template switch oligo + poly-A) as an unmapped record.
+                                if cr_align && output_unmapped {
+                                    let mut record = SamWriter::build_unmapped_record(
+                                        &out_read_name,
+                                        &read.sequence,
+                                        &read.quality,
+                                        params,
+                                        crate::stats::UnmappedReason::Other,
+                                    )?;
+                                    *record.mapping_quality_mut() =
+                                        noodles::sam::alignment::record::MappingQuality::new(0);
+                                    // STAR never saw the read: CellRanger's record has none of
+                                    // STAR's NH HI AS nM uT.
+                                    for tag in [b"NH", b"HI", b"AS", b"nM", b"uT"] {
+                                        record.data_mut().remove(
+                                            &noodles::sam::alignment::record::data::field::Tag::new(
+                                                tag[0], tag[1],
+                                            ),
+                                        );
+                                    }
+                                    buffer.push(record);
+                                    if solo.want_metrics {
+                                        crate::io::sam::add_cr_annotation_tags(
+                                            &mut buffer.records,
+                                            None,
+                                            cr4_5p,
+                                            cr4_3p,
+                                        );
+                                    }
+                                    if !solo_tags.is_empty() {
+                                        let values = crate::solo::SoloTagStrings::build(
+                                            sread.barcode.as_ref(),
+                                            sread.barcode_read.as_ref(),
+                                            outcome.barcode,
+                                            None,
+                                        );
+                                        crate::io::sam::add_solo_barcode_tags(
+                                            &mut buffer.records,
+                                            &values.as_values(),
+                                            solo_tags,
+                                        );
+                                        buffer.reorder_tags();
+                                    }
+                                }
                                 return Ok(SoloReadProduct {
                                     sam_records: buffer,
                                     per_feature: outcome.per_feature,
@@ -2553,15 +2621,45 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             if emit_sam {
                                 if transcripts.is_empty() {
                                     if output_unmapped {
-                                        let record = SamWriter::build_unmapped_record(
+                                        // CellRanger: the whole read, MAPQ 0.
+                                        let (useq, uqual) = if cr_align {
+                                            (&read.sequence, &read.quality)
+                                        } else {
+                                            (&clipped_seq, &clipped_qual)
+                                        };
+                                        let mut record = SamWriter::build_unmapped_record(
                                             &out_read_name,
-                                            &clipped_seq,
-                                            &clipped_qual,
+                                            useq,
+                                            uqual,
                                             params,
                                             unmapped_reason
                                                 .unwrap_or(crate::stats::UnmappedReason::Other),
                                         )?;
+                                        if cr_align {
+                                            *record.mapping_quality_mut() =
+                                                noodles::sam::alignment::record::MappingQuality::new(0);
+                                            // AS and nM of the best alignment (STAR's trBest).
+                                            let (best_score, best_nmm) =
+                                                crate::align::last_unmapped_best();
+                                            let data = record.data_mut();
+                                            data.insert(
+                                                noodles::sam::alignment::record::data::field::Tag::ALIGNMENT_SCORE,
+                                                noodles::sam::alignment::record_buf::data::field::Value::from(best_score),
+                                            );
+                                            data.insert(
+                                                noodles::sam::alignment::record::data::field::Tag::new(b'n', b'M'),
+                                                noodles::sam::alignment::record_buf::data::field::Value::from(best_nmm as i32),
+                                            );
+                                        }
                                         buffer.push(record);
+                                        if cr_align && solo.want_metrics {
+                                            crate::io::sam::add_cr_annotation_tags(
+                                                &mut buffer.records,
+                                                None,
+                                                cr4_5p,
+                                                cr4_3p,
+                                            );
+                                        }
                                     }
                                 } else if transcripts.len() <= max_multimaps {
                                     // Soft-clip ALL trimmed bases (CR4 TSO/polyA + fixed
@@ -2578,6 +2676,25 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                         params,
                                         n_for_mapq,
                                     )?;
+                                    // CellRanger keeps one record per read: the
+                                    // transcriptomic alignment when the read has just one
+                                    // gene to go to (MAPQ 255), else STAR's primary.
+                                    if cr_align {
+                                        let rescued = index
+                                            .transcriptome
+                                            .as_ref()
+                                            .and_then(|tx| {
+                                                crate::align::cr_primary::rescued_primary(
+                                                    &transcripts,
+                                                    tx,
+                                                )
+                                            });
+                                        crate::align::cr_primary::keep_primary_only(
+                                            &mut records,
+                                            &transcripts,
+                                            rescued,
+                                        );
+                                    }
                                     // CellRanger's region and clip tags; the BAM writer
                                     // puts them in cellranger's order.
                                     if solo.want_metrics {

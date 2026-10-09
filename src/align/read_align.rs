@@ -266,6 +266,19 @@ pub fn align_read(
     align_read_inner(read_seq, read_name, index, params, true)
 }
 
+thread_local! {
+    /// Score and mismatches of the best alignment of the last read `align_read` left
+    /// unmapped, which STAR's unmapped record carries as `AS` and `nM`
+    /// (`ReadAlign_outputTranscriptSAM.cpp`, `trBest`). `(0, 0)` when no window aligned.
+    static LAST_UNMAPPED_BEST: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `AS` and `nM` for the unmapped record of the read `align_read` just processed on this
+/// thread.
+pub fn last_unmapped_best() -> (i32, u32) {
+    LAST_UNMAPPED_BEST.with(std::cell::Cell::get)
+}
+
 /// `align_read` with or without STAR's `mappedFilter`. The `--peOverlapNbasesMin`
 /// merged read is mapped without it: STAR runs only `mapOneRead` on it
 /// (`ReadAlign_peOverlapMergeMap.cpp`) and filters once the alignments are back
@@ -278,6 +291,7 @@ fn align_read_inner(
     mapped_filter: bool,
 ) -> Result<AlignReadResult, Error> {
     let debug_read = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
+    LAST_UNMAPPED_BEST.with(|c| c.set((0, 0)));
 
     // Step 1: Find seeds (seedMapMin from params)
     let min_seed_length = params.seed_map_min;
@@ -498,6 +512,23 @@ fn align_read_inner(
             .then_with(|| a.is_reverse.cmp(&b.is_reverse))
     });
 
+    // `--soloOutLayout CellRanger` runs STAR 2.7.2a with its default multimapper order:
+    // the primary is `trBest`, the first best-scoring window alignment with the
+    // shortest genomic span (`ReadAlign_stitchPieces.cpp`), which is what
+    // `cellranger count` reports for a multimapper with equal-scoring loci.
+    if params.solo_out_layout == "CellRanger"
+        && let Some(best) = (0..transcripts.len()).min_by_key(|&i| {
+            let t = &transcripts[i];
+            (
+                std::cmp::Reverse(t.score),
+                t.genome_end - t.genome_start,
+                t.star_order,
+            )
+        })
+    {
+        transcripts[..=best].rotate_right(1);
+    }
+
     // Primary selection — STAR's multMapSelect (ReadAlign_multMapSelect.cpp).
     //
     // STAR's DEFAULT (`--outMultimapperOrder Old_2.4`) does NOT consult the RNG
@@ -617,11 +648,13 @@ fn align_read_inner(
     } else if let Some(reason) = unmapped_by_filter {
         // Only too-many-loci carries a loci count to the stats; a read that
         // failed the quality gates is not counted as mapped anywhere.
+        LAST_UNMAPPED_BEST.with(|c| c.set((transcripts[0].score, transcripts[0].n_mismatch)));
         transcripts.clear();
         n_for_mapq = 0;
         Some(reason)
     } else if mapped_filter && transcripts.len() > params.out_filter_multimap_nmax as usize {
         // `n_for_mapq` already holds the loci count; drop the alignments.
+        LAST_UNMAPPED_BEST.with(|c| c.set((transcripts[0].score, transcripts[0].n_mismatch)));
         transcripts.clear();
         Some(UnmappedReason::TooManyLoci)
     } else {
@@ -708,8 +741,9 @@ pub fn align_paired_read(
         params,
         debug_name,
     )?;
-    let mut m2_seeds = Seed::find_seeds(
+    let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
+        len1 + 1,
         index,
         params.seed_map_min,
         params,
