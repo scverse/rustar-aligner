@@ -6,6 +6,7 @@ use crate::genome::Genome;
 use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::record::MappingQuality;
+use noodles::sam::alignment::record::data::field::Tag;
 use noodles::sam::alignment::record_buf::data::field::Value;
 use noodles::sam::alignment::record_buf::{QualityScores, RecordBuf, Sequence};
 use std::fs::File;
@@ -193,10 +194,13 @@ impl ChimericJunctionWriter {
 /// Returns `[donor_record, acceptor_record]`:
 /// - Donor: normal FLAGS; full read sequence; SA tag pointing to acceptor.
 /// - Acceptor: FLAG 0x0800 (supplementary); empty SEQ/QUAL; SA tag pointing to donor.
+///
+/// `ch_tag` adds `ch:A:1` to both (`--outSAMattributes` has `ch`).
 pub fn build_within_bam_records(
     alignment: &ChimericAlignment,
     genome: &Genome,
     mapq: u8,
+    ch_tag: bool,
 ) -> Result<Vec<RecordBuf>, Error> {
     let donor = &alignment.donor;
     let acceptor = &alignment.acceptor;
@@ -243,7 +247,16 @@ pub fn build_within_bam_records(
         &donor_sa,
     )?;
 
-    Ok(vec![donor_record, acceptor_record])
+    let mut records = vec![donor_record, acceptor_record];
+    if ch_tag {
+        // `ch:A:1` marks every chimeric record (ReadAlign_alignBAM.cpp, ATTR_ch,
+        // alignType<=-10); it is only valid in BAM output.
+        for r in &mut records {
+            r.data_mut()
+                .insert(Tag::new(b'c', b'h'), Value::Character(b'1'));
+        }
+    }
+    Ok(records)
 }
 
 /// Format one SA tag entry: `chr,pos,strand,CIGAR,mapQ,NM;`
@@ -277,7 +290,6 @@ fn build_segment_record(
     sa_tag: &str,
 ) -> Result<RecordBuf, Error> {
     use crate::io::fastq::{complement_base, decode_base};
-    use noodles::sam::alignment::record::data::field::Tag;
 
     let mut record = RecordBuf::default();
     record.name_mut().replace(read_name.into());
@@ -844,7 +856,7 @@ mod tests {
             "READ_001".to_string(),
         );
         let genome = make_genome_2chr();
-        let records = build_within_bam_records(&alignment, &genome, 255).unwrap();
+        let records = build_within_bam_records(&alignment, &genome, 255, false).unwrap();
 
         assert_eq!(records.len(), 2);
     }
@@ -908,7 +920,7 @@ mod tests {
             "READ_001".to_string(),
         );
         let genome = make_genome_2chr();
-        let records = build_within_bam_records(&alignment, &genome, 255).unwrap();
+        let records = build_within_bam_records(&alignment, &genome, 255, false).unwrap();
 
         let donor_flags = records[0].flags();
         let acceptor_flags = records[1].flags();
@@ -926,7 +938,6 @@ mod tests {
     #[test]
     fn test_within_bam_sa_tag_format() {
         use cigar::op::{Kind, Op};
-        use noodles::sam::alignment::record::data::field::Tag;
         let donor = ChimericSegment {
             chr_idx: 0,
             genome_start: 100,
@@ -983,7 +994,7 @@ mod tests {
             "READ_001".to_string(),
         );
         let genome = make_genome_2chr();
-        let records = build_within_bam_records(&alignment, &genome, 255).unwrap();
+        let records = build_within_bam_records(&alignment, &genome, 255, false).unwrap();
 
         // Donor record's SA tag should point to acceptor
         let sa_tag = Tag::new(b'S', b'A');
@@ -1057,7 +1068,8 @@ mod tests {
             vec![0u8; 120],
             "READ_BARE".to_string(),
         );
-        let records = build_within_bam_records(&alignment, &make_genome_2chr(), 255).unwrap();
+        let records =
+            build_within_bam_records(&alignment, &make_genome_2chr(), 255, false).unwrap();
 
         for rec in &records {
             let q: usize = rec
@@ -1131,7 +1143,7 @@ mod tests {
         let alignment =
             ChimericAlignment::new(donor, acceptor, 0, 0, 0, read_seq, "READ_001".to_string());
         let genome = make_genome_2chr();
-        let records = build_within_bam_records(&alignment, &genome, 255).unwrap();
+        let records = build_within_bam_records(&alignment, &genome, 255, false).unwrap();
 
         // The representative record carries the whole read against a CIGAR that
         // spans it.

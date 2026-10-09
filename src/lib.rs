@@ -1672,7 +1672,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         if params.chim_out_within_bam() {
                             use crate::chimeric::build_within_bam_records;
                             for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                                let supp = build_within_bam_records(
+                                    chim_aln,
+                                    &index.genome,
+                                    255,
+                                    params
+                                        .out_sam_attributes
+                                        .contains(crate::params::SamAttributes::CH),
+                                )?;
                                 writer.write_batch(&supp)?;
                             }
                         }
@@ -1739,8 +1746,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             if params.chim_out_within_bam() {
                                 use crate::chimeric::build_within_bam_records;
                                 for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
+                                    let supp = build_within_bam_records(
+                                        chim_aln,
+                                        &index.genome,
+                                        255,
+                                        params
+                                            .out_sam_attributes
+                                            .contains(crate::params::SamAttributes::CH),
+                                    )?;
                                     writer.write_batch(&supp)?;
                                 }
                             }
@@ -3013,7 +3026,14 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         if params.chim_out_within_bam() {
                             use crate::chimeric::build_within_bam_records;
                             for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
+                                let supp = build_within_bam_records(
+                                    chim_aln,
+                                    &index.genome,
+                                    255,
+                                    params
+                                        .out_sam_attributes
+                                        .contains(crate::params::SamAttributes::CH),
+                                )?;
                                 writer.write_batch(&supp)?;
                             }
                         }
@@ -3083,8 +3103,14 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             if params.chim_out_within_bam() {
                                 use crate::chimeric::build_within_bam_records;
                                 for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
+                                    let supp = build_within_bam_records(
+                                        chim_aln,
+                                        &index.genome,
+                                        255,
+                                        params
+                                            .out_sam_attributes
+                                            .contains(crate::params::SamAttributes::CH),
+                                    )?;
                                     writer.write_batch(&supp)?;
                                 }
                             }
