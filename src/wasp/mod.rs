@@ -608,6 +608,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         }
     }
 

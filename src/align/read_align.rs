@@ -121,6 +121,11 @@ pub struct PairedAlignment {
     /// Combined pair score: sum of per-mate finalized scores (each includes genomic length penalty).
     /// Used for multi-mapper score-range ranking and mappedFilter quality check.
     pub combined_wt_score: i32,
+    /// Position of this pair in STAR's alignment order (`trMult`: window
+    /// creation order, then the order inside the window). The genomic output
+    /// sorts pairs by score and position; the transcriptome output follows
+    /// this rank, as STAR's does. Set once the pair list is final.
+    pub star_order: u32,
 }
 
 impl PairedAlignment {
@@ -164,6 +169,7 @@ impl PairedAlignment {
             n_junction: m1.n_junction + m2.n_junction,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 }
@@ -476,6 +482,10 @@ fn align_read_inner(
                 t.cigar_string(),
             ))
         });
+    }
+
+    for (rank, t) in transcripts.iter_mut().enumerate() {
+        t.star_order = rank as u32;
     }
 
     // Deterministic primary tie-break (score, then a fixed positional order).
@@ -1034,6 +1044,7 @@ pub fn align_paired_read(
                     is_proper_pair,
                     insert_size,
                     combined_wt_score,
+                    star_order: 0,
                 });
             }
             if !converted.is_empty() {
@@ -1142,6 +1153,10 @@ pub fn align_paired_read(
             .unwrap_or(0);
         let score_threshold = best_score - params.out_filter_multimap_score_range;
         joint_pairs.retain(|pa| pa.combined_wt_score >= score_threshold);
+    }
+
+    for (rank, pair) in joint_pairs.iter_mut().enumerate() {
+        pair.star_order = rank as u32;
     }
 
     // Deterministic primary tie-break (combined score, then a fixed positional
@@ -1353,6 +1368,7 @@ fn try_pair_transcripts(
         is_proper_pair,
         insert_size,
         combined_wt_score,
+        star_order: 0,
     })
 }
 
@@ -1650,6 +1666,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
         let pair = PairedAlignment {
             mate1_transcript: make_tr(1000, 1100, 0, 100),
@@ -1659,6 +1676,7 @@ mod tests {
             is_proper_pair: true,
             insert_size: 400,
             combined_wt_score: 200,
+            star_order: 0,
         };
         let combined = pair.combined_transcript_for_projection();
         assert_eq!(combined.exons.len(), 2);
@@ -1721,6 +1739,7 @@ mod tests {
             is_proper_pair: true,
             insert_size: 275,
             combined_wt_score: score,
+            star_order: 0,
         };
         // pairs[0] is from an earlier window: never compared.
         let mut pairs = vec![pair(66, 100), pair(75, 141), pair(66, 140), pair(66, 141)];
@@ -1755,6 +1774,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 
@@ -1908,6 +1928,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1929,6 +1950,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 300bp, within default limit (auto mode = unlimited)
@@ -1962,6 +1984,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1983,6 +2006,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 400bp, exceeds limit of 100bp
@@ -2014,6 +2038,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -2035,6 +2060,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2067,6 +2093,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Create a transcript with consistent strand motifs (all + strand)
@@ -2089,6 +2116,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::GcAg], // both + strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Note: STAR's RemoveInconsistentStrands filters transcripts where
@@ -2167,6 +2195,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -2188,6 +2217,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2228,6 +2258,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Case 1: NonCanonical + unannotated → should be filtered
@@ -2313,6 +2344,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Test BothMapped variant
@@ -2324,6 +2356,7 @@ mod tests {
             is_proper_pair: true,
             insert_size: 200,
             combined_wt_score: 0,
+            star_order: 0,
         }));
         assert!(matches!(both, PairedAlignmentResult::BothMapped(_)));
 
@@ -2417,6 +2450,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         }
     }
 

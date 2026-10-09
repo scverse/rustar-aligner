@@ -364,6 +364,7 @@ pub fn convert_merged_transcript_to_pe(
             n_junction,
             junction_motifs: out_junctions[i].iter().map(|(m, _)| *m).collect(),
             junction_annotated: out_junctions[i].iter().map(|(_, a)| *a).collect(),
+            star_order: 0,
         });
     }
 
@@ -478,6 +479,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let scorer = AlignmentScorer::from_params_minimal();
@@ -550,6 +552,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let scorer = AlignmentScorer::from_params_minimal();
