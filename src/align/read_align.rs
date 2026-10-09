@@ -1315,15 +1315,13 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Genomic span check: use alignMatesGapMax if set, else fall back to win_bin_window_dist
-    // (STAR's effective limit when alignMatesGapMax=0 is the window distance ~589kb)
+    // Genomic span check, only when alignMatesGapMax is set. With the default 0 STAR
+    // has no span limit beyond the window itself (stitchAlignToTranscript tests
+    // alignMatesGapMax only when it is > 0), so a pair whose span exceeds
+    // winBinNbits*winAnchorDistNbins (~589 kb) is still valid if both mates sit in
+    // one window.
     let span = right.genome_end - left.genome_start;
-    let max_span = if params.align_mates_gap_max > 0 {
-        params.align_mates_gap_max as u64
-    } else {
-        params.win_bin_window_dist()
-    };
-    if span > max_span {
+    if params.align_mates_gap_max > 0 && span > params.align_mates_gap_max as u64 {
         return None;
     }
 

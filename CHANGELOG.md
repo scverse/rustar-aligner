@@ -11,6 +11,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- Window formation and per-window dedup follow STAR (long splices with the default
+  `alignIntronMax 0`): a pair spanning more than `winBinNbits*winAnchorDistNbins`
+  is no longer rejected, window flanks stop at the chromosome boundary, the window
+  merge scan stops at the first window it meets, and transcripts are deduplicated
+  and ordered as in `stitchWindowAligns`, after STAR's overhang and mate-placement
+  checks.
+
 ### Other changes
 
 - noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
