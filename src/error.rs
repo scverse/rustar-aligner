@@ -26,6 +26,49 @@ pub enum Error {
 
     #[error("chimeric detection error: {0}")]
     Chimeric(String),
+
+    #[error("read input error: {0}")]
+    ReadInput(String),
+
+    #[error("failed to open CBQ input {path}: {source}")]
+    CbqOpen {
+        path: PathBuf,
+        #[source]
+        source: binseq::Error,
+    },
+
+    #[error("failed to decode CBQ input {path} records {start}..{end}: {source}")]
+    CbqDecode {
+        path: PathBuf,
+        start: usize,
+        end: usize,
+        #[source]
+        source: binseq::Error,
+    },
+
+    #[error("invalid CBQ record {record_index}{mate_context} in {path}: {message}")]
+    CbqRecord {
+        path: PathBuf,
+        record_index: usize,
+        mate_context: String,
+        message: String,
+    },
+
+    #[error(
+        "CBQ ordering error in {path}: expected record {expected_index}, observed {observed_index}"
+    )]
+    CbqOrdering {
+        path: PathBuf,
+        expected_index: usize,
+        observed_index: usize,
+    },
+
+    #[error("CBQ worker panicked while processing {path} records {start}..{end}")]
+    CbqWorkerPanic {
+        path: PathBuf,
+        start: usize,
+        end: usize,
+    },
 }
 
 impl Error {

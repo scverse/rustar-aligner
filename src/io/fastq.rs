@@ -1,5 +1,6 @@
 /// FASTQ reader with base encoding and decompression support
 use crate::error::Error;
+use crate::io::reads::{EncodedRead, PairedRead, decode_base, encode_base, strip_mate_suffix};
 use flate2::read::MultiGzDecoder;
 use noodles::fastq;
 use std::fs::File;
@@ -44,29 +45,6 @@ impl UnmappedFastqWriter {
     pub fn flush(&mut self) -> Result<(), Error> {
         self.writer.flush().map_err(Error::from)
     }
-}
-
-/// A read from a FASTQ file with encoded bases
-#[derive(Debug, Clone)]
-pub struct EncodedRead {
-    /// Read identifier
-    pub name: String,
-    /// Base sequence encoded as 0=A, 1=C, 2=G, 3=T, 4=N
-    pub sequence: Vec<u8>,
-    /// FASTQ ASCII quality bytes (Phred+33 encoded) - subtract 33 before
-    /// writing to BAM binary QUAL.
-    pub quality: Vec<u8>,
-}
-
-/// A paired-end read from two FASTQ files
-#[derive(Debug, Clone)]
-pub struct PairedRead {
-    /// Base read name (without /1 or /2 suffix)
-    pub name: String,
-    /// First mate in pair
-    pub mate1: EncodedRead,
-    /// Second mate in pair
-    pub mate2: EncodedRead,
 }
 
 /// FASTQ reader that handles decompression and base encoding
@@ -329,113 +307,10 @@ impl PairedFastqReader {
     }
 }
 
-/// Strip mate suffix from read name for pairing
-///
-/// Removes common paired-end suffixes:
-/// - /1 or /2 (Illumina convention)
-/// - .R1 or .R2 (alternative convention)
-/// - _1 or _2 (another convention)
-/// - space and everything after (e.g., "READ_NAME 1:N:0:0" -> "READ_NAME")
-///
-/// # Arguments
-/// * `name` - Original read name from FASTQ
-///
-/// # Returns
-/// Base name with mate suffix removed
-#[allow(clippy::case_sensitive_file_extension_comparisons)] // false positive
-pub fn strip_mate_suffix(name: &str) -> String {
-    // First, strip space and everything after (Illumina format)
-    let name = if let Some(pos) = name.find(' ') {
-        &name[..pos]
-    } else {
-        name
-    };
-
-    // Strip common mate suffixes
-    if name.ends_with("/1") || name.ends_with("/2") {
-        name[..name.len() - 2].to_string()
-    } else if name.ends_with(".R1") || name.ends_with(".R2") {
-        name[..name.len() - 3].to_string()
-    } else if name.ends_with("_1") || name.ends_with("_2") {
-        name[..name.len() - 2].to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-/// Convert FASTQ base character to genome encoding
-///
-/// # Arguments
-/// * `base` - ASCII base character (A, C, G, T, N, or lowercase variants)
-///
-/// # Returns
-/// Encoded base: 0=A, 1=C, 2=G, 3=T, 4=N (or any ambiguous base)
-pub fn encode_base(base: u8) -> u8 {
-    match base.to_ascii_uppercase() {
-        b'A' => 0,
-        b'C' => 1,
-        b'G' => 2,
-        b'T' => 3,
-        _ => 4, // N or any ambiguous base (R, Y, S, W, K, M, etc.)
-    }
-}
-
-/// Decode genome encoding to ASCII base character
-///
-/// # Arguments
-/// * `encoded` - Encoded base (0-4)
-///
-/// # Returns
-/// ASCII base character (A, C, G, T, or N)
-pub fn decode_base(encoded: u8) -> u8 {
-    match encoded {
-        0 => b'A',
-        1 => b'C',
-        2 => b'G',
-        3 => b'T',
-        _ => b'N',
-    }
-}
-
-/// Complement an encoded base (A=0↔T=3, C=1↔G=2, N=4→N=4).
-pub fn complement_base(encoded: u8) -> u8 {
-    match encoded {
-        0 => 3,       // A -> T
-        1 => 2,       // C -> G
-        2 => 1,       // G -> C
-        3 => 0,       // T -> A
-        _ => encoded, // N -> N
-    }
-}
-
-/// Apply read clipping from 5' and 3' ends
-///
-/// # Arguments
-/// * `seq` - Original sequence
-/// * `qual` - Original quality scores
-/// * `clip5p` - Number of bases to clip from 5' end
-/// * `clip3p` - Number of bases to clip from 3' end
-///
-/// # Returns
-/// Tuple of (clipped_sequence, clipped_quality)
-pub fn clip_read(seq: &[u8], qual: &[u8], clip5p: usize, clip3p: usize) -> (Vec<u8>, Vec<u8>) {
-    let len = seq.len();
-
-    // Handle edge cases
-    if clip5p + clip3p >= len {
-        // Clipping removes entire read
-        return (Vec::new(), Vec::new());
-    }
-
-    let start = clip5p;
-    let end = len - clip3p;
-
-    (seq[start..end].to_vec(), qual[start..end].to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::reads::clip_read;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

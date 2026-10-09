@@ -34,7 +34,7 @@ use crate::align::read_align::{
 use crate::align::transcript::Transcript;
 use crate::error::Error;
 use crate::index::GenomeIndex;
-use crate::io::fastq::complement_base;
+use crate::io::reads::complement_base;
 use crate::params::{Parameters, SamAttributes};
 
 /// One heterozygous SNV: absolute 0-based genomic `loci`, and `nt = [ref, allele0,

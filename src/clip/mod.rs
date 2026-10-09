@@ -21,7 +21,7 @@
 //! adapter is not a thing STAR itself supports either (only `CellRanger4` mode
 //! clips a 5' adapter, the 10x TSO) — that mode is out of scope here.
 
-use crate::io::fastq::encode_base;
+use crate::io::reads::encode_base;
 use crate::params::Parameters;
 
 /// One end's clipping parameters (STAR `ClipMate`). `n` = fixed clip, `adapter` =

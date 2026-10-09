@@ -12,7 +12,7 @@
 //! quality, exactly as STAR's `cbMatchString`.
 
 use crate::error::Error;
-use crate::io::fastq::{decode_base, encode_base};
+use crate::io::reads::{decode_base, encode_base};
 use flate2::read::MultiGzDecoder;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -412,7 +412,7 @@ impl CbWhitelist {
     pub fn index_of_barcode(&self, ascii: &[u8]) -> Option<u32> {
         let codes: Vec<u8> = ascii
             .iter()
-            .map(|&b| crate::io::fastq::encode_base(b))
+            .map(|&b| crate::io::reads::encode_base(b))
             .collect();
         match pack_barcode(&codes) {
             PackResult::NoN(packed) => self.search(packed),

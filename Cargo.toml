@@ -64,6 +64,7 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
+binseq = { version = "0.9.4", default-features = false, features = ["anyhow"] }
 
 [dev-dependencies]
 assert_cmd = "2"

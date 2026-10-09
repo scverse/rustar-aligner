@@ -29,7 +29,8 @@ pub use whitelist::{
 
 use crate::align::transcript::Transcript;
 use crate::error::Error;
-use crate::io::fastq::{EncodedRead, FastqReader, decode_base};
+use crate::io::fastq::FastqReader;
+use crate::io::reads::{EncodedRead, decode_base};
 use crate::params::{Parameters, SoloType};
 use crate::quant::GeneAnnotation;
 use std::path::Path;
@@ -408,7 +409,7 @@ pub fn clip_adapter_cr4(seq: &[u8], qual: &[u8]) -> (Vec<u8>, Vec<u8>, usize, us
     if seq.len() >= TSO_SEQ.len() {
         let tso: Vec<u8> = TSO_SEQ
             .iter()
-            .map(|&b| crate::io::fastq::encode_base(b))
+            .map(|&b| crate::io::reads::encode_base(b))
             .collect();
         let mismatches = seq[..tso.len()]
             .iter()
@@ -1020,7 +1021,7 @@ impl SoloContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::fastq::encode_base;
+    use crate::io::reads::encode_base;
 
     fn encoded_read(name: &str, seq: &str, qual: &str) -> EncodedRead {
         EncodedRead {

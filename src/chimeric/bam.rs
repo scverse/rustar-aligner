@@ -12,7 +12,7 @@ use crate::chimeric::detect::{ChimExon, WinTr};
 use crate::chimeric::{ChimBam, ChimericAlignment};
 use crate::error::Error;
 use crate::genome::Genome;
-use crate::io::fastq::{complement_base, decode_base};
+use crate::io::reads::{complement_base, decode_base};
 use crate::io::sam::{apply_sam_flag_or_and, fastq_qual_to_phred, maybe_insert_rg_tag};
 use crate::params::{Parameters, SamAttributes};
 use bstr::BString;

@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::index::GenomeIndex;
-use crate::io::fastq::complement_base;
+use crate::io::reads::complement_base;
 use crate::params::Parameters;
 
 /// A seed represents an exact match between a read position and genome location(s).

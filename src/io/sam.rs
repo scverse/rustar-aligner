@@ -3,7 +3,7 @@ use crate::align::read_align::PairedAlignment;
 use crate::align::transcript::{Transcript, cigar_to_string};
 use crate::error::Error;
 use crate::genome::Genome;
-use crate::io::fastq::{complement_base, decode_base};
+use crate::io::reads::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
 use crate::params::{Parameters, SamAttributes};
@@ -266,7 +266,7 @@ impl SamWriter {
         // (CIGAR core, MD, NM) is built from that aligned slice, then apply_read_clips
         // restores the full read + soft-clips. clip5p/clip3p == 0 => aligned == full.
         let aligned_seq = &read_seq[clip5p..read_seq.len() - clip3p];
-        let aligned_qual = &read_qual[clip5p..read_qual.len() - clip3p];
+        let aligned_qual = clipped_quality(read_qual, clip5p, clip3p);
 
         let n_alignments = transcripts.len();
         let max_output = if params.out_sam_mult_nmax < 0 {
@@ -508,7 +508,7 @@ impl SamWriter {
             };
         // Aligned slice of the mapped mate (core SEQ/CIGAR/MD built from this).
         let aligned_mapped_seq = &mapped_seq[mapped_clip5p..mapped_seq.len() - mapped_clip3p];
-        let aligned_mapped_qual = &mapped_qual[mapped_clip5p..mapped_qual.len() - mapped_clip3p];
+        let aligned_mapped_qual = clipped_quality(mapped_qual, mapped_clip5p, mapped_clip3p);
 
         // --- Build mapped mate record ---
         let mut mapped_rec = RecordBuf::default();
@@ -1168,6 +1168,16 @@ pub(crate) fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
     qual.iter().map(|&b| b.saturating_sub(33)).collect()
 }
 
+/// Return the clipped stored qualities, preserving an empty slice as the
+/// SAM/BAM missing-quality sentinel for quality-less CBQ input.
+fn clipped_quality(qual: &[u8], clip5p: usize, clip3p: usize) -> &[u8] {
+    if qual.is_empty() {
+        qual
+    } else {
+        &qual[clip5p..qual.len() - clip3p]
+    }
+}
+
 /// Re-attach clipped bases to a mapped record as soft-clips, matching STAR (and
 /// STAR-rs): the record is first built from the *clipped* read (so CIGAR core, MD
 /// and NM cover only the aligned bases), then this restores the full original read
@@ -1651,7 +1661,7 @@ fn build_paired_mate_record(
     // Core SEQ/QUAL/MD are built from the aligned (clipped) slice; apply_read_clips
     // below restores the full mate read + soft-clips (clip==0 => aligned == mate_seq).
     let aligned_seq = &mate_seq[clip5p..mate_seq.len() - clip3p];
-    let aligned_qual = &mate_qual[clip5p..mate_qual.len() - clip3p];
+    let aligned_qual = clipped_quality(mate_qual, clip5p, clip3p);
 
     // Sequence and quality scores (reverse complement for reverse strand)
     if transcript.is_reverse {
@@ -1986,6 +1996,69 @@ mod tests {
 
         let stored: &[u8] = record.quality_scores().as_ref();
         assert_eq!(stored, &[0u8, 0, 1]);
+    }
+
+    #[test]
+    fn missing_quality_survives_clipping_and_is_emitted_as_absent() {
+        use cigar::op::{Kind, Op};
+
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.cbq"]);
+        let read_seq = vec![0, 1, 2, 3];
+        let transcript = Transcript {
+            chr_idx: 0,
+            genome_start: 1,
+            genome_end: 3,
+            is_reverse: false,
+            exons: vec![],
+            cigar: vec![Op::new(Kind::Match, 2)],
+            score: 2,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+        };
+
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &read_seq,
+            &[],
+            1,
+            1,
+            &[transcript],
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].sequence().len(), read_seq.len());
+        assert!(records[0].quality_scores().is_empty());
+
+        let unmapped = SamWriter::build_unmapped_record(
+            "read2",
+            &read_seq,
+            &[],
+            &params,
+            UnmappedReason::Other,
+        )
+        .unwrap();
+        assert!(unmapped.quality_scores().is_empty());
+
+        let output = NamedTempFile::new().unwrap();
+        {
+            let mut writer = SamWriter::create(output.path(), &genome, &params).unwrap();
+            writer.write_batch(&[unmapped]).unwrap();
+        }
+        let text = std::fs::read_to_string(output.path()).unwrap();
+        let fields: Vec<_> = text
+            .lines()
+            .find(|line| !line.starts_with('@'))
+            .unwrap()
+            .split('\t')
+            .collect();
+        assert_eq!(fields[10], "*");
     }
 
     #[test]

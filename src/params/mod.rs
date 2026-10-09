@@ -534,6 +534,10 @@ pub struct Parameters {
     #[arg(long = "readFilesCommand")]
     pub read_files_command: Option<String>,
 
+    /// Number of CBQ decoder threads; 0 selects a conservative automatic value
+    #[arg(long = "readFilesNthreads", default_value_t = 0)]
+    pub read_files_n_threads: usize,
+
     /// Prefix prepended to every path in `--readFilesIn`.
     #[arg(long = "readFilesPrefix", default_value = "")]
     pub read_files_prefix: String,
@@ -2467,6 +2471,16 @@ mod tests {
         assert_eq!(p.align_intron_max, 1_000_000);
         assert_eq!(p.sjdb_gtf_file, Some(PathBuf::from("gencode.gtf")));
         assert_eq!(p.twopass_mode, TwopassMode::Basic);
+    }
+
+    #[test]
+    fn cbq_decoder_thread_parameter() {
+        let default = try_parse(&["--readFilesIn", "reads.cbq"]).unwrap();
+        assert_eq!(default.read_files_n_threads, 0);
+
+        let explicit =
+            try_parse(&["--readFilesIn", "reads.cbq", "--readFilesNthreads", "6"]).unwrap();
+        assert_eq!(explicit.read_files_n_threads, 6);
     }
 
     #[test]

@@ -29,8 +29,9 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). |
+| `--readFilesIn` | — | Input FASTQ file(s), or one CBQ file. A second FASTQ is mate 2; paired-end CBQ stores both mates in one file (required for `alignReads`). |
 | `--readFilesCommand` | — | Decompression command, e.g. `zcat` for `.gz`. |
+| `--readFilesNthreads` | `0` | CBQ decoder threads (`0` = derive a bounded default from `--runThreadN`; ignored for FASTQ). |
 | `--readMapNumber` | `-1` | Number of reads to map (`-1` = all). |
 | `--clip5pNbases` | `0` | Bases to clip from the 5' end of each mate. |
 | `--clip3pNbases` | `0` | Bases to clip from the 3' end of each mate. |

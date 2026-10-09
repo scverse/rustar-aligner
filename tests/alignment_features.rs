@@ -4,6 +4,8 @@
 //! GT-AG intron structure for splice tests.
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use binseq::SequencingRecordBuilder;
+use binseq::write::{BinseqWriterBuilder, Format};
 use noodles::bam;
 use std::fs;
 use std::io::Write;
@@ -135,6 +137,50 @@ fn rc(seq: &[u8]) -> Vec<u8> {
 fn count_sam_records(sam_path: &Path) -> usize {
     let content = fs::read_to_string(sam_path).unwrap();
     content.lines().filter(|l| !l.starts_with('@')).count()
+}
+
+fn sam_records(sam_path: &Path) -> Vec<String> {
+    fs::read_to_string(sam_path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(str::to_string)
+        .collect()
+}
+
+type CbqMate = (String, Vec<u8>, Option<Vec<u8>>);
+type CbqRecord = (String, Vec<u8>, Option<Vec<u8>>, Option<CbqMate>);
+
+fn write_cbq_records(path: &Path, records: &[CbqRecord]) {
+    let paired = records.iter().any(|record| record.3.is_some());
+    let qualities = records.iter().all(|record| {
+        record.2.is_some()
+            && record
+                .3
+                .as_ref()
+                .is_none_or(|(_, _, quality)| quality.is_some())
+    });
+    let mut writer = BinseqWriterBuilder::new(Format::Cbq)
+        .paired(paired)
+        .quality(qualities)
+        .headers(true)
+        .block_size(512)
+        .build(fs::File::create(path).unwrap())
+        .unwrap();
+    for (name1, seq1, qual1, mate2) in records {
+        let mut record = SequencingRecordBuilder::default()
+            .s_header(name1.as_bytes())
+            .s_seq(seq1)
+            .opt_s_qual(qual1.as_deref());
+        if let Some((name2, seq2, qual2)) = mate2 {
+            record = record
+                .x_header(name2.as_bytes())
+                .x_seq(seq2)
+                .opt_x_qual(qual2.as_deref());
+        }
+        writer.push(record.build().unwrap()).unwrap();
+    }
+    writer.finish().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2132,6 +2178,134 @@ fn test_sorted_bam_spills_to_disk_and_matches_unbounded_sort() {
         .filter(|name| name.starts_with("rustar-bamsort-"))
         .collect();
     assert!(leftover.is_empty(), "spill files left behind: {leftover:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Native CBQ input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cbq_single_end_matches_fastq_and_honors_read_map_number() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let fastq = tmpdir.path().join("reads.fq");
+    let cbq = tmpdir.path().join("reads.binary-data");
+    let mut logical_records = Vec::new();
+    {
+        let mut writer = fs::File::create(&fastq).unwrap();
+        for i in 0..31usize {
+            let start = 200 + i * 200;
+            let sequence = genome[start..start + 50].to_vec();
+            let name = format!("cbq-se-{i}");
+            let quality = vec![b'I'; sequence.len()];
+            writeln!(writer, "@{name}").unwrap();
+            writer.write_all(&sequence).unwrap();
+            writeln!(writer, "\n+\n{}", "I".repeat(sequence.len())).unwrap();
+            logical_records.push((name, sequence, Some(quality), None));
+        }
+    }
+    write_cbq_records(&cbq, &logical_records);
+
+    let fastq_out = tmpdir.path().join("fastq-out");
+    let cbq_out = tmpdir.path().join("cbq-out");
+    fs::create_dir_all(&fastq_out).unwrap();
+    fs::create_dir_all(&cbq_out).unwrap();
+    for (input, output, decoder_threads) in
+        [(&fastq, &fastq_out, None), (&cbq, &cbq_out, Some("4"))]
+    {
+        let prefix = format!("{}/", output.display());
+        let mut command = cargo_bin_cmd!("rustar-aligner");
+        command.args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            input.to_str().unwrap(),
+            "--readMapNumber",
+            "19",
+            "--outSAMtype",
+            "SAM",
+            "--outFileNamePrefix",
+            &prefix,
+        ]);
+        if let Some(threads) = decoder_threads {
+            command.args(["--readFilesNthreads", threads]);
+        }
+        command.assert().success();
+    }
+
+    let fastq_records = sam_records(&fastq_out.join("Aligned.out.sam"));
+    let cbq_records = sam_records(&cbq_out.join("Aligned.out.sam"));
+    assert_eq!(fastq_records.len(), 19);
+    assert_eq!(cbq_records, fastq_records);
+}
+
+#[test]
+fn test_qualityless_paired_cbq_two_pass_output_is_ordered_and_has_missing_qual() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    let cbq = tmpdir.path().join("paired.cbq");
+    let mut logical_records = Vec::new();
+    for i in 0..13usize {
+        let mate1_start = 500 + i * 300;
+        let mate2_start = mate1_start + 100;
+        let name = format!("cbq-pe-{i}");
+        logical_records.push((
+            format!("{name}/1"),
+            genome[mate1_start..mate1_start + 50].to_vec(),
+            None,
+            Some((
+                format!("{name}/2"),
+                rc(&genome[mate2_start..mate2_start + 50]),
+                None,
+            )),
+        ));
+    }
+    write_cbq_records(&cbq, &logical_records);
+
+    let output = tmpdir.path().join("paired-out");
+    fs::create_dir_all(&output).unwrap();
+    let prefix = format!("{}/", output.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cbq.to_str().unwrap(),
+            "--readFilesNthreads",
+            "3",
+            "--twopassMode",
+            "Basic",
+            "--outSAMtype",
+            "SAM",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let records = sam_records(&output.join("Aligned.out.sam"));
+    assert_eq!(records.len(), 26);
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    for (pair_index, pair) in records.chunks_exact(2).enumerate() {
+        let first: Vec<_> = pair[0].split('\t').collect();
+        let second: Vec<_> = pair[1].split('\t').collect();
+        assert_eq!(first[0], format!("cbq-pe-{pair_index}"));
+        assert_eq!(second[0], first[0]);
+        assert_eq!(first[10], "*");
+        assert_eq!(second[10], "*");
+    }
 }
 
 // ---------------------------------------------------------------------------

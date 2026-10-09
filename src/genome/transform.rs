@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::io::fastq::encode_base;
+use crate::io::reads::encode_base;
 
 use super::compute_chr_starts;
 use super::fasta::Chromosome;

@@ -286,6 +286,7 @@ impl AlignmentWriter for crate::io::bam::SortedBamStdoutWriter {
 
 fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     use crate::index::GenomeIndex;
+    use crate::io::input::ReadInputPlan;
 
     use crate::params::TwopassMode;
 
@@ -308,6 +309,14 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     if params.read_files_in.is_empty() && params.solo_type != params::SoloType::SmartSeq {
         anyhow::bail!("No read files specified (--readFilesIn)");
     }
+
+    // Resolve content-based input format and logical layout once. SmartSeq reads
+    // come from its manifest and do not participate in ordinary input planning.
+    let input_plan = if params.solo_type == params::SoloType::SmartSeq {
+        None
+    } else {
+        Some(ReadInputPlan::resolve(params)?)
+    };
 
     // 1. Load genome index
     info!("Loading genome index from {}", params.genome_dir.display());
@@ -405,6 +414,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             run_single_pass(
                 &index,
                 &params,
+                input_plan.as_ref(),
                 quant_ctx.as_ref(),
                 tr_idx.as_ref(),
                 solo_ctx.as_ref(),
@@ -415,6 +425,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             run_two_pass(
                 &index,
                 &params,
+                input_plan.as_ref(),
                 quant_ctx.as_ref(),
                 tr_idx.as_ref(),
                 solo_ctx.as_ref(),
@@ -669,6 +680,7 @@ fn run_smartseq(
 fn run_single_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
+    input_plan: Option<&crate::io::input::ReadInputPlan>,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
     solo_ctx: Option<&std::sync::Arc<crate::solo::SoloContext>>,
@@ -702,7 +714,9 @@ fn run_single_pass(
     use crate::io::fastq::UnmappedFastqWriter;
     use crate::params::OutReadsUnmapped;
 
-    let is_paired = params.read_files_in.len() == 2 && !params.solo_enabled();
+    let is_paired = solo_ctx.is_none()
+        && input_plan
+            .is_some_and(|input| input.layout() == crate::io::input::ReadLayout::PairedEnd);
     let mut unmapped_w1: Option<UnmappedFastqWriter> =
         if params.out_reads_unmapped == OutReadsUnmapped::Fastx {
             let path = params.output_path("Unmapped.out.mate1");
@@ -828,10 +842,11 @@ fn run_single_pass(
         return Ok(stats);
     }
 
-    let n_align_files = params.read_files_in.len();
-    match n_align_files {
-        1 => align_reads_single_end(
+    let input = input_plan.ok_or_else(|| anyhow::anyhow!("ordinary alignment input is missing"))?;
+    match input.layout() {
+        crate::io::input::ReadLayout::SingleEnd => align_reads_single_end(
             params,
+            input,
             index,
             writer.as_mut(),
             &stats,
@@ -841,8 +856,9 @@ fn run_single_pass(
             tr_writer.as_mut(),
             unmapped_w1.as_mut(),
         ),
-        2 => align_reads_paired_end(
+        crate::io::input::ReadLayout::PairedEnd => align_reads_paired_end(
             params,
+            input,
             index,
             writer.as_mut(),
             &stats,
@@ -853,7 +869,6 @@ fn run_single_pass(
             unmapped_w1.as_mut(),
             unmapped_w2.as_mut(),
         ),
-        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }?;
 
     writer.finish()?;
@@ -884,6 +899,7 @@ fn run_single_pass(
 fn run_two_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
+    input_plan: Option<&crate::io::input::ReadInputPlan>,
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
     solo_ctx: Option<&std::sync::Arc<crate::solo::SoloContext>>,
@@ -892,7 +908,7 @@ fn run_two_pass(
 
     // PASS 1: Junction discovery (no quant counting in pass 1)
     info!("Two-pass mode: Pass 1 - Junction discovery");
-    let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
+    let (sj_stats_pass1, novel_junctions) = run_pass1(index, params, input_plan)?;
 
     let pass1_dir = params.output_path("_STARpass1");
     std::fs::create_dir_all(&pass1_dir)?;
@@ -917,7 +933,14 @@ fn run_two_pass(
 
     // PASS 2: Re-alignment with merged DB (quant counts happen here)
     info!("Two-pass mode: Pass 2 - Re-alignment");
-    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx, tr_idx, solo_ctx)?;
+    let stats = run_single_pass(
+        &Arc::new(merged_index),
+        params,
+        input_plan,
+        quant_ctx,
+        tr_idx,
+        solo_ctx,
+    )?;
 
     Ok(stats)
 }
@@ -926,6 +949,7 @@ fn run_two_pass(
 fn run_pass1(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
+    input_plan: Option<&crate::io::input::ReadInputPlan>,
 ) -> anyhow::Result<(
     crate::junction::SpliceJunctionStats,
     Vec<(
@@ -952,14 +976,19 @@ fn run_pass1(
 
     // Align reads (single-end or paired-end); no quant counting in pass 1.
     // Solo runs align only the cDNA read (file 0) — route to the SE path.
-    let n_align_files = if params.solo_enabled() {
-        1
+    let solo_input;
+    let input = if params.solo_enabled() {
+        solo_input = crate::io::input::ReadInputPlan::FastqSingle {
+            path: params.read_files_in[0].clone(),
+        };
+        &solo_input
     } else {
-        params.read_files_in.len()
+        input_plan.ok_or_else(|| anyhow::anyhow!("ordinary alignment input is missing"))?
     };
-    match n_align_files {
-        1 => align_reads_single_end(
+    match input.layout() {
+        crate::io::input::ReadLayout::SingleEnd => align_reads_single_end(
             &params_pass1,
+            input,
             index,
             &mut null_writer,
             &stats,
@@ -969,8 +998,9 @@ fn run_pass1(
             None,
             None,
         )?,
-        2 => align_reads_paired_end(
+        crate::io::input::ReadLayout::PairedEnd => align_reads_paired_end(
             &params_pass1,
+            input,
             index,
             &mut null_writer,
             &stats,
@@ -981,7 +1011,6 @@ fn run_pass1(
             None,
             None,
         )?,
-        n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }
 
     info!("Pass 1 aligned {} reads", stats.total_reads());
@@ -1000,7 +1029,7 @@ fn run_pass1(
 fn rc_encode(seq: &[u8]) -> Vec<u8> {
     seq.iter()
         .rev()
-        .map(|&b| crate::io::fastq::complement_base(b))
+        .map(|&b| crate::io::reads::complement_base(b))
         .collect()
 }
 
@@ -1127,7 +1156,7 @@ where
         let take = ((max_reads - read_count) as usize).min(batch.len());
         batch.truncate(take);
 
-        // Batch base offset in input (FASTQ) order — threaded to `align` so per-read
+        // Batch base offset in input order — threaded to `align` so per-read
         // indices (e.g. --outSAMreadID Number) are deterministic regardless of pool
         // scheduling: dispatch is sequential here, so `read_count` is this batch's base.
         let base = read_count;
@@ -1446,6 +1475,7 @@ fn write_signal_tracks(
 #[allow(clippy::too_many_arguments)]
 fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     params: &Parameters,
+    input: &crate::io::input::ReadInputPlan,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     writer: &mut W,
     stats: &std::sync::Arc<crate::stats::AlignmentStats>,
@@ -1456,7 +1486,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     unmapped_writer: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::align_read;
-    use crate::io::fastq::{FastqReader, clip_read};
+    use crate::io::reads::clip_read;
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::params::OutFilterType;
     use rayon::prelude::*;
@@ -1465,11 +1495,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let quant = quant_ctx.map(Arc::clone);
     let tr = tr_idx.map(Arc::clone);
 
-    let read_file = &params.read_files_in[0];
-    info!("Reading single-end from {}", read_file.display());
-
-    let reader =
-        FastqReader::open(read_file, params.read_files_command.as_deref())?.with_params(params);
+    info!("Reading single-end {} input", input.label());
+    let producer = input.open_single_end_producer(params)?;
 
     // Create chimeric output writer if enabled
     let chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
@@ -1493,6 +1520,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
+    let producer_max_records = usize::try_from(max_reads).unwrap_or(usize::MAX);
 
     let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
@@ -1524,9 +1552,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let bysj_meta: Vec<BySJReadMeta> = Vec::new();
 
     info!("Aligning reads...");
-    // Three-stage pipeline: a producer thread decodes the next FASTQ batch, rayon
+    // Three-stage pipeline: a producer thread decodes the next input batch, rayon
     // aligns the current batch in parallel, and a dedicated writer thread serializes
-    // SAM/BAM output — so gzip inflate, alignment, and record encoding all overlap
+    // SAM/BAM output — so input decoding, alignment, and record encoding all overlap
     // instead of running one-after-another per batch. Bounded channels (depth 2) give
     // backpressure. Output order is preserved: aligned batches flow through the
     // channel in input order and the writer consumes them in that order.
@@ -1537,7 +1565,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let params_arc = Arc::new(params.clone());
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let (read_tx, read_rx) = std::sync::mpsc::sync_channel::<
-            Result<Vec<crate::io::fastq::EncodedRead>, error::Error>,
+            Result<Vec<crate::io::reads::EncodedRead>, error::Error>,
         >(2);
         #[allow(clippy::type_complexity)]
         let (res_tx, res_rx) =
@@ -1545,20 +1573,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
         // Stage 1: decode.
         scope.spawn(move || {
-            let mut reader = reader;
-            loop {
-                match reader.read_batch(batch_size) {
-                    Ok(batch) => {
-                        let last = batch.is_empty();
-                        if read_tx.send(Ok(batch)).is_err() || last {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = read_tx.send(Err(e));
-                        break;
-                    }
-                }
+            if let Err(error) = producer.produce(batch_size, producer_max_records, &read_tx) {
+                let _ = read_tx.send(Err(error));
             }
         });
 
@@ -1812,7 +1828,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             let params_arc = Arc::clone(&params_arc);
             let wasp_ctx = Arc::clone(&wasp_ctx);
             let align = move |base: u64,
-                              batch: Vec<crate::io::fastq::EncodedRead>|
+                              batch: Vec<crate::io::reads::EncodedRead>|
                   -> BatchOut<AlignmentBatchResults> {
                 let params: &Parameters = &params_arc;
                 // Adapter-aware clip params (fixed 5'/3' Nbases + 3' adapter Hamming
@@ -1823,7 +1839,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     .enumerate()
                     .map(|(read_idx, read)| {
                         // --outSAMreadID Number: replace the output QNAME with the
-                        // read's 1-based input index (deterministic — from the FASTQ
+                        // read's 1-based input index (deterministic — from the input
                         // order via `base`, not parallel execution order). The seed
                         // name passed to align_read is left as the real read name.
                         let out_read_name =
@@ -2130,7 +2146,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     solo_ctx: &std::sync::Arc<crate::solo::SoloContext>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::align_read;
-    use crate::io::fastq::clip_read;
+    use crate::io::reads::clip_read;
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::solo::{SoloCountRecord, SoloMultiRecord};
     use rayon::prelude::*;
@@ -2444,7 +2460,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     solo_ctx: &std::sync::Arc<crate::solo::SoloContext>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::{PairedAlignment, PairedAlignmentResult, align_paired_read};
-    use crate::io::fastq::clip_read;
+    use crate::io::reads::clip_read;
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::solo::{SoloCountRecord, SoloMultiRecord};
     use rayon::prelude::*;
@@ -2809,6 +2825,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     params: &Parameters,
+    input: &crate::io::input::ReadInputPlan,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     writer: &mut W,
     stats: &std::sync::Arc<crate::stats::AlignmentStats>,
@@ -2820,7 +2837,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     unmapped_writer2: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::{PairedAlignment, PairedAlignmentResult, align_paired_read};
-    use crate::io::fastq::{PairedFastqReader, clip_read};
+    use crate::io::reads::clip_read;
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::params::OutFilterType;
     use rayon::prelude::*;
@@ -2829,18 +2846,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let quant = quant_ctx.map(Arc::clone);
     let tr = tr_idx.map(Arc::clone);
 
-    info!(
-        "Reading paired-end from {} and {}",
-        params.read_files_in[0].display(),
-        params.read_files_in[1].display()
-    );
-
-    let reader = PairedFastqReader::open(
-        &params.read_files_in[0],
-        &params.read_files_in[1],
-        params.read_files_command.as_deref(),
-    )?
-    .with_params(params);
+    info!("Reading paired-end {} input", input.label());
+    let producer = input.open_paired_end_producer(params)?;
 
     // Create chimeric output writer if enabled
     let chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
@@ -2864,6 +2871,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
+    let producer_max_records = usize::try_from(max_reads).unwrap_or(usize::MAX);
 
     let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
@@ -2896,7 +2904,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     info!("Aligning paired-end reads...");
     // Three-stage pipeline: producer decodes the next pair batch, rayon aligns the
     // current batch, and a dedicated writer thread serializes output — overlapping
-    // gzip inflate of both mate files, alignment, and record encoding. Bounded
+    // input decoding, alignment, and record encoding. Bounded
     // channels (depth 2) give backpressure; output order is preserved.
     let stats_writer = Arc::clone(&stats);
     let sj_stats_writer = Arc::clone(&sj_stats);
@@ -2905,7 +2913,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let params_arc = Arc::new(params.clone());
     std::thread::scope(|scope| -> anyhow::Result<()> {
         let (read_tx, read_rx) = std::sync::mpsc::sync_channel::<
-            Result<Vec<crate::io::fastq::PairedRead>, error::Error>,
+            Result<Vec<crate::io::reads::PairedRead>, error::Error>,
         >(2);
         #[allow(clippy::type_complexity)]
         let (res_tx, res_rx) =
@@ -2913,20 +2921,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
 
         // Stage 1: decode.
         scope.spawn(move || {
-            let mut reader = reader;
-            loop {
-                match reader.read_paired_batch(batch_size) {
-                    Ok(batch) => {
-                        let last = batch.is_empty();
-                        if read_tx.send(Ok(batch)).is_err() || last {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = read_tx.send(Err(e));
-                        break;
-                    }
-                }
+            if let Err(error) = producer.produce(batch_size, producer_max_records, &read_tx) {
+                let _ = read_tx.send(Err(error));
             }
         });
 
@@ -3183,7 +3179,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             let params_arc = Arc::clone(&params_arc);
             let wasp_ctx = Arc::clone(&wasp_ctx);
             let align = move |base: u64,
-                              batch: Vec<crate::io::fastq::PairedRead>|
+                              batch: Vec<crate::io::reads::PairedRead>|
                   -> BatchOut<AlignmentBatchResults> {
                 let params: &Parameters = &params_arc;
                 // Adapter-aware clip params per mate (fixed Nbases are per-mate; the
