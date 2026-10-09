@@ -1631,6 +1631,7 @@ mod tests {
             genome_sa_index_start: vec![0],
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         };
 
         GenomeIndex {

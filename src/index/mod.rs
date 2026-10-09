@@ -70,7 +70,8 @@ impl GenomeIndex {
         log::info!("Suffix array built: {} entries", suffix_array.len());
 
         log::info!("Building SA index...");
-        let sa_index = SaIndex::build(&genome, &suffix_array, params.genome_sa_index_nbases)?;
+        let mut sa_index = SaIndex::build(&genome, &suffix_array, params.genome_sa_index_nbases)?;
+        sa_index.sparse_d = params.genome_sa_sparse_d as u64;
         log::info!(
             "SA index built: nbases={}, {} indices",
             sa_index.nbases,
@@ -481,7 +482,8 @@ impl GenomeIndex {
             prepared.len()
         );
         let suffix_array = SuffixArray::build_sparse(&genome, sparse_d)?;
-        let sa_index = SaIndex::build(&genome, &suffix_array, self.sa_index.nbases)?;
+        let mut sa_index = SaIndex::build(&genome, &suffix_array, self.sa_index.nbases)?;
+        sa_index.sparse_d = sparse_d;
         let idx = GenomeIndex {
             genome,
             suffix_array,
