@@ -524,6 +524,7 @@ fn write_solo_output(
             &dirs,
             &crate::solo::h5::MtxNames::from_params(params),
         )?;
+        crate::solo::h5::write_molecule_info(sctx, params)?;
     }
     Ok(())
 }
@@ -789,7 +790,16 @@ fn run_single_pass(
                 }
                 OutSamFormat::Bam => {
                     let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
-                    let output_path = if sorted {
+                    let cr_bam =
+                        sorted && solo_ctx.is_some() && params.solo_out_layout == "CellRanger";
+                    let output_path = if cr_bam {
+                        // CellRanger's name, beside its matrices in `outs/`.
+                        let dir = params
+                            .solo_out_file_names
+                            .first()
+                            .map_or("outs/", String::as_str);
+                        params.output_path(&format!("{dir}possorted_genome_bam.bam"))
+                    } else if sorted {
                         params.output_path("Aligned.sortedByCoord.out.bam")
                     } else {
                         params.output_path("Aligned.out.bam")
@@ -799,11 +809,12 @@ fn run_single_pass(
                         std::fs::create_dir_all(parent)?;
                     }
                     if sorted {
-                        Box::new(SortedBamWriter::create(
-                            &output_path,
-                            &index.genome,
-                            params,
-                        )?)
+                        let w = SortedBamWriter::create(&output_path, &index.genome, params)?;
+                        Box::new(if cr_bam {
+                            w.with_cellranger_layout(&params.solo_out_sample_id)
+                        } else {
+                            w
+                        })
                     } else {
                         Box::new(BamWriter::create(&output_path, &index.genome, params)?)
                     }
@@ -855,6 +866,9 @@ fn run_single_pass(
         if params.solo_type != params::SoloType::CbSamTagOut {
             write_solo_output(sctx, params, &stats, &sj_stats, index)?;
         }
+        let cr_bam = params.solo_out_layout == "CellRanger"
+            && params.bam_sorted_output()
+            && matches!(params.out_std, params::OutStd::None);
         if sctx.read_info_enabled() {
             let info = sctx
                 .read_info
@@ -871,6 +885,9 @@ fn run_single_pass(
                     umi_len,
                     &params.out_sam_attributes,
                 );
+                if cr_bam {
+                    crate::io::sam::apply_cr_bam_tags(record, &params.solo_out_sample_id);
+                }
             })?;
         } else {
             writer.finish()?;
@@ -2561,6 +2578,16 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                         params,
                                         n_for_mapq,
                                     )?;
+                                    // CellRanger's region and clip tags; the BAM writer
+                                    // puts them in cellranger's order.
+                                    if solo.want_metrics {
+                                        crate::io::sam::add_cr_annotation_tags(
+                                            &mut records,
+                                            outcome.region,
+                                            cr4_5p,
+                                            cr4_3p,
+                                        );
+                                    }
                                     // STARsolo GX/GN gene tags (Gene-feature assignment).
                                     if solo_tags.intersects(
                                         crate::params::SamAttributes::GX

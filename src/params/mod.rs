@@ -1389,6 +1389,13 @@ pub struct Parameters {
     #[arg(long = "soloOutH5", default_value = "no")]
     pub solo_out_h5: String,
 
+    /// Sample (library) name that `--soloOutLayout CellRanger` records in the
+    /// `.h5` attributes (`library_ids`), the BAM `@RG` ids and the
+    /// `molecule_info.h5` library table. CellRanger takes it from `--id`.
+    /// rustar extension beyond STARsolo.
+    #[arg(long = "soloOutSampleID", default_value = "sample")]
+    pub solo_out_sample_id: String,
+
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
     pub solo_strand: String,
@@ -2679,6 +2686,26 @@ fn apply_cellranger_layout(params: &mut Parameters, matches: &clap::ArgMatches) 
     {
         // CellRanger writes its matrices under `outs/`, not `Solo.out/`.
         *dir = "outs/".to_string();
+    }
+    // `possorted_genome_bam.bam` carries cellranger's tag set and the unmapped
+    // reads (`outSAMunmapped Within`); the tags come from the same names the
+    // user would otherwise list in `--outSAMattributes`.
+    if params.solo_type == SoloType::CbUmiSimple && params.bam_sorted_output() {
+        params.out_sam_attributes |= SamAttributes::NH
+            | SamAttributes::HI
+            | SamAttributes::AS
+            | SamAttributes::NMM
+            | SamAttributes::CR
+            | SamAttributes::CY
+            | SamAttributes::UR
+            | SamAttributes::UY
+            | SamAttributes::CB
+            | SamAttributes::UB
+            | SamAttributes::GX
+            | SamAttributes::GN;
+        if params.out_sam_unmapped == OutSamUnmapped::None {
+            params.out_sam_unmapped = OutSamUnmapped::Within;
+        }
     }
 }
 

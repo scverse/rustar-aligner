@@ -3143,6 +3143,8 @@ fn check_starsolo_barcode_sam_tags(extra_args: &[&str]) {
             "CB_UMI_Simple",
             "--soloCBwhitelist",
             wl_path.to_str().unwrap(),
+            "--soloOutLayout",
+            "STARsolo",
             "--soloFeatures",
             "Gene",
             "--sjdbGTFfile",

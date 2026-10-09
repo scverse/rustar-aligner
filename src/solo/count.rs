@@ -478,8 +478,31 @@ pub struct CellStat {
     pub n_genes: u32,
 }
 
+/// One deduplicated molecule: the unit CellRanger's `molecule_info.h5` stores.
+/// `umi` is the corrected UMI, `count` the reads that collapsed onto it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Molecule {
+    pub cb: u32,
+    pub gene: u32,
+    pub umi: u64,
+    pub count: u32,
+}
+
+/// What `--soloOutLayout CellRanger` keeps for `molecule_info.h5`: the
+/// molecules of the first feature, the cells that were called, and the read
+/// total for the library metrics.
+pub struct MoleculeTable {
+    pub molecules: Vec<Molecule>,
+    /// Whitelist indices of the called cells, ascending.
+    pub called: Vec<u32>,
+    pub raw_read_pairs: u64,
+}
+
 /// What `build_matrix_body` returns alongside the temp matrix body.
 pub struct MatrixStats {
+    /// Every molecule behind the matrix, `(cb, gene, umi)`-ascending. Only
+    /// collected when the caller asks for it (`molecule_info.h5`).
+    pub molecules: Vec<Molecule>,
     pub nnz: usize,
     /// One entry per barcode that received ≥1 UMI (the raw, unfiltered set).
     pub cells: Vec<CellStat>,
@@ -502,6 +525,7 @@ fn build_matrix_body(
     dir: &Path,
     n_features: usize,
     record_read_info: bool,
+    collect_molecules: bool,
 ) -> Result<(tempfile::NamedTempFile, MatrixStats), Error> {
     let mut body_tmp = tempfile::Builder::new()
         .prefix(".matrix_body")
@@ -509,6 +533,7 @@ fn build_matrix_body(
         .map_err(|e| Error::io(e, dir))?;
     let mut nnz = 0usize;
     let mut cell_stats: Vec<CellStat> = Vec::new();
+    let mut molecules: Vec<Molecule> = Vec::new();
     let mut gene_seen = vec![false; n_features];
 
     {
@@ -554,9 +579,12 @@ fn build_matrix_body(
         // run it in parallel and emit the pre-formatted bodies sequentially in CB
         // order. This keeps the matrix byte-identical to the serial version.
         struct CellOut {
+            cb: u32,
             body: Vec<u8>,
             stat: Option<CellStat>,
             genes: Vec<u32>,
+            /// `(gene, corrected UMI, reads)` of this cell, when asked for.
+            mols: Vec<(u32, u64, u32)>,
             /// `(read index, readInfo entry)` for this cell's reads, when the
             /// `CB`/`UB` SAM tags asked for STAR's readInfo.
             read_info: Vec<(u32, crate::solo::ReadInfo)>,
@@ -602,6 +630,12 @@ fn build_matrix_body(
                     entries
                 };
                 cell_entries.sort_unstable_by_key(|&(g, _)| g);
+
+                let mols = if collect_molecules {
+                    cell_molecules(&umi_genes, method, filtering, umi_len)
+                } else {
+                    Vec::new()
+                };
 
                 // STAR's readInfo: every read counted for this cell records the
                 // cell it landed in and the UMI it collapsed onto
@@ -649,9 +683,11 @@ fn build_matrix_body(
                     n_genes,
                 });
                 CellOut {
+                    cb,
                     body: cbody,
                     stat,
                     genes,
+                    mols,
                     read_info,
                 }
             })
@@ -670,6 +706,12 @@ fn build_matrix_body(
             if let Some(s) = co.stat {
                 cell_stats.push(s);
             }
+            molecules.extend(co.mols.iter().map(|&(gene, umi, count)| Molecule {
+                cb: co.cb,
+                gene,
+                umi,
+                count,
+            }));
             if let Some(info) = info_guard.as_mut() {
                 for (read_index, entry) in co.read_info {
                     if let Some(slot) = info.get_mut(read_index as usize) {
@@ -686,6 +728,7 @@ fn build_matrix_body(
     Ok((
         body_tmp,
         MatrixStats {
+            molecules,
             nnz,
             cells: cell_stats,
             genes_detected,
@@ -1075,6 +1118,21 @@ fn multi_gene_umi_cr_counts(
     umi_genes: &HashMap<u64, HashMap<u32, u32>>,
     umi_len: usize,
 ) -> Vec<(u32, u64)> {
+    let mut counts: HashMap<u32, u64> = HashMap::default();
+    for (gene, _, _) in multi_gene_umi_cr_molecules(umi_genes, umi_len) {
+        *counts.entry(gene).or_insert(0) += 1;
+    }
+    let mut out: Vec<(u32, u64)> = counts.into_iter().filter(|&(_, c)| c > 0).collect();
+    out.sort_unstable_by_key(|&(g, _)| g);
+    out
+}
+
+/// The molecules `multi_gene_umi_cr_counts` counts: `(gene, corrected UMI,
+/// reads)` for each corrected UMI that a gene won, in no particular order.
+fn multi_gene_umi_cr_molecules(
+    umi_genes: &HashMap<u64, HashMap<u32, u32>>,
+    umi_len: usize,
+) -> Vec<(u32, u64, u32)> {
     // Regroup as gene → (raw UMI → reads); correction happens per gene.
     let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
     for (&umi, genes) in umi_genes {
@@ -1096,7 +1154,7 @@ fn multi_gene_umi_cr_counts(
         }
     }
 
-    let mut counts: HashMap<u32, u64> = HashMap::default();
+    let mut mols: Vec<(u32, u64, u32)> = Vec::new();
     for (cu, genes) in &corrected {
         // Condition 1: a strict maximum, ties lose.
         let mut best = 0u32;
@@ -1120,11 +1178,43 @@ fn multi_gene_umi_cr_counts(
                 continue;
             }
         }
-        *counts.entry(winner).or_insert(0) += 1;
+        mols.push((winner, *cu, best));
     }
+    mols
+}
 
-    let mut out: Vec<(u32, u64)> = counts.into_iter().filter(|&(_, c)| c > 0).collect();
-    out.sort_unstable_by_key(|&(g, _)| g);
+/// `(gene, corrected UMI, reads)` for every molecule of one cell, after the
+/// same `--soloUMIfiltering` / `--soloUMIdedup` steps that produce its matrix
+/// column, sorted `(gene, umi)`-ascending.
+fn cell_molecules(
+    umi_genes: &HashMap<u64, HashMap<u32, u32>>,
+    method: UmiDedup,
+    filtering: UmiFiltering,
+    umi_len: usize,
+) -> Vec<(u32, u64, u32)> {
+    let mut out: Vec<(u32, u64, u32)> = if filtering == UmiFiltering::MultiGeneUmiCr {
+        multi_gene_umi_cr_molecules(umi_genes, umi_len)
+    } else {
+        let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+        for (&umi, genes) in umi_genes {
+            for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
+                *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+            }
+        }
+        let mut mols = Vec::new();
+        for (&gene, umis) in &gene_umis {
+            let map = umi_correction_map(umis, method, umi_len);
+            let mut by_umi: HashMap<u64, u32> = HashMap::default();
+            for (&umi, &rc) in umis {
+                *by_umi
+                    .entry(map.get(&umi).copied().unwrap_or(umi))
+                    .or_insert(0) += rc;
+            }
+            mols.extend(by_umi.into_iter().map(|(u, c)| (gene, u, c)));
+        }
+        mols
+    };
+    out.sort_unstable_by_key(|&(g, u, _)| (g, u));
     out
 }
 
@@ -1683,7 +1773,7 @@ pub fn write_gene_matrix(
 
         // Stream the deduplicated counts into a shared temp body, then finalize
         // the raw matrix (and the filtered one below) from it.
-        let (body, mstats) = build_matrix_body(
+        let (body, mut mstats) = build_matrix_body(
             ctx,
             recorder,
             method,
@@ -1695,6 +1785,7 @@ pub fn write_gene_matrix(
             // STAR fills readInfo from one feature only: the first on the
             // --soloFeatures list (`ParametersSolo.cpp:423-434`).
             fi == 0 && ctx.read_info_enabled(),
+            fi == 0 && ctx.want_molecules,
         )?;
         write_features(
             &raw_dir.join(&features_name),
@@ -1795,6 +1886,13 @@ pub fn write_gene_matrix(
         } else {
             called_cells(&mstats.cells, &params.solo_cell_filter)
         };
+        if fi == 0 && ctx.want_molecules {
+            *ctx.molecules.lock().unwrap() = Some(MoleculeTable {
+                molecules: std::mem::take(&mut mstats.molecules),
+                called: called.clone().unwrap_or_default(),
+                raw_read_pairs: total_reads,
+            });
+        }
         if let Some(cbs) = called
             && !cbs.is_empty()
         {
@@ -3473,5 +3571,45 @@ mod tests {
             "MultiGeneUMI".parse::<UmiFiltering>().unwrap(),
             UmiFiltering::MultiGeneUmi
         );
+    }
+
+    #[test]
+    fn molecules_agree_with_the_counts() {
+        // umi -> gene -> reads for one cell: 3 UMIs on gene 0 (two 1MM apart),
+        // one UMI shared with gene 1 at fewer reads.
+        let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
+        let mut add = |u: u64, g: u32, c: u32| {
+            *umi_genes.entry(u).or_default().entry(g).or_insert(0) += c;
+        };
+        add(0b0000_0001, 0, 5);
+        add(0b0000_0010, 0, 1); // one mismatch from the first: collapses onto it
+        add(0b1111_0000, 0, 2);
+        add(0b1111_0000, 1, 1);
+        for filtering in [UmiFiltering::None, UmiFiltering::MultiGeneUmiCr] {
+            let mols = cell_molecules(&umi_genes, UmiDedup::OneMmCr, filtering, 4);
+            let counts = if filtering == UmiFiltering::MultiGeneUmiCr {
+                multi_gene_umi_cr_counts(&umi_genes, 4)
+            } else {
+                let mut per: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+                for (&u, gs) in &umi_genes {
+                    for (&g, &c) in gs {
+                        *per.entry(g).or_default().entry(u).or_insert(0) += c;
+                    }
+                }
+                let mut v: Vec<(u32, u64)> = per
+                    .iter()
+                    .map(|(&g, m)| (g, dedup_count(m, UmiDedup::OneMmCr, 4)))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            let mut from_mols: HashMap<u32, u64> = HashMap::default();
+            for (g, _, _) in &mols {
+                *from_mols.entry(*g).or_insert(0) += 1;
+            }
+            let mut from_mols: Vec<(u32, u64)> = from_mols.into_iter().collect();
+            from_mols.sort_unstable();
+            assert_eq!(from_mols, counts, "{filtering:?}");
+        }
     }
 }

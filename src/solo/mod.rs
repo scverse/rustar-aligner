@@ -967,6 +967,10 @@ pub struct SoloContext {
     /// back when the sorted BAM is written to fill `CB`/`UB`. `None` unless one
     /// of those tags was requested.
     pub read_info: Option<Mutex<Vec<ReadInfo>>>,
+    /// `--soloOutLayout CellRanger` with `--soloOutH5 yes`: keep the molecules
+    /// behind the first feature's matrix for `molecule_info.h5`.
+    pub want_molecules: bool,
+    pub molecules: Mutex<Option<count::MoleculeTable>>,
 }
 
 /// Bases seen and bases at Phred ≥ 30, split the way CellRanger's
@@ -1047,6 +1051,9 @@ pub struct SoloReadOutcome {
     /// Barcode facts for the per-read SAM tags. `None` when the barcode read was
     /// too short to extract a CB+UMI at all.
     pub barcode: Option<SoloBarcodeTags>,
+    /// CellRanger's `RE` tag value (`E`xonic, `I`ntronic, i`N`tergenic) for a
+    /// uniquely-mapped read; `None` when the read has no single locus.
+    pub region: Option<u8>,
 }
 
 impl SoloReadOutcome {
@@ -1220,6 +1227,8 @@ impl SoloContext {
                 .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
             want_metrics,
             q30: Q30Stats::default(),
+            want_molecules: want_metrics && params.solo_out_h5(),
+            molecules: Mutex::new(None),
             // Sized once the read count is known (`reserve_read_info`).
             read_info: params
                 .solo_read_info_needed()
@@ -1419,6 +1428,16 @@ impl SoloContext {
             want_body,
             self.want_multi,
         );
+
+        out.region = if n_loci == 1 {
+            class.region.map(|r| match r {
+                Region::Exonic => b'E',
+                Region::Intronic => b'I',
+                Region::Intergenic => b'N',
+            })
+        } else {
+            None
+        };
 
         // Mapping funnel: count uniquely-mapped reads by region (CellRanger's
         // "confidently mapped" = MAPQ 255 ≈ a single alignment), independent of

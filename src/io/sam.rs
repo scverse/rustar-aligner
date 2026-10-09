@@ -1255,6 +1255,105 @@ pub fn apply_solo_read_info(
     order_record_tags(rec, attrs);
 }
 
+/// Tags only `cellranger count` writes, from facts rustar has on hand: `RE`
+/// (region of a uniquely-mapped read), `ts` (bases trimmed as a 5' template
+/// switch oligo) and `pa` (bases trimmed as a 3' poly-A tail). `ts`/`pa` are
+/// left off when nothing was trimmed.
+pub fn add_cr_annotation_tags(records: &mut [RecordBuf], region: Option<u8>, ts: usize, pa: usize) {
+    for rec in records.iter_mut() {
+        let data = rec.data_mut();
+        if ts > 0 {
+            data.insert(Tag::new(b't', b's'), Value::Int32(ts as i32));
+        }
+        if pa > 0 {
+            data.insert(Tag::new(b'p', b'a'), Value::Int32(pa as i32));
+        }
+        if let Some(re) = region {
+            data.insert(Tag::new(b'R', b'E'), Value::Character(re));
+        }
+    }
+}
+
+/// `--soloOutLayout CellRanger` read-group id of a read:
+/// `<sample>:0:<gem group>:<flowcell>:<lane>`, the flowcell and lane being the
+/// third and fourth `:` fields of an Illumina read name (as `cellranger count`
+/// derives them from the FASTQ). A name without them falls back to
+/// `<sample>:0:1`.
+pub fn cr_read_group_id(sample: &str, name: &[u8]) -> String {
+    let mut fields = name.split(|&b| b == b':').skip(2);
+    match (fields.next(), fields.next()) {
+        (Some(flowcell), Some(lane)) => format!(
+            "{sample}:0:1:{}:{}",
+            String::from_utf8_lossy(flowcell),
+            String::from_utf8_lossy(lane)
+        ),
+        _ => format!("{sample}:0:1"),
+    }
+}
+
+/// The order `cellranger count` writes a record's optional tags in. Tags it
+/// does not know (user-requested extras) keep their relative order after these.
+const CR_TAG_ORDER: [[u8; 2]; 22] = [
+    *b"NH", *b"HI", *b"AS", *b"nM", *b"pa", *b"ts", *b"uT", *b"RG", *b"TX", *b"GX", *b"GN", *b"fx",
+    *b"RE", *b"mm", *b"AN", *b"xf", *b"CR", *b"CY", *b"CB", *b"UR", *b"UY", *b"UB",
+];
+
+/// Rewrite a finished record's tags the way `cellranger count` writes them
+/// into `possorted_genome_bam.bam`: its tag order, `RG` from the read name,
+/// `fx` mirroring `GX`, the `xf` flags, and no `-` placeholders (an unassigned
+/// gene or uncounted barcode/UMI simply has no tag).
+///
+/// `xf` is rustar's own reading of CellRanger's flag word: 1 when the read has
+/// a gene, 16 with a corrected barcode, 8 with a counted UMI. CellRanger's
+/// duplicate marking (flag 1024) is not reproduced.
+pub fn apply_cr_bam_tags(rec: &mut RecordBuf, sample: &str) {
+    let rg = rec.name().map_or_else(
+        || format!("{sample}:0:1"),
+        |n| cr_read_group_id(sample, n.as_ref()),
+    );
+    let unmapped = rec.flags().is_unmapped();
+    let data = rec.data_mut();
+    let mut fields: Vec<(Tag, Value)> = data.iter().map(|(t, v)| (t, v.clone())).collect();
+    data.clear();
+    let is_dash = |v: &Value| matches!(v, Value::String(s) if s.as_slice() == b"-");
+    fields.retain(|(t, v)| !(matches!(t.as_ref(), b"GX" | b"GN" | b"CB" | b"UB") && is_dash(v)));
+    // CellRanger spells the corrected barcode with its GEM-well suffix.
+    for (t, v) in &mut fields {
+        if t.as_ref() == b"CB"
+            && let Value::String(cb) = v
+        {
+            cb.extend_from_slice(b"-1");
+        }
+    }
+    let find =
+        |fields: &[(Tag, Value)], t: &[u8; 2]| fields.iter().position(|(k, _)| k.as_ref() == t);
+    if let Some(i) = find(&fields, b"GX") {
+        let gx = fields[i].1.clone();
+        fields.push((Tag::new(b'f', b'x'), gx));
+    }
+    fields.push((Tag::new(b'R', b'G'), Value::String(BString::from(rg))));
+    // Mapped reads carry RE only when the caller put it there.
+    let has = |fields: &[(Tag, Value)], t: &[u8; 2]| find(fields, t).is_some();
+    let mut xf = 0i32;
+    if !unmapped && has(&fields, b"GX") && has(&fields, b"CB") {
+        xf = 1 | 16;
+        if has(&fields, b"UB") {
+            xf |= 8;
+        }
+    }
+    fields.push((Tag::new(b'x', b'f'), Value::Int32(xf)));
+    let mut ordered: Vec<(Tag, Value)> = Vec::with_capacity(fields.len());
+    for t in CR_TAG_ORDER {
+        if let Some(i) = fields.iter().position(|(k, _)| k.as_ref() == &t) {
+            ordered.push(fields.remove(i));
+        }
+    }
+    ordered.extend(fields);
+    for (t, v) in ordered {
+        data.insert(t, v);
+    }
+}
+
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
 /// `(FLAG & flagAND) | flagOR`. Matches STAR/STAR-rs, which apply this only to
 /// mapped-mate records; unmapped and transcriptome-BAM records are untouched.
@@ -5303,5 +5402,86 @@ mod tests {
         let b = a - SamAttributes::AS;
         assert_eq!(b.iter().collect::<Vec<_>>(), [SamAttr::NMM, SamAttr::NH]);
         assert!(b.contains(SamAttributes::NH) && !b.contains(SamAttributes::AS));
+    }
+}
+
+#[cfg(test)]
+mod cr_bam_tests {
+    use super::*;
+
+    fn rec(name: &str, mapped: bool) -> RecordBuf {
+        let mut r = RecordBuf::default();
+        *r.name_mut() = Some(name.into());
+        *r.flags_mut() = if mapped {
+            sam::alignment::record::Flags::empty()
+        } else {
+            sam::alignment::record::Flags::UNMAPPED
+        };
+        r
+    }
+
+    fn tags(r: &RecordBuf) -> Vec<String> {
+        r.data()
+            .iter()
+            .map(|(t, _)| String::from_utf8_lossy(t.as_ref()).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn read_group_comes_from_flowcell_and_lane() {
+        assert_eq!(
+            cr_read_group_id("pbmc1k", b"A00228:279:HFWFVDMXX:2:1385:2085:18975"),
+            "pbmc1k:0:1:HFWFVDMXX:2"
+        );
+        assert_eq!(cr_read_group_id("s", b"read1"), "s:0:1");
+    }
+
+    #[test]
+    fn cellranger_tag_order_and_placeholders() {
+        let mut r = rec("A:1:FC:3:1:2:3", true);
+        let d = r.data_mut();
+        // Inserted in rustar's order, with placeholders for an uncounted read.
+        for (t, v) in [
+            (*b"NH", Value::Int32(1)),
+            (*b"HI", Value::Int32(1)),
+            (*b"AS", Value::Int32(89)),
+            (*b"nM", Value::Int32(0)),
+            (*b"CR", Value::String("AAAA".into())),
+            (*b"CY", Value::String("FFFF".into())),
+            (*b"UR", Value::String("CC".into())),
+            (*b"UY", Value::String("FF".into())),
+            (*b"CB", Value::String("AAAA".into())),
+            (*b"UB", Value::String("-".into())),
+            (*b"GX", Value::String("ENSG1".into())),
+            (*b"GN", Value::String("G1".into())),
+            (*b"RE", Value::Character(b'E')),
+        ] {
+            d.insert(Tag::new(t[0], t[1]), v);
+        }
+        apply_cr_bam_tags(&mut r, "smp");
+        assert_eq!(
+            tags(&r),
+            [
+                "NH", "HI", "AS", "nM", "RG", "GX", "GN", "fx", "RE", "xf", "CR", "CY", "CB", "UR",
+                "UY"
+            ]
+        );
+        let get = |t: &[u8; 2]| r.data().get(&Tag::new(t[0], t[1])).cloned();
+        assert_eq!(get(b"CB"), Some(Value::String("AAAA-1".into())));
+        assert_eq!(get(b"fx"), Some(Value::String("ENSG1".into())));
+        assert_eq!(get(b"RG"), Some(Value::String("smp:0:1:FC:3".into())));
+        assert_eq!(get(b"xf"), Some(Value::Int32(17)));
+    }
+
+    #[test]
+    fn unmapped_record_keeps_xf_zero() {
+        let mut r = rec("A:1:FC:3:1:2:3", false);
+        r.data_mut()
+            .insert(Tag::new(b'C', b'R'), Value::String("AAAA".into()));
+        r.data_mut()
+            .insert(Tag::new(b'u', b'T'), Value::Character(b'1'));
+        apply_cr_bam_tags(&mut r, "smp");
+        assert_eq!(tags(&r), ["uT", "RG", "xf", "CR"]);
+        assert_eq!(r.data().get(&Tag::new(b'x', b'f')), Some(&Value::Int32(0)));
     }
 }
