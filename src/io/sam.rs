@@ -1079,6 +1079,67 @@ pub fn add_gene_tags(records: &mut [RecordBuf], gx: &str, gn: &str, attrs: SamAt
     }
 }
 
+/// CellRanger's annotation tags for the one record it keeps of a read: the
+/// confident (or STAR-primary) alignment, with its MAPQ raised to 255 when the
+/// read is confident, and `TX`, `GX`, `GN`, `fx`, `RE`, `AN`, `xf`.
+///
+/// `records` holds one record per alignment, in the aligner's order; all but
+/// the chosen one are dropped, as CellRanger writes a single alignment per read
+/// (its `NH` still counts them all). `xf` starts as 17 for a read counted for a
+/// gene (bit 1: confidently mapped to a feature, bit 16: valid feature) and 0
+/// otherwise; UMI collapsing adds the molecule bits later.
+pub fn apply_cr_annotation(
+    records: &mut Vec<RecordBuf>,
+    model: &crate::solo::cr_annot::CrModel,
+    cr: &crate::solo::cr_annot::ReadAnnot,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let keep = cr.primary.min(records.len() - 1);
+    let mut rec = records.swap_remove(keep);
+    records.clear();
+    let a = &cr.alns[keep];
+    if cr.conf {
+        *rec.mapping_quality_mut() = sam::alignment::record::MappingQuality::new(255);
+    }
+    let mut flags = rec.flags();
+    flags.remove(sam::alignment::record::Flags::SECONDARY);
+    *rec.flags_mut() = flags;
+    let cigar: Vec<cigar::Op> = rec.cigar().as_ref().to_vec();
+    let put = |rec: &mut RecordBuf, tag: [u8; 2], v: String| {
+        rec.data_mut()
+            .insert(Tag::new(tag[0], tag[1]), Value::String(BString::from(v)));
+    };
+    for tag in [*b"GX", *b"GN"] {
+        rec.data_mut().remove(&Tag::new(tag[0], tag[1]));
+    }
+    let tx = model.tx_tag(&cigar, a);
+    if !tx.is_empty() {
+        put(&mut rec, *b"TX", tx);
+    }
+    if !cr.genes.is_empty() {
+        let (gx, gn) = model.gx_gn(&cr.genes);
+        put(&mut rec, *b"GX", gx);
+        put(&mut rec, *b"GN", gn);
+    }
+    rec.data_mut().insert(
+        Tag::new(b'R', b'E'),
+        Value::Character(a.region.tag_char() as u8),
+    );
+    if cr.conf && cr.alns.len() > 1 {
+        rec.data_mut().insert(Tag::new(b'm', b'm'), Value::Int32(1));
+    }
+    let an = model.an_tag(&cigar, a);
+    if !an.is_empty() {
+        put(&mut rec, *b"AN", an);
+    }
+    let xf: i32 = if cr.gene.is_some() { 17 } else { 0 };
+    rec.data_mut()
+        .insert(Tag::new(b'x', b'f'), Value::Int32(xf));
+    records.push(rec);
+}
+
 /// The per-read STARsolo barcode tag values of one read
 /// (`ReadAlign_alignBAM.cpp:389-473`).
 ///
@@ -1220,12 +1281,14 @@ pub fn add_solo_read_index(records: &mut [RecordBuf], read_index: u32) {
 /// Both tags are written whenever either was requested, and both fall back to
 /// `"-"`, exactly as `SoloFeature::addBAMtags` does: a read that was not counted
 /// (no whitelist cell, no valid UMI, no gene) has no cell or molecule to name.
+#[allow(clippy::implicit_hasher)]
 pub fn apply_solo_read_info(
     rec: &mut RecordBuf,
     read_info: &[crate::solo::ReadInfo],
     whitelist: &crate::solo::CbWhitelist,
     umi_len: usize,
     attrs: &SamAttributes,
+    cellranger: Option<&std::collections::HashMap<u32, u32>>,
 ) {
     let tag = Tag::new(SOLO_READ_INDEX_TAG[0], SOLO_READ_INDEX_TAG[1]);
     // Read back as any integer: a record that went through a spill run is
@@ -1238,6 +1301,43 @@ pub fn apply_solo_read_info(
         .get(read_index as usize)
         .copied()
         .unwrap_or_default();
+    if let Some(multi_cb) = cellranger {
+        // CellRanger names the cell and molecule of every read it can, counted
+        // or not, so a read counting did not touch keeps the CB and UB it was
+        // given when it was aligned. Counted reads take the corrected UMI, and
+        // the molecule bits of `xf` (low support, representative) and the
+        // duplicate flag come from collapsing.
+        let resolved = if info.cb != u32::MAX {
+            Some(info.cb)
+        } else {
+            multi_cb.get(&(read_index as u32)).copied()
+        };
+        if let Some(cb_index) = resolved {
+            if let Some(cb) = whitelist.barcode_string(cb_index) {
+                rec.data_mut()
+                    .insert(Tag::new(b'C', b'B'), Value::String(BString::from(cb)));
+            }
+            if info.cb != u32::MAX && info.umi != u64::MAX {
+                let ub = crate::solo::whitelist::unpack_barcode(info.umi, umi_len);
+                rec.data_mut()
+                    .insert(Tag::new(b'U', b'B'), Value::String(BString::from(ub)));
+            }
+        }
+        let xf_tag = Tag::new(b'x', b'f');
+        if info.xf != 0
+            && let Some(xf) = rec.data().get(&xf_tag).and_then(Value::as_int)
+        {
+            rec.data_mut()
+                .insert(xf_tag, Value::Int32(xf as i32 | i32::from(info.xf)));
+        }
+        if info.dup {
+            let mut flags = rec.flags();
+            flags.insert(sam::alignment::record::Flags::DUPLICATE);
+            *rec.flags_mut() = flags;
+        }
+        order_record_tags(rec, attrs);
+        return;
+    }
     let cb = (info.cb != u32::MAX)
         .then(|| whitelist.barcode_string(info.cb))
         .flatten()
@@ -1334,14 +1434,17 @@ pub fn apply_cr_bam_tags(rec: &mut RecordBuf, sample: &str) {
     fields.push((Tag::new(b'R', b'G'), Value::String(BString::from(rg))));
     // Mapped reads carry RE only when the caller put it there.
     let has = |fields: &[(Tag, Value)], t: &[u8; 2]| find(fields, t).is_some();
-    let mut xf = 0i32;
-    if !unmapped && has(&fields, b"GX") && has(&fields, b"CB") {
-        xf = 1 | 16;
-        if has(&fields, b"UB") {
-            xf |= 8;
+    // The annotation's own `xf` (CellRanger's flag word) wins when present.
+    if !has(&fields, b"xf") {
+        let mut xf = 0i32;
+        if !unmapped && has(&fields, b"GX") && has(&fields, b"CB") {
+            xf = 1 | 16;
+            if has(&fields, b"UB") {
+                xf |= 8;
+            }
         }
+        fields.push((Tag::new(b'x', b'f'), Value::Int32(xf)));
     }
-    fields.push((Tag::new(b'x', b'f'), Value::Int32(xf)));
     let mut ordered: Vec<(Tag, Value)> = Vec::with_capacity(fields.len());
     for t in CR_TAG_ORDER {
         if let Some(i) = fields.iter().position(|(k, _)| k.as_ref() == &t) {

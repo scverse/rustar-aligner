@@ -877,6 +877,7 @@ fn run_single_pass(
                 .lock()
                 .unwrap();
             let umi_len = params.solo_umi_len as usize;
+            let multi_cb = sctx.cb_multi_resolved.lock().unwrap();
             writer.finish_with(&mut |record| {
                 crate::io::sam::apply_solo_read_info(
                     record,
@@ -884,6 +885,8 @@ fn run_single_pass(
                     &sctx.whitelist,
                     umi_len,
                     &params.out_sam_attributes,
+                    (params.solo_out_layout == "CellRanger" && sctx.cr_model.is_some())
+                        .then_some(&*multi_cb),
                 );
                 if cr_bam {
                     crate::io::sam::apply_cr_bam_tags(record, &params.solo_out_sample_id);
@@ -2323,6 +2326,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: Vec<crate::solo::SjCountRecord>,
         velocyto: Option<crate::solo::VelocytoRecord>,
+        /// CellRanger's order among reads, for picking a molecule's
+        /// representative read (see [`crate::solo::read_order_key`]).
+        order_key: u64,
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -2371,8 +2377,12 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
+                let mut read_order: Vec<u64> = Vec::new();
                 for result in products {
                     let product = result?;
+                    if solo.cr_model.is_some() {
+                        read_order.push(product.order_key);
+                    }
                     writer.write_batch(&product.sam_records.records)?;
                     for (fi, fo) in product.per_feature.into_iter().enumerate() {
                         if let Some(r) = fo.record {
@@ -2397,6 +2407,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     if !mg.is_empty() {
                         recorder.multi_gene.lock().unwrap().extend(mg);
                     }
+                }
+                if !read_order.is_empty() {
+                    solo.read_order.lock().unwrap().extend(read_order);
                 }
                 if !sj_batch.is_empty() {
                     solo.sj_records.lock().unwrap().extend(sj_batch);
@@ -2470,18 +2483,28 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 stats.record_alignment(0, max_multimaps);
                                 stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                                 // No alignment → barcode still counts toward stats (unmapped → no gene).
-                                let outcome = solo.process_read(
+                                let mut outcome = solo.process_read(
                                     &[],
                                     0,
                                     sread.barcode.as_ref(),
                                     &[],
                                     &read.quality,
                                 );
+                                if let Some(c) = outcome.cb_multi.take() {
+                                    solo.cb_multi
+                                        .lock()
+                                        .unwrap()
+                                        .push(((base + read_idx as u64) as u32, c));
+                                }
                                 return Ok(SoloReadProduct {
                                     sam_records: buffer,
                                     per_feature: outcome.per_feature,
                                     sj: outcome.sj,
                                     velocyto: outcome.velocyto,
+                                    order_key: crate::solo::read_order_key(
+                                        &read.name,
+                                        base + read_idx as u64,
+                                    ) | (1 << 63),
                                 });
                             }
 
@@ -2541,11 +2564,25 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                     None,
                                 )
                             };
+                            // CellRanger puts CB on every read whose barcode
+                            // matched the whitelist, counted or not.
+                            let cb_corrected = if solo.cr_model.is_some() && cb_corrected.is_none()
+                            {
+                                outcome
+                                    .barcode
+                                    .and_then(|b| b.cb_index)
+                                    .and_then(|i| solo.whitelist.barcode_string(i))
+                            } else {
+                                cb_corrected
+                            };
                             // CB/UB: tie this read's count records to its input
                             // index so collapsing can fill STAR's readInfo.
                             let read_index = (base + read_idx as u64) as u32;
-                            if track_read_info {
+                            if track_read_info || solo.cr_model.is_some() {
                                 outcome.set_read_index(read_index);
+                            }
+                            if let Some(c) = outcome.cb_multi.take() {
+                                solo.cb_multi.lock().unwrap().push((read_index, c));
                             }
 
                             // Build SAM records for the cDNA alignment (same as SE path).
@@ -2578,6 +2615,17 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                         params,
                                         n_for_mapq,
                                     )?;
+                                    // CellRanger keeps one record per read and tags it
+                                    // with its own annotation.
+                                    if let (Some(model), Some(cr)) =
+                                        (solo.cr_model.as_ref(), outcome.cr.as_ref())
+                                    {
+                                        crate::io::sam::apply_cr_annotation(
+                                            &mut records,
+                                            model,
+                                            cr,
+                                        );
+                                    }
                                     // CellRanger's region and clip tags; the BAM writer
                                     // puts them in cellranger's order.
                                     if solo.want_metrics {
@@ -2589,7 +2637,8 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                         );
                                     }
                                     // STARsolo GX/GN gene tags (Gene-feature assignment).
-                                    if solo_tags.intersects(
+                                    if solo.cr_model.is_none()
+                                        && solo_tags.intersects(
                                         crate::params::SamAttributes::GX
                                             | crate::params::SamAttributes::GN,
                                     ) {
@@ -2636,6 +2685,28 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                     &values.as_values(),
                                     solo_tags,
                                 );
+                                // ... and UB on every read with a valid UMI, as the
+                                // raw UMI until counting corrects it.
+                                if solo.cr_model.is_some()
+                                    && solo_tags.contains(crate::params::SamAttributes::UB)
+                                    && sread.barcode.as_ref().is_some_and(|bc| {
+                                        matches!(
+                                            crate::solo::check_umi(&bc.umi_seq),
+                                            crate::solo::UmiCheck::Ok(_)
+                                        )
+                                    })
+                                {
+                                    for rec in &mut buffer.records {
+                                        rec.data_mut().insert(
+                                            noodles::sam::alignment::record::data::field::Tag::new(
+                                                b'U', b'B',
+                                            ),
+                                            noodles::sam::alignment::record_buf::data::field::Value::String(
+                                                values.as_values().umi_seq.into(),
+                                            ),
+                                        );
+                                    }
+                                }
                                 buffer.reorder_tags();
                             }
                             if track_read_info {
@@ -2650,6 +2721,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 per_feature: outcome.per_feature,
                                 sj: outcome.sj,
                                 velocyto: outcome.velocyto,
+                                order_key: crate::solo::read_order_key(
+                                    &read.name,
+                                    base + read_idx as u64,
+                                ) | (u64::from(!outcome.cr.as_ref().is_some_and(solo::cr_annot::ReadAnnot::txomic)) << 63),
                             })
                         })
                         .collect()

@@ -250,35 +250,24 @@ useful as a target even where our value differs.
 read, because the exonic/intronic split needs it and a `Gene`-only run does not
 otherwise do it.
 
-**Not all 20 are certainties.** Twelve match a real `cellranger count` 10.0.0
-run exactly on the 20 000-read fixture. The other eight follow from our own
-tallies under a stated interpretation, because CellRanger does not document the
-denominators:
+**Definitions.** Taken from CellRanger 10.0.0's source and checked against a
+full `pbmc_1k_v3` run, not guessed:
 
-* `Reads Mapped Confidently to *` reads "confidently" as MAPQ 255, i.e. our
-  uniquely-mapped set.
-* `Reads Mapped Confidently to Transcriptome` is the `Gene` feature's own
-  uniquely-assigned read tally.
-* `Valid UMI Sequences` is measured over reads that reached the UMI check, i.e.
-  those with a valid barcode.
-* `Sequencing Saturation` is `1 - molecules / reads` over the reads that
-  entered the matrix. This is the largest disagreement on the fixture: 12.7%
-  against CellRanger's 7.4%. 10x define it as
-  `1 - n_deduped_reads / n_reads`, with `n_deduped_reads` the number of unique
-  `(barcode, UMI, gene)` combinations among confidently mapped reads. Taking
-  that literally — counting distinct triples *before* UMI correction — gives
-  **0.0%** on this fixture, because no two reads here share an exact triple, so
-  the literal reading is ruled out and their numerator is the corrected
-  molecule count, as ours is. The residual is therefore the denominator: at
-  7.4% theirs implies about 16 300 reads where ours counts about 17 300. The
-  difference is which reads are "confidently mapped", not the formula.
-* `Mean Reads per Cell` is total reads over called cells, not reads-in-cells
-  over called cells, which is what reproduces CellRanger's value.
-
-The cell-count-dependent metrics (`Median Genes per Cell`,
-`Median UMI Counts per Cell`, `Total Genes Detected`) differ by 2-4 on the
-fixture, following the count differences recorded in §1.3 rather than a
-different definition.
+* every read-count metric is a fraction of all reads (`total_read_pairs`);
+* `Reads Mapped Confidently to *` counts reads CellRanger's annotation calls
+  confident (§3.6), by the region of the confident alignment;
+* `Reads Mapped Confidently to Transcriptome` counts reads whose confident
+  alignment names exactly one gene, intronic reads included;
+* `Reads Mapped Antisense to Gene` counts confident reads with an antisense hit
+  and no sense hit, at transcript or gene level;
+* `Valid UMI Sequences` is over all reads (an `N` or a homopolymer UMI is
+  invalid whatever its barcode did); `Valid Barcodes` counts a barcode valid once
+  it is exact, one mismatch from the whitelist, or resolved by the posterior;
+* `Sequencing Saturation` is `1 - molecules / reads` over reads that are
+  candidates for counting (barcoded, confident, not low support);
+* `Fraction Reads in Cells` uses the same reads, split by called cell;
+* `Mean Reads per Cell` is all reads over called cells, rounded;
+* `Total Genes Detected` is over the called cells only.
 
 **Source.** `src/solo/count.rs` (`write_metrics_summary`, `metric_int`,
 `metric_pct`), `src/solo/mod.rs` (`Q30Stats`). CellRanger: the
@@ -322,6 +311,50 @@ a graded distribution with no plateau, which is what the unit tests cover.
 **Source.** `src/solo/count.rs` (`ordmag_at`, `ordmag_threshold`). CellRanger:
 the Gene Expression algorithm page, "Cell Calling", read rather than taken from
 its source. Coverage of the rest of that page is tracked in #181.
+
+### 3.6 CellRanger's read annotation, counting and cell calling (non-STAR)
+
+**What STAR does.** STARsolo assigns a read to a gene by overlap, counts
+molecules with `--soloUMIdedup`/`--soloUMIfiltering`, and calls cells with
+`--soloCellFilter`.
+
+**What rustar-aligner does.** Under `--soloOutLayout CellRanger`, with a
+transcriptome in the index, it follows `cellranger count` 10.0.0 instead, ported
+from `lib/rust/tx_annotation` (`transcript.rs`, `read.rs`, `mark_dups.rs`),
+`lib/python/cellranger/cell_calling*.py` and `stats.py`:
+
+* each alignment is annotated against every transcript it overlaps: exonic when
+  each aligned segment has at least half its bases in the first exon ending to
+  its right, transcript-compatible when its blocks are exactly the exons, intronic
+  when it lies inside the transcript. CellRanger's overlap counts mix inclusive
+  and exclusive ends, and that is kept;
+* a multi-mapped read is rescued to MAPQ 255 on its first sense-transcriptomic
+  alignment when those alignments name a single gene;
+* a read counts for a gene when its primary alignment is MAPQ 255 and names one;
+* molecules follow `mark_dups`: UMIs move to the neighbour with more reads (the
+  larger UMI on a tie), one read per corrected UMI is counted before the
+  low-support test and the rest after, a UMI is low support for every gene tied
+  or below the maximum, and the representative read is the smallest
+  `(UMI type, read name)`. Others are duplicates (flag 1024);
+* cells are `ordmag` (100 bootstraps of NumPy's `RandomState(0)`) plus barcodes
+  whose profile differs from the ambient one (`default_rng(42)` simulations,
+  Benjamini-Hochberg at 0.001), with NumPy's generators and `argsort` reproduced
+  bit for bit, because the calls depend on them.
+
+**Why.** CellRanger's counts differ from STARsolo's in ways no flag recovers: it
+rescues multi-mappers by gene, counts intronic reads by transcript span, and
+drops UMIs on a staged read count.
+
+**Impact.** On `pbmc_1k_v3` with the CellRanger-compatible alignments: 18 of the
+20 `metrics_summary.csv` fields identical, 99.98% of raw-matrix entries
+identical, the same 1 221 called cells, and tags agreeing on 99.998% of reads
+whose alignment is identical. What remains follows from reads that align
+differently, not from the annotation.
+
+**Source.** `src/solo/cr_annot.rs`, `cr_dups.rs`, `cr_cells.rs`,
+`src/solo/count.rs`. CellRanger: `cellranger-10.0.0` source.
+
+---
 
 ---
 

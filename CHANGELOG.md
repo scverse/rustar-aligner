@@ -25,6 +25,20 @@ Sections commonly used: Features, Bug fixes, Other changes.
   need `--soloOutH5 yes` and a `hdf5-out` build. New `--soloOutSampleID` names the
   library in the attributes and read-group ids.
 
+- `--soloOutLayout CellRanger` annotates, counts and calls cells the way `cellranger count`
+  10.0.0 does, ported from its source (`tx_annotation`, `mark_dups`, `cell_calling`)
+  using the transcriptome in the index. Each alignment gets `RE`, `TX`, `AN`, `GX`, `GN`,
+  `fx` and `xf`; a multi-mapped read is rescued to MAPQ 255 (`mm:i:1`) when its
+  transcriptomic alignments name one gene; UMIs are corrected, low-support-filtered and
+  de-duplicated as CellRanger does, the other reads of a molecule carrying the duplicate
+  flag; cells are CellRanger's `ordmag` call plus the non-ambient rescue, with NumPy's
+  generators reproduced so the same 1,221 barcodes come out. The raw matrix lists every
+  detected barcode, `CB` is set on every read whose barcode resolves and `UB` on every
+  read with a valid UMI, `molecule_info.h5` carries `umi_type`, and
+  `metrics_summary.csv` uses CellRanger's definitions (`Reads Mapped Confidently to
+  Transcriptome` no longer prints 0.0%). A 10x run now defaults to `--soloCellFilter
+  EmptyDrops_CR`.
+
 ### Bug fixes
 
 - Window formation and per-window dedup follow STAR (long splices with the default

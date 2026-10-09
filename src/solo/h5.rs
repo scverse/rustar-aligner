@@ -761,7 +761,7 @@ mod imp {
         let ones16 = vec![meta.gem_group as u16; n];
         let zeros16 = vec![0u16; n];
         // Bit 0 is CellRanger's "transcriptomic UMI" flag.
-        let umi_type = vec![1u32; n];
+        let umi_type: Vec<u32> = mols.iter().map(|m| u32::from(m.utype)).collect();
 
         let feature_reads: u64 = count.iter().map(|&c| u64::from(c)).sum();
         let called: std::collections::HashSet<u32> = table.called.iter().copied().collect();
@@ -818,7 +818,8 @@ mod imp {
         fb.add_group(bi.finish());
 
         let ds = fb.create_dataset("barcodes");
-        strings_w(ds, &barcodes, max_len(&barcodes), path)?;
+        // CellRanger's fixed-width barcode string is 43 bytes (`MAX_BARCODE_LENGTH`).
+        strings_w(ds, &barcodes, max_len(&barcodes).max(43), path)?;
         if !barcodes.is_empty() {
             ds.with_chunks(&[CHUNK.min(barcodes.len() as u64)])
                 .with_shuffle()
@@ -1112,18 +1113,21 @@ mod imp {
                         gene: 1,
                         umi: 9,
                         count: 3,
+                        utype: 1,
                     },
                     Molecule {
                         cb: 2,
                         gene: 0,
                         umi: 7,
                         count: 1,
+                        utype: 1,
                     },
                     Molecule {
                         cb: 2,
                         gene: 0,
                         umi: 3,
                         count: 2,
+                        utype: 1,
                     },
                 ],
                 called: vec![2],
