@@ -29,7 +29,7 @@ const ACCEPTED_BUT_INERT: &[(&str, &str)] = &[
     ),
     (
         "limitGenomeGenerateRAM",
-        "genome generation manages its own memory",
+        "only picks the suffix-array builder (libsais when it fits); the index bytes are the same either way",
     ),
     (
         "limitIObufferSize",
