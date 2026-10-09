@@ -886,83 +886,14 @@ pub fn cluster_seeds(
         }
     }
 
-    // Pre-dedup overlapping diagonals (order-independent, length wins):
-    // Two candidate entries on the same diagonal with overlapping read ranges represent
-    // the same alignment position — keep only the longest. This is what STAR achieves
-    // via sorted-order overlap detection (longer seed enters first, shorter blocked).
-    // Pre-computing this dedup ensures correct results regardless of discovery order,
-    // fixing window capacity overflow without changing capacity-eviction behavior
-    // for other reads (seeds on unique diagonals are unaffected).
-    //
-    // After pre-dedup, Phase 4 processes survivors in original discovery order.
-    // The overlap detection in the main Phase 4 loop below is still present but will
-    // never find an overlap (since pre-dedup already resolved all of them). It serves
-    // as a safety net for any edge cases not covered by pre-dedup.
-    let win_n = windows.len();
-    let mut win_blocked: Vec<Vec<bool>> = (0..win_n)
-        .map(|i| vec![false; win_candidates[i].len()])
-        .collect();
-
-    // Hoisted out of the per-window loop: the sort buffer and the diagonal map
-    // (with its hash table) are allocated once per read and reused across
-    // windows via `clear()` — previously this was O(windows) fresh allocations
-    // + hash-table rehashes per read (a measured allocator hotspot). Reused
-    // storage only; the results are identical.
-    let mut by_len: Vec<usize> = Vec::new();
-    type DiagKey = (i64, u8, Option<usize>); // (diagonal, mate_id, sj_a)
-    let mut diag_ranges: FxHashMap<DiagKey, Vec<(usize, usize)>> = FxHashMap::default();
-
-    for win_idx in 0..win_n {
-        let candidates = &win_candidates[win_idx];
-        if candidates.is_empty() {
-            continue;
-        }
-        // Sort indices by length descending so that the longest entry per diagonal
-        // is processed first (and blocks shorter overlapping entries on the same diagonal).
-        by_len.clear();
-        by_len.extend(0..candidates.len());
-        by_len.sort_by(|&a, &b| candidates[b].length.cmp(&candidates[a].length));
-
-        // For each (diagonal, mate_id, sj_a), track accepted [ps_rstart, ps_rend) ranges.
-        // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] and
-        // WA_sjA==sjA before the overlap test: seeds from different fragments, or
-        // a Gsj junction half and a genomic seed, are never overlapping duplicates.
-        diag_ranges.clear();
-        for &ci in &by_len {
-            let cand = &candidates[ci];
-            let diag = cand.forward_pos as i64 - cand.ps_rstart as i64;
-            let ps_rend = cand.ps_rstart + cand.length;
-            let key = (diag, cand.mate_id, cand.sj_a);
-
-            let blocked = diag_ranges.get(&key).is_some_and(|ranges| {
-                ranges.iter().any(|&(rs, re)| {
-                    (cand.ps_rstart >= rs && cand.ps_rstart < re) || (ps_rend >= rs && ps_rend < re)
-                })
-            });
-
-            if blocked {
-                win_blocked[win_idx][ci] = true;
-            } else {
-                diag_ranges
-                    .entry(key)
-                    .or_default()
-                    .push((cand.ps_rstart, ps_rend));
-            }
-        }
-    }
-
-    // Process each window's candidates in original discovery order,
-    // skipping pre-dedup-blocked entries.
+    // Process each window's candidates in discovery order, which is STAR's PC
+    // order (rStart ascending, longer first at one rStart; see `find_seeds`).
     let mut too_many_anchors = false; // STAR: MARKER_TOO_MANY_ANCHORS_PER_WINDOW
-    'outer: for win_idx in 0..win_n {
+    'outer: for win_idx in 0..windows.len() {
         if !windows[win_idx].alive {
             continue;
         }
-        for (ci, cand) in win_candidates[win_idx].iter().enumerate() {
-            if win_blocked[win_idx][ci] {
-                continue; // blocked by a longer overlapping entry on same diagonal
-            }
-
+        for cand in &win_candidates[win_idx] {
             let seed_idx = cand.seed_idx;
             let seed = &seeds[seed_idx];
             let length = cand.length;
@@ -1390,8 +1321,10 @@ fn stitch_align_to_transcript(
     let read_gap = (eff_read_pos as i64) - (last_exon.read_end as i64);
     let genome_gap = (eff_genome_pos as i64) - (last_exon.genome_end as i64);
 
-    // Reject negative gaps
-    if read_gap < 0 || genome_gap < 0 {
+    // STAR returns -1000001/-1000002 when B ends inside A (read or genome). A B
+    // that only starts before A's genome end (`genome_gap < 0`) is an
+    // insertion with overlapping seeds: its score drops by the overlap below.
+    if read_gap < 0 || eff_genome_pos + eff_length as u64 <= last_exon.genome_end {
         return None;
     }
 
@@ -2067,54 +2000,71 @@ pub(crate) fn finalize_transcript(
         return None;
     }
 
-    // STAR finalization check: exon lengths including repeat lengths (shiftSJ)
-    // For non-annotated junctions: exon_len >= alignSJoverhangMin + shiftSJ[side]
-    // For annotated junctions: exon_len >= alignSJDBoverhangMin
-    // The first exon length includes left extension, last exon includes right extension.
+    // STAR finalization check (`stitchWindowAligns.cpp:96-108`): exon lengths
+    // including repeat lengths (shiftSJ). An unannotated junction needs
+    // `alignSJoverhangMin + shiftSJ` on both sides. An annotated one needs
+    // `alignSJDBoverhangMin`, but a side is only checked when it is the end of
+    // the mate or is bounded by an unannotated junction on its other side:
+    // between two annotated junctions, or next to an indel, a short exon is fine.
+    // The first exon length includes left extension, the last the right one.
     if wt.n_junction > 0 {
+        let n = wt.exons.len();
+        // Per gap between exon i and i+1: Some((annotated, shifts)) for a
+        // splice junction, None for an indel.
+        let mut gaps: Vec<Option<(bool, (u32, u32))>> = Vec::with_capacity(n.saturating_sub(1));
         let mut junction_idx = 0usize;
-        for (isj, exon) in wt.exons.iter().enumerate() {
-            if isj >= wt.exons.len() - 1 {
-                break;
-            }
-            // Check if this gap between exon[isj] and exon[isj+1] is a junction
+        for isj in 0..n.saturating_sub(1) {
+            let exon = &wt.exons[isj];
             let next_exon = &wt.exons[isj + 1];
             let genome_gap = next_exon.genome_start as i64 - exon.genome_end as i64;
             let read_gap = next_exon.read_start as i64 - exon.read_end as i64;
             let del = genome_gap - read_gap.max(0);
             if del >= scorer.align_intron_min as i64 && junction_idx < wt.junction_shifts.len() {
-                // This is a junction — check exon lengths with repeat
-                let (shift_l, shift_r) = wt.junction_shifts[junction_idx];
-                let is_annotated = wt.junction_annotated[junction_idx];
-
-                // Left exon length (includes left extension for first exon)
-                let left_exon_len = if isj == 0 {
-                    (exon.read_end - exon.read_start) + left_extend.extend_len
-                } else {
-                    exon.read_end - exon.read_start
-                };
-
-                // Right exon length (includes right extension for last exon)
-                let right_exon_len = if isj + 1 == wt.exons.len() - 1 {
-                    (next_exon.read_end - next_exon.read_start) + right_extend.extend_len
-                } else {
-                    next_exon.read_end - next_exon.read_start
-                };
-
-                if is_annotated {
-                    let min_oh = scorer.align_sjdb_overhang_min as usize;
-                    if left_exon_len < min_oh || right_exon_len < min_oh {
-                        return None;
-                    }
-                } else {
-                    let min_oh_l = scorer.align_sj_overhang_min as usize + shift_l as usize;
-                    let min_oh_r = scorer.align_sj_overhang_min as usize + shift_r as usize;
-                    if left_exon_len < min_oh_l || right_exon_len < min_oh_r {
-                        return None;
-                    }
-                }
+                gaps.push(Some((
+                    wt.junction_annotated[junction_idx],
+                    wt.junction_shifts[junction_idx],
+                )));
                 junction_idx += 1;
+            } else {
+                gaps.push(None);
             }
+        }
+        let exon_len = |i: usize| -> usize {
+            let e = &wt.exons[i];
+            let mut len = e.read_end - e.read_start;
+            if i == 0 {
+                len += left_extend.extend_len;
+            }
+            if i + 1 == n {
+                len += right_extend.extend_len;
+            }
+            len
+        };
+        // Whether gap `g` is an unannotated splice junction (not an indel).
+        let unannotated = |g: usize| matches!(gaps[g], Some((false, _)));
+        let sj_min = scorer.align_sj_overhang_min as usize;
+        let sjdb_min = scorer.align_sjdb_overhang_min as usize;
+        for (isj, gap) in gaps.iter().enumerate() {
+            let Some((annotated, (shift_l, shift_r))) = *gap else {
+                continue;
+            };
+            let (left_len, right_len) = (exon_len(isj), exon_len(isj + 1));
+            if annotated {
+                let left_edge = isj == 0 || unannotated(isj - 1);
+                let right_edge = isj + 2 == n || unannotated(isj + 1);
+                if (left_len < sjdb_min && left_edge) || (right_len < sjdb_min && right_edge) {
+                    return None;
+                }
+            } else if left_len < sj_min + shift_l as usize || right_len < sj_min + shift_r as usize
+            {
+                return None;
+            }
+        }
+        // STAR's extra test: the mate's last exon after an annotated junction.
+        if let Some(Some((true, _))) = gaps.last()
+            && exon_len(n - 1) < sjdb_min
+        {
+            return None;
         }
     }
 
@@ -3032,73 +2982,7 @@ pub(crate) fn stitch_seeds_core(
     // of repetitive seeds, matching STAR's WA_Anchor=2 "last anchor" logic.
     let mut wa_entries: Vec<WindowAlignment> = cluster.alignments.clone();
 
-    // Diagonal dedup: for each diagonal (genome_pos - ps_rstart), merge overlapping
-    // seeds into intervals, keeping only the longest seed per merged interval.
-    // This prevents combinatorial explosion in the recursive stitcher when many
-    // redundant seeds cover the same diagonal region.
-    // Uses positive-strand coordinates consistent with cluster_seeds overlap detection.
-    {
-        use rustc_hash::{FxHashMap, FxHashSet};
-        let read_len = read_seq.len();
-        let is_rev = cluster.is_reverse;
-        // For each (diagonal, mate_id, sj_a), find the longest seed per merged interval.
-        // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] and WA_sjA==sjA
-        // before the overlap test: seeds from different fragments, or a Gsj junction
-        // half and a genomic seed, are never treated as duplicates.
-        type DiagMateKey = (i64, u8, Option<usize>);
-        type DiagSeeds = Vec<(usize, usize, usize)>;
-        let mut diag_seeds: FxHashMap<DiagMateKey, DiagSeeds> = FxHashMap::default();
-        for (idx, wa) in wa_entries.iter().enumerate() {
-            let ps = if is_rev {
-                read_len - (wa.length + wa.read_pos)
-            } else {
-                wa.read_pos
-            };
-            let diag = wa.genome_pos as i64 - ps as i64;
-            diag_seeds
-                .entry((diag, wa.mate_id, wa.sj_a))
-                .or_default()
-                .push((ps, ps + wa.length, idx));
-        }
-
-        let mut keep_indices = FxHashSet::default();
-        for (_diag, mut seeds) in diag_seeds {
-            // Sort by start position
-            seeds.sort_unstable();
-            // Merge intervals, keeping the index of the longest seed in each merged group
-            let mut merged_end = seeds[0].1;
-            let mut best_idx = seeds[0].2;
-            let mut best_len = seeds[0].1 - seeds[0].0;
-
-            for &(s, e, idx) in &seeds[1..] {
-                if s <= merged_end {
-                    // Overlapping — extend and track longest
-                    merged_end = merged_end.max(e);
-                    let len = e - s;
-                    if len > best_len {
-                        best_len = len;
-                        best_idx = idx;
-                    }
-                } else {
-                    // New interval — commit previous best
-                    keep_indices.insert(best_idx);
-                    merged_end = e;
-                    best_len = e - s;
-                    best_idx = idx;
-                }
-            }
-            // Commit last group
-            keep_indices.insert(best_idx);
-        }
-
-        // Retain only the kept indices
-        let mut idx = 0usize;
-        wa_entries.retain(|_| {
-            let keep = keep_indices.contains(&idx);
-            idx += 1;
-            keep
-        });
-    }
+    // `cluster_seeds` already applied STAR's `assignAlignToWindow` overlap rule.
 
     // STAR-faithful coordinate conversion for stitching:
     // STAR stores WA_gStart in FORWARD genome coordinates (converting RC positions via
