@@ -1,6 +1,7 @@
 /// BAM output writer with noodles (streaming, unsorted)
 use crate::error::Error;
 use crate::genome::Genome;
+use crate::io::bgzf_writer::BgzfWriter;
 use crate::params::Parameters;
 use crate::quant::transcriptome::TranscriptomeIndex;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -45,11 +46,30 @@ fn bgzf_compression(level: i32) -> bgzf::io::writer::CompressionLevel {
 }
 
 /// Create a BGZF writer with the given STAR compression level.
-fn make_bgzf_writer<W: std::io::Write>(inner: W, compression: i32) -> bgzf::io::Writer<W> {
-    bgzf::io::writer::Builder::default()
-        .set_compression_level(bgzf_compression(compression))
-        .build_from_writer(inner)
+///
+/// `threads > 1` compresses blocks on that many dedicated worker threads
+/// (see [`BgzfWriter`]); the output bytes do not depend on `threads`.
+fn make_bgzf_writer<W: Write + Send + 'static>(
+    inner: W,
+    compression: i32,
+    threads: usize,
+) -> Result<BgzfWriter<W>, Error> {
+    Ok(BgzfWriter::new(
+        inner,
+        bgzf_compression(compression),
+        threads,
+    )?)
 }
+
+/// BGZF compression workers for a run: one per `--runThreadN`, like STAR,
+/// which deflates its BAM output inside every alignment thread. The workers
+/// only use CPU while there are blocks to compress.
+fn bgzf_threads(params: &Parameters) -> usize {
+    params.run_thread_n.get()
+}
+
+type BgzfFile = BgzfWriter<BufWriter<File>>;
+type BgzfStdout = BgzfWriter<BufWriter<std::io::Stdout>>;
 
 /// BAM file writer (streaming, unsorted)
 ///
@@ -57,7 +77,7 @@ fn make_bgzf_writer<W: std::io::Write>(inner: W, compression: i32) -> bgzf::io::
 /// without buffering or sorting. The output is BGZF-compressed but unsorted.
 /// Users can sort the output with `samtools sort` if needed.
 pub struct BamWriter {
-    writer: bam::io::Writer<bgzf::io::Writer<BufWriter<File>>>,
+    writer: bam::io::Writer<BgzfFile>,
     header: sam::Header,
 }
 
@@ -168,6 +188,7 @@ struct CoordinateSorter {
     runs: Vec<tempfile::TempPath>,
     header: sam::Header,
     compression: i32,
+    threads: usize,
     ram_limit: u64,
     temp_dir: std::path::PathBuf,
     n_records: u64,
@@ -181,6 +202,7 @@ impl CoordinateSorter {
             runs: Vec::new(),
             header,
             compression: params.out_bam_compression,
+            threads: bgzf_threads(params),
             ram_limit: resolve_bam_sort_ram(params),
             temp_dir: sort_temp_dir(params),
             n_records: 0,
@@ -224,16 +246,16 @@ impl CoordinateSorter {
         // Headerless: `Reader::read_record_buf` ignores the header entirely, so
         // runs carry only record blocks and never re-parse reference names.
         let mut writer = bam::io::Writer::from(make_bgzf_writer(
-            BufWriter::new(temp.as_file()),
+            BufWriter::new(temp.as_file().try_clone()?),
             self.compression,
-        ));
+            self.threads,
+        )?);
         for record in &self.records {
             writer.write_alignment_record(&self.header, record)?;
         }
         // Finish and flush explicitly rather than on drop, so a failure to write
         // the run surfaces here instead of being swallowed and read back short.
-        writer.try_finish()?;
-        writer.into_inner().into_inner().flush()?;
+        writer.get_mut().finish()?.flush()?;
         log::debug!(
             "Coordinate sort: spilled run {} ({} records, ~{} MiB)",
             self.runs.len(),
@@ -251,12 +273,16 @@ impl CoordinateSorter {
     }
 
     /// Merge every spill run and the in-memory tail into `out` as a sorted BAM.
-    fn write_sorted<W: Write>(&mut self, out: W, destination: &str) -> Result<(), Error> {
+    fn write_sorted<W: Write + Send + 'static>(
+        &mut self,
+        out: W,
+        destination: &str,
+    ) -> Result<(), Error> {
         let spilled_runs = self.runs.len();
         self.reduce_runs()?;
         self.records.sort_by_key(sort_key);
 
-        let mut bgzf = make_bgzf_writer(out, self.compression);
+        let mut bgzf = make_bgzf_writer(out, self.compression, self.threads)?;
         write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
         let mut writer = bam::io::Writer::from(bgzf);
 
@@ -272,8 +298,7 @@ impl CoordinateSorter {
             drop(runs);
             written
         };
-        writer.try_finish()?;
-        writer.into_inner().into_inner().flush()?;
+        writer.get_mut().finish()?.flush()?;
 
         if written != self.n_records {
             return Err(Error::Alignment(format!(
@@ -309,12 +334,12 @@ impl CoordinateSorter {
                 }
                 let temp = self.new_run()?;
                 let mut writer = bam::io::Writer::from(make_bgzf_writer(
-                    BufWriter::new(temp.as_file()),
+                    BufWriter::new(temp.as_file().try_clone()?),
                     self.compression,
-                ));
+                    self.threads,
+                )?);
                 self.merge(&group, None, &mut writer)?;
-                writer.try_finish()?;
-                writer.into_inner().into_inner().flush()?;
+                writer.get_mut().finish()?.flush()?;
                 // Dropping `group` here deletes the consumed runs, so scratch use
                 // does not grow across passes.
                 drop(group);
@@ -331,11 +356,11 @@ impl CoordinateSorter {
 
     /// K-way merge `runs` (and optionally an in-memory `tail`, which sorts last on
     /// ties) into `writer`. Returns the number of records written.
-    fn merge<W: Write>(
+    fn merge<W: Write + Send + 'static>(
         &self,
         runs: &[tempfile::TempPath],
         tail: Option<&[RecordBuf]>,
-        writer: &mut bam::io::Writer<bgzf::io::Writer<W>>,
+        writer: &mut bam::io::Writer<BgzfWriter<W>>,
     ) -> Result<u64, Error> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
@@ -430,9 +455,10 @@ impl BamWriter {
         output_path: &Path,
         header: sam::Header,
         compression: i32,
+        threads: usize,
     ) -> Result<Self, Error> {
         let buf_writer = BufWriter::new(File::create(output_path)?);
-        let mut bgzf = make_bgzf_writer(buf_writer, compression);
+        let mut bgzf = make_bgzf_writer(buf_writer, compression, threads)?;
         write_bam_header_lenient(&mut bgzf, &header, None)?;
         let writer = bam::io::Writer::from(bgzf);
         Ok(Self { writer, header })
@@ -444,6 +470,7 @@ impl BamWriter {
             output_path,
             crate::io::sam::build_sam_header(genome, params)?,
             params.out_bam_compression,
+            bgzf_threads(params),
         )
     }
 
@@ -464,6 +491,7 @@ impl BamWriter {
             output_path,
             crate::io::sam::build_sam_header_from_refs(refs, params)?,
             params.out_bam_compression,
+            bgzf_threads(params),
         )
     }
 
@@ -480,7 +508,7 @@ impl BamWriter {
 
     /// Flush and close BAM file
     pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.finish(&self.header)?;
+        self.writer.get_mut().finish()?;
         log::info!("BAM file written successfully");
         Ok(())
     }
@@ -653,7 +681,7 @@ fn render_sam_text_lenient(header: &sam::Header, sort_order: Option<&str>) -> Ve
 
 /// Streaming unsorted BAM writer that writes to stdout.
 pub struct BamStdoutWriter {
-    writer: bam::io::Writer<bgzf::io::Writer<BufWriter<std::io::Stdout>>>,
+    writer: bam::io::Writer<BgzfStdout>,
     header: sam::Header,
 }
 
@@ -663,7 +691,8 @@ impl BamStdoutWriter {
         let mut bgzf = make_bgzf_writer(
             BufWriter::new(std::io::stdout()),
             params.out_bam_compression,
-        );
+            bgzf_threads(params),
+        )?;
         write_bam_header_lenient(&mut bgzf, &header, None)?;
         let writer = bam::io::Writer::from(bgzf);
         Ok(Self { writer, header })
@@ -677,7 +706,7 @@ impl BamStdoutWriter {
     }
 
     pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.finish(&self.header)?;
+        self.writer.get_mut().finish()?;
         Ok(())
     }
 }
