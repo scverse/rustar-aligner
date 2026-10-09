@@ -74,8 +74,8 @@ noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
 #
 # `nalgebra-sparse` / `polars` are pinned to the versions anndata 0.7 depends
 # on — the `CsrMatrix` and `DataFrame` we hand to it must be the *same* types.
-anndata = { version = "0.7", optional = true }
-anndata-zarr = { version = "0.2", optional = true }
+anndata = { git = "https://github.com/scverse/anndata-rs.git", branch = "ig/set_index", optional = true }
+anndata-zarr = { git = "https://github.com/scverse/anndata-rs.git", branch = "ig/set_index", optional = true }
 polars = { version = "0.53", default-features = false, optional = true }
 
 [features]
