@@ -65,6 +65,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- Paired-end multimapper depth no longer counts soft-clipped variants of an
+  alignment as separate loci. STAR drops an alignment whose blocks are a subset
+  of another's and which scores lower (`stitchWindowAligns.cpp`); the same rule
+  now applies to whole pairs, after the score-range filter. On the
+  nf-core/rnaseq test data the deepest multimapper falls from NH=20 to NH=14,
+  which is STAR's own maximum, and the uniquely-mapped count moves from 41 665
+  to 41 684 against STAR's 41 691. No change on the yeast tier: 7860 uniquely
+  mapped either way, 98.48% of mates at the same position, with NH agreement
+  rising from 99.964% to 99.976%. Closes #31.
 - **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
   `alignBAM`). The chimera now replaces the read's normal alignment, as in
   STAR: one segment as a normal record and the other as a supplementary

@@ -182,6 +182,75 @@ pub enum PairedAlignmentResult {
     },
 }
 
+/// Drop a pair whose two mates are both covered by another pair scoring at
+/// least as well, using STAR's mapped-length overlap test per mate.
+fn dedup_pair_subsets(pairs: &mut Vec<PairedAlignment>) {
+    if pairs.len() < 2 {
+        return;
+    }
+    let mapped = |t: &Transcript| -> u32 {
+        t.exons
+            .iter()
+            .map(|e| (e.read_end - e.read_start) as u32)
+            .sum()
+    };
+    let subset_of = |a: &Transcript, b: &Transcript| -> bool {
+        mapped(a).saturating_sub(blocks_overlap_transcripts(a, b)) == 0
+    };
+
+    let mut kept: Vec<PairedAlignment> = Vec::with_capacity(pairs.len());
+    for p in pairs.drain(..) {
+        let dominated = kept.iter().any(|k| {
+            k.combined_wt_score > p.combined_wt_score
+                && subset_of(&p.mate1_transcript, &k.mate1_transcript)
+                && subset_of(&p.mate2_transcript, &k.mate2_transcript)
+        });
+        if dominated {
+            continue;
+        }
+        kept.retain(|k| {
+            !(p.combined_wt_score > k.combined_wt_score
+                && subset_of(&k.mate1_transcript, &p.mate1_transcript)
+                && subset_of(&k.mate2_transcript, &p.mate2_transcript))
+        });
+        kept.push(p);
+    }
+    *pairs = kept;
+}
+
+/// Bases covered by both transcripts, counting only blocks that sit on the
+/// same read-to-genome diagonal. Port of STAR's `blocksOverlap`, including its
+/// rule of advancing both cursors when two blocks end at the same read
+/// position.
+fn blocks_overlap_transcripts(t1: &Transcript, t2: &Transcript) -> u32 {
+    let (mut i1, mut i2, mut overlap) = (0usize, 0usize, 0u32);
+    while i1 < t1.exons.len() && i2 < t2.exons.len() {
+        let a = &t1.exons[i1];
+        let b = &t2.exons[i2];
+        let (rs1, re1) = (a.read_start, a.read_end);
+        let (rs2, re2) = (b.read_start, b.read_end);
+
+        if rs1 >= re2 {
+            i2 += 1;
+        } else if rs2 >= re1 {
+            i1 += 1;
+        } else {
+            let diag1 = a.genome_start as i64 - rs1 as i64;
+            let diag2 = b.genome_start as i64 - rs2 as i64;
+            if diag1 == diag2 {
+                overlap += (re1.min(re2) - rs1.max(rs2)) as u32;
+            }
+            if re1 >= re2 {
+                i2 += 1;
+            }
+            if re2 >= re1 {
+                i1 += 1;
+            }
+        }
+    }
+    overlap
+}
+
 /// Align a read to the genome.
 ///
 /// # Algorithm
@@ -1089,6 +1158,13 @@ pub fn align_paired_read(
             .unwrap_or(0);
         let score_threshold = best_score - params.out_filter_multimap_score_range;
         joint_pairs.retain(|pa| pa.combined_wt_score >= score_threshold);
+
+        // STAR drops an alignment whose blocks are a subset of another's and
+        // which scores lower (`stitchWindowAligns.cpp`). Applied here to whole
+        // pairs: the extra loci #31 reports are pairs whose mate1 is a
+        // soft-clipped variant of another pair's mate1, with the same mate2,
+        // scoring one point less.
+        dedup_pair_subsets(&mut joint_pairs);
     }
 
     // Deterministic primary tie-break (combined score, then a fixed positional
@@ -1477,6 +1553,91 @@ pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case #31 reports: a pair whose mate1 is a soft-clipped variant of
+    /// another pair's mate1, with the same mate2 and a lower score, is not a
+    /// second locus.
+    #[test]
+    fn a_pair_that_is_a_subset_of_a_better_one_is_dropped() {
+        let full = pair_for_dedup(0, 1_000, 0, 100, 5_000, 174);
+        let clipped = pair_for_dedup(0, 1_009, 9, 100, 5_000, 173);
+        let mut pairs = vec![full, clipped];
+        dedup_pair_subsets(&mut pairs);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].combined_wt_score, 174);
+    }
+
+    /// Order must not decide the outcome: the subset arriving first is still
+    /// the one removed.
+    #[test]
+    fn the_subset_is_dropped_whichever_order_it_arrives_in() {
+        let full = pair_for_dedup(0, 1_000, 0, 100, 5_000, 174);
+        let clipped = pair_for_dedup(0, 1_009, 9, 100, 5_000, 173);
+        let mut pairs = vec![clipped, full];
+        dedup_pair_subsets(&mut pairs);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].combined_wt_score, 174);
+    }
+
+    /// Two genuinely different loci are both kept, even at different scores:
+    /// neither mate1 covers the other.
+    #[test]
+    fn distinct_loci_are_both_kept() {
+        let a = pair_for_dedup(0, 1_000, 0, 100, 5_000, 174);
+        let b = pair_for_dedup(0, 40_000, 0, 100, 44_000, 173);
+        let mut pairs = vec![a, b];
+        dedup_pair_subsets(&mut pairs);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    /// Equal scores keep both, as STAR does: its test is a strict `<`.
+    #[test]
+    fn an_equal_scoring_subset_is_kept() {
+        let full = pair_for_dedup(0, 1_000, 0, 100, 5_000, 174);
+        let clipped = pair_for_dedup(0, 1_009, 9, 100, 5_000, 174);
+        let mut pairs = vec![full, clipped];
+        dedup_pair_subsets(&mut pairs);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    fn pair_for_dedup(
+        chr_idx: usize,
+        m1_genome_start: u64,
+        m1_read_start: usize,
+        m1_read_end: usize,
+        m2_genome_start: u64,
+        score: i32,
+    ) -> PairedAlignment {
+        let mate = |gs: u64, rs: usize, re: usize| Transcript {
+            chr_idx,
+            genome_start: gs,
+            genome_end: gs + (re - rs) as u64,
+            is_reverse: false,
+            exons: vec![crate::align::transcript::Exon {
+                genome_start: gs,
+                genome_end: gs + (re - rs) as u64,
+                read_start: rs,
+                read_end: re,
+                i_frag: 0,
+            }],
+            cigar: Vec::new(),
+            score,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: Vec::new(),
+            junction_annotated: Vec::new(),
+        };
+        PairedAlignment {
+            mate1_transcript: mate(m1_genome_start, m1_read_start, m1_read_end),
+            mate2_transcript: mate(m2_genome_start, 0, 100),
+            mate1_region: (m1_read_start, m1_read_end),
+            mate2_region: (0, 100),
+            is_proper_pair: true,
+            insert_size: 0,
+            combined_wt_score: score,
+        }
+    }
     use crate::align::score::SpliceMotif;
     use crate::params::IntronMotifFilter;
 
