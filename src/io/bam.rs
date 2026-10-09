@@ -251,7 +251,15 @@ impl CoordinateSorter {
     }
 
     /// Merge every spill run and the in-memory tail into `out` as a sorted BAM.
-    fn write_sorted<W: Write>(&mut self, out: W, destination: &str) -> Result<(), Error> {
+    ///
+    /// `finalize`, when given, is applied to each record just before it is
+    /// written to `out` (never to the intermediate runs).
+    fn write_sorted<W: Write>(
+        &mut self,
+        out: W,
+        destination: &str,
+        mut finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
+    ) -> Result<(), Error> {
         let spilled_runs = self.runs.len();
         self.reduce_runs()?;
         self.records.sort_by_key(sort_key);
@@ -262,13 +270,16 @@ impl CoordinateSorter {
 
         let written = if self.runs.is_empty() {
             // Nothing spilled: identical to the previous in-memory-only path.
-            for record in &self.records {
+            for record in &mut self.records {
+                if let Some(finalize) = finalize.as_mut() {
+                    finalize(record);
+                }
                 writer.write_alignment_record(&self.header, record)?;
             }
             self.records.len() as u64
         } else {
             let runs = std::mem::take(&mut self.runs);
-            let written = self.merge(&runs, Some(&self.records), &mut writer)?;
+            let written = self.merge(&runs, Some(&self.records), &mut writer, finalize)?;
             drop(runs);
             written
         };
@@ -312,7 +323,7 @@ impl CoordinateSorter {
                     BufWriter::new(temp.as_file()),
                     self.compression,
                 ));
-                self.merge(&group, None, &mut writer)?;
+                self.merge(&group, None, &mut writer, None)?;
                 writer.try_finish()?;
                 writer.into_inner().into_inner().flush()?;
                 // Dropping `group` here deletes the consumed runs, so scratch use
@@ -336,6 +347,7 @@ impl CoordinateSorter {
         runs: &[tempfile::TempPath],
         tail: Option<&[RecordBuf]>,
         writer: &mut bam::io::Writer<bgzf::io::Writer<W>>,
+        mut finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
     ) -> Result<u64, Error> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
@@ -370,9 +382,12 @@ impl CoordinateSorter {
 
         let mut written = 0u64;
         while let Some(Reverse((_, run))) = heap.pop() {
-            let record = heads[run]
+            let mut record = heads[run]
                 .take()
                 .ok_or_else(|| Error::Alignment("BAM sort merge lost a record".to_string()))?;
+            if let Some(finalize) = finalize.as_mut() {
+                finalize(&mut record);
+            }
             writer.write_alignment_record(&self.header, &record)?;
             written += 1;
 
@@ -508,11 +523,27 @@ impl SortedBamWriter {
 
     /// Merge every run plus the in-memory tail into a coordinate-sorted BAM.
     pub fn finish(&mut self) -> Result<(), Error> {
+        self.write_file(None)
+    }
+
+    /// [`finish`](Self::finish), passing each record through `finalize` as it
+    /// leaves the merge. STARsolo's `CB`/`UB` tags are only known after the
+    /// counting pass, so they are filled here rather than when the record is
+    /// built; STAR likewise adds them while writing the sorted bins.
+    pub fn finish_with(&mut self, finalize: &mut dyn FnMut(&mut RecordBuf)) -> Result<(), Error> {
+        self.write_file(Some(finalize))
+    }
+
+    fn write_file(
+        &mut self,
+        finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
+    ) -> Result<(), Error> {
         let file = File::create(&self.output_path)
             .map_err(|source| Error::io(source, &self.output_path))?;
         self.sorter.write_sorted(
             BufWriter::new(file),
             &self.output_path.display().to_string(),
+            finalize,
         )
     }
 }
@@ -702,7 +733,14 @@ impl SortedBamStdoutWriter {
 
     pub fn finish(&mut self) -> Result<(), Error> {
         self.sorter
-            .write_sorted(BufWriter::new(std::io::stdout()), "stdout")
+            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", None)
+    }
+
+    /// [`finish`](Self::finish), passing each record through `finalize` as it
+    /// is written (see [`SortedBamWriter::finish_with`]).
+    pub fn finish_with(&mut self, finalize: &mut dyn FnMut(&mut RecordBuf)) -> Result<(), Error> {
+        self.sorter
+            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", Some(finalize))
     }
 }
 

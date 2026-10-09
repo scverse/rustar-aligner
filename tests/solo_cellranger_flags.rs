@@ -211,7 +211,16 @@ fn multi_gene_umi_cr_removes_a_tied_umi_from_the_matrix() {
         ],
     );
 
-    let plain = run_solo(root, &genome_dir, &gtf, "plain", &[]);
+    // The baseline is STAR's own behaviour (no multi-gene filtering, 1MM_All
+    // dedup): this geometry is 10x's, which would otherwise default the
+    // CellRanger pair on and make both runs identical.
+    let plain = run_solo(
+        root,
+        &genome_dir,
+        &gtf,
+        "plain",
+        &["--soloUMIfiltering", "-", "--soloUMIdedup", "1MM_All"],
+    );
     let cr = run_solo(
         root,
         &genome_dir,
