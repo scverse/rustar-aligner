@@ -4886,9 +4886,9 @@ mod tests {
     }
 
     #[test]
-    fn xs_tag_absent_when_xs_in_attrs_but_no_intron_motif() {
+    fn xs_tag_present_when_xs_in_attrs_without_intron_motif() {
         // XS listed in --outSAMattributes without --outSAMstrandField intronMotif:
-        // the bit is stripped at parse time, so no XS tag is emitted.
+        // STAR switches to intronMotif (Parameters_samAttributes.cpp:172-179), so XS is emitted.
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
             "rustar-aligner",
@@ -4920,8 +4920,8 @@ mod tests {
         assert_eq!(records.len(), 1);
         let data = records[0].data();
         assert!(
-            data.get(&Tag::new(b'X', b'S')).is_none(),
-            "XS:A: should be absent when --outSAMstrandField is not intronMotif"
+            data.get(&Tag::new(b'X', b'S')).is_some(),
+            "XS:A: should be present when XS is listed in --outSAMattributes"
         );
     }
 
