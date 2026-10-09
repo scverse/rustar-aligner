@@ -709,18 +709,8 @@ impl SoloContext {
                 .then(|| -> Result<_, Error> {
                     // GTF at mapping time wins (STAR); else the index tables.
                     if let Some(gtf_path) = params.sjdb_gtf_file.as_ref() {
-                        let exons = crate::junction::gtf::parse_gtf_configured(
-                            gtf_path,
-                            &params.sjdb_gtf_feature_exon,
-                            &params.sjdb_gtf_chr_prefix,
-                        )?;
-                        crate::quant::transcriptome::TranscriptomeIndex::from_gtf_exons_configured(
-                            &exons,
-                            genome,
-                            &params.sjdb_gtf_tag_exon_parent_transcript,
-                            &params.sjdb_gtf_tag_exon_parent_gene,
-                            &params.sjdb_gtf_tag_exon_parent_gene_name,
-                            &params.sjdb_gtf_tag_exon_parent_gene_type,
+                        crate::quant::transcriptome::TranscriptomeIndex::from_mapping_gtf(
+                            params, gtf_path, genome,
                         )
                     } else {
                         transcriptome.cloned().ok_or_else(|| {
