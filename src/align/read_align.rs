@@ -723,6 +723,7 @@ pub fn align_paired_read(
     // (higher score wins; the first one on a tie): its score and mismatches go on
     // the unmapped records.
     let mut best_tr: Option<(BestTr, u64)> = None;
+    let mut pe_overlap_replaced = false;
     let mut note_best = |score: i32, n_mm: u32, g_length: u64| {
         // STAR (ReadAlign_stitchPieces.cpp): greater score, or equal score and
         // shorter genomic length.
@@ -810,10 +811,18 @@ pub fn align_paired_read(
                 let combined_span =
                     t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
                 let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
+                // trBest keeps STAR's own score and length: the penalty is taken over
+                // first exon start to last exon end in transcript order, which differs
+                // from the span of the two mates when they overlap or protrude
+                // (stitchWindowAligns.cpp, scoreGenomicLength).
+                let star_g_length = match (wt.exons.first(), wt.exons.last()) {
+                    (Some(f), Some(l)) => l.genome_end.saturating_sub(f.genome_start),
+                    _ => combined_span,
+                };
                 note_best(
-                    combined_wt_score,
+                    wt.score + scorer.genomic_length_penalty(star_g_length),
                     t1.n_mismatch + t2.n_mismatch,
-                    combined_span,
+                    star_g_length,
                 );
 
                 let pair = try_pair_transcripts(
@@ -1035,6 +1044,7 @@ pub fn align_paired_read(
                 });
             }
             if !converted.is_empty() {
+                pe_overlap_replaced = true;
                 joint_pairs = converted;
             }
         }
@@ -1174,7 +1184,7 @@ pub fn align_paired_read(
 
     // `--peOverlapNbasesMin` may have replaced the pairs: fold the final ones into
     // trBest too (the best pair is STAR's trBest whenever a pair exists).
-    for p in &joint_pairs {
+    for p in joint_pairs.iter().filter(|_| pe_overlap_replaced) {
         let score = p.combined_wt_score;
         if best_tr.is_none_or(|(b, _)| score > b.score) {
             best_tr = Some((
