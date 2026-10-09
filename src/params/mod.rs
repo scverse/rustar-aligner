@@ -1379,6 +1379,16 @@ pub struct Parameters {
     #[arg(long = "soloVelocytoAmbiguous", default_value = "yes")]
     pub solo_velocyto_ambiguous: String,
 
+    /// CellRanger-style HDF5 count matrices (rustar extension beyond STARsolo).
+    /// `yes` additionally writes `raw_feature_bc_matrix.h5` (and
+    /// `filtered_feature_bc_matrix.h5` when cells were called) in each
+    /// `Gene`/`GeneFull` feature directory, next to `raw/` and `filtered/`, in
+    /// the CellRanger v3 layout that `scanpy.read_10x_h5` and `Seurat::Read10X_h5`
+    /// load. The MatrixMarket output is unchanged. Default `no`. Needs a binary
+    /// built with the `hdf5-out` cargo feature.
+    #[arg(long = "soloOutH5", default_value = "no")]
+    pub solo_out_h5: String,
+
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
     pub solo_strand: String,
@@ -2381,6 +2391,26 @@ impl Parameters {
                     ),
                 ));
             }
+            // --soloOutH5: yes/no, and `yes` only when the writer is compiled in.
+            match params.solo_out_h5.as_str() {
+                "no" => {}
+                "yes" if crate::solo::h5::is_available() => {}
+                "yes" => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloOutH5 yes needs the `{}` cargo feature, which this binary was built without",
+                            crate::solo::h5::CARGO_FEATURE
+                        ),
+                    ));
+                }
+                other => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!("unknown --soloOutH5 '{other}'; expected yes or no"),
+                    ));
+                }
+            }
             // A whitelist is required for any correction beyond None (SmartSeq
             // has no cell barcodes at all, so the rule does not apply).
             if params.solo_type != SoloType::SmartSeq
@@ -2422,6 +2452,11 @@ impl Parameters {
     /// True when a single-cell run is requested (`--soloType` != None).
     pub fn solo_enabled(&self) -> bool {
         self.solo_type != SoloType::None
+    }
+
+    /// True when `--soloOutH5 yes` asks for the CellRanger-style `.h5` matrices.
+    pub fn solo_out_h5(&self) -> bool {
+        self.solo_out_h5 == "yes"
     }
 
     /// Path to the cDNA (transcript) read file. For solo runs this is the

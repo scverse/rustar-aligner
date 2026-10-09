@@ -517,6 +517,14 @@ fn write_solo_output(
         );
     }
     crate::solo::write_gene_matrix(sctx, params, stats, Some(&**sj_stats), &index.genome)?;
+    if params.solo_out_h5() {
+        let dirs: Vec<&str> = sctx.features.iter().map(|f| f.dir_name()).collect();
+        crate::solo::h5::write_solo_h5(
+            params,
+            &dirs,
+            &crate::solo::h5::MtxNames::from_params(params),
+        )?;
+    }
     Ok(())
 }
 
@@ -672,6 +680,10 @@ fn run_smartseq(
         cells.len(),
         nnz,
     );
+    // SmartSeq writes the default triplet names, not `--soloOutFileNames`.
+    if params.solo_out_h5() {
+        crate::solo::h5::write_solo_h5(params, &["Gene"], &crate::solo::h5::MtxNames::default())?;
+    }
     stats.print_summary();
     Ok(stats)
 }

@@ -3567,3 +3567,138 @@ fn test_window_dedup_keeps_star_transcript_order() {
         "{sam:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 9h: `--soloOutH5 yes` (#270): CellRanger v3 `.h5` matrices next to the
+// MatrixMarket directories, built with the optional `hdf5-out` cargo feature.
+// Same one-cell, two-molecule setup as Test 9, with gzip output so the `.h5`
+// conversion reads the `.gz` triplet.
+// ---------------------------------------------------------------------------
+
+/// Run a one-cell CB_UMI_Simple solo job (8 Exon1 reads of G1, two UMI clouds)
+/// with `extra` arguments; returns the tempdir, output dir and the command result.
+fn run_one_cell_solo(extra: &[&str]) -> (TempDir, PathBuf, assert_cmd::assert::Assert) {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..8 {
+            writeln!(cf, "@read{i}").unwrap();
+            cf.write_all(&genome[10000..10050]).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            let umi = if i < 4 { "ACGTACGTAC" } else { "TGCATGCATG" };
+            writeln!(bf, "@read{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+    }
+    fs::write(
+        &wl_path,
+        format!("{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC\n"),
+    )
+    .unwrap();
+
+    let output_dir = tmpdir.path().join("out_solo");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    let mut args = vec![
+        "--runMode",
+        "alignReads",
+        "--genomeDir",
+        genome_dir.to_str().unwrap(),
+        "--readFilesIn",
+        cdna_path.to_str().unwrap(),
+        barcode_path.to_str().unwrap(),
+        "--soloType",
+        "CB_UMI_Simple",
+        "--soloCBwhitelist",
+        wl_path.to_str().unwrap(),
+        "--soloFeatures",
+        "Gene",
+        "--sjdbGTFfile",
+        gtf.to_str().unwrap(),
+        "--outFileNamePrefix",
+        &prefix,
+    ];
+    args.extend_from_slice(extra);
+    let assert = cargo_bin_cmd!("rustar-aligner").args(&args).assert();
+    (tmpdir, output_dir, assert)
+}
+
+#[cfg(feature = "hdf5-out")]
+#[test]
+fn test_starsolo_h5_output() {
+    let (_tmp, output_dir, assert) = run_one_cell_solo(&[
+        "--soloOutH5",
+        "yes",
+        "--soloOutGzip",
+        "yes",
+        // 10x geometry defaults to CellRanger's outs/ layout; this test
+        // reads Solo.out/.
+        "--soloOutLayout",
+        "STARsolo",
+    ]);
+    assert.success();
+    let gene = output_dir.join("Solo.out").join("Gene");
+    // The MatrixMarket output is still written.
+    assert!(gene.join("raw").join("matrix.mtx.gz").exists());
+
+    let read = |name: &str| hdf5_pure::File::open(gene.join(name)).unwrap();
+    let ds = |f: &hdf5_pure::File, p: &str| f.dataset(p).unwrap();
+    let raw = read("raw_feature_bc_matrix.h5");
+    let attrs = raw.root().attrs().unwrap();
+    assert_eq!(attrs["filetype"].as_str(), Some("matrix"));
+    // 1 gene × 3 whitelist barcodes, one entry: G1 in the first cell = 2 UMIs.
+    assert_eq!(ds(&raw, "matrix/shape").read_i32().unwrap(), [1, 3]);
+    assert_eq!(ds(&raw, "matrix/data").read_i32().unwrap(), [2]);
+    assert_eq!(ds(&raw, "matrix/indices").read_i64().unwrap(), [0]);
+    assert_eq!(ds(&raw, "matrix/indptr").read_i64().unwrap(), [0, 1, 1, 1]);
+    assert_eq!(
+        ds(&raw, "matrix/barcodes").read_string().unwrap(),
+        ["AAAACCCCGGGGTTTT", "CCCCGGGGTTTTAAAA", "GGGGTTTTAAAACCCC"]
+    );
+    assert_eq!(
+        ds(&raw, "matrix/features/id").read_string().unwrap(),
+        ["G1"]
+    );
+    assert_eq!(
+        ds(&raw, "matrix/features/feature_type")
+            .read_string()
+            .unwrap(),
+        ["Gene Expression"]
+    );
+
+    // The default CellRanger2.2 filter calls the one assayed cell.
+    let filt = read("filtered_feature_bc_matrix.h5");
+    assert_eq!(ds(&filt, "matrix/shape").read_i32().unwrap(), [1, 1]);
+    assert_eq!(ds(&filt, "matrix/data").read_i32().unwrap(), [2]);
+    assert_eq!(
+        ds(&filt, "matrix/barcodes").read_string().unwrap(),
+        ["AAAACCCCGGGGTTTT"]
+    );
+}
+
+#[cfg(not(feature = "hdf5-out"))]
+#[test]
+fn test_starsolo_h5_needs_cargo_feature() {
+    let (_tmp, _out, assert) = run_one_cell_solo(&["--soloOutH5", "yes"]);
+    assert
+        .failure()
+        .stderr(predicates::str::contains("`hdf5-out` cargo feature"));
+}
+
+#[test]
+fn test_starsolo_h5_rejects_unknown_value() {
+    let (_tmp, _out, assert) = run_one_cell_solo(&["--soloOutH5", "maybe"]);
+    assert
+        .failure()
+        .stderr(predicates::str::contains("unknown --soloOutH5 'maybe'"));
+}
