@@ -1541,6 +1541,7 @@ mod tests {
             transcriptome: None,
             prepared_junctions: Vec::new(),
             sjdb_overhang: 0,
+            transform_out: None,
         }
     }
 
