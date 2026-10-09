@@ -23,7 +23,7 @@ Coordinate-sorted BAM. Written when `--outSAMtype BAM SortedByCoordinate`. The s
 
 ### `sample_Aligned.toTranscriptome.out.bam`
 
-Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within.
+Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within. With `--quantTranscriptomeUnspliced Intron|PreMRNA` (rustar-aligner extension) the references also include one `<gene_id>-I` unspliced target per gene, and `sample_Aligned.toTranscriptome.targets.tsv` (target, gene, `spliced`/`unspliced` status, length) is written next to it, plus `sample_Aligned.toTranscriptome.unspliced.fa` with `--quantTranscriptomeUnsplicedFasta Yes`. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Log files
 
@@ -84,6 +84,10 @@ gene_id    unstranded    forward_stranded    reverse_stranded
 ```
 
 The first four rows are summary categories: `N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`. Subsequent rows are per-gene counts. Pick the column matching your library's strandedness — see the [quantification guide](/rustar-aligner/guides/quantification/).
+
+### `sample_ReadsPerGeneSplicing.out.tab` / `sample_ReadsPerGeneSplicing.summary.tsv`
+
+Written when `--quantGeneSplicing Yes` is set (rustar-aligner extension, not in STAR). The table has a header line and one line per gene with spliced, unspliced and ambiguous counts for the unstranded, forward and reverse strand conventions (nine count columns). The summary gives read accounting and the spliced / unspliced / ambiguous fractions per strand convention. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Unmapped reads
 

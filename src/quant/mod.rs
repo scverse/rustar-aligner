@@ -1,3 +1,4 @@
+pub mod splice_status;
 /// Gene-level read quantification (`--quantMode GeneCounts`).
 ///
 /// Implements HTSeq-style "union" counting: a read counts toward a gene if any
@@ -541,13 +542,31 @@ impl GeneCounts {
 // QuantContext — top-level bundle (passed as Arc to alignment loops)
 // ---------------------------------------------------------------------------
 
-/// Bundles GeneAnnotation + GeneCounts for cheap Arc sharing across threads.
+/// Bundles the per-read quantifications requested by `--quantMode`
+/// (`GeneCounts`, `--quantGeneSplicing`, `--outSAMsplicingStatus`) for cheap Arc sharing across threads.
 pub struct QuantContext {
+    /// `--quantMode GeneCounts`: exon-union gene counts.
+    pub gene: Option<GeneQuant>,
+    /// `--quantGeneSplicing Yes`: spliced / unspliced / ambiguous per gene.
+    pub splicing: Option<SplicingQuant>,
+    /// `--outSAMattributes sp`: annotated transcripts for the per-alignment
+    /// splicing-status tag.
+    pub splice_tag: Option<std::sync::Arc<transcriptome::TranscriptomeIndex>>,
+}
+
+/// GeneAnnotation + GeneCounts (`ReadsPerGene.out.tab`).
+pub struct GeneQuant {
     pub gene_ann: GeneAnnotation,
     pub counts: GeneCounts,
 }
 
-impl QuantContext {
+/// Transcript models + counters for `ReadsPerGeneSplicing.out.tab`.
+pub struct SplicingQuant {
+    pub transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>,
+    pub counts: splice_status::SplicingCounts,
+}
+
+impl GeneQuant {
     /// Build from a GTF file.  Call once before alignment.
     pub fn build(
         gtf_path: &Path,
@@ -561,7 +580,70 @@ impl QuantContext {
         let n = gene_ann.n_genes();
         log::info!("quantMode GeneCounts: {n} genes loaded from GTF");
         let counts = GeneCounts::new(n);
-        Ok(QuantContext { gene_ann, counts })
+        Ok(GeneQuant { gene_ann, counts })
+    }
+}
+
+impl SplicingQuant {
+    /// Counters over the genes of an already-loaded transcriptome index.
+    pub fn new(transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>) -> Self {
+        let counts = splice_status::SplicingCounts::new(transcriptome.gene_ids.len());
+        SplicingQuant {
+            transcriptome,
+            counts,
+        }
+    }
+}
+
+impl QuantContext {
+    /// Count a single-end read in every enabled quantification.
+    pub fn count_se_read(&self, transcripts: &[Transcript], n_for_mapq: usize) {
+        if let Some(g) = &self.gene {
+            g.counts.count_se_read(transcripts, n_for_mapq, &g.gene_ann);
+        }
+        if let Some(v) = &self.splicing {
+            v.counts.count_se_read(transcripts, &v.transcriptome);
+        }
+    }
+
+    /// Count a read pair in every enabled quantification.
+    pub fn count_pe_read(
+        &self,
+        both_mapped: &[&PairedAlignment],
+        unmapped: bool,
+        half_mapped: bool,
+    ) {
+        if let Some(g) = &self.gene {
+            g.counts
+                .count_pe_read(both_mapped, unmapped, half_mapped, &g.gene_ann);
+        }
+        if let Some(v) = &self.splicing {
+            v.counts
+                .count_pe_read(both_mapped, unmapped, &v.transcriptome);
+        }
+    }
+
+    /// Write the output files of every enabled quantification; returns the
+    /// paths written.
+    pub fn write_outputs(
+        &self,
+        output_path: impl Fn(&str) -> std::path::PathBuf,
+    ) -> Result<Vec<std::path::PathBuf>, Error> {
+        let mut written = Vec::new();
+        if let Some(g) = &self.gene {
+            let path = output_path("ReadsPerGene.out.tab");
+            g.counts.write_output(&path, &g.gene_ann)?;
+            written.push(path);
+        }
+        if let Some(v) = &self.splicing {
+            let path = output_path("ReadsPerGeneSplicing.out.tab");
+            v.counts.write_table(&path, &v.transcriptome)?;
+            written.push(path);
+            let path = output_path("ReadsPerGeneSplicing.summary.tsv");
+            v.counts.write_summary(&path)?;
+            written.push(path);
+        }
+        Ok(written)
     }
 }
 

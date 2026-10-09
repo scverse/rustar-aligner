@@ -117,7 +117,7 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI XS RG vW vA vG.",
+                     NH HI AS NM nM MD jM jI XS RG vW vA vG, and sp (rustar-aligner: splicing status).",
                 ),
         )
     }
