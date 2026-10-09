@@ -145,7 +145,7 @@ Clean domain modules mapping to STAR concepts: `genome/`, `index/` (packed_array
 - **Suffix array** (`index/suffix_array.rs`): custom `compare_suffixes` with a `packed_a.cmp(&packed_b)` tie-break that makes the SA **byte-for-byte identical to STAR's** for the yeast genome (Phase G3). Variable-width `PackedArray` backing store; 35-bit k-mer prefix table. Can load a STAR-generated index.
 - **Seeding** (`align/seed.rs`, 1,051 LOC): hierarchical SAindex lookup + MMP binary search, STAR-style.
 - **Stitch/score** (`align/stitch.rs` 3,522; `align/score.rs` 1,413): seed clustering into windows + recursive DP stitching + `extendAlign`, tracking STAR functions by name in comments.
-- **Multimapping / tie-break — the key divergence.** rustar-aligner uses `rand::StdRng` seeded **per read** via `per_read_seed(run_rng_seed, read_name)`, shuffling only the equal-top-score prefix. This **deliberately does not reproduce STAR's `mt19937`** primary choice. Consequence (from CLAUDE.md): near-exact on uniquely-mapping reads, but ties pick a different repeat copy → 299 (SE) / 475 (PE) tie-break diffs, excluded from the "tie-adjusted" metric.
+- **Multimapping / tie-break — the key divergence.** rustar-aligner uses `rand::StdRng` seeded **per read** via `per_read_seed(run_rng_seed, read_name)`, shuffling only the equal-top-score prefix. This **deliberately does not reproduce STAR's `mt19937`** primary choice. Consequence: near-exact on uniquely-mapping reads, but ties pick a different repeat copy → 299 (SE) / 475 (PE) tie-break diffs, excluded from the "tie-adjusted" metric.
 - **PE:** combined-read seeding, joint DP, per-mate seeding, half-mapped fallback, split-combined-WT — reports PE both-mapped 8390 (exact match to STAR), 0 half-mapped, 0 NH/MAPQ diffs.
 
 ### 5.3 Feature breadth
@@ -155,11 +155,11 @@ Clean domain modules mapping to STAR concepts: `genome/`, `index/` (packed_array
 
 ### 5.4 Parameter coverage
 
-**~86** `--camelCase` params (CLAUDE.md's "~52" is stale). clap's derive parser errors on unknown flags; some recognised-but-unenforced knobs are accepted with a warning (e.g. `--limitGenomeGenerateRAM`). No loud-reject discipline as strict as STAR-rs's, but it does not silently swallow arbitrary flags.
+**~86** `--camelCase` params (the figure in the retired CLAUDE.md, ~52, was stale). clap's derive parser errors on unknown flags; some recognised-but-unenforced knobs are accepted with a warning (e.g. `--limitGenomeGenerateRAM`). No loud-reject discipline as strict as STAR-rs's, but it does not silently swallow arbitrary flags.
 
 ### 5.5 Testing
 
-- **~434 `#[test]`** in `src/` (CLAUDE.md cites 396 passing); **14 integration tests** in `tests/` (`alignment_features.rs`, `phase9_threading.rs`, `transcriptome_sam.rs`) via `assert_cmd`.
+- **~434 `#[test]`** in `src/` (the retired CLAUDE.md cited 396); **14 integration tests** in `tests/` (`alignment_features.rs`, `phase9_threading.rs`, `transcriptome_sam.rs`) via `assert_cmd`.
 - **Differential testing via Python** (`test/`): `compare_sam.py`, `compare_sam_thorough.py`, `compare_pe.py`, `assess_faithfulness.py` (exact FLAG/RNAME/POS/MAPQ/CIGAR/NH/AS/NM + PE fields + SJ.out.tab), `compare_junctions.py`, `compare_chimeric.py`, etc. — these consume **real STAR output as ground truth**.
 - **Target is statistical, not byte-identical:** ~96–99.8% on 10k yeast reads with a **"tie-adjusted"** metric that excludes RNG tie-breaks. **0 STAR-only / 0 rustar-only reads** on SE — every disagreement is a documented tie.
 

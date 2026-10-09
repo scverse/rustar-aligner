@@ -624,6 +624,54 @@ mod tests {
         assert_eq!(read_names_from(&bytes, ".fq.xz"), ["read1", "read2"]);
     }
 
+    /// A `.gz` written as several concatenated gzip members — what `bcl2fastq`
+    /// emits, what `cat a.fq.gz b.fq.gz` produces, and what every BGZF file is.
+    /// `flate2::read::GzDecoder` stops after the first member and reports EOF,
+    /// so reading such a file used to drop reads with no error at all.
+    #[test]
+    fn test_fastq_reader_gzip_multi_member() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let mut tmpfile = tempfile::Builder::new()
+            .suffix(".fastq.gz")
+            .tempfile()
+            .unwrap();
+
+        // Member 1: read1. Each `finish()` closes a complete gzip stream, so
+        // the next encoder appends a second member rather than continuing.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        writeln!(encoder, "@read1").unwrap();
+        writeln!(encoder, "ACGT").unwrap();
+        writeln!(encoder, "+").unwrap();
+        writeln!(encoder, "IIII").unwrap();
+        tmpfile.write_all(&encoder.finish().unwrap()).unwrap();
+
+        // Member 2: read2.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        writeln!(encoder, "@read2").unwrap();
+        writeln!(encoder, "TGCA").unwrap();
+        writeln!(encoder, "+").unwrap();
+        writeln!(encoder, "HHHH").unwrap();
+        tmpfile.write_all(&encoder.finish().unwrap()).unwrap();
+        tmpfile.flush().unwrap();
+
+        let mut reader = FastqReader::open(tmpfile.path(), None).unwrap();
+
+        let read1 = reader.next_encoded().unwrap().unwrap();
+        assert_eq!(read1.name, "read1");
+        assert_eq!(read1.sequence, vec![0, 1, 2, 3]); // ACGT
+
+        let read2 = reader
+            .next_encoded()
+            .unwrap()
+            .expect("second gzip member must be decoded, not silently truncated");
+        assert_eq!(read2.name, "read2");
+        assert_eq!(read2.sequence, vec![3, 2, 1, 0]); // TGCA
+
+        assert!(reader.next_encoded().unwrap().is_none());
+    }
+
     #[test]
     fn test_strip_mate_suffix_slash() {
         assert_eq!(strip_mate_suffix("read123/1"), "read123");

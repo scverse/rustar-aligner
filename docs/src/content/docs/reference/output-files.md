@@ -71,7 +71,7 @@ Written when `--chimSegmentMin > 0`. Format depends on `--chimOutType`.
 
 ### Chimeric records in the primary BAM
 
-When `--chimOutType` includes `WithinBAM`, the chimeric segments are embedded as supplementary alignment records (FLAG `0x800`) in the main BAM output, with `SA` tags linking the donor and acceptor halves. Tools like Arriba and STAR-Fusion know how to read either format.
+When `--chimOutType` includes `WithinBAM`, a chimeric read is written into the main BAM in place of its normal alignment, as STAR does: one segment as a normal record and the other as a supplementary record (FLAG `0x800`, hard-clipped unless `SoftClip`), with `SA` tags linking the two. Paired reads whose mates lie on either side of the junction are written as two normal records. See the [chimeric guide](/rustar-aligner/guides/chimeric/).
 
 ## Quantification
 
