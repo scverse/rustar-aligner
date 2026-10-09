@@ -24,7 +24,7 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
+pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttr, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
