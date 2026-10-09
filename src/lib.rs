@@ -1669,13 +1669,6 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 )?;
                             }
                         }
-                        if params.chim_out_within_bam() {
-                            use crate::chimeric::build_within_bam_records;
-                            for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                writer.write_batch(&supp)?;
-                            }
-                        }
 
                         // Write unmapped FASTQ records
                         if let Some(ref mut uw) = unmapped_writer {
@@ -1734,14 +1727,6 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                         &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
-                                }
-                            }
-                            if params.chim_out_within_bam() {
-                                use crate::chimeric::build_within_bam_records;
-                                for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                    writer.write_batch(&supp)?;
                                 }
                             }
                         } else {
@@ -1918,6 +1903,47 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             if !chimeric_alns.is_empty() {
                                 stats.record_chimeric();
                             }
+                        }
+
+                        // --chimOutType WithinBAM: STAR writes the chimera in place of
+                        // the read's alignments and returns before outputAlignments
+                        // (`ReadAlign_oneRead.cpp:99`), so the read gets none of the
+                        // mapped-read accounting: no mapped stats, junctions, counts,
+                        // transcriptome or unmapped output. Unmapped reasons were
+                        // already counted by mappedFilter, which runs first.
+                        if params.chim_out_within_bam() && !chimeric_alns.is_empty() {
+                            if transcripts.is_empty() {
+                                stats.record_alignment(n_for_mapq, max_multimaps);
+                                if let Some(reason) = unmapped_reason {
+                                    stats.record_unmapped_reason(reason);
+                                }
+                            } else {
+                                stats.record_input_read();
+                            }
+                            let input = crate::chimeric::ChimReadInput {
+                                name: &out_read_name,
+                                seq: [&read.sequence, &[]],
+                                qual: [&read.quality, &[]],
+                                clip: [[clip5p, clip3p], [0, 0]],
+                            };
+                            for record in crate::chimeric::build_chimeric_bam_records(
+                                &chimeric_alns,
+                                &input,
+                                &index.genome,
+                                params,
+                            )? {
+                                buffer.push(record);
+                            }
+                            return Ok(AlignmentBatchResults {
+                                sam_records: buffer,
+                                chimeric_alns,
+                                primary_junction_keys: Vec::new(),
+                                transcriptome_records: Vec::new(),
+                                unmapped_mate1: Vec::new(),
+                                unmapped_mate2: Vec::new(),
+                                signal_contrib: Vec::new(),
+                                signal_n_tr: 0,
+                            });
                         }
 
                         // Record stats (atomic, lock-free)
@@ -3014,13 +3040,6 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 )?;
                             }
                         }
-                        if params.chim_out_within_bam() {
-                            use crate::chimeric::build_within_bam_records;
-                            for chim_aln in &batch.chimeric_alns {
-                                let supp = build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                writer.write_batch(&supp)?;
-                            }
-                        }
                         if let Some(ref mut uw1) = unmapped_writer1 {
                             for (name, seq, qual) in &batch.unmapped_mate1 {
                                 uw1.write_record(name, seq, qual)?;
@@ -3082,14 +3101,6 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                         &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
-                                }
-                            }
-                            if params.chim_out_within_bam() {
-                                use crate::chimeric::build_within_bam_records;
-                                for chim_aln in &meta.chimeric_alns {
-                                    let supp =
-                                        build_within_bam_records(chim_aln, &index.genome, 255)?;
-                                    writer.write_batch(&supp)?;
                                 }
                             }
                         } else {
@@ -3294,6 +3305,45 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         // Align paired read (CPU-intensive)
                         let (results, pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                             align_paired_read(&m1_seq, &m2_seq, &paired_read.name, &index, params)?;
+
+                        // --chimOutType WithinBAM: the chimera replaces the read's
+                        // alignments and STAR returns before outputAlignments
+                        // (`ReadAlign_oneRead.cpp:99`); see the single-end path.
+                        if params.chim_out_within_bam() && !pe_chimeric.is_empty() {
+                            stats.record_chimeric();
+                            if results.is_empty() {
+                                stats.record_alignment(n_for_mapq, max_multimaps);
+                                stats.record_unmapped_reason(
+                                    unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                );
+                            } else {
+                                stats.record_input_read();
+                            }
+                            let input = crate::chimeric::ChimReadInput {
+                                name: &out_read_name,
+                                seq: [&paired_read.mate1.sequence, &paired_read.mate2.sequence],
+                                qual: [&paired_read.mate1.quality, &paired_read.mate2.quality],
+                                clip: [[m1_clip5p, m1_clip3p], [m2_clip5p, m2_clip3p]],
+                            };
+                            for record in crate::chimeric::build_chimeric_bam_records(
+                                &pe_chimeric,
+                                &input,
+                                &index.genome,
+                                params,
+                            )? {
+                                buffer.push(record);
+                            }
+                            return Ok(AlignmentBatchResults {
+                                sam_records: buffer,
+                                chimeric_alns: pe_chimeric,
+                                primary_junction_keys: Vec::new(),
+                                transcriptome_records: Vec::new(),
+                                unmapped_mate1: Vec::new(),
+                                unmapped_mate2: Vec::new(),
+                                signal_contrib: Vec::new(),
+                                signal_n_tr: 0,
+                            });
+                        }
 
                         // Classify the result for stats and SAM output
                         let has_half_mapped = results
