@@ -618,7 +618,11 @@ pub struct FeatureOutcome {
 impl SoloContext {
     /// Build the solo context from parameters: load the whitelist and build the
     /// gene model from `--sjdbGTFfile`. Call once before alignment.
-    pub fn build(params: &Parameters, genome: &crate::genome::Genome) -> Result<Self, Error> {
+    pub fn build(
+        params: &Parameters,
+        genome: &crate::genome::Genome,
+        transcriptome: Option<&crate::quant::transcriptome::TranscriptomeIndex>,
+    ) -> Result<Self, Error> {
         let whitelist = if params.solo_type == SoloType::CbUmiComplex {
             // One whitelist per CB segment → combined cartesian-product whitelist.
             let paths: Vec<std::path::PathBuf> = params
@@ -650,28 +654,9 @@ impl SoloContext {
             }
         };
 
-        // Gene model from the GTF (validated to be present for Gene/GeneFull).
-        let gtf_path = params.sjdb_gtf_file.as_ref().ok_or_else(|| {
-            Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "STARsolo Gene feature requires --sjdbGTFfile",
-            ))
-        })?;
-        let exons = crate::junction::gtf::parse_gtf_configured(
-            gtf_path,
-            &params.sjdb_gtf_feature_exon,
-            &params.sjdb_gtf_chr_prefix,
-        )?;
-        let gene_ann = GeneAnnotation::from_gtf_exons_configured(
-            &exons,
-            genome,
-            &params.sjdb_gtf_tag_exon_parent_gene,
-        );
-        log::info!(
-            "STARsolo: {} genes loaded from {}",
-            gene_ann.n_genes(),
-            gtf_path.display()
-        );
+        // Gene model: --sjdbGTFfile if given, else the index's annotation tables.
+        let gene_ann = crate::quant::resolve_gene_annotation(params, genome, transcriptome)?;
+        log::info!("STARsolo: {} genes loaded", gene_ann.n_genes());
 
         let strand: SoloStrand = params.solo_strand.parse().map_err(|e: String| {
             Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
@@ -721,15 +706,31 @@ impl SoloContext {
                 .filter_map(|n| genome.chr_name.iter().position(|c| c == n))
                 .collect(),
             transcriptome: transcript3p
-                .then(|| {
-                    crate::quant::transcriptome::TranscriptomeIndex::from_gtf_exons_configured(
-                        &exons,
-                        genome,
-                        &params.sjdb_gtf_tag_exon_parent_transcript,
-                        &params.sjdb_gtf_tag_exon_parent_gene,
-                        &params.sjdb_gtf_tag_exon_parent_gene_name,
-                        &params.sjdb_gtf_tag_exon_parent_gene_type,
-                    )
+                .then(|| -> Result<_, Error> {
+                    // GTF at mapping time wins (STAR); else the index tables.
+                    if let Some(gtf_path) = params.sjdb_gtf_file.as_ref() {
+                        let exons = crate::junction::gtf::parse_gtf_configured(
+                            gtf_path,
+                            &params.sjdb_gtf_feature_exon,
+                            &params.sjdb_gtf_chr_prefix,
+                        )?;
+                        crate::quant::transcriptome::TranscriptomeIndex::from_gtf_exons_configured(
+                            &exons,
+                            genome,
+                            &params.sjdb_gtf_tag_exon_parent_transcript,
+                            &params.sjdb_gtf_tag_exon_parent_gene,
+                            &params.sjdb_gtf_tag_exon_parent_gene_name,
+                            &params.sjdb_gtf_tag_exon_parent_gene_type,
+                        )
+                    } else {
+                        transcriptome.cloned().ok_or_else(|| {
+                            Error::Index(
+                                "Solo transcript 3' features need the index's transcriptInfo.tab \
+                                 or --sjdbGTFfile"
+                                    .into(),
+                            )
+                        })
+                    }
                 })
                 .transpose()?,
             transcript3p: transcript3p
