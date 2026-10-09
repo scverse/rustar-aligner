@@ -266,8 +266,16 @@ impl GenomeIndex {
     /// share the same SA-input shape.
     fn build_prep(params: &Parameters) -> Result<BuildPrep, Error> {
         log::info!("Loading FASTA files...");
-        let mut genome = Genome::from_fasta(params)?;
+        let genome = Genome::from_fasta(params)?;
+        Self::prep_sjdb(params, genome)
+    }
 
+    /// Shared sjdb stage of `genomeGenerate` and of STAR's on-the-fly
+    /// insertion at mapping time (`sjdbInsertJunctions.cpp`): parse the GTF /
+    /// `--sjdbFileChrStartEnd`, run `sjdbPrepare` (shifts, sort, dedup) and
+    /// append the Gsj buffer to `genome`. The returned `junction_db` is keyed
+    /// on the same flushed coordinates as an index loaded from `sjdbInfo.txt`.
+    fn prep_sjdb(params: &Parameters, mut genome: Genome) -> Result<BuildPrep, Error> {
         log::info!(
             "Loaded {} chromosomes, total padded genome size: {} bytes",
             genome.n_chr_real,
@@ -329,8 +337,6 @@ impl GenomeIndex {
         }
 
         let (junction_db, prepared_junctions) = if !raw.is_empty() {
-            let jdb = SpliceJunctionDb::from_raw_junctions(&raw);
-
             let prepared: Vec<PreparedJunction> = raw
                 .iter()
                 .map(|&(chr_idx, intron_start, intron_end, strand)| {
@@ -355,6 +361,14 @@ impl GenomeIndex {
                 gsj.len()
             );
             genome.append_sjdb(&gsj);
+            // Key the database on the stored (post-sjdbPrepare, flushed)
+            // coordinates, exactly as `GenomeIndex::load` does from
+            // sjdbInfo.txt, so the stitcher's shift-back fires identically.
+            let stored: Vec<(usize, u64, u64, u8)> = prepared
+                .iter()
+                .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
+                .collect();
+            let jdb = SpliceJunctionDb::from_raw_junctions(&stored);
             log::info!(
                 "Extended genome with sjdb: n_genome = {} (pre-sjdb {})",
                 genome.n_genome,
@@ -378,6 +392,90 @@ impl GenomeIndex {
             transcriptome,
             prepared_junctions,
         })
+    }
+
+    /// STAR's mapping-time junction insertion (`sjdbInsertJunctions.cpp`) for an
+    /// index built without annotation: run the same sjdb preparation as
+    /// `genomeGenerate` on the loaded `genome`, then rebuild the suffix array
+    /// and SAindex over the extended genome. Returns `None` when no junction
+    /// results (the caller keeps the loaded index).
+    pub(crate) fn insert_junctions_on_the_fly(
+        genome: Genome,
+        params: &Parameters,
+        sparse_d: u64,
+        nbases: u32,
+    ) -> Result<Option<Self>, Error> {
+        let BuildPrep {
+            genome,
+            junction_db,
+            transcriptome,
+            prepared_junctions,
+        } = Self::prep_sjdb(params, genome)?;
+        if prepared_junctions.is_empty() {
+            return Ok(None);
+        }
+        log::info!("Rebuilding suffix array with inserted junctions...");
+        let suffix_array = SuffixArray::build_sparse(&genome, sparse_d)?;
+        let sa_index = SaIndex::build(&genome, &suffix_array, nbases)?;
+        let idx = GenomeIndex {
+            genome,
+            suffix_array,
+            sa_index,
+            junction_db,
+            transcriptome,
+            prepared_junctions,
+            sjdb_overhang: params.sjdb_overhang,
+        };
+        let dir = params.output_path("_STARgenome");
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io(e, &dir))?;
+        if params.sjdb_insert_save == "All" {
+            idx.write(&dir, params)?;
+        } else {
+            idx.write_annotation_files(&dir, params)?;
+        }
+        Ok(Some(idx))
+    }
+
+    /// Write the transcriptome tables and `sjdbInfo.txt` / `sjdbList.out.tab`
+    /// (STAR's `_STARgenome/` content after on-the-fly insertion, and the tail
+    /// of a `genomeGenerate` run).
+    pub fn write_annotation_files(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
+        // Write transcriptome index files (STAR-compatible) when the GTF
+        // was supplied. Matches STAR's `GTF_transcriptGeneSJ.cpp` outputs.
+        if let Some(tr) = &self.transcriptome {
+            tr.write_transcript_info(dir)?;
+            tr.write_exon_info(dir)?;
+            tr.write_gene_info(dir)?;
+            tr.write_exon_ge_tr_info(dir)?;
+            tr.write_sjdb_list_from_gtf(dir, &self.genome)?;
+            log::info!(
+                "Wrote transcriptome index files: {} transcripts, {} genes",
+                tr.n_transcripts(),
+                tr.gene_ids.len()
+            );
+        }
+
+        // Write sjdbInfo.txt + sjdbList.out.tab — the sjdb-insertion outputs
+        // STAR emits alongside the transcriptome files when junctions are
+        // baked into the genome at `genomeGenerate` time.
+        if !self.prepared_junctions.is_empty() {
+            sjdb_insert::write_sjdb_info_tab(
+                &dir.join("sjdbInfo.txt"),
+                &self.prepared_junctions,
+                params.sjdb_overhang,
+            )?;
+            sjdb_insert::write_sjdb_list_out_tab(
+                &dir.join("sjdbList.out.tab"),
+                &self.prepared_junctions,
+                &self.genome,
+            )?;
+            log::info!(
+                "Wrote sjdb files: {} junctions",
+                self.prepared_junctions.len()
+            );
+        }
+
+        Ok(())
     }
 
     /// Convert a raw SA position for a reverse-strand match to forward genome coordinates.
@@ -423,40 +521,7 @@ impl GenomeIndex {
             sa_size,
         )?;
 
-        // Write transcriptome index files (STAR-compatible) when the GTF
-        // was supplied. Matches STAR's `GTF_transcriptGeneSJ.cpp` outputs.
-        if let Some(tr) = &self.transcriptome {
-            tr.write_transcript_info(dir)?;
-            tr.write_exon_info(dir)?;
-            tr.write_gene_info(dir)?;
-            tr.write_exon_ge_tr_info(dir)?;
-            tr.write_sjdb_list_from_gtf(dir, &self.genome)?;
-            log::info!(
-                "Wrote transcriptome index files: {} transcripts, {} genes",
-                tr.n_transcripts(),
-                tr.gene_ids.len()
-            );
-        }
-
-        // Write sjdbInfo.txt + sjdbList.out.tab — the sjdb-insertion outputs
-        // STAR emits alongside the transcriptome files when junctions are
-        // baked into the genome at `genomeGenerate` time.
-        if !self.prepared_junctions.is_empty() {
-            sjdb_insert::write_sjdb_info_tab(
-                &dir.join("sjdbInfo.txt"),
-                &self.prepared_junctions,
-                params.sjdb_overhang,
-            )?;
-            sjdb_insert::write_sjdb_list_out_tab(
-                &dir.join("sjdbList.out.tab"),
-                &self.prepared_junctions,
-                &self.genome,
-            )?;
-            log::info!(
-                "Wrote sjdb files: {} junctions",
-                self.prepared_junctions.len()
-            );
-        }
+        self.write_annotation_files(dir, params)?;
 
         Ok(())
     }

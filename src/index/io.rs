@@ -29,6 +29,25 @@ impl GenomeIndex {
             genome.n_genome
         );
 
+        // STAR's on-the-fly insertion (sjdbInsertJunctions): an index without
+        // junctions plus a GTF / --sjdbFileChrStartEnd at mapping time. Build
+        // exactly what genomeGenerate would have built.
+        if !genome_dir.join("sjdbInfo.txt").exists()
+            && (params.sjdb_gtf_file.is_some() || !params.sjdb_file_chr_start_end.is_empty())
+        {
+            let (sparse_d, nbases) = read_sa_params(genome_dir, params);
+            if let Some(idx) =
+                GenomeIndex::insert_junctions_on_the_fly(genome.clone(), params, sparse_d, nbases)?
+            {
+                log::info!(
+                    "Inserted {} junctions on the fly (sjdbOverhang={})",
+                    idx.prepared_junctions.len(),
+                    idx.sjdb_overhang
+                );
+                return Ok(idx);
+            }
+        }
+
         // Load SA file
         let suffix_array = load_suffix_array(genome_dir, &genome)?;
         log::info!("Loaded suffix array: {} entries", suffix_array.len());
@@ -148,6 +167,22 @@ impl GenomeIndex {
             sjdb_overhang,
         })
     }
+}
+
+/// `genomeSAsparseD` and `genomeSAindexNbases` recorded in the index.
+fn read_sa_params(genome_dir: &Path, params: &Parameters) -> (u64, u32) {
+    let mut sparse_d = u64::from(params.genome_sa_sparse_d);
+    let mut nbases = params.genome_sa_index_nbases;
+    if let Ok(txt) = std::fs::read_to_string(genome_dir.join("genomeParameters.txt")) {
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("genomeSAsparseD\t") {
+                sparse_d = v.trim().parse().unwrap_or(sparse_d);
+            } else if let Some(v) = line.strip_prefix("genomeSAindexNbases\t") {
+                nbases = v.trim().parse().unwrap_or(nbases);
+            }
+        }
+    }
+    (sparse_d, nbases)
 }
 
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt

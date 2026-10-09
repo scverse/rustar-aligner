@@ -1113,6 +1113,12 @@ pub struct Parameters {
     #[arg(long = "sjdbOverhang", default_value_t = 100)]
     pub sjdb_overhang: u32,
 
+    /// What to save of the genome after on-the-fly junction insertion at
+    /// mapping time: `Basic` (sjdb and annotation tables) or `All` (also
+    /// Genome, SA, SAindex), written to `<prefix>_STARgenome/`.
+    #[arg(long = "sjdbInsertSave", default_value = "Basic")]
+    pub sjdb_insert_save: String,
+
     /// Extra score for alignments crossing annotated junctions
     #[arg(long = "sjdbScore", default_value_t = 2)]
     pub sjdb_score: i32,
