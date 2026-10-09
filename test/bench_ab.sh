@@ -48,6 +48,11 @@ BIN_A=${1:?usage: bench_ab.sh <binA> <binB> <genomeDir> <reads.fastq> [threads] 
 BIN_B=${2:?usage: bench_ab.sh <binA> <binB> <genomeDir> <reads.fastq> [threads] [rounds]}
 GENOME_DIR=${3:?usage: bench_ab.sh <binA> <binB> <genomeDir> <reads.fastq> [threads] [rounds]}
 READS=${4:?usage: bench_ab.sh <binA> <binB> <genomeDir> <reads.fastq> [threads] [rounds]}
+# Each round runs from a private temp directory, so every path handed to the
+# aligner has to be absolute or it will not resolve from there.
+GENOME_DIR=$(cd "$GENOME_DIR" && pwd)
+READS=$(cd "$(dirname "$READS")" && pwd)/$(basename "$READS")
+
 THREADS=${5:-16}
 ROUNDS=${6:-6}
 
@@ -69,7 +74,24 @@ cp "$BIN_A" "$WORK/a/rustar-aligner"
 cp "$BIN_B" "$WORK/b/rustar-aligner"
 
 cpu_idle() { # percent idle, sampled over one second
-  top -l 2 -n 0 2>/dev/null | awk '/CPU usage/ {gsub("%","",$(NF-1)); v=$(NF-1)} END {print v+0}'
+  # macOS and Linux disagree on how to ask. `top -l` is macOS-only; on Linux it
+  # exits non-zero, and under `set -o pipefail` that aborts the whole script
+  # with no message, so this must branch rather than rely on a fallback.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    top -l 2 -n 0 2>/dev/null | awk '/CPU usage/ {gsub("%","",$(NF-1)); v=$(NF-1)} END {print v+0}'
+    return
+  fi
+  # Linux: two /proc/stat samples a second apart. Field 5 is idle; the total is
+  # every field, so the ratio is idle time over elapsed jiffies across all CPUs.
+  local s1 s2
+  s1=$(awk '/^cpu /{t=0; for (j=2; j<=NF; j++) t+=$j; print $5, t; exit}' /proc/stat)
+  sleep 1
+  s2=$(awk '/^cpu /{t=0; for (j=2; j<=NF; j++) t+=$j; print $5, t; exit}' /proc/stat)
+  awk -v a="$s1" -v b="$s2" 'BEGIN {
+    split(a, x, " "); split(b, y, " ");
+    di = y[1] - x[1]; dt = y[2] - x[2];
+    print (dt > 0) ? int(100 * di / dt + 0.5) : 100
+  }'
 }
 
 # Returns "<seconds> <idle_before> <idle_after>".

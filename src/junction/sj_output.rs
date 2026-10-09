@@ -48,6 +48,12 @@ pub(crate) struct SjCounts {
 pub struct SpliceJunctionStats {
     /// Thread-safe map for parallel accumulation
     junctions: DashMap<SjKey, SjCounts>,
+    /// `--outSJfilterReads Unique`: drop junctions from multi-mapping reads at
+    /// record time rather than discounting them at output time. STAR gates the
+    /// recording itself (`ReadAlign::recordSJ`: the whole read is skipped
+    /// unless `outSJfilterReads=="All" || nTrO==1`), so a multimapper
+    /// contributes nothing at all — not its counts, and not its overhang.
+    unique_reads_only: bool,
 }
 
 impl Clone for SpliceJunctionStats {
@@ -66,7 +72,10 @@ impl Clone for SpliceJunctionStats {
                 },
             );
         }
-        Self { junctions: new_map }
+        Self {
+            junctions: new_map,
+            unique_reads_only: self.unique_reads_only,
+        }
     }
 }
 
@@ -75,6 +84,15 @@ impl SpliceJunctionStats {
     pub fn new() -> Self {
         Self {
             junctions: DashMap::new(),
+            unique_reads_only: false,
+        }
+    }
+
+    /// [`Self::new`] honouring `--outSJfilterReads`.
+    pub fn with_params(params: &Parameters) -> Self {
+        Self {
+            junctions: DashMap::new(),
+            unique_reads_only: params.out_sj_filter_reads == "Unique",
         }
     }
 
@@ -101,6 +119,10 @@ impl SpliceJunctionStats {
         overhang: u32,
         annotated: bool,
     ) {
+        if self.unique_reads_only && !is_unique {
+            return; // STAR records nothing for this read under `Unique`.
+        }
+
         let key = SjKey {
             chr_idx,
             intron_start: start,
@@ -132,22 +154,28 @@ impl SpliceJunctionStats {
             .map(|entry| {
                 let key = entry.key().clone();
                 let counts = entry.value();
+                let multi = counts.multi_count.load(Ordering::Relaxed);
                 (
                     key,
                     counts.annotated,
                     counts.unique_count.load(Ordering::Relaxed),
-                    counts.multi_count.load(Ordering::Relaxed),
+                    multi,
                     counts.max_overhang.load(Ordering::Relaxed),
                 )
             })
             .collect();
 
-        // Sort by chromosome, start, end (for distance calculation)
+        // Sort by chromosome, start, end (for distance calculation). Strand and
+        // motif join the key because the source is a `DashMap`, whose iteration
+        // order is not stable across runs or thread counts: a tie left to that
+        // order would carry it forward (#210).
         junctions.sort_by(|a, b| {
             a.0.chr_idx
                 .cmp(&b.0.chr_idx)
                 .then(a.0.intron_start.cmp(&b.0.intron_start))
                 .then(a.0.intron_end.cmp(&b.0.intron_end))
+                .then(a.0.strand.cmp(&b.0.strand))
+                .then(a.0.motif.cmp(&b.0.motif))
         });
 
         let overhang_min = &params.out_sj_filter_overhang_min;
@@ -251,17 +279,18 @@ impl SpliceJunctionStats {
     /// keys so the SJ recorder can be mapped to matrix rows.
     pub(crate) fn sj_feature_order(&self, params: &Parameters) -> Vec<(u64, u64)> {
         let surviving = self.compute_surviving_junctions(params);
-        let mut keys: Vec<(usize, u64, u64)> = self
+        let mut keys: Vec<(usize, u64, u64, u8, u8)> = self
             .junctions
             .iter()
             .filter(|e| surviving.contains(e.key()))
             .map(|e| {
                 let k = e.key();
-                (k.chr_idx, k.intron_start, k.intron_end)
+                (k.chr_idx, k.intron_start, k.intron_end, k.strand, k.motif)
             })
             .collect();
+        // Total key again: these are the SJ matrix row positions (#210).
         keys.sort_unstable();
-        keys.into_iter().map(|(_, s, e)| (s, e)).collect()
+        keys.into_iter().map(|(_, s, e, _, _)| (s, e)).collect()
     }
 
     /// Write the 9-column `SJ.out.tab` lines (sorted) to `writer`; returns the
@@ -281,21 +310,27 @@ impl SpliceJunctionStats {
             .map(|entry| {
                 let key = entry.key().clone();
                 let counts = entry.value();
+                let multi = counts.multi_count.load(Ordering::Relaxed);
                 (
                     key,
                     counts.annotated,
                     counts.unique_count.load(Ordering::Relaxed),
-                    counts.multi_count.load(Ordering::Relaxed),
+                    multi,
                     counts.max_overhang.load(Ordering::Relaxed),
                 )
             })
             .collect();
 
+        // Total order, for the same reason as `compute_surviving_junctions`:
+        // these rows are the bytes of SJ.out.tab, so a tie broken by `DashMap`
+        // iteration order would be a file that differs between runs (#210).
         output_junctions.sort_by(|a, b| {
             a.0.chr_idx
                 .cmp(&b.0.chr_idx)
                 .then(a.0.intron_start.cmp(&b.0.intron_start))
                 .then(a.0.intron_end.cmp(&b.0.intron_end))
+                .then(a.0.strand.cmp(&b.0.strand))
+                .then(a.0.motif.cmp(&b.0.motif))
         });
 
         let mut written = 0u32;

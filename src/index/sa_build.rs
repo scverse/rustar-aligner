@@ -633,7 +633,13 @@ fn dispatch_caps_sa_segmented(
     );
 
     if use_ext_mem(n) {
-        let opts = caps_sa_ext_mem_opts(temp_dir);
+        // The production segmented genome-plus-junction layout contains many
+        // long shared contexts across phase-4 partition merges. Enable caps-sa's
+        // bounded, partition-local geometric LCP memoization with its measured
+        // defaults. The policy remains explicit here: caps-sa itself defaults
+        // to the direct kernel for generic inputs.
+        let opts = caps_sa_ext_mem_opts(temp_dir)
+            .lcp_memoization(caps_sa::LcpMemoizationPolicy::geometric());
         // Predicate accepts ACGT only (rejects N at 4, spacer at 5).
         // Borrows `original` via `&[u8]` — `Send + Sync` is satisfied.
         let original_ref: &[u8] = original;

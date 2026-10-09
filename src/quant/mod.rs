@@ -320,7 +320,7 @@ impl GeneAnnotation {
                     out.push(chr[nlo].2);
                     continue;
                 }
-                let mid = (nlo + nhi) >> 1;
+                let mid = usize::midpoint(nlo, nhi);
                 stack[sp] = (2 * node, nlo, mid);
                 sp += 1;
                 stack[sp] = (2 * node + 1, mid, nhi);
@@ -803,7 +803,7 @@ mod tests {
 
         // Read in gap between exons
         let t = make_transcript(0, 250, 290, false);
-        assert!(ann.overlapping_genes(&t).is_empty());
+        assert_eq!(ann.overlapping_genes(&t), []);
     }
 
     #[test]

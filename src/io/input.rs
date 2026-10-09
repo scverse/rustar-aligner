@@ -2,8 +2,8 @@
 
 use crate::error::Error;
 use crate::io::cbq::{
-    CbqProducer, PairedEndConverter, SingleEndConverter, decoder_threads, paired_end_producer,
-    single_end_producer,
+    CbqProducer, CbqReadOpts, PairedEndConverter, SingleEndConverter, decoder_threads,
+    paired_end_producer, single_end_producer,
 };
 use crate::io::fastq::{FastqReader, PairedFastqReader};
 use crate::io::reads::{EncodedRead, PairedRead};
@@ -28,17 +28,9 @@ pub enum ReadLayout {
 /// cannot accidentally construct (for example) paired CBQ from two paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadInputPlan {
-    FastqSingle {
-        path: PathBuf,
-    },
-    FastqPaired {
-        mate1: PathBuf,
-        mate2: PathBuf,
-    },
-    Cbq {
-        path: PathBuf,
-        layout: ReadLayout,
-    },
+    FastqSingle { path: PathBuf },
+    FastqPaired { mate1: PathBuf, mate2: PathBuf },
+    Cbq { path: PathBuf, layout: ReadLayout },
 }
 
 #[derive(Debug)]
@@ -165,10 +157,9 @@ impl ReadInputPlan {
         params: &Parameters,
     ) -> Result<SingleEndProducer, Error> {
         match self {
-            Self::FastqSingle { path } => Ok(SingleEndProducer::Fastq(FastqReader::open(
-                path,
-                params.read_files_command.as_deref(),
-            )?)),
+            Self::FastqSingle { path } => Ok(SingleEndProducer::Fastq(
+                FastqReader::open(path, params.read_files_command.as_deref())?.with_params(params),
+            )),
             Self::Cbq {
                 path,
                 layout: ReadLayout::SingleEnd,
@@ -176,6 +167,7 @@ impl ReadInputPlan {
             } => Ok(SingleEndProducer::Cbq(single_end_producer(
                 path.clone(),
                 decoder_threads(params),
+                CbqReadOpts::from_params(params),
             ))),
             Self::FastqPaired { .. }
             | Self::Cbq {
@@ -193,7 +185,8 @@ impl ReadInputPlan {
     ) -> Result<PairedEndProducer, Error> {
         match self {
             Self::FastqPaired { mate1, mate2 } => Ok(PairedEndProducer::Fastq(
-                PairedFastqReader::open(mate1, mate2, params.read_files_command.as_deref())?,
+                PairedFastqReader::open(mate1, mate2, params.read_files_command.as_deref())?
+                    .with_params(params),
             )),
             Self::Cbq {
                 path,
@@ -202,6 +195,7 @@ impl ReadInputPlan {
             } => Ok(PairedEndProducer::Cbq(paired_end_producer(
                 path.clone(),
                 decoder_threads(params),
+                CbqReadOpts::from_params(params),
             ))),
             Self::FastqSingle { .. }
             | Self::Cbq {
@@ -223,12 +217,9 @@ impl SingleEndProducer {
     ) -> Result<(), Error> {
         match self {
             Self::Cbq(producer) => producer.produce(batch_size, max_records, sender),
-            Self::Fastq(mut reader) => produce_fastq(
-                |n| reader.read_batch(n),
-                batch_size,
-                max_records,
-                sender,
-            ),
+            Self::Fastq(mut reader) => {
+                produce_fastq(|n| reader.read_batch(n), batch_size, max_records, sender)
+            }
         }
     }
 }

@@ -28,11 +28,9 @@ pub fn find_stop(read: &[u8], genome: &[u8]) -> Option<usize> {
     debug_assert_eq!(read.len(), genome.len());
 
     let mut base = 0usize;
-    let mut r_chunks = read.chunks_exact(16);
-    let mut g_chunks = genome.chunks_exact(16);
-    while let (Some(rc), Some(gc)) = (r_chunks.next(), g_chunks.next()) {
-        let rc: &[u8; 16] = rc.try_into().unwrap();
-        let gc: &[u8; 16] = gc.try_into().unwrap();
+    let (r_chunks, r_rem) = read.as_chunks::<16>();
+    let (g_chunks, g_rem) = genome.as_chunks::<16>();
+    for (rc, gc) in r_chunks.iter().zip(g_chunks) {
         if !chunk_all_match(rc, gc) {
             for k in 0..16 {
                 if gc[k] >= 5 || rc[k] != gc[k] {
@@ -45,8 +43,6 @@ pub fn find_stop(read: &[u8], genome: &[u8]) -> Option<usize> {
     }
 
     // Tail shorter than 16 bytes: plain scalar scan.
-    let r_rem = r_chunks.remainder();
-    let g_rem = g_chunks.remainder();
     for (k, (&r, &g)) in r_rem.iter().zip(g_rem.iter()).enumerate() {
         if g >= 5 || r != g {
             return Some(base + k);

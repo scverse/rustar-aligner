@@ -71,8 +71,34 @@ pub trait RecordConverter: Clone + Send + 'static {
     fn convert<R: BinseqRecord>(&self, record: R, path: &Path) -> Result<Self::Output, Error>;
 }
 
-#[derive(Clone, Copy)]
-pub struct SingleEndConverter;
+/// Read-input knobs that also make sense for CBQ input: the same
+/// `--readNameSeparator` and `--outQSconversionAdd` handling the FASTQ reader
+/// applies in `FastqReader::with_params`. (`--readQualityScoreBase` is a
+/// FASTQ-encoding concept: CBQ qualities are stored as Phred+33.)
+#[derive(Clone, Debug, Default)]
+pub struct CbqReadOpts {
+    name_separators: Vec<u8>,
+    qual_shift: i32,
+}
+
+impl CbqReadOpts {
+    pub fn from_params(params: &crate::params::Parameters) -> Self {
+        Self {
+            name_separators: params
+                .read_name_separator
+                .iter()
+                .filter(|s| s.as_str() != "-")
+                .filter_map(|s| s.as_bytes().first().copied())
+                .collect(),
+            qual_shift: params.out_qs_conversion_add,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct SingleEndConverter {
+    opts: CbqReadOpts,
+}
 
 impl RecordConverter for SingleEndConverter {
     type Output = EncodedRead;
@@ -87,12 +113,14 @@ impl RecordConverter for SingleEndConverter {
                 "paired record found in single-end CBQ",
             ));
         }
-        convert_mate(&record, path, index, 1, false)
+        convert_mate(&record, path, index, 1, false, &self.opts)
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct PairedEndConverter;
+#[derive(Clone, Default)]
+pub struct PairedEndConverter {
+    opts: CbqReadOpts,
+}
 
 impl RecordConverter for PairedEndConverter {
     type Output = PairedRead;
@@ -108,8 +136,8 @@ impl RecordConverter for PairedEndConverter {
             ));
         }
 
-        let mate1 = convert_mate(&record, path, index, 1, false)?;
-        let mate2 = convert_mate(&record, path, index, 2, true)?;
+        let mate1 = convert_mate(&record, path, index, 1, false, &self.opts)?;
+        let mate2 = convert_mate(&record, path, index, 2, true, &self.opts)?;
         let name1 = strip_mate_suffix(&mate1.name);
         let name2 = strip_mate_suffix(&mate2.name);
         if name1 != name2 {
@@ -223,10 +251,11 @@ pub struct CbqProducer<C: RecordConverter> {
 pub fn single_end_producer(
     path: PathBuf,
     decoder_threads: usize,
+    opts: CbqReadOpts,
 ) -> CbqProducer<SingleEndConverter> {
     CbqProducer {
         path,
-        converter: SingleEndConverter,
+        converter: SingleEndConverter { opts },
         decoder_threads,
         window_records: MAX_RECORDS_PER_WINDOW,
     }
@@ -235,10 +264,11 @@ pub fn single_end_producer(
 pub fn paired_end_producer(
     path: PathBuf,
     decoder_threads: usize,
+    opts: CbqReadOpts,
 ) -> CbqProducer<PairedEndConverter> {
     CbqProducer {
         path,
-        converter: PairedEndConverter,
+        converter: PairedEndConverter { opts },
         decoder_threads,
         window_records: MAX_RECORDS_PER_WINDOW,
     }
@@ -601,6 +631,7 @@ fn convert_mate<R: BinseqRecord>(
     index: usize,
     mate: u8,
     extended: bool,
+    opts: &CbqReadOpts,
 ) -> Result<EncodedRead, Error> {
     let (header, sequence, quality) = if extended {
         (record.xheader(), record.xseq(), record.xqual())
@@ -621,6 +652,15 @@ fn convert_mate<R: BinseqRecord>(
         .next()
         .unwrap_or_default()
         .to_string();
+    let name = match opts
+        .name_separators
+        .iter()
+        .filter_map(|&sep| name.as_bytes().iter().position(|&b| b == sep))
+        .min()
+    {
+        Some(cut) => name[..cut].to_string(),
+        None => name,
+    };
     let encoded_sequence = sequence.iter().map(|&base| encode_base(base)).collect();
     let encoded_quality = if !record.has_quality() {
         // No placeholder: qualities are never read by alignment, clipping or
@@ -639,7 +679,14 @@ fn convert_mate<R: BinseqRecord>(
                 ),
             ));
         }
-        quality.to_vec()
+        if opts.qual_shift == 0 {
+            quality.to_vec()
+        } else {
+            quality
+                .iter()
+                .map(|&b| (i32::from(b) + opts.qual_shift).clamp(33, 126) as u8)
+                .collect()
+        }
     };
 
     Ok(EncodedRead {
@@ -737,7 +784,7 @@ mod tests {
         let (sender, receiver) = sync_channel(128);
         CbqProducer {
             path: path.to_path_buf(),
-            converter: SingleEndConverter,
+            converter: SingleEndConverter::default(),
             decoder_threads: threads,
             window_records,
         }
@@ -764,7 +811,7 @@ mod tests {
         let (sender, receiver) = sync_channel(128);
         CbqProducer {
             path: path.to_path_buf(),
-            converter: PairedEndConverter,
+            converter: PairedEndConverter::default(),
             decoder_threads: threads,
             window_records,
         }
@@ -1003,8 +1050,8 @@ mod tests {
             assert_eq!(read.mate1.name, i.to_string());
             assert_eq!(read.mate2.name, i.to_string());
             // No placeholder buffer is allocated for a quality-less record.
-            assert!(read.mate1.quality.is_empty());
-            assert!(read.mate2.quality.is_empty());
+            assert_eq!(read.mate1.quality, Vec::<u8>::new());
+            assert_eq!(read.mate2.quality, Vec::<u8>::new());
         }
     }
 
@@ -1021,10 +1068,36 @@ mod tests {
     }
 
     #[test]
+    fn read_opts_apply_name_separator_and_quality_shift() {
+        let params = crate::params::Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "x.fq",
+            "--readNameSeparator",
+            "d",
+            "--outQSconversionAdd",
+            "-2",
+        ]);
+        let path = write_cbq(false, true, true, 1);
+        let (sender, receiver) = sync_channel(8);
+        single_end_producer(path.to_path_buf(), 1, CbqReadOpts::from_params(&params))
+            .produce(10, usize::MAX, &sender)
+            .unwrap();
+        drop(sender);
+        let read = receiver
+            .into_iter()
+            .flat_map(Result::unwrap)
+            .next()
+            .unwrap();
+        assert_eq!(read.name, "rea");
+        assert_eq!(read.quality, b"?@ABCDEFGH");
+    }
+
+    #[test]
     fn invalid_utf8_and_mismatched_pair_names_are_contextual_errors() {
         let invalid = write_custom_headers(&[0xff], None);
         let (sender, _receiver) = sync_channel(8);
-        let error = single_end_producer(invalid.to_path_buf(), 1)
+        let error = single_end_producer(invalid.to_path_buf(), 1, CbqReadOpts::default())
             .produce(10, usize::MAX, &sender)
             .unwrap_err();
         let message = error.to_string();
@@ -1033,7 +1106,7 @@ mod tests {
 
         let mismatched = write_custom_headers(b"left/1", Some(b"right/2"));
         let (sender, _receiver) = sync_channel(8);
-        let error = paired_end_producer(mismatched.to_path_buf(), 2)
+        let error = paired_end_producer(mismatched.to_path_buf(), 2, CbqReadOpts::default())
             .produce(10, usize::MAX, &sender)
             .unwrap_err();
         assert!(error.to_string().contains("paired read names do not match"));
@@ -1044,7 +1117,7 @@ mod tests {
         let path = write_cbq(false, true, true, 75);
         let (sender, receiver) = sync_channel(0);
         drop(receiver);
-        single_end_producer(path.to_path_buf(), 4)
+        single_end_producer(path.to_path_buf(), 4, CbqReadOpts::default())
             .produce(1, usize::MAX, &sender)
             .unwrap();
     }
@@ -1067,7 +1140,7 @@ mod tests {
         }
 
         let mut coordinator = OrderedBlocks::new(PathBuf::from("test.cbq"), 0);
-        assert!(coordinator.push(block(2, &[2, 3])).unwrap().is_empty());
+        assert_eq!(coordinator.push(block(2, &[2, 3])).unwrap().len(), 0);
         assert_eq!(
             coordinator.push(block(0, &[0, 1])).unwrap(),
             vec![0, 1, 2, 3]
@@ -1095,8 +1168,11 @@ mod tests {
         file.flush().unwrap();
 
         let (sender, _receiver) = sync_channel(64);
-        let result =
-            single_end_producer(path.to_path_buf(), 3).produce(10, usize::MAX, &sender);
+        let result = single_end_producer(path.to_path_buf(), 3, CbqReadOpts::default()).produce(
+            10,
+            usize::MAX,
+            &sender,
+        );
         assert!(result.is_err());
     }
 }

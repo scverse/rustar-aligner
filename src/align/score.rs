@@ -1,5 +1,5 @@
 /// Scoring functions for alignment gaps and splice junctions
-use crate::genome::Genome;
+use crate::genome::{Genome, SeqView};
 use crate::params::Parameters;
 
 /// Alignment scorer with user-defined penalties
@@ -52,6 +52,69 @@ pub struct AlignmentScorer {
     /// Read-end extension policy (alignEndsType). `ext[iMate][iEnd]==true` forces
     /// full end-to-end extension (no terminal soft-clip) of that mate/end.
     pub align_ends_type: crate::params::AlignEndsType,
+    /// STAR's stitch-time intron filters; see [`IntronFilter`].
+    pub intron_filter: IntronFilter,
+}
+
+/// The three intron checks STAR applies when a transcript is finalized
+/// (`stitchWindowAligns.cpp:146-180`), before the window's dedup: a rejected
+/// transcript never enters the window, so it cannot evict another, set the
+/// score range, become `trBest`, or be a chimeric segment.
+#[derive(Debug, Clone)]
+pub struct IntronFilter {
+    pub motifs: crate::params::IntronMotifFilter,
+    pub strands: crate::params::IntronStrandFilter,
+    /// `--outSAMstrandField intronMotif`, which also drops a spliced
+    /// transcript whose junctions leave its strand undefined.
+    pub strand_field_intron_motif: bool,
+}
+
+impl Default for IntronFilter {
+    fn default() -> Self {
+        Self {
+            motifs: crate::params::IntronMotifFilter::None,
+            strands: crate::params::IntronStrandFilter::RemoveInconsistentStrands,
+            strand_field_intron_motif: false,
+        }
+    }
+}
+
+impl IntronFilter {
+    /// Whether a transcript with these junctions (motif, annotated) survives.
+    pub fn passes<'a>(
+        &self,
+        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
+    ) -> bool {
+        use crate::params::{IntronMotifFilter, IntronStrandFilter};
+        // `intronMotifs[sjStr]` counts: STAR's sjStr is 0 for a non-canonical
+        // junction, else the motif's strand.
+        let (mut n_junctions, mut plus, mut minus) = (0u32, 0u32, 0u32);
+        for (m, _) in junctions.clone() {
+            n_junctions += 1;
+            match m.implied_strand() {
+                Some('+') => plus += 1,
+                Some('-') => minus += 1,
+                _ => {}
+            }
+        }
+        if self.strands == IntronStrandFilter::RemoveInconsistentStrands && plus > 0 && minus > 0 {
+            return false;
+        }
+        // `sjMotifStrand` is defined only when exactly one strand is present.
+        let motif_strand_defined = (plus > 0) != (minus > 0);
+        if self.strand_field_intron_motif && n_junctions > 0 && !motif_strand_defined {
+            return false;
+        }
+        match self.motifs {
+            IntronMotifFilter::None => true,
+            IntronMotifFilter::RemoveNoncanonical => !junctions
+                .into_iter()
+                .any(|(m, _)| *m == SpliceMotif::NonCanonical),
+            IntronMotifFilter::RemoveNoncanonicalUnannotated => !junctions
+                .into_iter()
+                .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated),
+        }
+    }
 }
 
 impl AlignmentScorer {
@@ -80,6 +143,7 @@ impl AlignmentScorer {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         }
     }
 
@@ -120,6 +184,11 @@ impl AlignmentScorer {
             out_filter_score_min_over_lread: params.out_filter_score_min_over_lread,
             // Parsed+validated in Parameters::validate; default to Local if unset.
             align_ends_type: params.align_ends_type.parse().unwrap_or_default(),
+            intron_filter: IntronFilter {
+                motifs: params.out_filter_intron_motifs.clone(),
+                strands: params.out_filter_intron_strands.clone(),
+                strand_field_intron_motif: params.out_sam_strand_field == "intronMotif",
+            },
         }
     }
 
@@ -263,6 +332,57 @@ impl AlignmentScorer {
         }
     }
 
+    /// Memoized wrapper around [`AlignmentScorer::find_best_junction_position`].
+    ///
+    /// The scan is a pure function of its arguments. Within one window's stitch
+    /// recursion, `read_seq`, the genome, `is_reverse` and `n_genome` are fixed,
+    /// so the six remaining coordinates identify a scan completely.
+    /// `stitchWindowAligns`' include/exclude recursion reaches the same
+    /// (exon A end, seed B) pair through many different branch paths, so without
+    /// a memo the identical scan is repeated thousands of times per window.
+    /// Results are bit-identical to calling the uncached function.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_best_junction_position_cached(
+        &self,
+        cache: &mut JunctionScanCache,
+        read_seq: &[u8],
+        r_a_end: usize,
+        g_a_end: u64,
+        r_gap: i64,
+        g_gap: i64,
+        genome: &Genome,
+        is_reverse: bool,
+        n_genome: u64,
+        prev_exon_len: usize,
+        next_seed_len: usize,
+    ) -> (i32, SpliceMotif, i32, u32, u32) {
+        let key = JunctionScanKey {
+            r_a_end,
+            g_a_end,
+            r_gap,
+            g_gap,
+            prev_exon_len,
+            next_seed_len,
+        };
+        if let Some(hit) = cache.map.get(&key) {
+            return *hit;
+        }
+        let val = self.find_best_junction_position(
+            read_seq,
+            r_a_end,
+            g_a_end,
+            r_gap,
+            g_gap,
+            genome,
+            is_reverse,
+            n_genome,
+            prev_exon_len,
+            next_seed_len,
+        );
+        cache.map.insert(key, val);
+        val
+    }
+
     /// Find the optimal junction boundary position by scanning all candidates.
     ///
     /// STAR's jR scanning: given a gap between seeds A and B where gGap > rGap,
@@ -305,6 +425,10 @@ impl AlignmentScorer {
         let g_b_start1 = g_a_end_inc as i64 + del;
 
         let genome_offset: u64 = if is_reverse { n_genome } else { 0 };
+        // Resolve the genome storage once: the three scans below read a base per
+        // iteration, and `Genome::get_base` re-checks the `GenomeSeq` variant on
+        // every one of them.
+        let seq = genome.sequence.view();
 
         // Phase 1: Move LEFT from jR1=1, scoring mismatches
         // Find how far left we need to start scanning
@@ -324,17 +448,15 @@ impl AlignmentScorer {
                 break;
             }
 
-            let g_upstream = genome.get_base(g_up_pos as u64 + genome_offset);
-            let g_downstream = genome.get_base(g_dn_pos as u64 + genome_offset);
+            let g_up = seq.base((g_up_pos as u64 + genome_offset) as usize);
+            let g_dn = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-            match (g_upstream, g_downstream) {
-                (Some(g_up), Some(g_dn)) if g_up < 4 && g_dn < 4 => {
-                    if read_base == g_up && read_base != g_dn {
-                        // Moving left costs: this base matches upstream but not downstream
-                        score1 -= 1;
-                    }
-                }
-                _ => break,
+            if g_up >= 4 || g_dn >= 4 {
+                break;
+            }
+            if read_base == g_up && read_base != g_dn {
+                // Moving left costs: this base matches upstream but not downstream
+                score1 -= 1;
             }
 
             if score1 + self.score_stitch_sj_shift < 0 {
@@ -353,6 +475,18 @@ impl AlignmentScorer {
         let mut best_motif = SpliceMotif::NonCanonical;
         let mut best_motif_score = self.score_gap_noncan;
 
+        // `del` does not change across the scan, so whether the motif branch
+        // runs is decided once rather than per iteration.
+        let motif_in_range =
+            del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64;
+
+        // The four motif bases sit at `donor`, `donor+1`, `donor+del-2` and
+        // `donor+del-1`, and `donor` moves exactly one base per iteration, so
+        // consecutive iterations share two of the four. Carrying the window
+        // instead of re-fetching it turns four genome reads per position into
+        // two. `window` is `None` until the first motif iteration primes it.
+        let mut window: Option<MotifWindow> = None;
+
         loop {
             let ri = r_a_end_inc as i64 + jr1 as i64;
             if ri >= 0 && (ri as usize) < read_seq.len() {
@@ -361,24 +495,21 @@ impl AlignmentScorer {
                 let g_dn_pos = g_b_start1 + jr1 as i64;
 
                 if g_up_pos >= 0 && g_dn_pos >= 0 {
-                    let g_up = genome.get_base(g_up_pos as u64 + genome_offset);
-                    let g_dn = genome.get_base(g_dn_pos as u64 + genome_offset);
+                    let gu = seq.base((g_up_pos as u64 + genome_offset) as usize);
+                    let gd = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-                    match (g_up, g_dn) {
-                        (Some(gu), Some(gd)) if gu < 4 && gd < 4 => {
-                            if read_base == gu && read_base != gd {
-                                score1 += 1;
-                            } else if read_base != gu && read_base == gd {
-                                score1 -= 1;
-                            }
+                    if gu < 4 && gd < 4 {
+                        if read_base == gu && read_base != gd {
+                            score1 += 1;
+                        } else if read_base != gu && read_base == gd {
+                            score1 -= 1;
                         }
-                        _ => {}
                     }
                 }
             }
 
             // Check splice motif at this junction position
-            if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
+            if motif_in_range {
                 // Donor position in SA space: one past the last donor-exon base
                 let donor_sa = (g_a_end_inc as i64 + jr1 as i64 + 1) as u64;
                 // Convert to forward genome coordinates for motif detection
@@ -387,7 +518,14 @@ impl AlignmentScorer {
                 } else {
                     donor_sa
                 };
-                let motif = self.detect_splice_motif(donor_fwd, del as u32, genome);
+                let w = match window.as_mut() {
+                    Some(w) => {
+                        w.slide_to(donor_fwd, del as u64, seq);
+                        &*w
+                    }
+                    None => window.insert(MotifWindow::at(donor_fwd, del as u64, seq)),
+                };
+                let motif = w.motif();
                 let motif_score = self.score_splice_junction(motif);
                 let score2 = score1 + motif_score;
 
@@ -429,13 +567,12 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let g_left = genome.get_base(left_pos as u64 + genome_offset);
-            let g_right = genome.get_base(right_pos as u64 + genome_offset);
-            match (g_left, g_right) {
-                (Some(gl), Some(gr)) if gl < 4 && gl == gr => {
-                    jj_l += 1;
-                }
-                _ => break,
+            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
+            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            if gl < 4 && gl == gr {
+                jj_l += 1;
+            } else {
+                break;
             }
             if jj_l > 255 {
                 break;
@@ -450,13 +587,12 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let g_left = genome.get_base(left_pos as u64 + genome_offset);
-            let g_right = genome.get_base(right_pos as u64 + genome_offset);
-            match (g_left, g_right) {
-                (Some(gl), Some(gr)) if gl < 4 && gl == gr => {
-                    jj_r += 1;
-                }
-                _ => break,
+            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
+            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            if gl < 4 && gl == gr {
+                jj_r += 1;
+            } else {
+                break;
             }
             if jj_r > 255 {
                 break;
@@ -535,20 +671,129 @@ impl AlignmentScorer {
 /// `donor_pos` is the 0-based position of the intron's first base on the
 /// forward strand; `intron_len` is the intron length in bases.
 pub fn detect_splice_motif(donor_pos: u64, intron_len: u32, genome: &Genome) -> SpliceMotif {
-    let d1 = genome.get_base(donor_pos);
-    let d2 = genome.get_base(donor_pos + 1);
-    let a1 = genome.get_base(donor_pos + intron_len as u64 - 2);
-    let a2 = genome.get_base(donor_pos + intron_len as u64 - 1);
+    MotifWindow::at(donor_pos, intron_len as u64, genome.sequence.view()).motif()
+}
 
-    // Base encoding: A=0, C=1, G=2, T=3.
-    match (d1, d2, a1, a2) {
-        (Some(2), Some(3), Some(0), Some(2)) => SpliceMotif::GtAg,
-        (Some(2), Some(1), Some(0), Some(2)) => SpliceMotif::GcAg,
-        (Some(0), Some(3), Some(0), Some(1)) => SpliceMotif::AtAc,
-        (Some(1), Some(3), Some(0), Some(1)) => SpliceMotif::CtAc,
-        (Some(1), Some(3), Some(2), Some(1)) => SpliceMotif::CtGc,
-        (Some(2), Some(3), Some(0), Some(3)) => SpliceMotif::GtAt,
-        _ => SpliceMotif::NonCanonical,
+/// The four bases that decide a splice motif: the intron's first two and last
+/// two, on the forward strand.
+///
+/// Kept as a struct so the junction scan can slide it. Successive junction
+/// positions differ by one base, so three of the four positions overlap the
+/// previous window and only two bases have to be read from the genome.
+#[derive(Clone, Copy)]
+struct MotifWindow {
+    donor: u64,
+    d1: u8,
+    d2: u8,
+    a1: u8,
+    a2: u8,
+}
+
+impl MotifWindow {
+    #[inline]
+    fn at(donor: u64, intron_len: u64, seq: SeqView<'_>) -> Self {
+        Self {
+            donor,
+            d1: seq.base(donor as usize),
+            d2: seq.base((donor + 1) as usize),
+            a1: seq.base((donor + intron_len - 2) as usize),
+            a2: seq.base((donor + intron_len - 1) as usize),
+        }
+    }
+
+    /// Move the window to `donor`, reusing what overlaps.
+    ///
+    /// A step of exactly one base either way shares two of the four: moving
+    /// right, the old `d2`/`a2` become the new `d1`/`a1`; moving left, the old
+    /// `d1`/`a1` become the new `d2`/`a2`. Any other step is rare enough that
+    /// re-reading all four is the simpler answer.
+    #[inline]
+    fn slide_to(&mut self, donor: u64, intron_len: u64, seq: SeqView<'_>) {
+        if donor == self.donor + 1 {
+            self.d1 = self.d2;
+            self.a1 = self.a2;
+            self.d2 = seq.base((donor + 1) as usize);
+            self.a2 = seq.base((donor + intron_len - 1) as usize);
+            self.donor = donor;
+        } else if donor + 1 == self.donor {
+            self.d2 = self.d1;
+            self.a2 = self.a1;
+            self.d1 = seq.base(donor as usize);
+            self.a1 = seq.base((donor + intron_len - 2) as usize);
+            self.donor = donor;
+        } else if donor != self.donor {
+            *self = Self::at(donor, intron_len, seq);
+        }
+    }
+
+    /// Base encoding: A=0, C=1, G=2, T=3.
+    ///
+    /// A table lookup rather than a match on the four bases. The match compiled
+    /// to a chain of compares whose outcome is data-dependent and close to
+    /// unpredictable, which the scan pays at every junction position; the table
+    /// is one load at a computed index. `|` binds tighter than `>=` in Rust, so
+    /// the guard tests the union of the four bases and rejects anything that is
+    /// not `A`, `C`, `G` or `T` — `N`, the chromosome-boundary byte, and the
+    /// out-of-range sentinel all take that path, exactly as no match arm
+    /// covered them.
+    #[inline]
+    fn motif(&self) -> SpliceMotif {
+        let (d1, d2, a1, a2) = (self.d1, self.d2, self.a1, self.a2);
+        if d1 | d2 | a1 | a2 >= 4 {
+            return SpliceMotif::NonCanonical;
+        }
+        MOTIF_TABLE[motif_index(d1, d2, a1, a2)]
+    }
+}
+
+/// Every four-base combination, packed `d1 d2 a1 a2` at two bits each.
+static MOTIF_TABLE: [SpliceMotif; 256] = build_motif_table();
+
+/// Pack the four bases into the table index, two bits each.
+const fn motif_index(d1: u8, d2: u8, a1: u8, a2: u8) -> usize {
+    ((d1 << 6) | (d2 << 4) | (a1 << 2) | a2) as usize
+}
+
+const fn build_motif_table() -> [SpliceMotif; 256] {
+    // A=0, C=1, G=2, T=3.
+    let mut t = [SpliceMotif::NonCanonical; 256];
+    t[motif_index(2, 3, 0, 2)] = SpliceMotif::GtAg;
+    t[motif_index(2, 1, 0, 2)] = SpliceMotif::GcAg;
+    t[motif_index(0, 3, 0, 1)] = SpliceMotif::AtAc;
+    t[motif_index(1, 3, 0, 1)] = SpliceMotif::CtAc;
+    t[motif_index(1, 3, 2, 1)] = SpliceMotif::CtGc;
+    t[motif_index(2, 3, 0, 3)] = SpliceMotif::GtAt;
+    t
+}
+
+/// Key for [`JunctionScanCache`]: the arguments of
+/// `find_best_junction_position` that vary within a single window's stitch
+/// recursion. Everything else (`read_seq`, the genome, `is_reverse`,
+/// `n_genome`) is loop-invariant there, so these six fields identify a scan
+/// exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct JunctionScanKey {
+    r_a_end: usize,
+    g_a_end: u64,
+    r_gap: i64,
+    g_gap: i64,
+    prev_exon_len: usize,
+    next_seed_len: usize,
+}
+
+/// Per-window memo table for the junction-position scan.
+///
+/// Create one per `stitch_seeds_core` call and pass it down the recursion; it
+/// must not outlive the read, genome and strand it was filled for; the
+/// per-window lifetime guarantees by construction.
+#[derive(Default)]
+pub struct JunctionScanCache {
+    map: rustc_hash::FxHashMap<JunctionScanKey, (i32, SpliceMotif, i32, u32, u32)>,
+}
+
+impl JunctionScanCache {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -624,6 +869,47 @@ mod tests {
 
     use super::*;
 
+    /// The table has to agree with the match it replaced on every input the
+    /// scan can present, not merely on the six motifs. That includes `N` (4),
+    /// the chromosome-boundary byte (5) and the out-of-range sentinel, all of
+    /// which no match arm covered and which must therefore be `NonCanonical`.
+    #[test]
+    fn the_motif_table_agrees_with_the_original_match_on_every_input() {
+        fn original(d1: u8, d2: u8, a1: u8, a2: u8) -> SpliceMotif {
+            match (d1, d2, a1, a2) {
+                (2, 3, 0, 2) => SpliceMotif::GtAg,
+                (2, 1, 0, 2) => SpliceMotif::GcAg,
+                (0, 3, 0, 1) => SpliceMotif::AtAc,
+                (1, 3, 0, 1) => SpliceMotif::CtAc,
+                (1, 3, 2, 1) => SpliceMotif::CtGc,
+                (2, 3, 0, 3) => SpliceMotif::GtAt,
+                _ => SpliceMotif::NonCanonical,
+            }
+        }
+
+        let values = [0u8, 1, 2, 3, 4, 5, crate::genome::OUT_OF_RANGE];
+        for &d1 in &values {
+            for &d2 in &values {
+                for &a1 in &values {
+                    for &a2 in &values {
+                        let w = MotifWindow {
+                            donor: 0,
+                            d1,
+                            d2,
+                            a1,
+                            a2,
+                        };
+                        assert_eq!(
+                            w.motif(),
+                            original(d1, d2, a1, a2),
+                            "disagreement at ({d1}, {d2}, {a1}, {a2})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn make_test_genome(seq: &[u8]) -> Genome {
         // Create simple genome with one chromosome
         let n_genome = ((seq.len() as u64 + 1) / 64 + 1) * 64; // Pad to 64-byte boundary
@@ -693,6 +979,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -738,6 +1025,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -782,6 +1070,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -824,6 +1113,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -859,6 +1149,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -892,6 +1183,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -933,6 +1225,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -972,6 +1265,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1012,6 +1306,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1120,6 +1415,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1200,6 +1496,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1252,6 +1549,7 @@ mod tests {
             align_spliced_mate_map_lmin_over_lmate: 0.66,
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
+            intron_filter: IntronFilter::default(),
         }
     }
 

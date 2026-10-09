@@ -229,7 +229,7 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 - Single-end and paired-end alignment with mate rescue
 - Native single-file CBQ input (single-end or interleaved paired-end), with parallel decoding controlled by `--readFilesNthreads`. Decoded reads are bounded by a fixed per-window record budget, so peak input memory is independent of both the thread count and the input file's block size
 - Read-end alignment mode (`--alignEndsType Local` (default) / `EndToEnd` / `Extend5pOfRead1` / `Extend5pOfReads12` / `Extend3pOfRead1`)
-- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, or `BAM SortedByCoordinate`)
+- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, or `BAM SortedByCoordinate`). The coordinate sort is external: it buffers up to `--limitBAMsortRAM`, spills sorted runs beside the output, and merges them, so peak memory is independent of output size
 - Multi-threaded parallel alignment (`--runThreadN`)
 - GTF-based junction annotation with scoring bonus (`--sjdbGTFfile`)
 - Two-pass mode for novel junction discovery (`--twopassMode Basic`)
