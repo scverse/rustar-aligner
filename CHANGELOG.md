@@ -219,6 +219,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
   unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
   **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
 
+- STARsolo cell-barcode correction now applies STAR's `cbMinP` posterior
+  threshold (0.975, single precision), caps the mismatch quality at `QSmax`
+  (33), and enforces `oneExact`: under every `--soloCBmatchWLtype` except the
+  pseudocount ones, a barcode corrected to a single whitelist entry counts
+  only if some read matched that entry exactly. Without these,
+  `1MM_multi_Nbase_pseudocounts` produced the same matrix as the default
+  `1MM_multi` (#172).
+
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
   verified against real STARsolo (#90).

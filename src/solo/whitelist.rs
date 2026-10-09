@@ -100,6 +100,15 @@ pub struct CbMatchType {
     pub pseudocounts: bool,
 }
 
+impl CbMatchType {
+    /// STAR's `CBmatchWL.oneExact`: true for every match type except the
+    /// pseudocount ones (`ParametersSolo.cpp`). A barcode corrected to a single
+    /// whitelist entry then only counts if that entry was also seen exactly.
+    pub fn one_exact(self) -> bool {
+        !self.pseudocounts
+    }
+}
+
 impl FromStr for CbMatchType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
