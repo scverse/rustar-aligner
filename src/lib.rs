@@ -665,6 +665,34 @@ fn run_smartseq(
     Ok(stats)
 }
 
+/// Give records of a read from file `file_index` that file's read group
+/// (`--outSAMattrRGline` with one entry per `--readFilesIn` file). The writers
+/// stamp the first RG ID, so only files after the first need the tag replaced.
+fn apply_rg_per_file(
+    records: &mut [noodles::sam::alignment::record_buf::RecordBuf],
+    rg_ids: &[String],
+    file_index: u32,
+) {
+    use noodles::sam::alignment::record::data::field::Tag;
+    use noodles::sam::alignment::record_buf::data::field::Value;
+    let Some(id) = rg_ids.get(file_index as usize).filter(|_| file_index > 0) else {
+        return;
+    };
+    for rec in records {
+        rec.data_mut()
+            .insert(Tag::READ_GROUP, Value::String(id.as_str().into()));
+    }
+}
+
+/// Comma-joined display of a mate's read files, for log messages.
+fn join_paths(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Run single-pass alignment (original logic)
 fn run_single_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
@@ -1465,11 +1493,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let quant = quant_ctx.map(Arc::clone);
     let tr = tr_idx.map(Arc::clone);
 
-    let read_file = &params.read_files_in[0];
-    info!("Reading single-end from {}", read_file.display());
+    let read_files = params.mate_files(0);
+    info!("Reading single-end from {}", join_paths(read_files));
 
-    let reader =
-        FastqReader::open(read_file, params.read_files_command.as_deref())?.with_params(params);
+    let reader = FastqReader::open_files(read_files, params.read_files_command.as_deref())?
+        .with_params(params);
 
     // Create chimeric output writer if enabled
     let chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
@@ -1815,10 +1843,15 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                               batch: Vec<crate::io::fastq::EncodedRead>|
                   -> BatchOut<AlignmentBatchResults> {
                 let params: &Parameters = &params_arc;
+                let rg_ids: Vec<String> = if params.read_files_n() > 1 {
+                    params.rg_id_per_file()
+                } else {
+                    Vec::new()
+                };
                 // Adapter-aware clip params (fixed 5'/3' Nbases + 3' adapter Hamming
                 // scan); built once per batch, applied per read via clip_mate.
                 let clip_params = crate::clip::clip_params_from(params, 0);
-                batch
+                let mut out: BatchOut<AlignmentBatchResults> = batch
                     .par_iter()
                     .enumerate()
                     .map(|(read_idx, read)| {
@@ -2085,7 +2118,17 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             signal_n_tr,
                         })
                     })
-                    .collect()
+                    .collect();
+                if !rg_ids.is_empty() {
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            let fi = batch[i].file_index;
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
+                            apply_rg_per_file(&mut o.transcriptome_records, &rg_ids, fi);
+                        }
+                    }
+                }
+                out
             };
             run_batch_pipeline(
                 read_rx,
@@ -2136,12 +2179,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     use rayon::prelude::*;
     use std::sync::Arc;
 
-    let cdna_file = &params.read_files_in[0];
-    let barcode_file = &params.read_files_in[1];
     info!(
         "STARsolo: cDNA reads from {}, barcode reads from {}",
-        cdna_file.display(),
-        barcode_file.display()
+        join_paths(params.mate_files(0)),
+        join_paths(params.mate_files(1))
     );
     let reader = crate::solo::open_reader(params)?;
 
@@ -2265,8 +2306,13 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 let params_arc = Arc::clone(&params_arc);
                 move |base: u64, batch: Vec<crate::solo::SoloRead>| -> BatchOut<SoloReadProduct> {
                     let params: &Parameters = &params_arc;
+                    let rg_ids: Vec<String> = if params.read_files_n() > 1 {
+                        params.rg_id_per_file()
+                    } else {
+                        Vec::new()
+                    };
                     let index = &index;
-                    batch
+                    let mut out: BatchOut<SoloReadProduct> = batch
                         .par_iter()
                         .enumerate()
                         .map(|(read_idx, sread)| {
@@ -2409,7 +2455,16 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 velocyto: outcome.velocyto,
                             })
                         })
-                        .collect()
+                        .collect();
+                    if !rg_ids.is_empty() {
+                        for (i, res) in out.iter_mut().enumerate() {
+                            if let Ok(o) = res {
+                                let fi = batch[i].cdna.file_index;
+                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
+                            }
+                        }
+                    }
+                    out
                 }
             };
             run_batch_pipeline(
@@ -2455,8 +2510,8 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     })?;
     info!(
         "STARsolo (5' paired-end): mate 1 (barcode + cDNA) from {}, mate 2 (cDNA) from {}",
-        m1_file.display(),
-        m2_file.display()
+        join_paths(m1_file),
+        join_paths(m2_file)
     );
     let reader = crate::solo::open_paired_reader(params)?;
 
@@ -2566,8 +2621,13 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                       batch: Vec<crate::solo::SoloPairedRead>|
                       -> BatchOut<SoloReadProduct> {
                     let params: &Parameters = &params_arc;
+                    let rg_ids: Vec<String> = if params.read_files_n() > 1 {
+                        params.rg_id_per_file()
+                    } else {
+                        Vec::new()
+                    };
                     let index = &index;
-                    batch
+                    let mut out: BatchOut<SoloReadProduct> = batch
                         .par_iter()
                         .enumerate()
                         .map(|(pair_idx, pread)| {
@@ -2784,7 +2844,16 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 velocyto: outcome.velocyto,
                             })
                         })
-                        .collect()
+                        .collect();
+                    if !rg_ids.is_empty() {
+                        for (i, res) in out.iter_mut().enumerate() {
+                            if let Ok(o) = res {
+                                let fi = batch[i].mate1.file_index;
+                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
+                            }
+                        }
+                    }
+                    out
                 }
             };
             run_batch_pipeline(
@@ -2831,13 +2900,13 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
 
     info!(
         "Reading paired-end from {} and {}",
-        params.read_files_in[0].display(),
-        params.read_files_in[1].display()
+        join_paths(params.mate_files(0)),
+        join_paths(params.mate_files(1))
     );
 
-    let reader = PairedFastqReader::open(
-        &params.read_files_in[0],
-        &params.read_files_in[1],
+    let reader = PairedFastqReader::open_files(
+        params.mate_files(0),
+        params.mate_files(1),
         params.read_files_command.as_deref(),
     )?
     .with_params(params);
@@ -3186,11 +3255,16 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                               batch: Vec<crate::io::fastq::PairedRead>|
                   -> BatchOut<AlignmentBatchResults> {
                 let params: &Parameters = &params_arc;
+                let rg_ids: Vec<String> = if params.read_files_n() > 1 {
+                    params.rg_id_per_file()
+                } else {
+                    Vec::new()
+                };
                 // Adapter-aware clip params per mate (fixed Nbases are per-mate; the
                 // adapter is shared). Applied via clip_mate below.
                 let clip_params_m1 = crate::clip::clip_params_from(params, 0);
                 let clip_params_m2 = crate::clip::clip_params_from(params, 1);
-                batch
+                let mut out: BatchOut<AlignmentBatchResults> = batch
                     .par_iter()
                     .enumerate()
                     .map(|(pair_idx, paired_read)| {
@@ -3615,7 +3689,17 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             signal_n_tr,
                         })
                     })
-                    .collect()
+                    .collect();
+                if !rg_ids.is_empty() {
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            let fi = batch[i].mate1.file_index;
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
+                            apply_rg_per_file(&mut o.transcriptome_records, &rg_ids, fi);
+                        }
+                    }
+                }
+                out
             };
             run_batch_pipeline(
                 read_rx,

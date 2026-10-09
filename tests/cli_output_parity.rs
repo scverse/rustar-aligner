@@ -43,7 +43,10 @@ fn out_sj_knobs_accept_stars_values_and_reject_others() {
 #[test]
 fn read_files_prefix_is_applied_to_every_input_path() {
     let p = with_reads(&["--readFilesPrefix", "/data/run7/"]).unwrap();
-    assert_eq!(p.read_files_in[0].to_str().unwrap(), "/data/run7/reads.fq");
+    assert_eq!(
+        p.read_files_names[0][0].to_str().unwrap(),
+        "/data/run7/reads.fq"
+    );
 
     // Paired input: both mates get the prefix.
     let p = parse(&[
@@ -54,12 +57,18 @@ fn read_files_prefix_is_applied_to_every_input_path() {
         "/data/run7/",
     ])
     .unwrap();
-    assert_eq!(p.read_files_in[0].to_str().unwrap(), "/data/run7/r1.fq");
-    assert_eq!(p.read_files_in[1].to_str().unwrap(), "/data/run7/r2.fq");
+    assert_eq!(
+        p.read_files_names[0][0].to_str().unwrap(),
+        "/data/run7/r1.fq"
+    );
+    assert_eq!(
+        p.read_files_names[1][0].to_str().unwrap(),
+        "/data/run7/r2.fq"
+    );
 
     // Absent by default.
     let p = with_reads(&[]).unwrap();
-    assert_eq!(p.read_files_in[0].to_str().unwrap(), "reads.fq");
+    assert_eq!(p.read_files_names[0][0].to_str().unwrap(), "reads.fq");
 }
 
 #[test]

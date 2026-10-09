@@ -526,7 +526,8 @@ pub struct Parameters {
     pub genome_transform_vcf: Option<PathBuf>,
 
     // ── Read files ──────────────────────────────────────────────────────
-    /// Input read file(s); second file is mate 2 for paired-end
+    /// Input read file(s); second file is mate 2 for paired-end. Several files
+    /// per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`).
     #[arg(long = "readFilesIn", num_args = 1..=2)]
     pub read_files_in: Vec<PathBuf>,
 
@@ -1346,6 +1347,12 @@ pub struct Parameters {
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,
+
+    /// Per-mate list of read files after splitting each `--readFilesIn` entry on
+    /// commas and prepending `--readFilesPrefix` (STAR `readFilesNames`). Filled
+    /// by `parse_from`; all mates have the same number of files.
+    #[arg(skip)]
+    pub read_files_names: Vec<Vec<PathBuf>>,
 }
 
 impl Parameters {
@@ -1395,6 +1402,61 @@ impl Parameters {
                 _ => None,
             })
             .unwrap_or(true)
+    }
+
+    /// Split each `--readFilesIn` entry on commas and prepend
+    /// `--readFilesPrefix` (`-` means none), as `Parameters_readFilesInit.cpp`:
+    /// a trailing comma is dropped and every mate must list the same number of
+    /// files.
+    pub fn build_read_files_names(&self) -> Result<Vec<Vec<PathBuf>>, String> {
+        let prefix = if self.read_files_prefix == "-" {
+            ""
+        } else {
+            self.read_files_prefix.as_str()
+        };
+        let mut names: Vec<Vec<PathBuf>> = Vec::with_capacity(self.read_files_in.len());
+        for (imate, entry) in self.read_files_in.iter().enumerate() {
+            let entry = entry.to_string_lossy();
+            let mut parts: Vec<&str> = entry.split(',').collect();
+            if parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+                parts.pop();
+            }
+            if let Some(prev) = names.last()
+                && prev.len() != parts.len()
+            {
+                return Err(format!(
+                    "number of input files for mate{}={} is not equal to that for mate{}={}\n\
+                     Make sure that the number of files in --readFilesIn is the same for both mates",
+                    imate + 1,
+                    parts.len(),
+                    imate,
+                    prev.len()
+                ));
+            }
+            names.push(
+                parts
+                    .iter()
+                    .map(|f| PathBuf::from(format!("{prefix}{f}")))
+                    .collect(),
+            );
+        }
+        Ok(names)
+    }
+
+    /// Number of read files per mate (STAR `readFilesN`); 0 when none given.
+    pub fn read_files_n(&self) -> usize {
+        self.read_files_names.first().map_or(0, Vec::len)
+    }
+
+    /// Files of mate `imate` (empty slice if absent).
+    pub fn mate_files(&self, imate: usize) -> &[PathBuf] {
+        self.read_files_names.get(imate).map_or(&[], Vec::as_slice)
+    }
+
+    /// Read group ID for each read file index (`outSAMattrRG`); empty without an
+    /// RG line.
+    pub fn rg_id_per_file(&self) -> Vec<String> {
+        self.rg_ids().unwrap_or_default()
     }
 
     /// True if the user provided a non-default `--outSAMattrRGline`.
@@ -1454,7 +1516,7 @@ impl Parameters {
                 first.trim_start_matches("ID:").to_string()
             })
             .collect();
-        let n_files = self.read_files_in.len().max(1);
+        let n_files = self.read_files_n().max(1);
         if ids.len() > 1 && ids.len() != n_files {
             return Err(crate::error::Error::Parameter(format!(
                 "--outSAMattrRGline: {} RG entries does not match --readFilesIn count {} (must be 1 or N)",
@@ -1779,6 +1841,14 @@ impl Parameters {
             ));
         }
 
+        // Split every --readFilesIn entry on commas (STAR `readFilesNames`) and
+        // prepend --readFilesPrefix to each file name (plain string concatenation,
+        // Parameters_readFilesInit.cpp).
+        match params.build_read_files_names() {
+            Ok(names) => params.read_files_names = names,
+            Err(e) => return Err(command.error(ErrorKind::InvalidValue, e)),
+        }
+
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
         // does NOT include RG, so only match a literal user-supplied RG flag.
@@ -1839,15 +1909,6 @@ impl Parameters {
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
             ));
-        }
-
-        // --readFilesPrefix is prepended to every input read path, so apply it
-        // here and let every consumer see the final paths.
-        if !params.read_files_prefix.is_empty() {
-            let prefix = std::path::Path::new(&params.read_files_prefix);
-            for rf in &mut params.read_files_in {
-                *rf = prefix.join(&*rf);
-            }
         }
 
         // Validate --outSAMmode.
@@ -2214,15 +2275,15 @@ impl Parameters {
     /// Path to the cDNA (transcript) read file. For solo runs this is the
     /// FIRST `--readFilesIn` file (STAR convention: `cDNA_read barcode_read`).
     /// Returns `None` if no read files are configured.
-    pub fn cdna_read_file(&self) -> Option<&PathBuf> {
-        self.read_files_in.first()
+    pub fn cdna_read_file(&self) -> Option<&[PathBuf]> {
+        self.read_files_names.first().map(Vec::as_slice)
     }
 
     /// Path to the barcode (CB+UMI) read file — the SECOND `--readFilesIn`
     /// file when solo is enabled. `None` if absent.
-    pub fn barcode_read_file(&self) -> Option<&PathBuf> {
+    pub fn barcode_read_file(&self) -> Option<&[PathBuf]> {
         if self.solo_enabled() {
-            self.read_files_in.get(1)
+            self.read_files_names.get(1).map(Vec::as_slice)
         } else {
             None
         }
@@ -2235,9 +2296,9 @@ impl Parameters {
     }
 
     /// The two cDNA mate files (mate 1, mate 2) for a `--soloBarcodeMate 1` run.
-    pub fn solo_cdna_mate_files(&self) -> Option<(&PathBuf, &PathBuf)> {
-        match (self.read_files_in.first(), self.read_files_in.get(1)) {
-            (Some(m1), Some(m2)) => Some((m1, m2)),
+    pub fn solo_cdna_mate_files(&self) -> Option<(&[PathBuf], &[PathBuf])> {
+        match (self.read_files_names.first(), self.read_files_names.get(1)) {
+            (Some(m1), Some(m2)) => Some((m1.as_slice(), m2.as_slice())),
             _ => None,
         }
     }
@@ -2310,6 +2371,62 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    #[test]
+    fn read_files_comma_lists_and_prefix() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "a1.fq,b1.fq",
+            "a2.fq,b2.fq",
+            "--readFilesPrefix",
+            "dir_",
+        ])
+        .unwrap();
+        assert_eq!(p.read_files_n(), 2);
+        assert_eq!(
+            p.read_files_names,
+            vec![
+                vec![PathBuf::from("dir_a1.fq"), PathBuf::from("dir_b1.fq")],
+                vec![PathBuf::from("dir_a2.fq"), PathBuf::from("dir_b2.fq")],
+            ]
+        );
+        // Trailing comma is dropped.
+        let p = try_parse(&["--readFilesIn", "a.fq,b.fq,"]).unwrap();
+        assert_eq!(p.mate_files(0).len(), 2);
+    }
+
+    #[test]
+    fn read_files_mate_count_mismatch_is_error() {
+        let e = try_parse(&["--readFilesIn", "a1.fq,b1.fq", "a2.fq"]).unwrap_err();
+        assert!(e.to_string().contains("number of input files for mate2"));
+    }
+
+    #[test]
+    fn rg_line_count_must_match_file_count() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "a.fq,b.fq",
+            "--outSAMattrRGline",
+            "ID:x",
+            ",",
+            "ID:y",
+        ])
+        .unwrap();
+        assert_eq!(p.rg_ids().unwrap(), vec!["x", "y"]);
+        let p = try_parse(&["--readFilesIn", "a.fq,b.fq", "--outSAMattrRGline", "ID:x"]).unwrap();
+        assert_eq!(p.rg_ids().unwrap(), vec!["x", "x"]);
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "a.fq,b.fq,c.fq",
+                "--outSAMattrRGline",
+                "ID:x",
+                ",",
+                "ID:y",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -2838,8 +2955,7 @@ mod tests {
     fn rg_line_multi() {
         let p = try_parse(&[
             "--readFilesIn",
-            "r1.fq",
-            "r2.fq",
+            "r1.fq,r2.fq",
             "--outSAMattrRGline",
             "ID:a",
             "SM:a",
@@ -2860,8 +2976,7 @@ mod tests {
     fn rg_line_single_replicates_for_multi_file() {
         let p = try_parse(&[
             "--readFilesIn",
-            "r1.fq",
-            "r2.fq",
+            "r1.fq,r2.fq",
             "--outSAMattrRGline",
             "ID:foo",
         ])

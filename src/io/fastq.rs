@@ -4,7 +4,7 @@ use flate2::read::MultiGzDecoder;
 use noodles::fastq;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Writer for unmapped reads in FASTQ format (`--outReadsUnmapped Fastx`).
@@ -56,6 +56,9 @@ pub struct EncodedRead {
     /// FASTQ ASCII quality bytes (Phred+33 encoded) - subtract 33 before
     /// writing to BAM binary QUAL.
     pub quality: Vec<u8>,
+    /// Index of the `--readFilesIn` file this read came from (STAR
+    /// `readFilesIndex`); selects the read group.
+    pub file_index: u32,
 }
 
 /// A paired-end read from two FASTQ files
@@ -85,9 +88,28 @@ pub struct FastqReader {
     /// Characters that terminate a read name (`--readNameSeparator`). Empty
     /// means keep the whole name.
     name_separators: Vec<u8>,
+    /// Files still to read after the current one (several files per mate).
+    pending: std::collections::VecDeque<PathBuf>,
+    decompress_cmd: Option<String>,
+    /// Index of the file `inner` is reading.
+    file_index: u32,
 }
 
 impl FastqReader {
+    /// Open a list of FASTQ files read one after another (STAR's comma-separated
+    /// `--readFilesIn` list for one mate), each through `decompress_cmd` if given.
+    pub fn open_files(paths: &[PathBuf], decompress_cmd: Option<&str>) -> Result<Self, Error> {
+        let (first, rest) = paths.split_first().ok_or_else(|| {
+            Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no read files given",
+            ))
+        })?;
+        let mut reader = Self::open(first, decompress_cmd)?;
+        reader.pending = rest.iter().cloned().collect();
+        Ok(reader)
+    }
+
     /// Open a FASTQ file (plain or gzip compressed)
     ///
     /// # Arguments
@@ -130,6 +152,9 @@ impl FastqReader {
             inner: fastq_reader,
             qual_shift: 0,
             name_separators: vec![b'/'],
+            pending: std::collections::VecDeque::new(),
+            decompress_cmd: decompress_cmd.map(str::to_owned),
+            file_index: 0,
         })
     }
 
@@ -171,6 +196,21 @@ impl FastqReader {
 
     /// Get next read with encoded bases
     pub fn next_encoded(&mut self) -> Result<Option<EncodedRead>, Error> {
+        loop {
+            if let Some(read) = self.next_in_current_file()? {
+                return Ok(Some(read));
+            }
+            // Current file exhausted: continue with the next one, if any.
+            let Some(next) = self.pending.pop_front() else {
+                return Ok(None);
+            };
+            let next_reader = Self::open(&next, self.decompress_cmd.as_deref())?;
+            self.inner = next_reader.inner;
+            self.file_index += 1;
+        }
+    }
+
+    fn next_in_current_file(&mut self) -> Result<Option<EncodedRead>, Error> {
         match self.inner.records().next() {
             Some(Ok(record)) => {
                 let name = std::str::from_utf8(record.name())
@@ -208,6 +248,7 @@ impl FastqReader {
                     name,
                     sequence,
                     quality,
+                    file_index: self.file_index,
                 }))
             }
             Some(Err(e)) => Err(Error::from(e)),
@@ -255,6 +296,18 @@ impl PairedFastqReader {
         let reader2 = FastqReader::open(path2, decompress_cmd)?;
 
         Ok(Self { reader1, reader2 })
+    }
+
+    /// Open the file lists of both mates (several comma-separated files per mate).
+    pub fn open_files(
+        paths1: &[PathBuf],
+        paths2: &[PathBuf],
+        decompress_cmd: Option<&str>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            reader1: FastqReader::open_files(paths1, decompress_cmd)?,
+            reader2: FastqReader::open_files(paths2, decompress_cmd)?,
+        })
     }
 
     /// Apply the read-input knobs to both mates. See
@@ -825,5 +878,24 @@ mod tests {
         // EOF batch
         let batch3 = reader.read_paired_batch(3).unwrap();
         assert_eq!(batch3.len(), 0);
+    }
+
+    #[test]
+    fn test_open_files_chains_files_and_tracks_index() {
+        let mut f1 = NamedTempFile::new().unwrap();
+        writeln!(f1, "@r1\nACGT\n+\nIIII").unwrap();
+        f1.flush().unwrap();
+        let mut f2 = NamedTempFile::new().unwrap();
+        writeln!(f2, "@r2\nTTTT\n+\nIIII\n@r3\nGGGG\n+\nIIII").unwrap();
+        f2.flush().unwrap();
+        let paths = vec![f1.path().to_path_buf(), f2.path().to_path_buf()];
+        let mut reader = FastqReader::open_files(&paths, None).unwrap();
+        let got: Vec<(String, u32)> = std::iter::from_fn(|| reader.next_encoded().unwrap())
+            .map(|r| (r.name, r.file_index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("r1".into(), 0), ("r2".into(), 1), ("r3".into(), 1)]
+        );
     }
 }

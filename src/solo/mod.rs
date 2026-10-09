@@ -32,7 +32,7 @@ use crate::error::Error;
 use crate::io::fastq::{EncodedRead, FastqReader, decode_base};
 use crate::params::{Parameters, SoloType};
 use crate::quant::GeneAnnotation;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -236,14 +236,14 @@ pub struct SoloRead {
 impl SoloReadReader {
     /// Open the cDNA and barcode FASTQ files for a solo run.
     pub fn open(
-        cdna_path: &Path,
-        barcode_path: &Path,
+        cdna_path: &[PathBuf],
+        barcode_path: &[PathBuf],
         layout: SoloBarcodeLayout,
         decompress_cmd: Option<&str>,
     ) -> Result<Self, Error> {
         Ok(Self {
-            cdna: FastqReader::open(cdna_path, decompress_cmd)?,
-            barcode: FastqReader::open(barcode_path, decompress_cmd)?,
+            cdna: FastqReader::open_files(cdna_path, decompress_cmd)?,
+            barcode: FastqReader::open_files(barcode_path, decompress_cmd)?,
             layout,
         })
     }
@@ -326,14 +326,14 @@ pub struct SoloPairedReader {
 
 impl SoloPairedReader {
     pub fn open(
-        mate1_path: &Path,
-        mate2_path: &Path,
+        mate1_path: &[PathBuf],
+        mate2_path: &[PathBuf],
         layout: SoloBarcodeLayout,
         decompress_cmd: Option<&str>,
     ) -> Result<Self, Error> {
         Ok(Self {
-            mate1: FastqReader::open(mate1_path, decompress_cmd)?,
-            mate2: FastqReader::open(mate2_path, decompress_cmd)?,
+            mate1: FastqReader::open_files(mate1_path, decompress_cmd)?,
+            mate2: FastqReader::open_files(mate2_path, decompress_cmd)?,
             layout,
         })
     }
@@ -1027,6 +1027,7 @@ mod tests {
             name: name.to_string(),
             sequence: seq.bytes().map(encode_base).collect(),
             quality: qual.bytes().collect(),
+            file_index: 0,
         }
     }
 
@@ -1177,7 +1178,13 @@ mod tests {
         .unwrap();
         bc.flush().unwrap();
 
-        let mut reader = SoloReadReader::open(cdna.path(), bc.path(), v2_layout(), None).unwrap();
+        let mut reader = SoloReadReader::open(
+            &[cdna.path().to_path_buf()],
+            &[bc.path().to_path_buf()],
+            v2_layout(),
+            None,
+        )
+        .unwrap();
         let batch = reader.read_batch(10).unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].cdna.name, "r1");
@@ -1209,7 +1216,13 @@ mod tests {
         .unwrap();
         bc.flush().unwrap();
 
-        let mut reader = SoloReadReader::open(cdna.path(), bc.path(), v2_layout(), None).unwrap();
+        let mut reader = SoloReadReader::open(
+            &[cdna.path().to_path_buf()],
+            &[bc.path().to_path_buf()],
+            v2_layout(),
+            None,
+        )
+        .unwrap();
         assert!(reader.read_batch(10).is_err());
     }
 }
