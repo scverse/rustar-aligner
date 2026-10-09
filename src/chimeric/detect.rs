@@ -412,8 +412,20 @@ fn comp(b: u8) -> u8 {
 /// `Transcript::alignScore` (`Transcript_alignScore.cpp`): re-score a
 /// transcript from its exons.
 fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentScorer) -> i32 {
+    align_score_mm(tr, read, genome, scorer).0
+}
+
+/// `alignScore` with the mismatch count it recomputes alongside (`nMM`), which
+/// is what a chimeric BAM record reports as `nM`.
+fn align_score_mm(
+    tr: &WinTr,
+    read: &ChimRead,
+    genome: &Genome,
+    scorer: &AlignmentScorer,
+) -> (i32, u32) {
     let r: &[u8] = if tr.str_ == 0 { read.fwd } else { &read.rev };
     let mut score = 0i32;
+    let mut n_mm = 0u32;
     for e in &tr.exons {
         for ii in 0..e.l {
             let r1 = r.get(e.r + ii).copied().unwrap_or(5);
@@ -423,6 +435,7 @@ fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentS
                 score += 1;
             } else {
                 score -= 1;
+                n_mm += 1;
             }
         }
     }
@@ -451,7 +464,7 @@ fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentS
         let span = tr.g_length().max(1) as f64;
         score += (span.log2() * scorer.score_genomic_length_log2_scale - 0.5).ceil() as i32;
     }
-    score
+    (score, n_mm)
 }
 
 /// `Transcript::generateCigarP` / `ReadAlign::outputTranscriptCIGARp`: the
@@ -1153,12 +1166,16 @@ fn mate_segment(tr: &WinTr, junction_exon: usize, read: &ChimRead, score: i32) -
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn to_alignment(
     p: &Placed,
     score: i32,
     read: &ChimRead,
     genome: &Genome,
     scorer: &AlignmentScorer,
+    i_tr: usize,
+    chim_n: usize,
+    is_best: bool,
 ) -> ChimericAlignment {
     let e0 = if p.t0.str_ == 1 {
         0
@@ -1195,7 +1212,39 @@ fn to_alignment(
         acceptor_start: p.t1.exons[0].g,
         acceptor_cigar: cigar_p(&p.t1, read),
     });
+    // What `chimericBAMoutput` needs. Both detectors re-score the placed
+    // transcripts with `alignScore` before writing BAM, which is where `AS` and
+    // `nM` come from (`chimericDetectionOldOutput.cpp:12-13`,
+    // `ChimericAlign_chimericStitching.cpp:180`).
+    let (s0, mm0) = align_score_mm(&p.t0, read, genome, scorer);
+    let (s1, mm1) = align_score_mm(&p.t1, read, genome, scorer);
+    chim.bam = Some(Box::new(ChimBam {
+        tr: [p.t0.clone(), p.t1.clone()],
+        max_score: [s0, s1],
+        n_mm: [mm0, mm1],
+        i_tr,
+        chim_n,
+        is_best,
+        read_length: read.read_length,
+        paired: read.paired,
+    }));
     chim
+}
+
+/// A chimera as STAR's `chimericBAMoutput` receives it: the two placed
+/// transcripts in read order, their re-scored `maxScore` / `nMM`, and the
+/// run-level `iTr` / `chimN` / `isBestChimAlign`.
+#[derive(Debug, Clone)]
+pub struct ChimBam {
+    pub tr: [WinTr; 2],
+    pub max_score: [i32; 2],
+    pub n_mm: [u32; 2],
+    pub i_tr: usize,
+    pub chim_n: usize,
+    pub is_best: bool,
+    /// `readLength[0..2]` of the (clipped) mates the exons index.
+    pub read_length: [usize; 2],
+    pub paired: bool,
 }
 
 /// `ReadAlign::chimericDetection`: run whichever STAR detector the parameters
@@ -1219,7 +1268,8 @@ pub fn chimeric_detection(
         // single-best bookkeeping use the re-scored segments.
         let score =
             align_score(&p.t0, read, genome, scorer) + align_score(&p.t1, read, genome, scorer);
-        return vec![to_alignment(&p, score, read, genome, scorer)];
+        // `chimericBAMoutput(&trChim[0], &trChim[1], this, 0, 1, true, P)`.
+        return vec![to_alignment(&p, score, read, genome, scorer, 0, 1, true)];
     }
     let Some(ib) = w.best() else {
         return Vec::new();
@@ -1233,21 +1283,32 @@ pub fn chimeric_detection(
     if best == 0 {
         return Vec::new();
     }
-    let kept: Vec<&MultChim> = chims.iter().filter(|c| c.score >= min_score).collect();
+    let kept: Vec<(usize, &MultChim)> = chims
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.score >= min_score)
+        .collect();
     if kept.len() > params.chim_multimap_nmax {
         return Vec::new();
     }
     let chim_n = kept.len();
+    // `bestChimAlign`: the chimera that last raised `chimScoreBest`, i.e. the
+    // first one to reach the final best score.
+    let best_idx = chims.iter().position(|c| c.score == best);
     kept.into_iter()
-        .map(|c| {
-            to_alignment(&c.p, c.score, read, genome, scorer).with_multimap(MultimapInfo {
-                chim_n,
-                max_possible_score: frag_len,
-                max_non_chim_score: max_non_chim,
-                chim_score: c.score,
-                best_chim_score: best,
-                pe_merged: false,
-            })
+        .enumerate()
+        .map(|(i_tr, (idx, c))| {
+            let is_best = best_idx == Some(idx);
+            to_alignment(&c.p, c.score, read, genome, scorer, i_tr, chim_n, is_best).with_multimap(
+                MultimapInfo {
+                    chim_n,
+                    max_possible_score: frag_len,
+                    max_non_chim_score: max_non_chim,
+                    chim_score: c.score,
+                    best_chim_score: best,
+                    pe_merged: false,
+                },
+            )
         })
         .collect()
 }
