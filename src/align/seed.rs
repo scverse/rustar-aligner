@@ -592,7 +592,8 @@ fn compare_seq_to_genome(
                 if let Some(off) = crate::align::simd_scan::find_stop(read_chunk, genome_chunk) {
                     let genome_base = genome_chunk[off];
                     if genome_base >= 5 {
-                        return (i + off, true);
+                        // Padding sorts above every base (STAR compareSeqToGenome: s>g only).
+                        return (i + off, false);
                     }
                     let read_base = read_chunk[off];
                     return (i + off, read_base > genome_base);
@@ -607,15 +608,17 @@ fn compare_seq_to_genome(
         let genome_idx = genome_start + i;
 
         if genome_idx >= index.genome.sequence.len() {
-            // Past end of genome array — treat like padding (STAR: comp_res > 0)
-            return (match_len, true);
+            // Past end of genome array: treat like padding (read < genome)
+            return (match_len, false);
         }
 
         let genome_base = index.genome.sequence.base(genome_idx);
 
         if genome_base >= 5 {
-            // Padding character — STAR returns comp_res > 0 (read > genome)
-            return (match_len, true);
+            // Padding (spacer) sorts above every base: STAR compareSeqToGenome
+            // sets compRes only when s[ii]>g[ii], and the reverse-strand branch
+            // sets it false when g>3. So the read compares as smaller.
+            return (match_len, false);
         }
 
         let read_base = read_seq[read_pos + i];
@@ -1289,5 +1292,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Longest prefix of `read[pos..]` found anywhere in the two-strand genome
+    /// buffer, by brute force.
+    fn brute_force_mmp(read: &[u8], pos: usize, index: &GenomeIndex) -> usize {
+        let n = index.genome.sequence.len();
+        (0..n)
+            .map(|g| {
+                (0..read.len() - pos)
+                    .take_while(|&i| {
+                        g + i < n
+                            && index.genome.sequence.base(g + i) < 4
+                            && index.genome.sequence.base(g + i) == read[pos + i]
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// STAR's `compareSeqToGenome` sets `compRes` only when `s[ii] > g[ii]`, so a
+    /// chromosome-end pad (or an sjdb spacer) in the genome sorts ABOVE every
+    /// base and the read compares as smaller. A suffix that runs into padding
+    /// after a long shared prefix must therefore not capture the binary search:
+    /// the MMP has to equal the true longest match. Here `GATTAC` + pad ends the
+    /// chromosome, so its suffix sits between two longer, GATT-prefixed hits.
+    #[test]
+    fn mmp_is_exact_when_a_probed_suffix_runs_into_padding() {
+        let index = make_test_index("GATTACAGGCCATTGATTACTCCAGATTGCCAGATTAC");
+        let params = params(&[]);
+        let genome = "GATTACAGGCCATTGATTACTCCAGATTGCCAGATTAC";
+        let mut checked = 0;
+        for start in 0..genome.len() - 8 {
+            for len in 8..=genome.len() - start {
+                let mut read = encode_sequence(&genome[start..start + len]);
+                // One mismatch near the end, so the true MMP stops short of the read.
+                let last = read.len() - 1;
+                read[last] = (read[last] + 1) % 4;
+                let want = brute_force_mmp(&read, 0, &index);
+                let got = find_seed_at_position(&read, 0, &index, 1, false, &params).advance;
+                assert_eq!(got, want, "read {start}+{len}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
     }
 }
