@@ -168,6 +168,52 @@ impl PairedAlignment {
     }
 }
 
+/// STAR's within-window transcript dedup (`stitchWindowAligns.cpp`) for the
+/// pairs found in one window, `pairs[start..]`: drop a pair whose blocks, on
+/// both mates, are all covered by another pair with a strictly higher score.
+/// STAR applies it to the combined two-mate transcript, so the overlap and the
+/// mapped length are summed over both mates. Without it, a lower-scoring
+/// sub-alignment at the same locus (`66M9S` beside `66M2I7M`) is reported as
+/// an extra multimapper.
+fn drop_covered_pairs(pairs: &mut Vec<PairedAlignment>, start: usize) {
+    use crate::align::stitch::finalized_exon_overlap;
+    let window = &pairs[start..];
+    let mapped = |p: &PairedAlignment| -> u32 {
+        [&p.mate1_transcript, &p.mate2_transcript]
+            .iter()
+            .flat_map(|t| t.exons.iter())
+            .map(|e| (e.read_end - e.read_start) as u32)
+            .sum()
+    };
+    let mut keep = vec![true; window.len()];
+    for i in 0..window.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in 0..window.len() {
+            if i == j || !keep[j] {
+                continue;
+            }
+            let (a, b) = (&window[i], &window[j]);
+            let overlap =
+                finalized_exon_overlap(&a.mate1_transcript.exons, &b.mate1_transcript.exons)
+                    + finalized_exon_overlap(&a.mate2_transcript.exons, &b.mate2_transcript.exons);
+            if mapped(a) <= overlap && a.combined_wt_score < b.combined_wt_score {
+                keep[i] = false;
+                break;
+            } else if mapped(b) <= overlap && b.combined_wt_score < a.combined_wt_score {
+                keep[j] = false;
+            }
+        }
+    }
+    let mut idx = 0;
+    pairs.retain(|_| {
+        let k = idx < start || keep[idx - start];
+        idx += 1;
+        k
+    });
+}
+
 /// Result of paired-end alignment, covering all mapping outcomes.
 #[derive(Debug, Clone)]
 pub enum PairedAlignmentResult {
@@ -702,6 +748,7 @@ pub fn align_paired_read(
         let mut chim_window: Vec<crate::chimeric::WinTr> = Vec::new();
         let str_ = u8::from(stitch_is_reverse);
 
+        let window_pairs_start = joint_pairs.len();
         for wt in &wts {
             let split_result =
                 split_combined_wt(wt, len1, len2, stitch_is_reverse, scorer.align_intron_min);
@@ -900,6 +947,7 @@ pub fn align_paired_read(
                 }
             }
         }
+        drop_covered_pairs(&mut joint_pairs, window_pairs_start);
         if chim_on {
             chim_windows.push(chim_window);
         }
@@ -1625,6 +1673,29 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3]; // ACGT
         let result = align_read(&read_seq, "READ_003", &index, &params);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn drop_covered_pairs_removes_lower_scoring_subsets_within_the_window() {
+        let pair = |m1_len: usize, score: i32| PairedAlignment {
+            mate1_transcript: tx_at(1000, m1_len, false),
+            mate2_transcript: tx_at(1200, 75, true),
+            mate1_region: (0, m1_len),
+            mate2_region: (0, 75),
+            is_proper_pair: true,
+            insert_size: 275,
+            combined_wt_score: score,
+        };
+        // pairs[0] is from an earlier window: never compared.
+        let mut pairs = vec![pair(66, 100), pair(75, 141), pair(66, 140), pair(66, 141)];
+        drop_covered_pairs(&mut pairs, 1);
+        let kept: Vec<(usize, i32)> = pairs
+            .iter()
+            .map(|p| (p.mate1_region.1, p.combined_wt_score))
+            .collect();
+        // (66, 140) is covered by (75, 141) with a lower score: dropped.
+        // (66, 141) is covered but scores the same: kept, as in STAR.
+        assert_eq!(kept, vec![(66, 100), (75, 141), (66, 141)]);
     }
 
     /// A gapless forward or reverse transcript over the test genome.
