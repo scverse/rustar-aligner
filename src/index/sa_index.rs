@@ -52,6 +52,11 @@ pub struct SaIndex {
 
     /// Strand bit position (from SA)
     pub gstrand_bit: u32,
+
+    /// `genomeSAsparseD` of the suffix array this index fronts: only every
+    /// `sparse_d`-th genome position is a suffix, so the seed search tries
+    /// `sparse_d` shifted starts (STAR's `iDist` loop). 1 for a dense SA.
+    pub sparse_d: u64,
 }
 
 impl SaIndex {
@@ -504,6 +509,7 @@ impl SaIndex {
             data,
             word_length: sai_word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
     }
 
@@ -665,6 +671,7 @@ impl SaIndex {
             data,
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
     }
 }
@@ -748,6 +755,7 @@ impl SaIndexBuilder<'_> {
             data: self.data,
             word_length: self.word_length,
             gstrand_bit: self.gstrand_bit,
+            sparse_d: 1,
         }
     }
 }

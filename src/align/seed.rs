@@ -358,12 +358,18 @@ fn search_direction_sparse(
                     break;
                 }
 
-                let result =
-                    find_seed_at_position(piece_seq, pos, index, min_seed_length, false, params);
+                let result = find_seeds_sparse_sa(
+                    piece_seq,
+                    pos,
+                    piece_end - pos,
+                    index,
+                    min_seed_length,
+                    params,
+                );
 
                 if !debug_name.is_empty() {
                     let dir = if is_rc { "RC" } else { "FWD" };
-                    let seed_info = match &result.seed {
+                    let seed_info = match result.seeds.first() {
                         Some(s) => {
                             format!("seed(len={} sa={}-{})", s.length, s.sa_start, s.sa_end)
                         }
@@ -382,7 +388,7 @@ fn search_direction_sparse(
                     );
                 }
 
-                if let Some(mut seed) = result.seed {
+                for mut seed in result.seeds {
                     // Apply seedSearchLmax cap
                     if params.seed_search_lmax > 0 && seed.length > params.seed_search_lmax {
                         seed.length = params.seed_search_lmax;
@@ -406,6 +412,59 @@ fn search_direction_sparse(
                 // Remaining-length check at loop top: stop when < seedMapMin bases remain
             }
         }
+    }
+}
+
+/// Seeds stored by one `maxMappableLength2strands` call, and the length to
+/// advance the chain by.
+struct SparseMmp {
+    seeds: Vec<Seed>,
+    advance: usize,
+}
+
+/// STAR's `maxMappableLength2strands`: the MMP search at `pos`, repeated for
+/// the `min(pieceLength, genomeSAsparseD)` shifted starts `pos + iDist` that a
+/// sparse suffix array needs (only every `sparse_d`-th genome position is a
+/// suffix, so a read start that falls between two stored suffixes is found by
+/// starting a few bases later). Only the starts whose `maxL + iDist` is the
+/// largest are stored, and the chain advances by that `maxLbest`.
+///
+/// With a dense SA (`sparse_d == 1`) this is one plain `find_seed_at_position`.
+fn find_seeds_sparse_sa(
+    read_seq: &[u8],
+    pos: usize,
+    piece_len: usize,
+    index: &GenomeIndex,
+    min_seed_length: usize,
+    params: &Parameters,
+) -> SparseMmp {
+    let sparse_d = index.sa_index.sparse_d.max(1) as usize;
+    if sparse_d == 1 {
+        let r = find_seed_at_position(read_seq, pos, index, min_seed_length, false, params);
+        return SparseMmp {
+            seeds: r.seed.into_iter().collect(),
+            advance: r.advance,
+        };
+    }
+    let n_dist = piece_len.min(sparse_d);
+    let results: Vec<MmpResult> = (0..n_dist)
+        .map(|d| find_seed_at_position(read_seq, pos + d, index, min_seed_length, false, params))
+        .collect();
+    let best = results
+        .iter()
+        .enumerate()
+        .map(|(d, r)| r.advance + d)
+        .max()
+        .unwrap_or(1);
+    let seeds = results
+        .into_iter()
+        .enumerate()
+        .filter(|(d, r)| r.advance + d == best)
+        .filter_map(|(_, r)| r.seed)
+        .collect();
+    SparseMmp {
+        seeds,
+        advance: best,
     }
 }
 
