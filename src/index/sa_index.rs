@@ -762,8 +762,9 @@ impl SaIndex {
     ///   - sa_start: first SA index in range
     ///   - sa_end_exclusive: past-the-end SA index
     ///   - matched_level: how many bases the SAindex resolved
-    ///   - bounds_tight: both bounds came from present SAindex entries
-    ///     (safe to skip first matched_level bases in binary search)
+    ///   - bounds_tight: STAR's `iSA2good && iSA1noN`: the upper bound came from
+    ///     a present SAindex entry and the range holds no N-flagged suffix (safe
+    ///     to skip first matched_level bases in binary search)
     ///
     /// Returns None if no prefix exists in the index (all levels absent).
     pub fn hierarchical_lookup(
@@ -801,11 +802,17 @@ impl SaIndex {
                 let level_end = self.genome_sa_index_start[lind as usize];
                 let next_pos = self.genome_sa_index_start[(lind - 1) as usize] + ind + 1;
 
+                // STAR's `iSA1noN`: the N flag (`SAiMarkNmaskC`, bit gstrand_bit+1) marks
+                // a prefix whose range holds suffixes that run into an N or a padding
+                // character within the first `lind` bases. They sort at the end of the
+                // range, so the first `lind` bases do not all match and the search must
+                // start from base 0 (`ReadAlign_maxMappableLength2strands.cpp:68-100`).
+                let start_has_n = (entry >> (self.gstrand_bit + 1)) & 1 != 0;
                 let (sa_end, bounds_tight) = if next_pos < level_end {
                     let next_entry = self.data.read(next_pos as usize);
                     let next_absent = (next_entry >> (self.gstrand_bit + 2)) & 1 != 0;
                     if !next_absent {
-                        ((next_entry & sa_pos_mask) as usize, true)
+                        ((next_entry & sa_pos_mask) as usize, !start_has_n)
                     } else {
                         (n_sa, false)
                     }

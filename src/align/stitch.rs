@@ -1368,17 +1368,10 @@ fn stitch_align_to_transcript(
             return None;
         }
 
-        // Reject a splice whose exon B is shorter than alignSJoverhangMin before
-        // scanning: such a short exon cannot pass the final overhang check
-        // unless its junction is annotated (alignSJDBoverhangMin, default 3),
-        // and skipping it keeps tiny seeds from spending the recursion budget.
-        // STAR has no such early exit, so B must not be the half of a Gsj
-        // (inserted-junction) hit: those are exactly the annotated junctions
-        // with a 3-4 base overhang that STAR aligns.
-        if is_splice && eff_length < scorer.align_sj_overhang_min as usize && wa.sj_a.is_none() {
-            return None;
-        }
-
+        // No early exit on a short exon B: after the overlap trim B can be shorter than
+        // alignSJoverhangMin, yet the junction scan below may shift the junction left
+        // and give B its bases back (STAR has no such exit; the overhang rule is
+        // applied to the final exons at finalization).
         // --- jR scanning for BOTH splice junctions and deletions (STAR-faithful) ---
         // STAR uses the same scanning code path for both cases; the only difference
         // is motif detection (splice) vs pure positional score (deletion).
