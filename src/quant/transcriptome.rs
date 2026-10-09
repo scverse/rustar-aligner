@@ -1202,6 +1202,7 @@ fn align_to_one_transcript(
         n_junction: 0,
         junction_motifs: Vec::new(),
         junction_annotated: Vec::new(),
+        star_order: 0,
     })
 }
 
@@ -2229,6 +2230,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         }
     }
 

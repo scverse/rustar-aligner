@@ -169,6 +169,7 @@ impl PairedAlignment {
             n_junction: m1.n_junction + m2.n_junction,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 }
@@ -481,6 +482,10 @@ fn align_read_inner(
                 t.cigar_string(),
             ))
         });
+    }
+
+    for (rank, t) in transcripts.iter_mut().enumerate() {
+        t.star_order = rank as u32;
     }
 
     // Deterministic primary tie-break (score, then a fixed positional order).
@@ -1661,6 +1666,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
         let pair = PairedAlignment {
             mate1_transcript: make_tr(1000, 1100, 0, 100),
@@ -1768,6 +1774,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 
@@ -1921,6 +1928,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1942,6 +1950,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 300bp, within default limit (auto mode = unlimited)
@@ -1975,6 +1984,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1996,6 +2006,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 400bp, exceeds limit of 100bp
@@ -2027,6 +2038,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -2048,6 +2060,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2080,6 +2093,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Create a transcript with consistent strand motifs (all + strand)
@@ -2102,6 +2116,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::GcAg], // both + strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Note: STAR's RemoveInconsistentStrands filters transcripts where
@@ -2180,6 +2195,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -2201,6 +2217,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2241,6 +2258,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Case 1: NonCanonical + unannotated → should be filtered
@@ -2326,6 +2344,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Test BothMapped variant
@@ -2431,6 +2450,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         }
     }
 

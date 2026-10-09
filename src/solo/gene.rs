@@ -382,6 +382,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 

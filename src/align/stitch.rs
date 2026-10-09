@@ -2301,6 +2301,7 @@ pub(crate) fn finalize_transcript(
         n_junction: wt.n_junction,
         junction_motifs: wt.junction_motifs.clone(),
         junction_annotated: wt.junction_annotated.clone(),
+        star_order: 0,
     })
 }
 
@@ -2387,6 +2388,27 @@ fn pe_mates_consistent(wt: &WorkingTranscript, read_seq: &[u8], scorer: &Alignme
     true
 }
 
+type NovelFilter = Option<std::rc::Rc<std::collections::HashSet<(u64, u64)>>>;
+
+thread_local! {
+    /// `--outFilterType BySJout` second stage: the novel junctions (intron
+    /// start, end; absolute 0-based) that passed the SJ filters. While set,
+    /// a transcript with an unannotated junction outside it is dropped at
+    /// finalization (STAR `stitchWindowAligns.cpp`, `outFilterBySJoutStage==2`).
+    static BYSJ_NOVEL: std::cell::RefCell<NovelFilter> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the second-stage BySJout junction filter active on this thread.
+pub(crate) fn with_bysj_novel_filter<R>(
+    novel: std::collections::HashSet<(u64, u64)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    BYSJ_NOVEL.with(|c| *c.borrow_mut() = Some(std::rc::Rc::new(novel)));
+    let out = f();
+    BYSJ_NOVEL.with(|c| *c.borrow_mut() = None);
+    out
+}
+
 /// The finalization checks STAR runs before recording a transcript in its window:
 /// mate placement, exon lengths next to a junction (`alignSJoverhangMin` plus the
 /// repeat shift, `alignSJDBoverhangMin`) and the mapped length of a spliced mate
@@ -2438,6 +2460,18 @@ fn passes_finalization_filters(
         } else {
             gaps.push(Gap::Other);
         }
+    }
+    // BySJout 2nd stage: unannotated junctions have to be in the filtered set.
+    let novel_ok = BYSJ_NOVEL.with(|c| {
+        c.borrow().as_ref().is_none_or(|set| {
+            wt.exons.windows(2).zip(&gaps).all(|(w, gap)| {
+                !matches!(gap, Gap::Junction(false, _))
+                    || set.contains(&(w[0].genome_end, w[1].genome_start - 1))
+            })
+        })
+    });
+    if !novel_ok {
+        return false;
     }
     // As in the finalization of `stitchWindowAligns.cpp:109-123`: an annotated
     // junction's short exon only counts when the exon sits at a mate end or next to
