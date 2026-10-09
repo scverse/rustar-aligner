@@ -410,13 +410,6 @@ impl SpliceJunctionStats {
     pub fn is_empty(&self) -> bool {
         self.junctions.is_empty()
     }
-
-    /// Iterate over all junctions (for two-pass mode filtering)
-    pub(crate) fn iter(
-        &self,
-    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, SjKey, SjCounts>> {
-        self.junctions.iter()
-    }
 }
 
 impl Default for SpliceJunctionStats {

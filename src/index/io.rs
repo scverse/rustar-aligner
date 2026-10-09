@@ -139,6 +139,22 @@ impl GenomeIndex {
     }
 }
 
+/// `genomeSAsparseD` and `genomeSAindexNbases` recorded in the index.
+pub(crate) fn read_sa_params(genome_dir: &Path, params: &Parameters) -> (u64, u32) {
+    let mut sparse_d = u64::from(params.genome_sa_sparse_d);
+    let mut nbases = params.genome_sa_index_nbases;
+    if let Ok(txt) = std::fs::read_to_string(genome_dir.join("genomeParameters.txt")) {
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("genomeSAsparseD\t") {
+                sparse_d = v.trim().parse().unwrap_or(sparse_d);
+            } else if let Some(v) = line.strip_prefix("genomeSAindexNbases\t") {
+                nbases = v.trim().parse().unwrap_or(nbases);
+            }
+        }
+    }
+    (sparse_d, nbases)
+}
+
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
 /// and return the first field (total genome byte count, including Gsj if
 /// sjdb was baked in). Returns `Ok(None)` if the file or line is absent,

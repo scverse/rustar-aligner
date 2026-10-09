@@ -859,7 +859,7 @@ fn run_single_pass(
     Ok(stats)
 }
 
-/// Run two-pass alignment mode
+/// Run two-pass alignment mode (`twoPassRunPass1.cpp`, `sjdbInsertJunctions.cpp`).
 fn run_two_pass(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
@@ -869,73 +869,83 @@ fn run_two_pass(
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
     use std::sync::Arc;
 
-    // PASS 1: Junction discovery (no quant counting in pass 1)
+    // PASS 1: junction discovery (no quant counting in pass 1)
     info!("Two-pass mode: Pass 1 - Junction discovery");
-    let (sj_stats_pass1, novel_junctions) = run_pass1(index, params)?;
-
     let pass1_dir = params.output_path("_STARpass1");
+    if pass1_dir.exists() {
+        std::fs::remove_dir_all(&pass1_dir)?;
+    }
     std::fs::create_dir_all(&pass1_dir)?;
     let pass1_path = pass1_dir.join("SJ.out.tab");
+    run_pass1(index, params, &pass1_dir)?;
 
-    info!("Writing pass 1 junctions to {}", pass1_path.display());
-    sj_stats_pass1.write_output(&pass1_path, &index.genome, params)?;
-    info!(
-        "Pass 1 discovered {} novel junctions",
-        novel_junctions.len()
-    );
+    // Insert the junctions of the first pass: the genome's own junctions
+    // (priority 30) plus the whole first-pass SJ.out.tab, through sjdbPrepare,
+    // with the suffix array rebuilt over the result.
+    let (sparse_d, _) = crate::index::io::read_sa_params(&params.genome_dir, params);
+    let inserted = index.insert_pass1_junctions(&pass1_path, params, sparse_d)?;
+    let pass2_index = match inserted {
+        Some(idx) => {
+            info!(
+                "Inserted {} junctions into the genome ({} before the first pass)",
+                idx.prepared_junctions.len(),
+                index.prepared_junctions.len()
+            );
+            Arc::new(idx)
+        }
+        None => Arc::clone(index),
+    };
 
-    // Insert novel junctions into DB
-    let mut merged_index = (**index).clone();
-    merged_index
-        .junction_db
-        .insert_novel(novel_junctions.clone());
-    info!(
-        "Merged junction DB: {} total junctions",
-        merged_index.junction_db.len()
-    );
-
-    // PASS 2: Re-alignment with merged DB (quant counts happen here)
+    // PASS 2: re-alignment with the extended genome (quant counts happen here)
     info!("Two-pass mode: Pass 2 - Re-alignment");
-    let stats = run_single_pass(&Arc::new(merged_index), params, quant_ctx, tr_idx, solo_ctx)?;
-
-    Ok(stats)
+    run_single_pass(&pass2_index, params, quant_ctx, tr_idx, solo_ctx)
 }
 
-/// Run pass 1 of two-pass mode (junction discovery)
+/// Run pass 1 of two-pass mode: align (up to `--twopass1readsN` reads) with
+/// everything but the junction statistics switched off, as `twoPassRunPass1.cpp`
+/// does, and write `SJ.out.tab` and `Log.final.out` into `_STARpass1/`.
 fn run_pass1(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
-) -> anyhow::Result<(
-    crate::junction::SpliceJunctionStats,
-    Vec<(
-        crate::junction::NovelJunctionKey,
-        crate::junction::JunctionInfo,
-    )>,
-)> {
+    pass1_dir: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::sync::Arc;
 
-    let stats = Arc::new(crate::stats::AlignmentStats::new());
-    let sj_stats = Arc::new(crate::junction::SpliceJunctionStats::with_params(params));
+    let time_start = chrono::Local::now();
 
-    // Modify params to limit reads for pass 1
+    // P1 = P with the unnecessary calculations turned off.
     let mut params_pass1 = params.clone();
-    if params.twopass1_reads_n >= 0 {
-        params_pass1.read_map_number = params.twopass1_reads_n;
-        info!("Pass 1 will align {} reads", params.twopass1_reads_n);
+    params_pass1.out_filter_type = params::OutFilterType::Normal;
+    params_pass1.out_sam_unmapped = params::OutSamUnmapped::None;
+    params_pass1.out_reads_unmapped = params::OutReadsUnmapped::None;
+    params_pass1.chim_segment_min = 0;
+    params_pass1.wasp_output_mode = params::WaspOutputMode::None;
+    // readMapNumber = min(pass1readsN, readMapNumber); a negative value is "all".
+    let limit = |n: i64| if n < 0 { u64::MAX } else { n as u64 };
+    let n = limit(params.twopass1_reads_n).min(limit(params.read_map_number));
+    if n != u64::MAX {
+        params_pass1.read_map_number = n as i64;
+        info!("Pass 1 will align {n} reads");
     } else {
         info!("Pass 1 will align all reads");
     }
+
+    let stats = Arc::new(crate::stats::AlignmentStats::new());
+    let sj_stats = Arc::new(crate::junction::SpliceJunctionStats::with_params(
+        &params_pass1,
+    ));
 
     // Create NullWriter (discard SAM/BAM output in pass 1)
     let mut null_writer = NullWriter;
 
     // Align reads (single-end or paired-end); no quant counting in pass 1.
-    // Solo runs align only the cDNA read (file 0) — route to the SE path.
+    // Solo runs align only the cDNA read (file 0), so route to the SE path.
     let n_align_files = if params.solo_enabled() {
         1
     } else {
         params.read_files_in.len()
     };
+    let time_map_start = chrono::Local::now();
     match n_align_files {
         1 => align_reads_single_end(
             &params_pass1,
@@ -962,16 +972,19 @@ fn run_pass1(
         )?,
         n => anyhow::bail!("Invalid number of read files: {n} (expected 1 or 2)"),
     }
-
     info!("Pass 1 aligned {} reads", stats.total_reads());
 
-    // Filter novel junctions
-    let novel_junctions = crate::junction::filter_novel_junctions(&sj_stats, params);
-
-    // Return ownership of sj_stats
-    let sj_stats = Arc::try_unwrap(sj_stats).unwrap_or_else(|arc| (*arc).clone());
-
-    Ok((sj_stats, novel_junctions))
+    // outputSJ(RAchunk1, P1): always written, whatever --outSJtype says.
+    let sj_path = pass1_dir.join("SJ.out.tab");
+    info!("Writing pass 1 junctions to {}", sj_path.display());
+    sj_stats.write_output(&sj_path, &index.genome, &params_pass1)?;
+    stats.write_log_final(
+        &pass1_dir.join("Log.final.out"),
+        time_start,
+        time_map_start,
+        chrono::Local::now(),
+    )?;
+    Ok(())
 }
 
 /// Reverse-complement an encoded read (A=0,C=1,G=2,T=3,N=4).  Shared by the

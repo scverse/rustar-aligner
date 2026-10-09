@@ -380,7 +380,15 @@ pub fn prepare_junction(
 /// - One canonical + one not → keep the canonical one.
 /// - Both canonical but on correct vs wrong strand relative to motif —
 ///   keep the one whose strand matches `2 - motif % 2`.
-pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunction> {
+pub fn sort_and_dedup(junctions: Vec<PreparedJunction>) -> Vec<PreparedJunction> {
+    sort_and_dedup_prio(junctions.into_iter().map(|j| (j, 0)).collect())
+}
+
+/// [`sort_and_dedup`] with STAR's source priorities (`sjdbLoci.priority`: 30 for
+/// junctions of the loaded genome, 0 for the first-pass junctions of
+/// `--twopassMode`). Of two junctions at the same place the higher priority
+/// wins before motif and shift are looked at (`sjdbPrepare.cpp:111-117,142-150`).
+pub fn sort_and_dedup_prio(mut junctions: Vec<(PreparedJunction, u8)>) -> Vec<PreparedJunction> {
     // Pass 1: shifted coords, strand-partitioned ('+' block, then '-',
     // then '.', mirroring STAR's `shift1` of 0 / nGenomeReal / 2n).
     let strand_block = |j: &PreparedJunction| match j.src_strand {
@@ -388,66 +396,82 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
         2 => 1u8,
         _ => 2u8,
     };
-    junctions.sort_by(|a, b| {
+    junctions.sort_by(|(a, _), (b, _)| {
         strand_block(a)
             .cmp(&strand_block(b))
             .then_with(|| a.start_pos.cmp(&b.start_pos))
             .then_with(|| a.end_pos.cmp(&b.end_pos))
     });
 
-    let mut pass1: Vec<PreparedJunction> = Vec::with_capacity(junctions.len());
-    for j in junctions {
+    let mut pass1: Vec<(PreparedJunction, u8)> = Vec::with_capacity(junctions.len());
+    for (j, prio) in junctions {
         match pass1.last_mut() {
-            Some(last)
+            Some((last, last_prio))
                 if strand_block(last) == strand_block(&j)
                     && last.start_pos == j.start_pos
                     && last.end_pos == j.end_pos =>
             {
-                // sjdbPrepare.cpp:116-121 (equal priority): the new
-                // junction wins if it is canonical and the old one is
-                // not, or if both have the same canonicality and the
-                // new one has the smaller left shift.
-                if (j.motif > 0 && last.motif == 0)
-                    || ((j.motif > 0) == (last.motif > 0) && j.shift_left < last.shift_left)
-                {
+                // sjdbPrepare.cpp:108-123: the higher priority wins; at equal
+                // priority the new junction wins if it is canonical and the
+                // old one is not, or if both have the same canonicality and
+                // the new one has the smaller left shift.
+                let wins = match prio.cmp(last_prio) {
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => {
+                        (j.motif > 0 && last.motif == 0)
+                            || ((j.motif > 0) == (last.motif > 0) && j.shift_left < last.shift_left)
+                    }
+                };
+                if wins {
                     *last = j;
+                    *last_prio = prio;
                 }
             }
-            _ => pass1.push(j),
+            _ => pass1.push((j, prio)),
         }
     }
 
     // Pass 2: stored coords, cross-strand collapse.
     let mut junctions = pass1;
-    junctions.sort_by(|a, b| {
+    junctions.sort_by(|(a, _), (b, _)| {
         a.stored_start()
             .cmp(&b.stored_start())
             .then_with(|| a.stored_end().cmp(&b.stored_end()))
     });
 
-    let mut out: Vec<PreparedJunction> = Vec::with_capacity(junctions.len());
-    for j in junctions {
+    let mut out: Vec<(PreparedJunction, u8)> = Vec::with_capacity(junctions.len());
+    // STAR compares the priority with the previous junction of the sorted list
+    // (`isj0 = sjdbSort[(ii-1)*3+2]`), the one looked at last, kept or not.
+    let mut prev_prio = 0u8;
+    for (j, prio) in junctions {
         match out.last() {
-            Some(last)
+            Some((last, _))
                 if last.stored_start() == j.stored_start()
                     && last.stored_end() == j.stored_end() =>
             {
-                if let Some(winner) = merge_cross_strand(last, &j) {
-                    *out.last_mut().unwrap() = winner;
+                let winner = match prio.cmp(&prev_prio) {
+                    std::cmp::Ordering::Less => None,
+                    std::cmp::Ordering::Greater => Some(j),
+                    std::cmp::Ordering::Equal => merge_cross_strand(last, &j),
+                };
+                if let Some(winner) = winner {
+                    *out.last_mut().unwrap() = (winner, prio);
                 }
                 // else: keep `last` unchanged.
             }
-            _ => out.push(j),
+            _ => out.push((j, prio)),
         }
+        prev_prio = prio;
     }
-    out
+    out.into_iter().map(|(j, _)| j).collect()
 }
 
 /// Decide what `(stored_start, stored_end)` duplicate to keep.
 /// Returns `Some(new)` to replace the stored entry, `None` to keep it.
 /// For the "both non-canonical on opposite strands" case we keep the
 /// existing entry but force its strand to 0 in-place (handled by the
-/// caller via a special-case — represented here as returning a cloned
+/// caller via a special-case, represented here as returning a cloned
 /// `old` with strand=0).
 fn merge_cross_strand(old: &PreparedJunction, new: &PreparedJunction) -> Option<PreparedJunction> {
     // sjdbPrepare.cpp:154-159 — STAR compares the RECORDED strand of the
@@ -1235,5 +1259,30 @@ mod tests {
         let parsed = read_sjdb_info_tab(tmp.path(), &genome).unwrap();
         assert_eq!(parsed.sjdb_overhang, 100);
         assert_eq!(parsed.junctions, junctions);
+    }
+
+    #[test]
+    fn priority_beats_motif_and_shift_in_dedup() {
+        // Same junction twice: a non-canonical one of priority 30 and a
+        // canonical one of priority 0 (as the genome's and the first pass's
+        // copies can be). STAR keeps the higher priority, not the canonical.
+        let mk = |motif: u8| PreparedJunction {
+            chr_idx: 0,
+            start_pos: 100,
+            end_pos: 200,
+            motif,
+            shift_left: 0,
+            shift_right: 0,
+            strand: 1,
+            src_strand: 1,
+        };
+        let kept = sort_and_dedup_prio(vec![(mk(0), 30), (mk(1), 0)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].motif, 0);
+        let kept = sort_and_dedup_prio(vec![(mk(1), 0), (mk(0), 30)]);
+        assert_eq!(kept[0].motif, 0);
+        // Equal priority: the canonical one wins.
+        let kept = sort_and_dedup_prio(vec![(mk(0), 5), (mk(1), 5)]);
+        assert_eq!(kept[0].motif, 1);
     }
 }
