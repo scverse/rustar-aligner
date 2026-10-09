@@ -1136,6 +1136,7 @@ fn align_to_one_transcript(
         n_junction: 0,
         junction_motifs: Vec::new(),
         junction_annotated: Vec::new(),
+        junction_strand: vec![],
     })
 }
 
@@ -2047,6 +2048,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         }
     }
 

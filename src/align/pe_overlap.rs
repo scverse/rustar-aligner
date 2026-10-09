@@ -252,7 +252,8 @@ pub fn convert_merged_transcript_to_pe(
     // without touching genome coordinates), so this classification carries over unchanged to the
     // post-split per-mate exon lists.
     let n = merged.exons.len();
-    let mut gap_info: Vec<Option<(SpliceMotif, bool)>> = Vec::with_capacity(n.saturating_sub(1));
+    let mut gap_info: Vec<Option<(SpliceMotif, bool, u8)>> =
+        Vec::with_capacity(n.saturating_sub(1));
     let mut orig_junction_idx = 0usize;
     for iex in 0..n.saturating_sub(1) {
         let cur = &merged.exons[iex];
@@ -264,6 +265,11 @@ pub fn convert_merged_transcript_to_pe(
                 Some((
                     merged.junction_motifs[orig_junction_idx],
                     merged.junction_annotated[orig_junction_idx],
+                    merged
+                        .junction_strand
+                        .get(orig_junction_idx)
+                        .copied()
+                        .unwrap_or(0),
                 ))
             } else {
                 None
@@ -279,7 +285,7 @@ pub fn convert_merged_transcript_to_pe(
     // mate index i_frag, not by the `imate` scan order below -- see module doc for why these
     // differ when `merged.is_reverse`).
     let mut out_exons: [Vec<Exon>; 2] = [Vec::new(), Vec::new()];
-    let mut out_junctions: [Vec<(SpliceMotif, bool)>; 2] = [Vec::new(), Vec::new()];
+    let mut out_junctions: [Vec<(SpliceMotif, bool, u8)>; 2] = [Vec::new(), Vec::new()];
 
     for imate in 0..2usize {
         let i_frag = if imate == 0 { s } else { 1 - s };
@@ -343,7 +349,10 @@ pub fn convert_merged_transcript_to_pe(
         };
         let (cigar_ops, score, n_mismatch, n_gap, n_junction) = score_mate_exons(
             &out_exons[i],
-            &out_junctions[i],
+            &out_junctions[i]
+                .iter()
+                .map(|&(m, a, _)| (m, a))
+                .collect::<Vec<_>>(),
             mate_lens[i],
             &native_read,
             genome,
@@ -362,8 +371,9 @@ pub fn convert_merged_transcript_to_pe(
             n_mismatch,
             n_gap,
             n_junction,
-            junction_motifs: out_junctions[i].iter().map(|(m, _)| *m).collect(),
-            junction_annotated: out_junctions[i].iter().map(|(_, a)| *a).collect(),
+            junction_motifs: out_junctions[i].iter().map(|(m, _, _)| *m).collect(),
+            junction_annotated: out_junctions[i].iter().map(|(_, a, _)| *a).collect(),
+            junction_strand: out_junctions[i].iter().map(|(_, _, s)| *s).collect(),
         });
     }
 
@@ -478,6 +488,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let scorer = AlignmentScorer::from_params_minimal();
@@ -550,6 +561,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let scorer = AlignmentScorer::from_params_minimal();

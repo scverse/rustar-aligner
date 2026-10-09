@@ -1797,15 +1797,22 @@ impl Parameters {
         if params.rg_line_set() {
             params.out_sam_attributes |= SamAttributes::RG;
         }
-        // XS is only emitted in intronMotif mode (Parameters_samAttributes.cpp:172-179).
-        // intronMotif forces XS on; anything else strips XS even if explicitly listed.
-        if params.out_sam_strand_field == "intronMotif" {
+        // Parameters_samAttributes.cpp: an explicit XS turns on
+        // --outSAMstrandField intronMotif (which also drops spliced
+        // alignments with an undefined strand); intronMotif appends XS when it
+        // is not listed.
+        if params.out_sam_attributes.contains(SamAttributes::XS) {
+            if params.out_sam_strand_field != "intronMotif" {
+                log::info!(
+                    "--outSAMattributes contains XS, therefore rustar-aligner will use --outSAMstrandField intronMotif"
+                );
+                params.out_sam_strand_field = "intronMotif".into();
+            }
+        } else if params.out_sam_strand_field == "intronMotif" {
             log::info!(
                 "--outSAMstrandField=intronMotif, therefore rustar-aligner will output XS attribute"
             );
             params.out_sam_attributes |= SamAttributes::XS;
-        } else {
-            params.out_sam_attributes.remove(SamAttributes::XS);
         }
 
         // --alignEndsType: reject unknown/unimplemented values up front.
@@ -3218,9 +3225,8 @@ mod tests {
     }
 
     #[test]
-    fn xs_without_intron_motif_is_stripped() {
-        // Explicit XS in attrs without --outSAMstrandField intronMotif: XS gets stripped.
-        // Users must set both to get XS output.
+    fn xs_without_intron_motif_enables_intron_motif() {
+        // Explicit XS in attrs turns on intronMotif, as STAR.
         let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
@@ -3230,8 +3236,8 @@ mod tests {
             "XS",
         ])
         .unwrap();
-        assert_eq!(p.out_sam_strand_field, "None");
-        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+        assert_eq!(p.out_sam_strand_field, "intronMotif");
+        assert!(p.out_sam_attributes.contains(SamAttributes::XS));
     }
 
     #[test]

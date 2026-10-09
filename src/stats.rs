@@ -806,6 +806,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![true],
+            junction_strand: vec![],
         };
 
         stats.record_transcript_stats(&transcript);
@@ -926,6 +927,7 @@ mod tests {
                 SpliceMotif::NonCanonical, // motif[0]
             ],
             junction_annotated: vec![true, false, true, false],
+            junction_strand: vec![],
         };
 
         stats.record_transcript_stats(&transcript);
