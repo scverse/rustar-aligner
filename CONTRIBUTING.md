@@ -55,6 +55,30 @@ Diverging from STAR (including adding non-STAR flags, or choosing STAR's *docume
 - Do not label a divergence "faithful", and do not invent a STAR flag/behaviour that does not exist and present it as parity.
 - A non-STAR flag or a change to default output behaviour needs maintainer sign-off before merge.
 
+### When a STAR-faithful change makes the numbers worse
+
+A change that brings an algorithm closer to STAR's can move the benchmark the
+wrong way. That is not evidence the change was wrong; it usually means the
+surrounding logic has not caught up yet. The question to ask is "what else does
+STAR do here that we do not", not "which approximation scored better".
+
+Keeping an approximation because it currently measures better is how a port
+stops converging. Say so in the PR when this happens, with the before and
+after, so the regression is a recorded step rather than a surprise.
+
+### Code conventions
+
+- The crate and binary are `rustar-aligner`; the Rust library name is
+  `rustar_aligner`. `#![allow(non_snake_case)]` in `lib.rs` is deliberate, so
+  STAR's camelCase identifiers can be kept where they help.
+- STAR parameters keep their `--camelCase` spelling through clap's
+  `#[arg(long = "camelCase")]`, mapping to snake_case Rust fields.
+- Multi-value parameters need an explicit `num_args`, and parameters with
+  negative defaults need `allow_hyphen_values = true`.
+- Validation that clap cannot express lives in `Parameters::validate()`.
+- No async. The work is CPU-bound; async would add machinery and buy nothing.
+- `thiserror` for the library's `Error` enum, `anyhow` at the top level.
+
 ### New dependencies need prior discussion
 
 Adding a dependency — **especially a non-Rust one** (a C library via a `-sys` crate, anything needing `bindgen`/`libclang` or a system library) — must be raised in an issue *before* the PR. This project is published to crates.io and builds on five platforms including Windows; a new C dependency is a maintenance and supply-chain decision, not an implementation detail.
@@ -143,7 +167,7 @@ python3 test/compare_sam.py \
 python3 test/compare_pe.py "$DATA/rustar_10k_pe_/Aligned.out.sam" "$DATA/star_10k_pe_/Aligned.out.sam"
 ```
 
-Baseline to beat: SE ~99.8% and PE ~99.9% tie-adjusted faithfulness (see `CLAUDE.md`). Faithfulness must not regress; if a STAR-faithful change regresses a metric, the fix is more STAR-matching work, not a revert (a deliberate, signed-off divergence is the documented exception).
+Baseline to beat: SE ~99.8% and PE ~99.9% tie-adjusted faithfulness (see `ROADMAP.md`). Faithfulness must not regress; if a STAR-faithful change regresses a metric, the fix is more STAR-matching work, not a revert (a deliberate, signed-off divergence is the documented exception).
 
 - **STARsolo** counting changes: run `test/solo_diff_docker.sh` against a real STARsolo oracle. A change to default barcode/UMI counting is not validated by unit tests alone.
 - **STARlong / long-read** changes: validate against real STARlong output, not just synthetic unit fixtures.
