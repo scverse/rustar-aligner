@@ -635,7 +635,7 @@ fn build_matrix_body(
                         .or_insert(0) += 1;
                 }
 
-                // CellRanger's own marking (`tx_annotation::mark_dups`), when
+                // CellRanger's duplicate marking (`cr_dups`), when
                 // CellRanger's annotation is in use.
                 let cr_dups = ctx.cr_model.is_some().then(|| {
                     let reads: Vec<crate::solo::cr_dups::DupRead> = records[i..j]
