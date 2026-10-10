@@ -2303,6 +2303,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     let clip5p = params.clip5p(0);
     let clip3p = params.clip3p(0);
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
+    // `--soloOutLayout CellRanger` trims the TSO and poly(A) as cellranger count 10 does
+    // (`solo::cr_trim`), in place of STARsolo's CellRanger4 clip.
+    let cr_trim_on = params.solo_out_layout == "CellRanger";
+    let cr4_clip = cr4_clip && !cr_trim_on;
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // With `--outSAMtype None` (count-only) we skip building SAM records entirely
     // — a large saving for solo runs that only need the count matrix.
@@ -2461,7 +2465,19 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 };
                             // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
                             // the fixed clip5p/clip3p Nbases trimming.
-                            let (cr_seq, cr_qual, cr4_5p, cr4_3p) = if cr4_clip {
+                            let cr_trim = cr_trim_on
+                                .then(|| crate::solo::cr_trim::trim(&read.sequence));
+                            let (cr_seq, cr_qual, cr4_5p, cr4_3p) = if let Some(t) = cr_trim {
+                                (
+                                    read.sequence[t.start..t.end].to_vec(),
+                                    read.quality
+                                        .get(t.start..t.end.min(read.quality.len()))
+                                        .map(<[u8]>::to_vec)
+                                        .unwrap_or_default(),
+                                    t.start,
+                                    read.sequence.len() - t.end,
+                                )
+                            } else if cr4_clip {
                                 crate::solo::clip_adapter_cr4_with_tso(
                                     &read.sequence,
                                     &read.quality,
@@ -2632,8 +2648,8 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                         crate::io::sam::add_cr_annotation_tags(
                                             &mut records,
                                             outcome.region,
-                                            cr4_5p,
-                                            cr4_3p,
+                                            cr_trim.map_or(cr4_5p, |t| t.tso),
+                                            cr_trim.map_or(cr4_3p, |t| t.polya),
                                         );
                                     }
                                     // STARsolo GX/GN gene tags (Gene-feature assignment).
