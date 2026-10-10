@@ -180,7 +180,13 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`star_order`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in
+            star_output_order(transcripts, |t| t.star_order)
+                .take(max_output)
+                .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -193,6 +199,7 @@ impl SamWriter {
                 params.out_sam_attr_ih_start,
                 attrs,
             )?;
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
             order_record_tags(&mut record, &attrs);
             apply_sam_flag_or_and(&mut record, params);
@@ -322,7 +329,13 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`star_order`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in
+            star_output_order(transcripts, |t| t.star_order)
+                .take(max_output)
+                .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -346,6 +359,7 @@ impl SamWriter {
                     transcript.is_reverse,
                 );
             }
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
             apply_sam_flag_or_and(&mut record, params);
             apply_primary_flag(&mut record, transcript.score, best_score, params);
@@ -417,7 +431,11 @@ impl SamWriter {
             .max()
             .unwrap_or(i32::MIN);
 
-        for (pair_idx, paired_aln) in paired_alignments.iter().take(max_output).enumerate() {
+        for (pair_idx, (is_primary, paired_aln)) in
+            star_output_order(paired_alignments, |p| p.star_order)
+                .take(max_output)
+                .enumerate()
+        {
             let hit_index = pair_idx + 1; // 1-based
             // STAR reports the pre-split combined WT score (with length penalty) as AS.
             // This is stored as combined_wt_score, matching STAR's primaryScore.
@@ -449,6 +467,7 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec1, !is_primary);
             maybe_insert_rg_tag(&mut rec1, rg_id);
             apply_sam_flag_or_and(&mut rec1, params);
             apply_primary_flag(&mut rec1, combined_score, best_score, params);
@@ -480,6 +499,7 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec2, !is_primary);
             maybe_insert_rg_tag(&mut rec2, rg_id);
             apply_sam_flag_or_and(&mut rec2, params);
             apply_primary_flag(&mut rec2, combined_score, best_score, params);
@@ -1470,6 +1490,24 @@ pub(crate) fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters)
 /// `--outSAMprimaryFlag AllBestScore`: clear the SECONDARY bit on every alignment tied for the
 /// best score, instead of only the single (already-sorted) best alignment (`OneBestScore`,
 /// the default, which the caller's existing hit-index-based SECONDARY assignment already gives).
+/// Alignments in STAR's output order (ascending `star_order`), each with whether it is
+/// the primary (`items[0]`, STAR's `trBest`).
+fn star_output_order<T>(
+    items: &[T],
+    star_order: impl Fn(&T) -> u32,
+) -> impl Iterator<Item = (bool, &T)> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| (star_order(&items[i]), i));
+    order.into_iter().map(move |i| (i == 0, &items[i]))
+}
+
+/// Set or clear the SECONDARY flag.
+fn set_secondary(record: &mut RecordBuf, secondary: bool) {
+    let mut flags = record.flags();
+    flags.set(sam::alignment::record::Flags::SECONDARY, secondary);
+    *record.flags_mut() = flags;
+}
+
 fn apply_primary_flag(record: &mut RecordBuf, score: i32, best_score: i32, params: &Parameters) {
     if params.out_sam_primary_flag == crate::params::OutSamPrimaryFlag::AllBestScore
         && score == best_score

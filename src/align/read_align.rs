@@ -24,6 +24,47 @@ pub(crate) fn per_read_seed(run_rng_seed: u64, read_name: &str) -> u64 {
     read_name.hash(&mut hasher);
     run_rng_seed.wrapping_mul(hasher.finish().wrapping_add(1))
 }
+/// STAR's multimapper order and primary (`ReadAlign_multMapSelect.cpp` and the
+/// `trBest` choice of `ReadAlign_stitchPieces.cpp`), default `--outMultimapperOrder
+/// Old_2.4`. `items` arrive in window order (`trMult`), which is the order STAR writes
+/// them in; the primary is `trBest`: the best score, then the shortest genomic span,
+/// then the first window. With `--outSAMmultNmax` set, the best-scoring alignments are
+/// first swapped to the top in window order and the first one is the primary.
+///
+/// On return each item's `star_order` is its rank in STAR's output order (the `HI`
+/// order of the genomic records, and the transcriptome order), and the primary is
+/// `items[0]`.
+fn star_mult_map_order<T>(
+    items: &mut Vec<T>,
+    score: impl Fn(&T) -> i32,
+    g_length: impl Fn(&T) -> u64,
+    star_order: impl Fn(&mut T) -> &mut u32,
+    mult_nmax_set: bool,
+) {
+    let Some(max_score) = items.iter().map(&score).max() else {
+        return;
+    };
+    let primary = if mult_nmax_set {
+        let mut n_best = 0;
+        for i in 0..items.len() {
+            if score(&items[i]) == max_score {
+                items.swap(i, n_best);
+                n_best += 1;
+            }
+        }
+        0
+    } else {
+        (0..items.len())
+            .filter(|&i| score(&items[i]) == max_score)
+            .min_by_key(|&i| (g_length(&items[i]), i))
+            .unwrap_or(0)
+    };
+    for (rank, item) in items.iter_mut().enumerate() {
+        *star_order(item) = rank as u32;
+    }
+    let best = items.remove(primary);
+    items.insert(0, best);
+}
 
 /// Shuffle the prefix of `items` whose `score_fn` equals the first element's score.
 ///
@@ -489,45 +530,40 @@ fn align_read_inner(
         });
     }
 
-    for (rank, t) in transcripts.iter_mut().enumerate() {
-        t.star_order = rank as u32;
+    // STAR's multMapSelect (ReadAlign_multMapSelect.cpp): score range, then the
+    // output order and the primary.
+    if !transcripts.is_empty() {
+        let max_score = transcripts.iter().map(|t| t.score).max().unwrap_or(0);
+        let score_threshold = max_score - params.out_filter_multimap_score_range;
+        transcripts.retain(|t| t.score >= score_threshold);
     }
-
-    // Deterministic primary tie-break (score, then a fixed positional order).
-    transcripts.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.n_junction.cmp(&b.n_junction))
-            .then_with(|| a.chr_idx.cmp(&b.chr_idx))
-            .then_with(|| a.genome_start.cmp(&b.genome_start))
-            .then_with(|| a.is_reverse.cmp(&b.is_reverse))
-    });
-
-    // Primary selection — STAR's multMapSelect (ReadAlign_multMapSelect.cpp).
-    //
-    // STAR's DEFAULT (`--outMultimapperOrder Old_2.4`) does NOT consult the RNG
-    // for primary selection; it marks the deterministic best alignment primary.
-    // Only `--outMultimapperOrder Random` shuffles. Previously rustar-aligner
-    // shuffled unconditionally, which randomised the primary among equal-score
-    // loci and diverged from STAR's deterministic choice. Gate the shuffle on
-    // the Random mode so the default is deterministic and STAR-faithful.
-    //
-    // Under Random, we shuffle the tied top-score prefix with a per-read seed
-    // (deterministic per read → thread-count invariant).
     if params.out_multimapper_order == MultimapperOrder::Random {
+        // Under Random, the tied top-score prefix is shuffled with a per-read seed
+        // (deterministic per read, so thread-count invariant).
+        transcripts.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.n_junction.cmp(&b.n_junction))
+                .then_with(|| a.chr_idx.cmp(&b.chr_idx))
+                .then_with(|| a.genome_start.cmp(&b.genome_start))
+                .then_with(|| a.is_reverse.cmp(&b.is_reverse))
+        });
         shuffle_tied_prefix(
             &mut transcripts,
             |t| t.score,
             per_read_seed(params.run_rng_seed, read_name),
         );
-    }
-
-    // Score-range filter: keep only alignments within outFilterMultimapScoreRange of the best.
-    // (STAR's multMapSelect step — must run before quality filters.)
-    if !transcripts.is_empty() {
-        let max_score = transcripts[0].score;
-        let score_threshold = max_score - params.out_filter_multimap_score_range;
-        transcripts.retain(|t| t.score >= score_threshold);
+        for (rank, t) in transcripts.iter_mut().enumerate() {
+            t.star_order = rank as u32;
+        }
+    } else {
+        star_mult_map_order(
+            &mut transcripts,
+            |t| t.score,
+            |t| t.genome_end - t.genome_start,
+            |t| &mut t.star_order,
+            params.out_sam_mult_nmax >= 0,
+        );
     }
 
     // Step 4: STAR's mappedFilter (`ReadAlign_mappedFilter.cpp`), which runs after
@@ -1163,37 +1199,41 @@ pub fn align_paired_read(
         joint_pairs.retain(|pa| pa.combined_wt_score >= score_threshold);
     }
 
-    for (rank, pair) in joint_pairs.iter_mut().enumerate() {
-        pair.star_order = rank as u32;
-    }
-
-    // Deterministic primary tie-break (combined score, then a fixed positional
-    // order on mate1).
-    joint_pairs.sort_by(|a, b| {
-        b.combined_wt_score.cmp(&a.combined_wt_score).then_with(|| {
-            (
-                a.mate1_transcript.chr_idx,
-                a.mate1_transcript.genome_start,
-                a.mate1_transcript.is_reverse,
-            )
-                .cmp(&(
-                    b.mate1_transcript.chr_idx,
-                    b.mate1_transcript.genome_start,
-                    b.mate1_transcript.is_reverse,
-                ))
-        })
-    });
-
-    // Primary selection — STAR's multMapSelect. STAR's default does not use the
-    // RNG for the primary; only `--outMultimapperOrder Random` shuffles. Gate
-    // the (previously unconditional) shuffle so the default is deterministic
-    // and STAR-faithful; under Random, shuffle the tied top-score prefix with a
-    // per-read seed (deterministic per read → thread-count invariant).
     if params.out_multimapper_order == MultimapperOrder::Random {
+        // Under Random, the tied top-score prefix is shuffled with a per-read seed
+        // (deterministic per read, so thread-count invariant).
+        joint_pairs.sort_by(|a, b| {
+            b.combined_wt_score.cmp(&a.combined_wt_score).then_with(|| {
+                (
+                    a.mate1_transcript.chr_idx,
+                    a.mate1_transcript.genome_start,
+                    a.mate1_transcript.is_reverse,
+                )
+                    .cmp(&(
+                        b.mate1_transcript.chr_idx,
+                        b.mate1_transcript.genome_start,
+                        b.mate1_transcript.is_reverse,
+                    ))
+            })
+        });
         shuffle_tied_prefix(
             &mut joint_pairs,
             |pa| pa.combined_wt_score,
             per_read_seed(params.run_rng_seed, read_name),
+        );
+        for (rank, pair) in joint_pairs.iter_mut().enumerate() {
+            pair.star_order = rank as u32;
+        }
+    } else {
+        star_mult_map_order(
+            &mut joint_pairs,
+            |pa| pa.combined_wt_score,
+            |pa| {
+                let (m1, m2) = (&pa.mate1_transcript, &pa.mate2_transcript);
+                m1.genome_end.max(m2.genome_end) - m1.genome_start.min(m2.genome_start)
+            },
+            |pa| &mut pa.star_order,
+            params.out_sam_mult_nmax >= 0,
         );
     }
 
@@ -2383,6 +2423,34 @@ mod tests {
         {
             assert!(mate1_is_mapped);
         }
+    }
+
+    #[test]
+    fn star_mult_map_order_keeps_window_order_and_picks_tr_best() {
+        // (score, gLength, star_order): windows in order A, B, C, D.
+        let mut items = vec![(89, 91, 0u32), (89, 90, 0), (88, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, false);
+        // trBest is the first best score with the shortest span (window B).
+        assert_eq!(items[0], (89, 90, 1));
+        // Output order stays the window order.
+        let mut out = items.clone();
+        out.sort_by_key(|t| t.2);
+        assert_eq!(
+            out,
+            vec![(89, 91, 0), (89, 90, 1), (88, 91, 2), (89, 90, 3)]
+        );
+    }
+
+    #[test]
+    fn star_mult_map_order_with_mult_nmax_swaps_best_to_top() {
+        let mut items = vec![(88, 91, 0u32), (89, 91, 0), (87, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, true);
+        // Best-scoring alignments swapped to the top in window order; the first is primary.
+        // (STAR swaps in place: [88, 89a, 87, 89b] -> [89a, 88, 87, 89b] -> [89a, 89b, 87, 88].)
+        assert_eq!(
+            items,
+            vec![(89, 91, 0), (89, 90, 1), (87, 91, 2), (88, 91, 3)]
+        );
     }
 
     #[test]
