@@ -94,10 +94,7 @@ fn tso_end(read: &[u8]) -> usize {
                 d.2 + 1,
             );
             c = pick(c, (prev[j].0 + GAP, prev[j].1 + 1, prev[j].2 + 1));
-            c = pick(
-                c,
-                (curead[j - 1].0 + GAP, curead[j - 1].1 + 1, curead[j - 1].2),
-            );
+            c = pick(c, (cur[j - 1].0 + GAP, cur[j - 1].1 + 1, cur[j - 1].2));
             cur[j] = c;
         }
         std::mem::swap(&mut prev, &mut cur);
