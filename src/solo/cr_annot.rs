@@ -1,42 +1,18 @@
-//! CellRanger's read annotation against the transcriptome (`--soloOutLayout
-//! CellRanger`).
+//! Read annotation in the style of CellRanger (region, transcript and gene
+//! hits, confident alignment, MAPQ, and the TX/AN/GX/GN/RE/mm/xf tags).
 //!
-//! CellRanger does not count the way STARsolo does. It annotates every
-//! alignment of a read against the reference's transcripts and genes, then
-//! decides from the whole alignment set which alignment is the confident one.
-//! The rules below were recovered by comparing against the `RE`, `TX`, `AN`,
-//! `GX`, `xf` and MAPQ values of a real `cellranger count` 10.0.0 BAM
-//! (`pbmc_1k_v3`, `refdata-gex-GRCh38-2024-A`); on 395k uniquely mapped reads
-//! the per-alignment rules reproduce those tags for >99.9% of alignments.
+//! Independent implementation from a behavioural specification.
 //!
-//! Per alignment, with *blocks* the aligned stretches separated by `N`
-//! (deletions stay inside a block):
-//!
-//! * A transcript is **compatible** when the first block starts inside one of
-//!   its exons, every block lies within one exon, and every junction joins the
-//!   end of an exon to the start of the next one. Soft clips are ignored. The
-//!   alignment is then *transcriptomic*: `RE:E`, and the compatible transcripts
-//!   on the read's strand go to `TX`, those on the other strand to `AN`.
-//! * Otherwise a gene is **hit** when every block has at least half its bases
-//!   inside the gene's span. `TX`/`AN` then carry `gene,+` / `gene,-` (sense /
-//!   antisense) and the region is `E` when some transcript of a hit gene has at
-//!   least half of the aligned bases in its exons and every block touches an
-//!   exon, `N` otherwise. No hit gene: `I`.
-//!
-//! Per read:
-//!
-//! * One alignment: it is the confident one (MAPQ 255).
-//! * Several: the read is rescued, to MAPQ 255 on its first sense-transcriptomic
-//!   alignment, when the sense-transcriptomic alignments all belong to a single
-//!   gene. Otherwise the read is multi-mapped and not confident.
-//! * A confident read counts for a gene when its `TX` names exactly one gene
-//!   (intronic reads included, as `--include-introns`, CellRanger's default).
+//! Coordinates are 0-based genome positions (global, as carried by
+//! [`Transcript`]). Exon and alignment ends are handled as inclusive last
+//! bases unless stated otherwise.
 
 use crate::align::transcript::Transcript;
 use crate::quant::transcriptome::TranscriptomeIndex;
 use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+use std::fmt::Write as _;
 
-/// CellRanger's `RE` tag: where an alignment falls.
+/// Region class of an alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrRegion {
     Exonic,
@@ -45,458 +21,401 @@ pub enum CrRegion {
 }
 
 impl CrRegion {
-    /// The `RE:A` character.
+    /// The `RE` tag character.
+    #[must_use]
     pub fn tag_char(self) -> char {
         match self {
-            Self::Exonic => 'E',
-            Self::Intronic => 'N',
-            Self::Intergenic => 'I',
+            CrRegion::Exonic => 'E',
+            CrRegion::Intronic => 'N',
+            CrRegion::Intergenic => 'I',
         }
     }
 }
 
-struct CrTx {
-    start: i64,
-    end: i64,
-    plus: bool,
-    gene: u32,
-    /// `(start, end inclusive, cumulative length before this exon)`, ascending.
-    exons: Vec<(i64, i64, u32)>,
-    len: u32,
-}
-
-/// The reference as the annotation needs it: transcripts per chromosome, and
-/// gene spans.
-pub struct CrModel {
-    tx: Vec<CrTx>,
-    /// Per chromosome: transcript indices ascending by start, and the running
-    /// maximum of their ends.
-    by_chr: Vec<(Vec<u32>, Vec<i64>)>,
-    /// Transcript ids, gene ids and names (for the tags).
-    pub tx_ids: Vec<String>,
-    pub gene_ids: Vec<String>,
-    pub gene_names: Vec<String>,
-    /// Rank of each transcript / gene when ordered by id, since CellRanger lists
-    /// ids in that order.
-    tx_rank: Vec<u32>,
-    gene_rank: Vec<u32>,
-}
-
-/// A transcript-level hit of one alignment.
-#[derive(Debug, Clone, Copy)]
+/// A transcript hit: transcript, gene and 0-based position from the
+/// transcript 5' end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxHit {
     pub tx: u32,
     pub gene: u32,
-    /// 0-based position of the alignment start in transcript space (for a `-`
-    /// transcript, measured from its 5' end).
     pub pos: u32,
 }
 
-/// What one alignment was annotated as.
-#[derive(Debug, Clone)]
+/// Annotation of one alignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlnAnnot {
     pub region: CrRegion,
-    /// Compatible transcripts on the read's strand, ascending by id.
     pub tx_sense: Vec<TxHit>,
-    /// Compatible transcripts on the opposite strand.
     pub tx_anti: Vec<TxHit>,
-    /// Genes hit at gene level (only when no transcript is compatible).
     pub gene_sense: Vec<u32>,
     pub gene_anti: Vec<u32>,
 }
 
 impl AlnAnnot {
-    /// Genes named by the `TX` tag (and so by `GX`), ascending by id.
-    fn tx_genes(&self, model: &CrModel) -> Vec<u32> {
-        let mut g: Vec<u32> = if self.tx_sense.is_empty() {
-            self.gene_sense.clone()
-        } else {
-            self.tx_sense.iter().map(|h| h.gene).collect()
-        };
-        g.sort_unstable_by_key(|&x| model.gene_rank[x as usize]);
-        g.dedup();
-        g
-    }
-}
-
-/// What a whole read was annotated as.
-#[derive(Debug, Clone)]
-pub struct ReadAnnot {
-    pub alns: Vec<AlnAnnot>,
-    /// The alignment CellRanger keeps as the read's primary record.
-    pub primary: usize,
-    /// MAPQ 255: unique, or rescued.
-    pub conf: bool,
-    /// Genes of the primary's `TX`, ascending by id.
-    pub genes: Vec<u32>,
-    /// The gene the read counts for: confident and exactly one gene.
-    pub gene: Option<u32>,
-}
-
-impl ReadAnnot {
-    /// `Reads Mapped Antisense to Gene`: confident, with an antisense hit (a
-    /// transcript or, for an intronic read, a gene) on the primary and nothing
-    /// on the sense strand.
-    pub fn antisense(&self) -> bool {
-        let a = &self.alns[self.primary];
-        self.conf
-            && (!a.tx_anti.is_empty() || !a.gene_anti.is_empty())
-            && a.tx_sense.is_empty()
-            && a.gene_sense.is_empty()
-    }
-
-    /// CellRanger's `is_conf_mapped_unique_txomic`: confidently mapped to one
-    /// gene with a transcript-level sense hit.
-    pub fn txomic(&self) -> bool {
-        self.conf && self.gene.is_some() && !self.alns[self.primary].tx_sense.is_empty()
-    }
-
-    pub fn primary_region(&self) -> CrRegion {
-        self.alns[self.primary].region
-    }
-}
-
-/// A run of aligned bases between two `N`s: `[start, end)` on the genome.
-struct Segment {
-    start: i64,
-    end: i64,
-}
-
-/// `get_cigar_segments`: the aligned stretches of a CIGAR, split at `N`.
-fn segments_of(cigar: &[Op], start: i64) -> Vec<Segment> {
-    let mut out = Vec::new();
-    let mut cur = Segment { start, end: start };
-    for op in cigar {
-        let n = op.len() as i64;
-        match op.kind() {
-            Kind::Skip => {
-                let next = cur.end + n;
-                out.push(std::mem::replace(
-                    &mut cur,
-                    Segment {
-                        start: next,
-                        end: next,
-                    },
-                ));
-            }
-            Kind::Match | Kind::Deletion | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                cur.end += n;
-            }
-            _ => {}
-        }
-    }
-    out.push(cur);
-    out
-}
-
-/// `get_overlap`: CellRanger's fraction of the read interval covered by the
-/// reference one. Its end coordinates are mixed inclusive and exclusive, and
-/// that is kept.
-fn overlap_frac(read_start: i64, read_end: i64, ref_start: i64, ref_end: i64) -> f64 {
-    let bases = (ref_end.min(read_end) - ref_start.max(read_start)).max(0);
-    bases as f64 / (read_end - read_start) as f64
-}
-
-/// `is_read_exonic` with `region_min_overlap` 0.5: every segment overlaps, by at
-/// least half, the first exon that ends right of its start.
-fn is_read_exonic(segments: &[Segment], exons: &[(i64, i64, u32)]) -> bool {
-    segments.iter().all(|seg| {
-        let idx = exons.partition_point(|e| e.1 <= seg.start);
-        let Some(e) = exons.get(idx) else {
-            return false;
-        };
-        overlap_frac(seg.start, seg.end, e.0, e.1) >= 0.5
-    })
-}
-
-impl CrModel {
-    pub fn from_transcriptome(tr: &TranscriptomeIndex, n_chr: usize) -> Self {
-        let n_tx = tr.n_transcripts();
-        let mut tx = Vec::with_capacity(n_tx);
-        for i in 0..n_tx {
-            let mut cum = 0u32;
-            let exons: Vec<(i64, i64, u32)> = tr.tr_exons[i]
-                .iter()
-                .map(|e| {
-                    let r = (e.genome_start as i64, e.genome_end as i64 - 1, cum);
-                    cum += (e.genome_end - e.genome_start) as u32;
-                    r
-                })
-                .collect();
-            let g = tr.tr_gene_idx[i];
-            let (s, e) = (tr.tr_start[i] as i64, tr.tr_end[i] as i64 - 1);
-            let plus = tr.tr_strand[i] != 2;
-            tx.push(CrTx {
-                start: s,
-                end: e,
-                plus,
-                gene: g,
-                exons,
-                len: cum,
-            });
-        }
-        let mut by_chr: Vec<(Vec<u32>, Vec<i64>)> = vec![(Vec::new(), Vec::new()); n_chr];
-        let mut per: Vec<Vec<u32>> = vec![Vec::new(); n_chr];
-        for i in 0..n_tx {
-            if let Some(v) = per.get_mut(tr.tr_chr_idx[i]) {
-                v.push(i as u32);
-            }
-        }
-        for (c, mut v) in per.into_iter().enumerate() {
-            v.sort_by_key(|&i| (tx[i as usize].start, tx[i as usize].end));
-            let mut mx = Vec::with_capacity(v.len());
-            let mut m = i64::MIN;
-            for &i in &v {
-                m = m.max(tx[i as usize].end);
-                mx.push(m);
-            }
-            by_chr[c] = (v, mx);
-        }
-        let rank = |ids: &[String]| -> Vec<u32> {
-            let mut order: Vec<usize> = (0..ids.len()).collect();
-            order.sort_by(|&a, &b| ids[a].cmp(&ids[b]));
-            let mut r = vec![0u32; ids.len()];
-            for (k, &i) in order.iter().enumerate() {
-                r[i] = k as u32;
-            }
-            r
-        };
-        Self {
-            tx,
-            by_chr,
-            tx_rank: rank(&tr.tr_ids),
-            gene_rank: rank(&tr.gene_ids),
-            tx_ids: tr.tr_ids.clone(),
-            gene_ids: tr.gene_ids.clone(),
-            gene_names: tr.gene_names.clone(),
-        }
-    }
-
-    /// Transcripts overlapping the alignment's extent, as `annotate_alignment`
-    /// walks them: start at or before the read's end, end at or after its start.
-    fn overlapping(&self, chr: usize, start: i64, end: i64) -> Vec<u32> {
-        let Some((order, mx)) = self.by_chr.get(chr) else {
-            return Vec::new();
-        };
-        let hi = order.partition_point(|&i| self.tx[i as usize].start <= end);
-        let mut out = Vec::new();
-        for k in (0..hi).rev() {
-            if mx[k] < start {
-                break;
-            }
-            let t = &self.tx[order[k] as usize];
-            if t.end >= start {
-                out.push(order[k]);
-            }
-        }
-        out
-    }
-
-    /// `TranscriptAnnotator::annotate_alignment` (tx_annotation/src/transcript.rs).
-    pub fn annotate(&self, t: &Transcript) -> AlnAnnot {
-        let mut out = AlnAnnot {
+    fn intergenic() -> Self {
+        AlnAnnot {
             region: CrRegion::Intergenic,
             tx_sense: Vec::new(),
             tx_anti: Vec::new(),
             gene_sense: Vec::new(),
             gene_anti: Vec::new(),
-        };
-        let start = t.genome_start as i64;
-        let alen: i64 = t
-            .cigar
-            .iter()
-            .filter(|o| {
-                matches!(
-                    o.kind(),
-                    Kind::Match
-                        | Kind::Deletion
-                        | Kind::Skip
-                        | Kind::SequenceMatch
-                        | Kind::SequenceMismatch
-                )
-            })
-            .map(|o| o.len() as i64)
-            .sum();
-        if alen == 0 {
-            return out;
         }
-        let end = start + alen - 1;
-        let segments = segments_of(&t.cigar, start);
-        let read_reverse = t.is_reverse;
+    }
+}
 
-        // (transcript, region, tx alignment position if transcript-compatible)
-        struct Aln {
-            gene: u32,
-            antisense: bool,
-            tx: Option<TxHit>,
+/// Annotation of one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadAnnot {
+    /// Per-alignment results, in aligner order.
+    pub alns: Vec<AlnAnnot>,
+    /// Index into `alns` of the chosen alignment.
+    pub primary: usize,
+    /// Whether the choice is confident.
+    pub conf: bool,
+    /// Genes named by the primary alignment (GX/GN), ascending by gene id.
+    pub genes: Vec<u32>,
+    /// The single counted gene, if any.
+    pub gene: Option<u32>,
+}
+
+impl ReadAnnot {
+    /// Confident, antisense hits only on the primary alignment.
+    #[must_use]
+    pub fn antisense(&self) -> bool {
+        if !self.conf {
+            return false;
         }
-        let mut any_exonic = false;
-        let mut any_intronic = false;
-        let mut alns: Vec<(u32, Aln)> = Vec::new();
-        for i in self.overlapping(t.chr_idx, start, end) {
-            let tx = &self.tx[i as usize];
-            let is_exonic = is_read_exonic(&segments, &tx.exons);
-            let is_intronic = !is_exonic && overlap_frac(start, end, tx.start, tx.end) >= 1.0;
-            if !is_exonic && !is_intronic {
-                continue;
+        let a = &self.alns[self.primary];
+        let anti = !a.tx_anti.is_empty() || !a.gene_anti.is_empty();
+        let sense = !a.tx_sense.is_empty() || !a.gene_sense.is_empty();
+        anti && !sense
+    }
+
+    /// Confident, counted gene, and transcript-level sense hits.
+    #[must_use]
+    pub fn txomic(&self) -> bool {
+        self.conf && self.gene.is_some() && !self.alns[self.primary].tx_sense.is_empty()
+    }
+
+    /// Region of the primary alignment.
+    #[must_use]
+    pub fn primary_region(&self) -> CrRegion {
+        self.alns[self.primary].region
+    }
+}
+
+/// Gene model used for annotation.
+#[derive(Debug, Clone, Default)]
+pub struct CrModel {
+    pub tx_ids: Vec<String>,
+    pub gene_ids: Vec<String>,
+    pub gene_names: Vec<String>,
+    tx_minus: Vec<bool>,
+    tx_gene: Vec<u32>,
+    tx_start: Vec<i64>,
+    tx_end: Vec<i64>,
+    tx_len: Vec<i64>,
+    /// Exons as (first base, last base, cumulative length before).
+    tx_exons: Vec<Vec<(i64, i64, i64)>>,
+    /// Per chromosome: transcripts sorted by start, with running max end.
+    by_chr: Vec<ChrIndex>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChrIndex {
+    order: Vec<u32>,
+    starts: Vec<i64>,
+    max_end: Vec<i64>,
+}
+
+/// An alignment reduced to what annotation needs.
+struct Aln {
+    reverse: bool,
+    start: i64,
+    end: i64,
+    /// Half-open reference segments between N operations.
+    segs: Vec<(i64, i64)>,
+}
+
+fn aln_of(t: &Transcript) -> Option<Aln> {
+    let mut segs = Vec::new();
+    let mut pos = i64::try_from(t.genome_start).unwrap_or(0);
+    let start = pos;
+    let mut seg_start = pos;
+    for op in &t.cigar {
+        let n = i64::try_from(op.len()).unwrap_or(0);
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                pos += n;
             }
-            let antisense = tx.plus == read_reverse;
-            let tx_align = if is_exonic {
-                Self::align_to_exons(tx, i, &segments, start, end)
-            } else {
-                None
-            };
-            if is_exonic {
-                any_exonic = true;
-            } else {
-                any_intronic = true;
-            }
-            alns.push((
-                i,
-                Aln {
-                    gene: tx.gene,
-                    antisense,
-                    tx: tx_align,
-                },
-            ));
-        }
-        if any_exonic {
-            out.region = CrRegion::Exonic;
-            let txome_exists = alns.iter().any(|(_, a)| a.tx.is_some());
-            let count_gene_level = !txome_exists;
-            for (_, a) in &alns {
-                match (&a.tx, a.antisense, count_gene_level) {
-                    (Some(h), false, _) => out.tx_sense.push(*h),
-                    (Some(h), true, _) => out.tx_anti.push(*h),
-                    (None, false, true) => out.gene_sense.push(a.gene),
-                    (None, true, true) => out.gene_anti.push(a.gene),
-                    _ => {}
+            Kind::Skip => {
+                if pos > seg_start {
+                    segs.push((seg_start, pos));
                 }
+                pos += n;
+                seg_start = pos;
             }
-        } else if any_intronic {
-            out.region = CrRegion::Intronic;
-            for (_, a) in &alns {
-                if a.antisense {
-                    out.gene_anti.push(a.gene);
-                } else {
-                    out.gene_sense.push(a.gene);
-                }
+            _ => {}
+        }
+    }
+    if pos > seg_start {
+        segs.push((seg_start, pos));
+    }
+    let first = segs.first()?.0;
+    let last = segs.last()?.1;
+    debug_assert!(first >= start);
+    Some(Aln {
+        reverse: t.is_reverse,
+        start: first,
+        end: last - 1,
+        segs,
+    })
+}
+
+impl CrModel {
+    /// Build from the transcriptome index.
+    #[must_use]
+    pub fn from_transcriptome(t: &TranscriptomeIndex, n_chr: usize) -> CrModel {
+        let n = t.tr_ids.len();
+        let mut m = CrModel {
+            tx_ids: t.tr_ids.clone(),
+            gene_ids: t.gene_ids.clone(),
+            gene_names: t.gene_names.clone(),
+            ..CrModel::default()
+        };
+        let mut n_chr = n_chr;
+        if let Some(mx) = t.tr_chr_idx.iter().max() {
+            n_chr = n_chr.max(mx + 1);
+        }
+        let mut per_chr: Vec<Vec<u32>> = vec![Vec::new(); n_chr];
+        for i in 0..n {
+            m.tx_minus.push(t.tr_strand[i] == 2);
+            m.tx_gene.push(t.tr_gene_idx[i]);
+            m.tx_start.push(t.tr_start[i] as i64);
+            m.tx_end.push(t.tr_end[i] as i64 - 1);
+            m.tx_len.push(i64::from(t.tr_length[i]));
+            m.tx_exons.push(
+                t.tr_exons[i]
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.genome_start as i64,
+                            e.genome_end as i64 - 1,
+                            i64::from(e.ex_len_cum),
+                        )
+                    })
+                    .collect(),
+            );
+            per_chr[t.tr_chr_idx[i]].push(i as u32);
+        }
+        for mut order in per_chr {
+            order.sort_by_key(|&i| (m.tx_start[i as usize], i));
+            let starts: Vec<i64> = order.iter().map(|&i| m.tx_start[i as usize]).collect();
+            let mut max_end = Vec::with_capacity(order.len());
+            let mut cur = i64::MIN;
+            for &i in &order {
+                cur = cur.max(m.tx_end[i as usize]);
+                max_end.push(cur);
+            }
+            m.by_chr.push(ChrIndex {
+                order,
+                starts,
+                max_end,
+            });
+        }
+        m
+    }
+
+    /// Transcripts on `chr` with `tx.start <= end` and `tx.end >= start`.
+    fn candidates(&self, chr: usize, start: i64, end: i64) -> Vec<u32> {
+        let Some(ci) = self.by_chr.get(chr) else {
+            return Vec::new();
+        };
+        let hi = ci.starts.partition_point(|&s| s <= end);
+        let mut out = Vec::new();
+        let mut i = hi;
+        while i > 0 {
+            i -= 1;
+            if ci.max_end[i] < start {
+                break;
+            }
+            let tx = ci.order[i];
+            if self.tx_end[tx as usize] >= start {
+                out.push(tx);
             }
         }
-        out.tx_sense
-            .sort_unstable_by_key(|h| self.tx_rank[h.tx as usize]);
-        out.tx_anti
-            .sort_unstable_by_key(|h| self.tx_rank[h.tx as usize]);
-        out.gene_sense
-            .sort_unstable_by_key(|&g| self.gene_rank[g as usize]);
-        out.gene_sense.dedup();
-        out.gene_anti
-            .sort_unstable_by_key(|&g| self.gene_rank[g as usize]);
-        out.gene_anti.dedup();
         out
     }
 
-    /// `find_exons` + `align_junctions` with CellRanger's zero tolerances:
-    /// the transcript position of the alignment when its blocks are exactly the
-    /// exons (inner ends flush with exon ends, outer ends inside exons).
-    fn align_to_exons(
-        tx: &CrTx,
-        tx_index: u32,
-        segments: &[Segment],
-        read_start: i64,
-        read_end: i64,
-    ) -> Option<TxHit> {
-        let ex = &tx.exons;
-        // First exon whose end lies right of the read start; last exon that
-        // starts left of the read end (strictly).
-        let ex_start = ex.partition_point(|e| e.1 <= read_start);
-        let ex_end = ex.partition_point(|e| e.0 < read_end) as i64 - 1;
-        if ex_start >= ex.len() || ex_end < 0 {
-            return None;
-        }
-        let ex_end = ex_end as usize;
-        if ex_end < ex_start {
-            return None;
-        }
-        if read_start < ex[ex_start].0 || read_end > ex[ex_end].1 {
-            return None;
-        }
-        let exons = &ex[ex_start..=ex_end];
-        if exons.len() != segments.len() {
-            return None;
-        }
-        let mut aligned = 0i64;
-        for (k, (seg, e)) in segments.iter().zip(exons).enumerate() {
-            aligned += e.1 - e.0 + 1;
-            let start_diff = e.0 - seg.start;
-            let end_diff = seg.end - e.1 - 1;
-            if k == 0 {
-                if start_diff > 0 {
-                    return None;
-                }
-                aligned -= start_diff.abs();
-            } else if start_diff != 0 {
-                return None;
-            }
-            if k == segments.len() - 1 {
-                if end_diff > 0 {
-                    return None;
-                }
-                aligned -= end_diff.abs();
-            } else if end_diff != 0 {
-                return None;
-            }
-        }
-        let ex_offset = (read_start - ex[ex_start].0).max(0);
-        let mut offset = i64::from(ex[ex_start].2) + ex_offset;
-        if !tx.plus {
-            offset = i64::from(tx.len) - (offset + aligned);
-        }
-        Some(TxHit {
-            tx: tx_index,
-            gene: tx.gene,
-            pos: offset as u32,
+    fn exonic(&self, tx: u32, a: &Aln) -> bool {
+        let exons = &self.tx_exons[tx as usize];
+        a.segs.iter().all(|&(sa, sb)| {
+            let Some(&(xs, xe, _)) = exons.iter().find(|e| e.1 > sa) else {
+                return false;
+            };
+            let den = sb - sa;
+            let num = (xe.min(sb) - xs.max(sa)).max(0);
+            den > 0 && 2 * num >= den
         })
     }
 
-    /// Annotate a read from all its alignments (`transcripts[0]` is STAR's primary).
-    /// The annotations, and `primary`, follow STAR's output order (`star_order`),
-    /// which is the order of the genomic records and the one CellRanger's rescue
-    /// walks (`tx_annotation::read::rescue_alignments_se`).
-    pub fn annotate_read(&self, transcripts: &[Transcript]) -> Option<ReadAnnot> {
-        if transcripts.is_empty() {
+    fn intronic(&self, tx: u32, a: &Aln) -> bool {
+        let ts = self.tx_start[tx as usize];
+        let te = self.tx_end[tx as usize];
+        a.end > a.start && te.min(a.end) - ts.max(a.start) >= a.end - a.start
+    }
+
+    /// Transcript-space position if the alignment is compatible with `tx`.
+    fn compatible(&self, tx: u32, a: &Aln) -> Option<u32> {
+        let exons = &self.tx_exons[tx as usize];
+        let first = exons.iter().position(|e| e.1 > a.start)?;
+        let last = exons.iter().rposition(|e| e.0 < a.end)?;
+        if last < first {
             return None;
         }
-        let mut order: Vec<usize> = (0..transcripts.len()).collect();
-        order.sort_by_key(|&i| (transcripts[i].star_order, i));
-        let star_primary = order.iter().position(|&i| i == 0).unwrap_or(0);
-        let alns: Vec<AlnAnnot> = order
-            .iter()
-            .map(|&i| self.annotate(&transcripts[i]))
-            .collect();
-        let (primary, conf) = if alns.len() == 1 {
+        if a.start < exons[first].0 || a.end > exons[last].1 {
+            return None;
+        }
+        let nseg = a.segs.len();
+        if last - first + 1 != nseg {
+            return None;
+        }
+        for (k, &(sa, sb)) in a.segs.iter().enumerate() {
+            let (xs, xe, _) = exons[first + k];
+            if k > 0 && sa != xs {
+                return None;
+            }
+            if k + 1 < nseg && sb - 1 != xe {
+                return None;
+            }
+            if k == 0 && sa < xs {
+                return None;
+            }
+            if k + 1 == nseg && sb - 1 > xe {
+                return None;
+            }
+        }
+        let full: i64 = exons[first..=last].iter().map(|e| e.1 - e.0 + 1).sum();
+        let aligned = full - (a.start - exons[first].0) - (exons[last].1 - a.end);
+        let offset = exons[first].2 + (a.start - exons[first].0);
+        let pos = if self.tx_minus[tx as usize] {
+            self.tx_len[tx as usize] - (offset + aligned)
+        } else {
+            offset
+        };
+        u32::try_from(pos.max(0)).ok()
+    }
+
+    fn sort_dedup_genes(&self, v: &mut Vec<u32>) {
+        v.sort_by(|&a, &b| self.gene_ids[a as usize].cmp(&self.gene_ids[b as usize]));
+        v.dedup();
+    }
+
+    /// Annotate one alignment.
+    #[must_use]
+    pub fn annotate(&self, t: &Transcript) -> AlnAnnot {
+        let Some(a) = aln_of(t) else {
+            return AlnAnnot::intergenic();
+        };
+        let mut exonic = Vec::new();
+        let mut intronic = Vec::new();
+        for tx in self.candidates(t.chr_idx, a.start, a.end) {
+            if self.exonic(tx, &a) {
+                exonic.push(tx);
+            } else if self.intronic(tx, &a) {
+                intronic.push(tx);
+            }
+        }
+        let is_anti = |tx: u32| self.tx_minus[tx as usize] != a.reverse;
+        let mut out = AlnAnnot::intergenic();
+        if !exonic.is_empty() {
+            out.region = CrRegion::Exonic;
+            let mut any = false;
+            for &tx in &exonic {
+                if let Some(pos) = self.compatible(tx, &a) {
+                    any = true;
+                    let hit = TxHit {
+                        tx,
+                        gene: self.tx_gene[tx as usize],
+                        pos,
+                    };
+                    if is_anti(tx) {
+                        out.tx_anti.push(hit);
+                    } else {
+                        out.tx_sense.push(hit);
+                    }
+                }
+            }
+            if !any {
+                for &tx in exonic.iter().chain(intronic.iter()) {
+                    let g = self.tx_gene[tx as usize];
+                    if is_anti(tx) {
+                        out.gene_anti.push(g);
+                    } else {
+                        out.gene_sense.push(g);
+                    }
+                }
+            }
+        } else if !intronic.is_empty() {
+            out.region = CrRegion::Intronic;
+            for &tx in &intronic {
+                let g = self.tx_gene[tx as usize];
+                if is_anti(tx) {
+                    out.gene_anti.push(g);
+                } else {
+                    out.gene_sense.push(g);
+                }
+            }
+        }
+        let key = |h: &TxHit| &self.tx_ids[h.tx as usize];
+        out.tx_sense.sort_by(|x, y| key(x).cmp(key(y)));
+        out.tx_anti.sort_by(|x, y| key(x).cmp(key(y)));
+        self.sort_dedup_genes(&mut out.gene_sense);
+        self.sort_dedup_genes(&mut out.gene_anti);
+        out
+    }
+
+    /// Genes named by an alignment (sense transcript hits, else sense genes).
+    fn aln_genes(&self, a: &AlnAnnot) -> Vec<u32> {
+        let mut g: Vec<u32> = if a.tx_sense.is_empty() {
+            a.gene_sense.clone()
+        } else {
+            a.tx_sense.iter().map(|h| h.gene).collect()
+        };
+        self.sort_dedup_genes(&mut g);
+        g
+    }
+
+    /// Annotate a read from its alignments (aligner order given by
+    /// `star_order`, then index). `None` when there are no alignments.
+    #[must_use]
+    pub fn annotate_read(&self, alns: &[Transcript]) -> Option<ReadAnnot> {
+        if alns.is_empty() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..alns.len()).collect();
+        order.sort_by_key(|&i| (alns[i].star_order, i));
+        let ann: Vec<AlnAnnot> = order.iter().map(|&i| self.annotate(&alns[i])).collect();
+        let (primary, conf) = if ann.len() == 1 {
             (0, true)
         } else {
-            let mut genes: Vec<u32> = alns
+            let mut genes: Vec<u32> = ann
                 .iter()
                 .flat_map(|a| a.tx_sense.iter().map(|h| h.gene))
                 .collect();
             genes.sort_unstable();
             genes.dedup();
             if genes.len() == 1 {
-                let first = alns
-                    .iter()
-                    .position(|a| !a.tx_sense.is_empty())
-                    .unwrap_or(0);
-                (first, true)
+                let p = ann.iter().position(|a| !a.tx_sense.is_empty()).unwrap_or(0);
+                (p, true)
             } else {
-                (star_primary, false)
+                (order.iter().position(|&i| i == 0).unwrap_or(0), false)
             }
         };
-        let genes = alns[primary].tx_genes(self);
+        let genes = self.aln_genes(&ann[primary]);
         let gene = (conf && genes.len() == 1).then(|| genes[0]);
         Some(ReadAnnot {
-            alns,
+            alns: ann,
             primary,
             conf,
             genes,
@@ -504,232 +423,366 @@ impl CrModel {
         })
     }
 
-    /// The `TX` tag value of an alignment (empty when it has none).
-    pub fn tx_tag(&self, cigar: &[Op], a: &AlnAnnot) -> String {
-        self.tx_like(cigar, &a.tx_sense, &a.gene_sense, '+')
-    }
-
-    /// The `AN` tag value of an alignment (empty when it has none).
-    pub fn an_tag(&self, cigar: &[Op], a: &AlnAnnot) -> String {
-        self.tx_like(cigar, &a.tx_anti, &a.gene_anti, '-')
-    }
-
-    fn tx_like(&self, cigar: &[Op], hits: &[TxHit], genes: &[u32], sym: char) -> String {
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        if hits.is_empty() {
-            for &g in genes {
-                if !s.is_empty() {
-                    s.push(';');
-                }
-                let _ = write!(s, "{},{sym}", self.gene_ids[g as usize]);
+    /// CIGAR text for a TX/AN entry: N removed, `=`/`X` as `M`, equal
+    /// neighbours merged, reversed for a minus-strand transcript.
+    fn hit_cigar(cigar: &[Op], minus: bool) -> String {
+        let mut ops: Vec<(char, usize)> = Vec::new();
+        for op in cigar {
+            let c = match op.kind() {
+                Kind::Skip => continue,
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => 'M',
+                Kind::Insertion => 'I',
+                Kind::Deletion => 'D',
+                Kind::SoftClip => 'S',
+                Kind::HardClip => 'H',
+                Kind::Pad => 'P',
+            };
+            match ops.last_mut() {
+                Some((lc, n)) if *lc == c => *n += op.len(),
+                _ => ops.push((c, op.len())),
             }
-            return s;
         }
-        for h in hits {
-            if !s.is_empty() {
-                s.push(';');
-            }
-            let tx = &self.tx[h.tx as usize];
-            let _ = write!(s, "{},{sym}{},", self.tx_ids[h.tx as usize], h.pos);
-            // The CIGAR in transcript space: no `N`, reversed on `-` transcripts.
-            let mut ops: Vec<(usize, char)> = Vec::new();
-            for op in cigar {
-                let c = match op.kind() {
-                    Kind::Skip => continue,
-                    Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => 'M',
-                    Kind::Insertion => 'I',
-                    Kind::Deletion => 'D',
-                    Kind::SoftClip => 'S',
-                    Kind::HardClip => 'H',
-                    Kind::Pad => 'P',
-                };
-                match ops.last_mut() {
-                    Some(l) if l.1 == c => l.0 += op.len(),
-                    _ => ops.push((op.len(), c)),
-                }
-            }
-            if !tx.plus {
-                ops.reverse();
-            }
-            for (n, c) in ops {
-                let _ = write!(s, "{n}{c}");
-            }
+        if minus {
+            ops.reverse();
+        }
+        let mut s = String::new();
+        for (c, n) in ops {
+            let _ = write!(s, "{n}{c}");
         }
         s
     }
 
-    /// The `GX` and `GN` tag values of a read's primary.
+    fn tag(&self, cigar: &[Op], hits: &[TxHit], genes: &[u32], sign: char) -> String {
+        if !hits.is_empty() {
+            hits.iter()
+                .map(|h| {
+                    format!(
+                        "{},{}{},{}",
+                        self.tx_ids[h.tx as usize],
+                        sign,
+                        h.pos,
+                        Self::hit_cigar(cigar, self.tx_minus[h.tx as usize])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        } else {
+            genes
+                .iter()
+                .map(|&g| format!("{},{}", self.gene_ids[g as usize], sign))
+                .collect::<Vec<_>>()
+                .join(";")
+        }
+    }
+
+    /// The `TX` tag value (empty when there is nothing to write).
+    #[must_use]
+    pub fn tx_tag(&self, cigar: &[Op], a: &AlnAnnot) -> String {
+        self.tag(cigar, &a.tx_sense, &a.gene_sense, '+')
+    }
+
+    /// The `AN` tag value (empty when there is nothing to write).
+    #[must_use]
+    pub fn an_tag(&self, cigar: &[Op], a: &AlnAnnot) -> String {
+        self.tag(cigar, &a.tx_anti, &a.gene_anti, '-')
+    }
+
+    /// `GX` and `GN` values for a gene list.
+    #[must_use]
     pub fn gx_gn(&self, genes: &[u32]) -> (String, String) {
-        let gx: Vec<&str> = genes
+        let gx = genes
             .iter()
             .map(|&g| self.gene_ids[g as usize].as_str())
-            .collect();
-        let gn: Vec<&str> = genes
+            .collect::<Vec<_>>()
+            .join(";");
+        let gn = genes
             .iter()
             .map(|&g| self.gene_names[g as usize].as_str())
-            .collect();
-        (gx.join(";"), gn.join(";"))
+            .collect::<Vec<_>>()
+            .join(";");
+        (gx, gn)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::transcript::Exon;
-    use noodles::sam::alignment::record::cigar::Op;
 
-    /// Two genes on chromosome 0: `GA` (+) with transcripts `TA1` (exons
-    /// 100..=199, 300..=399) and `TA2` (100..=199), and `GB` (-) with `TB`
-    /// (exon 1000..=1099).
-    fn model() -> CrModel {
-        let mk = |plus, gene, exons: Vec<(i64, i64)>| {
-            let mut cum = 0;
-            let ex: Vec<(i64, i64, u32)> = exons
-                .iter()
-                .map(|&(s, e)| {
-                    let r = (s, e, cum);
-                    cum += (e - s + 1) as u32;
-                    r
-                })
-                .collect();
-            CrTx {
-                start: ex[0].0,
-                end: ex[ex.len() - 1].1,
-                plus,
-                gene,
-                exons: ex,
-                len: cum,
-            }
-        };
-        let tx = vec![
-            mk(true, 0, vec![(100, 199), (300, 399)]),
-            mk(true, 0, vec![(100, 199)]),
-            mk(false, 1, vec![(1000, 1099)]),
-        ];
-        CrModel {
-            by_chr: vec![(vec![0, 1, 2], vec![399, 399, 1099])],
-            tx,
-            tx_ids: vec!["TA1".into(), "TA2".into(), "TB".into()],
-            gene_ids: vec!["GA".into(), "GB".into()],
-            gene_names: vec!["gA".into(), "gB".into()],
-            tx_rank: vec![0, 1, 2],
-            gene_rank: vec![0, 1],
-        }
+    fn ops(v: &[(Kind, usize)]) -> Vec<Op> {
+        v.iter().map(|&(k, n)| Op::new(k, n)).collect()
     }
 
-    fn aln(start: u64, cigar: &[(Kind, usize)], reverse: bool) -> Transcript {
-        let cigar: Vec<Op> = cigar.iter().map(|&(k, n)| Op::new(k, n)).collect();
-        let end = start
-            + cigar
-                .iter()
-                .filter(|o| o.kind().consumes_reference())
-                .map(|o| o.len() as u64)
-                .sum::<u64>();
+    /// Plus gene GA/TA: exons [100,149] [200,249]; minus gene GB/TB:
+    /// exons [1000,1049] [1100,1149]; plus gene GC/TC: exon [2000,2099]
+    /// and TD (gene GD, plus) exon [2000,2099].
+    fn model() -> CrModel {
+        let tx_ids: Vec<String> = ["TA", "TB", "TC", "TD"].map(String::from).to_vec();
+        let ex = |v: &[(i64, i64)]| {
+            let mut cum = 0;
+            v.iter()
+                .map(|&(s, e)| {
+                    let r = (s, e, cum);
+                    cum += e - s + 1;
+                    r
+                })
+                .collect::<Vec<_>>()
+        };
+        let exons = vec![
+            ex(&[(100, 149), (200, 249)]),
+            ex(&[(1000, 1049), (1100, 1149)]),
+            ex(&[(2000, 2099)]),
+            ex(&[(2000, 2099)]),
+        ];
+        let tx_start: Vec<i64> = exons.iter().map(|e| e[0].0).collect();
+        let tx_end: Vec<i64> = exons.iter().map(|e| e.last().unwrap().1).collect();
+        let mut m = CrModel {
+            tx_ids,
+            gene_ids: ["GA", "GB", "GC", "GD"].map(String::from).to_vec(),
+            gene_names: ["na", "nb", "nc", "nd"].map(String::from).to_vec(),
+            tx_minus: vec![false, true, false, false],
+            tx_gene: vec![0, 1, 2, 3],
+            tx_len: vec![100, 100, 100, 100],
+            tx_start,
+            tx_end,
+            tx_exons: exons,
+            by_chr: Vec::new(),
+        };
+        let order: Vec<u32> = (0..4).collect();
+        let starts = order.iter().map(|&i| m.tx_start[i as usize]).collect();
+        let mut max_end = Vec::new();
+        let mut cur = i64::MIN;
+        for &i in &order {
+            cur = cur.max(m.tx_end[i as usize]);
+            max_end.push(cur);
+        }
+        m.by_chr.push(ChrIndex {
+            order,
+            starts,
+            max_end,
+        });
+        m
+    }
+
+    fn aln(start: u64, rev: bool, cigar: &[(Kind, usize)], order: u32) -> Transcript {
         Transcript {
             chr_idx: 0,
             genome_start: start,
-            genome_end: end,
-            is_reverse: reverse,
-            exons: vec![Exon {
-                genome_start: start,
-                genome_end: end,
-                read_start: 0,
-                read_end: (end - start) as usize,
-                i_frag: 0,
-            }],
-            cigar,
+            genome_end: start,
+            is_reverse: rev,
+            exons: Vec::new(),
+            cigar: ops(cigar),
             score: 0,
             n_mismatch: 0,
             n_gap: 0,
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
-            star_order: 0,
+            star_order: order,
         }
     }
 
+    const M: Kind = Kind::Match;
+    const N: Kind = Kind::Skip;
+
     #[test]
-    fn a_spliced_read_matching_a_junction_is_transcriptomic() {
+    fn spliced_match() {
         let m = model();
-        // 20 bases ending exon 1, 30 starting exon 2: only TA1 has that junction.
-        let t = aln(
-            180,
-            &[(Kind::Match, 20), (Kind::Skip, 100), (Kind::Match, 30)],
-            false,
-        );
+        // 30 bases ending exon 1, 20 bases starting exon 2.
+        let t = aln(120, false, &[(M, 30), (N, 50), (M, 20)], 0);
         let a = m.annotate(&t);
         assert_eq!(a.region, CrRegion::Exonic);
         assert_eq!(a.tx_sense.len(), 1);
-        assert_eq!(m.tx_ids[a.tx_sense[0].tx as usize], "TA1");
-        assert_eq!(a.tx_sense[0].pos, 80);
-        assert!(a.tx_anti.is_empty());
-        assert_eq!(m.tx_tag(&t.cigar, &a), "TA1,+80,50M");
+        assert_eq!(a.tx_sense[0].pos, 20);
+        assert_eq!(a.tx_anti, Vec::<TxHit>::new());
+        assert_eq!(m.tx_tag(&t.cigar, &a), "TA,+20,50M");
+        assert_eq!(m.an_tag(&t.cigar, &a), "");
     }
 
     #[test]
-    fn an_exonic_read_on_the_wrong_strand_is_antisense() {
+    fn exact_match_pos() {
         let m = model();
-        let t = aln(1010, &[(Kind::Match, 50)], false);
+        let t = aln(150 + 50, false, &[(M, 50)], 0);
+        let a = m.annotate(&t);
+        assert_eq!(m.tx_tag(&t.cigar, &a), "TA,+50,50M");
+    }
+
+    #[test]
+    fn antisense_minus() {
+        let m = model();
+        // Forward read on a minus transcript is sense; reverse read is
+        // antisense here? plus==reverse => antisense; minus transcript with a
+        // forward read: (false) == (false) => antisense.
+        let t = aln(1110, false, &[(M, 30)], 0);
         let a = m.annotate(&t);
         assert_eq!(a.region, CrRegion::Exonic);
-        assert!(a.tx_sense.is_empty());
-        assert_eq!(m.an_tag(&t.cigar, &a), "TB,-40,50M");
-        // A `-` transcript counts position from its 5' end.
+        assert_eq!(a.tx_sense, Vec::<TxHit>::new());
+        assert_eq!(a.tx_anti.len(), 1);
+        assert_eq!(m.an_tag(&t.cigar, &a), "TB,-10,30M");
+        assert_eq!(m.tx_tag(&t.cigar, &a), "");
         let r = m.annotate_read(&[t]).unwrap();
-        assert!(r.conf && r.gene.is_none() && r.antisense());
+        assert!(r.antisense());
+        assert!(!r.txomic());
+        assert_eq!(r.gene, None);
     }
 
     #[test]
-    fn an_intronic_read_names_the_gene_not_a_transcript() {
+    fn intronic() {
         let m = model();
-        let t = aln(210, &[(Kind::Match, 50)], false);
+        let t = aln(160, false, &[(M, 30)], 0);
         let a = m.annotate(&t);
         assert_eq!(a.region, CrRegion::Intronic);
+        assert_eq!(a.tx_sense, Vec::<TxHit>::new());
         assert_eq!(m.tx_tag(&t.cigar, &a), "GA,+");
         let r = m.annotate_read(&[t]).unwrap();
         assert_eq!(r.gene, Some(0));
+        assert_eq!(m.gx_gn(&r.genes), ("GA".into(), "na".into()));
+        assert!(!r.txomic());
     }
 
     #[test]
-    fn a_read_beside_every_gene_is_intergenic() {
+    fn one_base_never_intronic() {
         let m = model();
-        let a = m.annotate(&aln(600, &[(Kind::Match, 50)], false));
-        assert_eq!(a.region, CrRegion::Intergenic);
-        assert!(a.tx_sense.is_empty() && a.gene_sense.is_empty() && a.gene_anti.is_empty());
+        let t = aln(160, false, &[(M, 1)], 0);
+        assert_eq!(m.annotate(&t).region, CrRegion::Intergenic);
     }
 
     #[test]
-    fn exonic_needs_half_of_each_segment_in_its_exon_and_stays_gene_level_when_it_overhangs() {
+    fn intergenic() {
         let m = model();
-        // Mostly outside TB: intergenic.
-        let a = m.annotate(&aln(950, &[(Kind::Match, 60)], false));
+        let t = aln(5000, false, &[(M, 50)], 0);
+        let a = m.annotate(&t);
         assert_eq!(a.region, CrRegion::Intergenic);
-        // 80 bases from 1050: 49 inside the exon, so exonic, but the end
-        // overhangs the exon, so the hit is the gene's, not a transcript's.
-        let t = aln(1050, &[(Kind::Match, 80)], true);
+        assert!(a.tx_sense.is_empty() && a.gene_sense.is_empty());
+        let r = m.annotate_read(&[t]).unwrap();
+        assert!(r.conf);
+        assert_eq!(r.gene, None);
+        assert_eq!(r.genes, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn zero_ref_length_is_intergenic() {
+        let m = model();
+        let t = aln(120, false, &[(Kind::SoftClip, 20)], 0);
+        assert_eq!(m.annotate(&t).region, CrRegion::Intergenic);
+    }
+
+    #[test]
+    fn overhang_gene_level_exonic() {
+        let m = model();
+        // Overhangs the end of exon 1 into the intron: exonic by the loose
+        // test (>= half inside) but not transcript compatible.
+        let t = aln(130, false, &[(M, 30)], 0);
         let a = m.annotate(&t);
         assert_eq!(a.region, CrRegion::Exonic);
-        assert!(a.tx_sense.is_empty() && a.tx_anti.is_empty());
-        assert_eq!(a.gene_sense, vec![1]);
+        assert_eq!(a.tx_sense, Vec::<TxHit>::new());
+        assert_eq!(a.gene_sense, vec![0]);
+        assert_eq!(m.tx_tag(&t.cigar, &a), "GA,+");
+        let r = m.annotate_read(&[t]).unwrap();
+        assert_eq!(r.gene, Some(0));
+        assert_eq!(r.primary_region(), CrRegion::Exonic);
     }
 
     #[test]
-    fn a_multimapper_with_one_gene_among_its_transcriptomic_alignments_is_rescued() {
+    fn wrong_junction_not_compatible() {
         let m = model();
-        let intergenic = aln(600, &[(Kind::Match, 50)], false);
-        let txomic = aln(110, &[(Kind::Match, 50)], false);
-        let r = m
-            .annotate_read(&[intergenic.clone(), txomic.clone()])
-            .unwrap();
+        // Junction one base off the exon end.
+        let t = aln(120, false, &[(M, 29), (N, 51), (M, 20)], 0);
+        let a = m.annotate(&t);
+        assert_eq!(a.tx_sense, Vec::<TxHit>::new());
+        assert_eq!(a.gene_sense, vec![0]);
+    }
+
+    #[test]
+    fn antisense_reverse_on_plus() {
+        let m = model();
+        let t = aln(120, true, &[(M, 30)], 0);
+        let a = m.annotate(&t);
+        // 120..149 inside exon 1 (30 bases), compatible, antisense.
+        assert_eq!(a.tx_anti.len(), 1);
+        assert_eq!(m.an_tag(&t.cigar, &a), "TA,-20,30M");
+    }
+
+    #[test]
+    fn minus_strand_cigar_reversed_and_merged() {
+        let m = model();
+        let c = ops(&[
+            (Kind::SoftClip, 3),
+            (M, 10),
+            (N, 5),
+            (M, 10),
+            (Kind::Insertion, 2),
+            (Kind::SequenceMatch, 4),
+        ]);
+        assert_eq!(CrModel::hit_cigar(&c, false), "3S20M2I4M");
+        assert_eq!(CrModel::hit_cigar(&c, true), "4M2I20M3S");
+        let _ = m;
+    }
+
+    #[test]
+    fn gene_and_tx_order_by_string() {
+        let m = model();
+        // TC and TD overlap: both compatible, genes GC and GD, two genes.
+        let t = aln(2010, false, &[(M, 40)], 0);
+        let a = m.annotate(&t);
+        assert_eq!(a.tx_sense.iter().map(|h| h.tx).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(m.tx_tag(&t.cigar, &a), "TC,+10,40M;TD,+10,40M");
+        let r = m.annotate_read(&[t]).unwrap();
+        assert_eq!(r.genes, vec![2, 3]);
+        assert_eq!(r.gene, None);
+        assert_eq!(m.gx_gn(&r.genes), ("GC;GD".into(), "nc;nd".into()));
+    }
+
+    #[test]
+    fn rescue_single_gene() {
+        let m = model();
+        // Primary (order 0) intergenic, second aligns in GA.
+        let a0 = aln(5000, false, &[(M, 50)], 0);
+        let a1 = aln(100, false, &[(M, 50)], 1);
+        let r = m.annotate_read(&[a0, a1]).unwrap();
         assert!(r.conf);
         assert_eq!(r.primary, 1);
         assert_eq!(r.gene, Some(0));
-        // Two transcriptomic alignments in different genes: stays multi-mapped.
-        let other = aln(1010, &[(Kind::Match, 50)], true);
-        let r = m.annotate_read(&[txomic, other]).unwrap();
+        assert!(r.txomic());
+    }
+
+    #[test]
+    fn two_gene_multimapper_unrescued() {
+        let m = model();
+        let a0 = aln(100, false, &[(M, 50)], 0);
+        let a1 = aln(2000, false, &[(M, 50)], 1);
+        // Input index 0 is the aligner's primary even though star_order of
+        // index 0 is larger.
+        let a0b = Transcript {
+            star_order: 1,
+            ..a0.clone()
+        };
+        let a1b = Transcript {
+            star_order: 0,
+            ..a1.clone()
+        };
+        let r = m.annotate_read(&[a0b, a1b]).unwrap();
+        assert!(!r.conf);
+        assert_eq!(r.alns.len(), 2);
+        assert_eq!(r.primary, 1);
+        assert_eq!(r.gene, None);
+        let r = m.annotate_read(&[a0, a1]).unwrap();
         assert!(!r.conf);
         assert_eq!(r.primary, 0);
-        assert_eq!(r.gene, None);
+    }
+
+    #[test]
+    fn same_gene_multimapper_rescues_first_sense() {
+        let m = model();
+        let a0 = aln(5000, false, &[(M, 50)], 0);
+        let a1 = aln(100, false, &[(M, 50)], 1);
+        let a2 = aln(200, false, &[(M, 50)], 2);
+        let r = m.annotate_read(&[a0, a1, a2]).unwrap();
+        assert_eq!(r.primary, 1);
+        assert!(r.conf);
+    }
+
+    #[test]
+    fn empty_read() {
+        assert!(model().annotate_read(&[]).is_none());
     }
 }
