@@ -70,11 +70,11 @@ pub fn trim(read: &[u8]) -> CrTrim {
 }
 
 /// End of the TSO in the read (0 when no TSO qualifies).
-fn tso_end(r: &[u8]) -> usize {
+fn tso_end(read: &[u8]) -> usize {
     // Cell: (score, errors, adapter bases aligned).
     type Cell = (i32, i32, i32);
     const NONE: Cell = (i32::MIN / 2, 0, 0);
-    let (m, n) = (TSO.len(), r.len());
+    let (adapter_len, n) = (TSO.len(), read.len());
     if n == 0 {
         return 0;
     }
@@ -82,11 +82,11 @@ fn tso_end(r: &[u8]) -> usize {
     // Row 0: the adapter may start before any read base.
     let mut prev: Vec<Cell> = vec![(0, 0, 0); n + 1];
     let mut cur: Vec<Cell> = vec![NONE; n + 1];
-    for i in 1..=m {
+    for i in 1..=adapter_len {
         // Column 0: the first `i` adapter bases hang off the read's 5' end, free.
         cur[0] = (0, 0, 0);
         for j in 1..=n {
-            let hit = TSO[i - 1] == r[j - 1];
+            let hit = TSO[i - 1] == read[j - 1];
             let d = prev[j - 1];
             let mut c = (
                 d.0 + if hit { 1 } else { MISMATCH },
@@ -94,7 +94,10 @@ fn tso_end(r: &[u8]) -> usize {
                 d.2 + 1,
             );
             c = pick(c, (prev[j].0 + GAP, prev[j].1 + 1, prev[j].2 + 1));
-            c = pick(c, (cur[j - 1].0 + GAP, cur[j - 1].1 + 1, cur[j - 1].2));
+            c = pick(
+                c,
+                (curead[j - 1].0 + GAP, curead[j - 1].1 + 1, curead[j - 1].2),
+            );
             cur[j] = c;
         }
         std::mem::swap(&mut prev, &mut cur);
