@@ -11,6 +11,7 @@
 
 pub mod cell_reads;
 pub mod count;
+pub mod cr_analysis;
 pub mod cr_annot;
 pub mod cr_cells;
 pub mod cr_dups;

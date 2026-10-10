@@ -2139,6 +2139,17 @@ pub fn write_gene_matrix(
                 cbs.len(),
                 fnnz,
             );
+            // CellRanger layout: secondary analysis (PCA, clustering,
+            // differential expression) next to the filtered matrix.
+            if cr_layout && fi == 0 {
+                crate::solo::cr_analysis::run_from_dir(
+                    &filt_dir,
+                    &format!("{features_name}{}", if gzip { ".gz" } else { "" }),
+                    &format!("{barcodes_name}{}", if gzip { ".gz" } else { "" }),
+                    &format!("{matrix_name}{}", if gzip { ".gz" } else { "" }),
+                    &feature_dir.join("analysis"),
+                );
+            }
         }
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
