@@ -611,6 +611,10 @@ mod tests {
 
     fn make_transcript(chr_idx: usize, gs: u64, ge: u64, is_reverse: bool) -> Transcript {
         Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx,
             genome_start: gs,
             genome_end: ge,
@@ -732,6 +736,10 @@ mod tests {
                 continue;
             }
             let t = Transcript {
+                nmm: 0,
+                junction_strands: vec![],
+                out_order: 0,
+                g_length: 0,
                 chr_idx: 0,
                 genome_start: t_exons[0].genome_start,
                 genome_end: t_exons.last().unwrap().genome_end,

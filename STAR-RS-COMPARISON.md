@@ -249,8 +249,8 @@ Do the cheap high-impact ones first and re-benchmark after each with the **raw e
 2. **#1 (RNG-free default primary)** — gate the shuffle behind `--outMultimapperOrder Random`. ✓ done (+480 raw exact, no regression). **This was the real win — see §7.5.**
 3. **#5 (seed `rStart` ordering + direction-agnostic dedup)** — STAR's `storeAligns` semantics. ✓ done (+8 raw exact, no regression). **#6 (flagDirMap) turned out redundant with #5's direction-agnostic dedup.**
 4. **#2 (STAR's `gLength` tie-break key)** — ~~apply after #5~~ **DROPPED**: measured to regress both with and without #5 (§7.5). The coordinate key matches STAR better for these ties.
-5. **#4 (sjdb snapping/fast-path)** — before any serious `--sjdbGTFfile` benchmarking. Best remaining lever.
-6. **#7, #8, #9** as follow-ups.
+5. **#4 (sjdb snapping/fast-path)**: ✓ done (#4a annotated-db load; #4b `sjA` simple-stitch path + non-canonical snapping, see §7.5).
+6. **#7** ✓ done (penalty-aware recursion dedup). **#8** already landed (`--alignEndsType`). **#9**: stitch mismatch cap and `alignInsertionFlush` ✓ done; `same_structure` guard, `seedPerReadNmax` abort and chain-stop threshold still open.
 
 All line numbers above are current as of this review; treat them as starting points, not guarantees.
 
@@ -296,6 +296,70 @@ Fixes were implemented and measured against real STAR 2.7.11b. **Use the raw exa
 - Unannotated path unchanged (8790, no regression — indices without `sjdbInfo.txt` skip the fallback). The residual gap (1 annotated junction, −5 total, 14 CIGAR diffs) is what the *actual* boundary-snapping (STAR-rs `star_model.rs:602-628`) would address — a good follow-up now that recognition works.
 
 Net revised sequencing (corrected by measurement): **#3 ✓ → #1 ✓ (+480) → #5 ✓ (+8) → #4a ✓ (annotated-db load; 0→70 annotated junctions) → #4b (boundary snapping, follow-up)**. **#2 (gLength key) is dropped** — it regresses both with and without #5. The recurring lesson: measure with raw exact-match against the real oracle; STAR's documented logic does not always translate to better agreement when another part of rustar-aligner's pipeline diverges, and end-to-end benchmark checks surface root causes (empty align-time db) that source-reading alone missed.
+
+**Fixes #4b, #7, #9 (partial), measured on the yeast 200k benchmark** (raw reads that differ from STAR 2.7.11b, fewer is better; "tie" diffs among equal-score multimapper loci with the same locus set are not counted). Baseline is `main` at `b5a70d0`.
+
+| Config | SE annotated | SE unannotated | PE annotated |
+|---|---|---|---|
+| Baseline (`b5a70d0`) | 103 | 16 | 459 |
+| **#4b `sjA` simple-stitch + sjdb snapping** | 38 | 16 | 329 |
+| + `sjA` kept distinct in the stitch-core diagonal dedup | **30** | 16 | 310 |
+| + #9 stitch mismatch cap, `alignInsertionFlush` | 30 | 16 | 310 |
+| + #7 penalty-aware recursion dedup | **30** | **16** | **308** |
+
+Every step had **zero new disagreements** (no read that matched STAR before stops matching).
+
+- **#4b is the big one.** A seed that crosses an annotated junction in the Gsj insert is now split with STAR's `sjA` (the junction index) kept on both pieces, and the pieces are stitched by STAR's simple path (`stitchAlignToTranscript.cpp:18-34`): junction exactly at the annotated coordinates, sjdb motif and repeat shifts, `sjdbScore`, no gap scan and no `alignSJoverhangMin` check. That is what lets STAR keep 3-4 nt overhangs on annotated junctions (`146M95N4M`) where rustar soft-clipped (`148M2S`). Window and stitch-core diagonal dedups now also require equal `sjA`, as `assignAlignToWindow` does; without that, the real-genome seed swallowed the donor piece.
+- The general stitch path now looks junctions up in the sjdb by their stored coordinates (`SpliceJunctionDb::from_prepared`), takes the sjdb motif and shifts, snaps a non-canonical annotated junction from its left-flushed position to the annotated one (with STAR's `-1000006` rejections), and applies `alignSJstitchMismatchNmax` with the final motif.
+- **#9:** the stitch mismatch cap is now STAR's `outFilterMismatchNmaxTotal = min(outFilterMismatchNmax, outFilterMismatchNoverReadLmax * readLength)` instead of `outFilterMismatchNoverLmax * partial length`; `--outFilterMismatchNoverReadLmax` and `--alignInsertionFlush None|Right` are now accepted. Both are neutral on defaults here.
+- **#7:** the recursion's dedup and eviction rank transcripts by score plus genomic-length penalty, as STAR does before recording (`stitchWindowAligns.cpp:185-189`).
+- Remaining after this step (closed below): STAR's exact window dedup (no `same_structure` guard; it needs the overhang checks moved from `finalize_transcript` into the recursion first), two-pass junction insertion into the sjdb (rustar's pass 2 marks inserted junctions unannotated), and an align-time `--sjdbGTFfile` db still keyed on raw GTF coordinates.
+
+**Follow-up: window dedup, on-the-fly insertion, two-pass, `seedPerReadNmax`** (same benchmark; base = `b5a70d0`).
+
+| Run | Base | After #4b/#7/#9 | **Now** |
+|---|---|---|---|
+| SE annotated index | 103 | 30 | **28** |
+| SE unannotated | 16 | 16 | **16** |
+| PE annotated index | 459 | 308 | **217** |
+| SE, GTF given at mapping (vs STAR annotated) | 367 | 364 | **28** |
+| SE `--twopassMode Basic` (vs STAR two-pass) | 749 | | **47** |
+
+- **STAR's window recording.** The recursion's terminal step now does what `stitchWindowAligns` does before recording: junction overhang checks (with STAR's annotated-neighbour rule), per-mate spliced mapped length, and mate-overlap consistency (`:58-108,155-166`), then STAR's exact dedup (no `same_structure` guard; a recorded transcript whose bases the new one covers is removed whatever its score) with sorted insertion and capacity. The post-finalization dedup became redundant and is gone. About 130 SE and 500 PE reads move from "tie" to identical. STAR's score-range filter before recording was tried and dropped: it needs `maxScoreMate` across windows, and the per-window version regressed PE (217 to 227).
+- **On-the-fly junction insertion** (`src/index/sjdb_otf.rs`, port of `sjdbInsertJunctions` + `sjdbBuildIndex`): a GTF or `--sjdbFileChrStartEnd` given at mapping, and the 1st-pass junctions in two-pass mode, are inserted into the genome, Gsj and suffix array, and the SA index is rebuilt. Inserting the yeast GTF into the plain index gives a genome, SA and SAindex **byte-identical** to STAR's annotated index (`otf_matches_star_genome_generate`, ignored test needing local indices), and mapping on it gives exactly the annotated-index output (0 diffs out of 178k reads).
+- **Two-pass:** pass 2 now reloads the 1st-pass `SJ.out.tab` like STAR and treats those junctions as sjdb (`sjdbScore`, simple-stitch path, annotated in the 2nd-pass `SJ.out.tab`: 287 of 287, STAR 291 of 291).
+- **`seedPerReadNmax`:** exceeding it is now STAR's fatal error instead of a silent truncation.
+- Still open: the score-range filter before recording (needs per-read `maxScoreMate`), the residual 4-junction difference in the 1st-pass `SJ.out.tab`, and `winBinNbits` computed from the post-insertion genome size for an on-the-fly GTF (STAR uses the pre-insertion size; only matters with `alignIntronMax > 0`).
+
+**Final state: output identical to STAR 2.7.11b on the yeast 200k benchmark.** All five runs (SE unannotated, SE annotated index, PE annotated index, SE with the GTF given at mapping, SE `--twopassMode Basic`) produce an `Aligned.out.sam` whose alignment records are line-for-line identical to STAR's (every field and tag, multimapper order and primary flag included), an identical `SJ.out.tab`, and identical `Log.final.out` statistics. Base `b5a70d0` differed on 103 / 16 / 459 / 367 / 749 reads, plus 2689 to 4501 multimapper "ties" per run.
+
+The last steps, each a STAR behaviour that rustar did differently:
+
+- Seeds: a chain stops once `seedMapMin` or fewer bases remain (`<=`, not `<`); the SAindex N mark (`iSA1noN`) forbids skipping the prefix; a spacer or N in the genome compares greater than any read base on both strands (`compareSeqToGenome`).
+- Windows: flanks stop at chromosome boundaries and a later window overwrites a flank bin; candidates are assigned one by one with STAR's asymmetric, order-dependent overlap test (no length-ordered pre-dedup, no diagonal dedup before stitching); a new entry goes after entries with the same `rStart`.
+- Stitching: equal read and genome gaps are never stitched (`jCan` stays 999, `-1000007`); a genome overlap becomes an insertion (`gGap < 0`); no early `alignSJoverhangMin` rejection; overhang, spliced-mate and mate-consistency checks run at recording only.
+- Pairs: no span limit (only `alignMatesGapMax`), no extra junction-consistency test, `gLength` = last exon end minus first exon start.
+- Order: alignments in window order, primary = `trBest` (first window with the best score, smaller `gLength` on ties), written in `trMult` order with the primary flag wherever it falls (`--outSAMmultNmax -1`).
+- `SJ.out.tab`: STAR's filters (intron length vs total count, donor and acceptor distances among junctions passing the first filter), overhang from the exon blocks, motif and annotation from the stitched transcript.
+
+Run time is unchanged or slightly lower (PE 200k: 10.6 s to 9.9 s, 8 threads).
+
+**Human (GRCh38).** STAR 2.7.11b index from the Cell Ranger 2024-A FASTA and Gencode GTF (dense SA, `sjdbOverhang 100`), 10x PBMC cDNA reads (91 nt, single-end). SE on 200k and 1.9M reads and `--twopassMode Basic` on 200k: `Aligned.out.sam`, `SJ.out.tab` and `Log.final.out` identical to STAR. Before the human-specific fixes the 200k SE run differed on 2028 reads plus 935 ties. What human data exposed, and yeast could not:
+
+- **SAindex entries truncated to 32 bits.** An SAi entry holds an SA index on GstrandBit+1 bits (the flags sit at GstrandBit+1 and +2); rustar masked it to GstrandBit bits. A human SA has about 6 billion entries, so every seed whose range starts past 2^32 searched the wrong part of the SA. This one bug accounted for almost all of the 2028 reads.
+- Junction-position scan over an N in the genome (chrM:3107): STAR compares bases as they are, and its left walk only requires the acceptor base to be A/C/G/T.
+- A deletion flushed left that would empty the previous exon is rejected (`-1000005`), not clamped.
+- `nM`, `mappedFilter`, transcriptome projection and the mismatch rate use STAR's running `nMM`, which can exceed the mismatches of the final alignment; NM/MD keep the real count.
+- Genome version check: an index whose `versionGenome` is not 2.7.4a is refused, as STAR does (rustar used to accept a 2.7.1a Cell Ranger index).
+- On-the-fly insertion at human scale: STAR's incremental SAindex update ported (byte-identical to STAR's on yeast) and the SA merge parallelised; human two-pass 200k now takes 13.5 s (STAR 53 s), down from 508 s. Peak RSS 64 GB vs STAR 36 GB.
+
+**Human paired-end.** 200k pairs of SRR1039508 (Illumina 2x63 nt RNA-seq, ENA), plain and `--twopassMode Basic`: `Aligned.out.sam`, `SJ.out.tab` and `Log.final.out` identical to STAR. Before the fixes below, 2 reads differed (both on annotated junctions):
+
+- **Short annotated junctions.** STAR looks every gap up in the sjdb, deletions included: a deletion shorter than `alignIntronMin` that matches an annotated junction becomes that junction (`N` in the CIGAR, sjdb motif and score), while still counting as a deletion in `Log.final.out`. rustar wrote it as `D`.
+- **Junction strand.** STAR's `sjStr`, used by `outFilterIntronStrands` and the XS tag, is the annotated strand for an sjdb junction and the motif's strand only for a novel one. rustar always used the motif, so a read spanning an annotated AT/AC junction and an annotated CT/AC junction of one minus-strand gene was dropped as strand-inconsistent.
+- **Junction source priority.** When two sources give the same junction, `sjdbPrepare` keeps the higher priority one (index 30, GTF 20, `sjdbFileChrStartEnd` 10, two-pass 1st-pass junctions 0). rustar had no priorities, so in two-pass a 1st-pass junction could replace the index's annotated copy and its strand.
+
+Not covered: chimeric detection, STARsolo, sparse SA indices.
 
 ---
 

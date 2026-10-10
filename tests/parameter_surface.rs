@@ -93,10 +93,8 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     // Aligner core (annotated-junction stitching, alignEndsType, in-recursion
     // length penalty).
     "alignEndsProtrude",
-    "alignInsertionFlush",
     "alignSoftClipAtReferenceEnds",
     "alignTranscriptsPerReadNmax",
-    "outFilterMismatchNoverReadLmax",
     "seedNoneLociPerWindow",
     // Long reads.
     "winReadCoverageBasesMin",

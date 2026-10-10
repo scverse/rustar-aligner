@@ -808,6 +808,10 @@ mod tests {
 
         // Create a simple transcript
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 104,

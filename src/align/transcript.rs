@@ -29,6 +29,22 @@ pub struct Transcript {
     pub junction_motifs: Vec<crate::align::score::SpliceMotif>,
     /// Whether each junction is annotated in the GTF (for jM +20 offset)
     pub junction_annotated: Vec<bool>,
+    /// STAR's `gLength` (`stitchWindowAligns.cpp:94`): end of the last exon
+    /// minus the start of the first, after the extensions. Breaks ties between
+    /// equal-score alignments (`trBest`, window order).
+    pub g_length: u64,
+    /// Position in STAR's output order (window order, `trMult`). The primary
+    /// is kept first in the vector; writers restore this order for output.
+    pub out_order: usize,
+    /// STAR's running mismatch counter `nMM` as stitched (for a pair, the
+    /// pair's). It is what STAR reports as `nM` and filters on; it can exceed
+    /// the mismatches of the final alignment (`n_mismatch`, used for NM/MD)
+    /// when stitching moves already-counted bases across a junction.
+    pub nmm: u32,
+    /// STAR's `sjStr` per junction (0 undefined, 1 +, 2 -): the annotated
+    /// strand for an sjdb junction, else the motif's. Drives the intron-strand
+    /// filter and the XS tag. Empty when unknown (strand then from the motif).
+    pub junction_strands: Vec<u8>,
 }
 
 /// An exon segment in a transcript.
@@ -96,6 +112,12 @@ pub(crate) fn cigar_to_string(cigar: &[cigar::Op]) -> String {
 }
 
 impl Transcript {
+    /// STAR's `nMM` for this alignment: the stitching counter when known,
+    /// never below the mismatches of the final alignment.
+    pub fn star_nmm(&self) -> u32 {
+        self.nmm.max(self.n_mismatch)
+    }
+
     /// Format CIGAR string
     pub fn cigar_string(&self) -> String {
         cigar_to_string(&self.cigar)
@@ -164,6 +186,10 @@ mod tests {
     fn test_cigar_string() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 250,
@@ -209,6 +235,10 @@ mod tests {
     fn test_transcript_lengths() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 250,
@@ -259,6 +289,10 @@ mod tests {
     fn test_count_soft_clips_both_ends() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 150,
@@ -286,6 +320,10 @@ mod tests {
     fn test_count_soft_clips_left_only() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 150,
@@ -309,6 +347,10 @@ mod tests {
     fn test_count_soft_clips_none() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 150,

@@ -905,14 +905,25 @@ fn run_two_pass(
         novel_junctions.len()
     );
 
-    // Insert novel junctions into DB
+    // STAR (twoPassRunPass1 -> sjdbInsertJunctions): reload the 1st-pass
+    // SJ.out.tab and insert its junctions into the genome, Gsj and suffix array.
+    // In pass 2 they are sjdb junctions like annotated ones (sjdbScore, the
+    // Gsj simple-stitch path, `annotated` in SJ.out.tab).
     let mut merged_index = (**index).clone();
-    merged_index
-        .junction_db
-        .insert_novel(novel_junctions.clone());
+    let pass1_raw = crate::junction::chr_start_end::parse_sjdb_chr_start_end(
+        std::slice::from_ref(&pass1_path),
+        &merged_index.genome,
+    )?;
+    let prepared = merged_index.prepare_raw_junctions(&pass1_raw, 0);
+    let n_inserted = crate::index::sjdb_otf::insert_junctions(
+        &mut merged_index,
+        prepared,
+        params.sjdb_overhang,
+    )?;
     info!(
-        "Merged junction DB: {} total junctions",
-        merged_index.junction_db.len()
+        "Inserted {} new junctions from pass 1; {} sjdb junctions in total",
+        n_inserted,
+        merged_index.prepared_junctions.len()
     );
 
     // PASS 2: Re-alignment with merged DB (quant counts happen here)
@@ -2637,8 +2648,10 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 let n = both_mapped.len();
                                 stats.record_alignment(n, max_multimaps);
                                 if n == 1 {
-                                    stats.record_transcript_stats(&both_mapped[0].mate1_transcript);
-                                    stats.record_transcript_stats(&both_mapped[0].mate2_transcript);
+                                    stats.record_pair_stats(
+                                        &both_mapped[0].mate1_transcript,
+                                        &both_mapped[0].mate2_transcript,
+                                    );
                                 }
                             }
 
@@ -3377,8 +3390,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             let n = both_mapped.len();
                             stats.record_alignment(n, max_multimaps);
                             if n == 1 {
-                                stats.record_transcript_stats(&both_mapped[0].mate1_transcript);
-                                stats.record_transcript_stats(&both_mapped[0].mate2_transcript);
+                                stats.record_pair_stats(
+                                    &both_mapped[0].mate1_transcript,
+                                    &both_mapped[0].mate2_transcript,
+                                );
                             }
                         }
 
@@ -3704,87 +3719,77 @@ fn extract_transcript_junctions(
     index: &crate::index::GenomeIndex,
 ) -> Vec<ReadJunction> {
     use crate::align::score::AlignmentScorer;
+
+    // STAR's outputTranscriptSJ: one entry per junction between consecutive
+    // exons (exons are split at indels), with overhang = min of the two
+    // adjacent exon lengths, and motif / annotation as stitched (canonSJ,
+    // sjAnnot). Strand follows the motif: 0 for non-canonical.
     use cigar::op::Kind;
-
-    let mut out: Vec<ReadJunction> = Vec::new();
-
-    // First pass: compute exon segment lengths (query-consuming bases between N operations)
-    // An "exon segment" is the query bases on each side of a splice junction.
-    let mut exon_lengths: Vec<u32> = Vec::new();
-    let mut current_exon_len = 0u32;
-
+    let scorer = AlignmentScorer::from_params_minimal();
+    // Aligned blocks between indels/junctions, and the junctions between them.
+    let mut blocks: Vec<u32> = vec![0];
+    let mut introns: Vec<(u64, u64)> = Vec::new();
+    let mut genome_pos = transcript.genome_start;
     for op in &transcript.cigar {
+        let len = op.len();
         match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Insertion => {
-                current_exon_len += op.len() as u32;
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                *blocks.last_mut().unwrap() += len as u32;
+                genome_pos += len as u64;
             }
             Kind::Skip => {
-                exon_lengths.push(current_exon_len);
-                current_exon_len = 0;
+                introns.push((genome_pos, len as u64));
+                blocks.push(0);
+                genome_pos += len as u64;
             }
-            // Soft clips, deletions, hard clips do not contribute to overhang
-            // STAR counts only matched/inserted bases (not soft-clipped bases)
-            Kind::Deletion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            Kind::Deletion => {
+                blocks.push(0);
+                genome_pos += len as u64;
+            }
+            Kind::Insertion => blocks.push(0),
+            Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
-    exon_lengths.push(current_exon_len); // Final exon segment
-
-    // Second pass: record junctions with computed overhangs
-    let mut genome_pos = transcript.genome_start;
-    let mut junction_idx = 0usize;
-
-    let scorer = AlignmentScorer::from_params_minimal();
-
+    let mut out: Vec<ReadJunction> = Vec::new();
+    // Block index to the left of each junction.
+    let mut block = 0usize;
+    let mut j = 0usize;
     for op in &transcript.cigar {
         match op.kind() {
             Kind::Skip => {
-                // This is a splice junction
-                let intron_len = op.len();
-                let intron_start = genome_pos;
-                let intron_end = genome_pos + intron_len as u64 - 1;
-
-                // Detect splice motif
-                let motif =
-                    scorer.detect_splice_motif(genome_pos, intron_len as u32, &index.genome);
-
-                // Compute overhang: min(left_exon_length, right_exon_length)
-                let left_exon = exon_lengths[junction_idx];
-                let right_exon = exon_lengths[junction_idx + 1];
-                let overhang = left_exon.min(right_exon);
-
-                // Derive strand from splice motif (STAR convention)
+                let (intron_start, intron_len) = introns[j];
+                let motif = transcript
+                    .junction_motifs
+                    .get(j)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        scorer.detect_splice_motif(intron_start, intron_len as u32, &index.genome)
+                    });
+                let annotated = transcript
+                    .junction_annotated
+                    .get(j)
+                    .copied()
+                    .unwrap_or(false);
                 let strand = match motif.implied_strand() {
                     Some('+') => 1u8,
                     Some('-') => 2u8,
-                    _ => 0u8, // non-canonical: unknown strand
+                    _ => 0u8,
                 };
-                let annotated = index.junction_db.is_annotated(
-                    transcript.chr_idx,
-                    intron_start,
-                    intron_end,
-                    strand,
-                );
-
                 out.push(ReadJunction {
                     chr_idx: transcript.chr_idx,
                     intron_start,
-                    intron_end,
+                    intron_end: intron_start + intron_len - 1,
                     strand,
                     motif,
-                    overhang,
+                    overhang: blocks[block].min(blocks[block + 1]),
                     annotated,
                 });
-
-                // Advance genome position past the intron
-                genome_pos += intron_len as u64;
-                junction_idx += 1;
+                j += 1;
+                block += 1;
             }
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
-                genome_pos += op.len() as u64;
-            }
-            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            Kind::Deletion | Kind::Insertion => block += 1,
+            _ => {}
         }
     }
-
     out
 }

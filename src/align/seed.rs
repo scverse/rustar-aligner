@@ -28,6 +28,21 @@ pub struct Seed {
     pub mate_id: u8,
 }
 
+/// STAR's `seedPerReadNmax` guard (`ReadAlign_storeAligns.cpp:46-51`): the
+/// stored, deduplicated pieces of one read (both mates) may not exceed the
+/// limit. STAR aborts the run rather than silently dropping seeds, since a
+/// truncated seed set changes the alignment.
+pub(crate) fn check_seed_per_read(n_seeds: usize, params: &Parameters) -> Result<(), Error> {
+    if n_seeds > params.seed_per_read_nmax {
+        return Err(Error::Alignment(
+            "EXITING because of FATAL error: too many pieces pere read\n\
+             SOLUTION: increase input parameter --seedPerReadNmax"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl Seed {
     /// Find all seeds for a read sequence using MMP (Maximal Mappable Prefix) search.
     ///
@@ -80,11 +95,6 @@ impl Seed {
             debug_name,
             &mut seeds,
         );
-
-        // Cap check between directions (STAR: seedPerReadNmax applies across both)
-        if seeds.len() >= params.seed_per_read_nmax {
-            return Ok(seeds);
-        }
 
         // Search R→L (reverse direction on read): sparse chain search on RC read.
         // The RC read carries the same good pieces mirrored end-for-end, which
@@ -139,6 +149,7 @@ impl Seed {
             seeds.retain(|s| seen.insert((s.read_pos, s.length)));
         }
 
+        check_seed_per_read(seeds.len(), params)?;
         Ok(seeds)
     }
 
@@ -180,6 +191,7 @@ impl Seed {
         // Pool seeds together
         seeds.extend(seeds2);
 
+        check_seed_per_read(seeds.len(), params)?;
         Ok(seeds)
     }
 
@@ -348,13 +360,12 @@ fn search_direction_sparse(
                 if pos >= piece_end {
                     break;
                 }
-                // Stop if remaining bases < seedMapMin (matches STAR's while condition:
-                // istart*Lstart + Lmapped + P.seedMapMin < splitR[1][ip]).
-                // STAR chains continue until only seedMapMin (5) bases remain, NOT
-                // seedSearchStartLmax (50). This allows chains to reach terminal small
+                // STAR maps while `istart*Lstart + Lmapped + seedMapMin < splitR[1][ip]`,
+                // i.e. it stops once seedMapMin (5) or fewer bases remain, NOT
+                // seedSearchStartLmax (50). This lets chains reach terminal small
                 // exons (e.g. 9M after intron) near the read end. Measured to the
                 // end of the piece, since that is where this chain must stop.
-                if piece_end - pos < min_seed_length {
+                if piece_end - pos <= min_seed_length {
                     break;
                 }
 
@@ -396,10 +407,6 @@ fn search_direction_sparse(
                     }
 
                     seeds.push(seed);
-
-                    if seeds.len() >= params.seed_per_read_nmax {
-                        return;
-                    }
                 }
 
                 pos += result.advance; // Always advance by MMP length (matches STAR)
@@ -590,12 +597,9 @@ fn compare_seq_to_genome(
                 let read_chunk = &read_seq[read_pos + i..read_pos + simd_end];
                 let genome_chunk = &genome_slice_all[genome_start + i..genome_start + simd_end];
                 if let Some(off) = crate::align::simd_scan::find_stop(read_chunk, genome_chunk) {
-                    let genome_base = genome_chunk[off];
-                    if genome_base >= 5 {
-                        return (i + off, true);
-                    }
-                    let read_base = read_chunk[off];
-                    return (i + off, read_base > genome_base);
+                    // A spacer or N in the genome compares greater than any
+                    // read base, as in STAR (`compareSeqToGenome`).
+                    return (i + off, read_chunk[off] > genome_chunk[off]);
                 }
                 match_len = simd_end;
                 i = simd_end;
@@ -607,16 +611,16 @@ fn compare_seq_to_genome(
         let genome_idx = genome_start + i;
 
         if genome_idx >= index.genome.sequence.len() {
-            // Past end of genome array — treat like padding (STAR: comp_res > 0)
-            return (match_len, true);
+            // Past the end of the genome: padding, which compares greater
+            // than the read (STAR: compRes = false).
+            return (match_len, false);
         }
 
         let genome_base = index.genome.sequence.base(genome_idx);
 
-        if genome_base >= 5 {
-            // Padding character — STAR returns comp_res > 0 (read > genome)
-            return (match_len, true);
-        }
+        // STAR's compareSeqToGenome: a spacer or N in the genome is greater
+        // than any read base on either strand (`g > 3` -> compRes = false), which
+        // the plain comparison below already gives since read bases are < 4.
 
         let read_base = read_seq[read_pos + i];
 
@@ -941,13 +945,15 @@ mod tests {
         Parameters::parse_from(full_args)
     }
 
+    // STAR seeds only while more than `seedMapMin` bases remain
+    // (`Lmapped + seedMapMin < length`), so a 4-base read needs a minimum of 3.
     #[test]
     fn find_exact_match() {
         let index = make_test_index("ACGTACGT");
         let read = encode_sequence("ACGT");
         let params = params(&["--runMode", "alignReads"]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
 
         // Should find at least one seed
         assert!(!seeds.is_empty());
@@ -990,7 +996,7 @@ mod tests {
         let read = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
         assert!(!seeds.is_empty());
 
         // Get positions for first seed
@@ -1009,7 +1015,7 @@ mod tests {
         let read = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
+        let seeds = Seed::find_seeds(&read, &index, 3, &params, "").unwrap();
         assert!(!seeds.is_empty());
 
         // Single-end seeds should have mate_id = 2
@@ -1025,7 +1031,7 @@ mod tests {
         let mate2 = encode_sequence("TTGG");
         let params = params(&[]);
 
-        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
+        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 3, &params).unwrap();
 
         // Should have seeds from both mates
         let mate1_seeds: Vec<_> = seeds.iter().filter(|s| s.mate_id == 0).collect();
@@ -1052,7 +1058,7 @@ mod tests {
         let mate2 = encode_sequence("ACGT");
         let params = params(&[]);
 
-        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 4, &params).unwrap();
+        let seeds = Seed::find_paired_seeds(&mate1, &mate2, &index, 3, &params).unwrap();
 
         // Should have roughly double the seeds (one set from each mate)
         let mate1_count = seeds.iter().filter(|s| s.mate_id == 0).count();
@@ -1128,17 +1134,26 @@ mod tests {
 
     #[test]
     fn test_shared_seed_cap() {
-        // Test that combined L→R + R→L respects seedPerReadNmax
+        // STAR aborts (rather than truncates) when the deduplicated pieces of a
+        // read exceed seedPerReadNmax; within the limit the seeds are returned.
         let index = make_test_index("ACGTACGTACGTACGT");
         let read = encode_sequence("ACGTACGT");
-        let params = params(&["--seedPerReadNmax", "3"]);
+        let n = Seed::find_seeds(&read, &index, 2, &params(&[]), "")
+            .unwrap()
+            .len();
+        assert!(n > 1, "fixture must produce several seeds, got {n}");
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
-        assert!(
-            seeds.len() <= 3,
-            "Total seeds ({}) should respect seedPerReadNmax=3",
-            seeds.len()
+        let at_limit = params(&["--seedPerReadNmax", &n.to_string()]);
+        assert_eq!(
+            Seed::find_seeds(&read, &index, 2, &at_limit, "")
+                .unwrap()
+                .len(),
+            n
         );
+
+        let below = params(&["--seedPerReadNmax", &(n - 1).to_string()]);
+        let err = Seed::find_seeds(&read, &index, 2, &below, "").unwrap_err();
+        assert!(err.to_string().contains("--seedPerReadNmax"), "{err}");
     }
 
     #[test]

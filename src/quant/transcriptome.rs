@@ -1122,6 +1122,10 @@ fn align_to_one_transcript(
     let proj_end = proj_exons.last().map_or(0, |e| e.genome_end);
 
     Some(Transcript {
+        nmm: 0,
+        junction_strands: vec![],
+        out_order: 0,
+        g_length: 0,
         chr_idx: tr_idx,
         genome_start: proj_start,
         genome_end: proj_end,
@@ -1248,7 +1252,7 @@ fn extend_softclips(
     let mismatch_nmax_rel =
         ((params.out_filter_mismatch_nover_lmax * (lread.saturating_sub(1) as f64)).floor()) as u32;
     let budget = mismatch_nmax_abs.min(mismatch_nmax_rel);
-    if align.n_mismatch.saturating_add(n_mm_extra) > budget {
+    if align.star_nmm().saturating_add(n_mm_extra) > budget {
         return None;
     }
 
@@ -2035,6 +2039,10 @@ mod tests {
         let gs = proj_exons.first().map_or(0, |e| e.genome_start);
         let ge = proj_exons.last().map_or(0, |e| e.genome_end);
         Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx,
             genome_start: gs,
             genome_end: ge,

@@ -154,6 +154,18 @@ impl AlignmentStats {
     /// Walks the CIGAR to extract mapped bases, ins/del counts, and splice motif counts.
     /// Only call this for unique mappers (n_alignments == 1).
     pub fn record_transcript_stats(&self, transcript: &Transcript) {
+        self.record_transcript_stats_nmm(transcript, transcript.star_nmm());
+    }
+
+    /// Both mates of a unique pair: STAR adds the pair's `nMM` once
+    /// (`Stats::transcriptStats`, `mappedMismatchesN += T.nMM`).
+    pub fn record_pair_stats(&self, mate1: &Transcript, mate2: &Transcript) {
+        let nmm = crate::io::sam::star_pair_nmm(mate1, mate2);
+        self.record_transcript_stats_nmm(mate1, nmm);
+        self.record_transcript_stats_nmm(mate2, 0);
+    }
+
+    fn record_transcript_stats_nmm(&self, transcript: &Transcript, nmm: u32) {
         use cigar::op::Kind;
         // Walk CIGAR for mapped bases, ins/del
         for op in &transcript.cigar {
@@ -178,7 +190,7 @@ impl AlignmentStats {
 
         // Mismatches
         self.mapped_mismatches
-            .fetch_add(transcript.n_mismatch as u64, Ordering::Relaxed);
+            .fetch_add(u64::from(nmm), Ordering::Relaxed);
 
         // Splice motif counts
         for motif in &transcript.junction_motifs {
@@ -779,6 +791,10 @@ mod tests {
 
         // Build a transcript with known CIGAR: 5S 45M 3I 2M 100N 50M 2D 5M
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 1000,
             genome_end: 1204,
@@ -903,6 +919,10 @@ mod tests {
 
         // Transcript with multiple junction types
         let transcript = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 1000,
             genome_end: 2000,
