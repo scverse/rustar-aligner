@@ -1111,6 +1111,7 @@ mod tests {
     /// Build the page from existing run output; run by hand:
     /// `cargo test --release --features hdf5-out web_summary_from_outs -- --ignored`.
     #[test]
+    #[cfg(unix)]
     #[ignore = "needs /Users/benjamin/rustar-parity data"]
     fn web_summary_from_outs() {
         let outs = Path::new("/Users/benjamin/rustar-parity/cr/rs7/rs_outs");
