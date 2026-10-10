@@ -448,6 +448,9 @@ pub struct WindowAlignment {
     /// = length + left_ext_score + right_ext_score (in stitch coords, forward strand).
     /// Computed in stitch_seeds_core after dedup/sort. Default: length as i32.
     pub pre_ext_score: i32,
+    /// sjdb junction this piece was split from (STAR: WA_sjA), for a seed that
+    /// crossed a junction in the Gsj insert; `None` for a real-genome hit.
+    pub sj_a: Option<u32>,
 }
 
 /// A cluster of seeds mapping to the same genomic region
@@ -524,45 +527,52 @@ pub fn cluster_seeds(
     // `[Option<T>; 2]` avoids a heap `Vec` allocation on every SA hit expanded
     // in this hot loop (the common `raw_fwd < n_genome_real` case is the
     // overwhelming majority of calls); iterate with `.into_iter().flatten()`.
-    let expand_hit =
-        |sa_pos: u64, strand: bool, length: usize| -> [Option<(u64, usize, usize, u64)>; 2] {
-            let raw_fwd = index.sa_pos_to_forward(sa_pos, strand, length);
-            if raw_fwd < n_genome_real {
-                return [Some((raw_fwd, 0, length, sa_pos)), None];
-            }
-            if sjdb_overhang == 0 || prepared.is_empty() {
-                return [None, None];
-            }
-            let mut decoded = crate::junction::sjdb_insert::decode_gsj_hit(
-                raw_fwd,
-                length,
-                n_genome_real,
-                sjdb_overhang,
-                prepared,
-            );
-            // Reverse-strand hits traverse the donor/acceptor halves in reverse
-            // read order: the leftmost forward bytes (donor flank) align to the
-            // last read bases. Swap the read offsets so each sub-seed's
-            // `read_pos = seed.read_pos + read_offset` lands at the right place
-            // in original-read coords.
-            if strand && decoded.len() == 2 {
-                let acceptor_len = decoded[1].2;
-                decoded[0].1 = acceptor_len;
-                decoded[1].1 = 0;
-            }
-            let mut out = [None, None];
-            for (slot, (real_fwd, read_off, sub_len)) in out.iter_mut().zip(decoded) {
-                let sub_sa_pos = if strand {
-                    n_genome
-                        .saturating_sub(real_fwd)
-                        .saturating_sub(sub_len as u64)
-                } else {
-                    real_fwd
-                };
-                *slot = Some((real_fwd, read_off, sub_len, sub_sa_pos));
-            }
-            out
-        };
+    // The fifth field is STAR's `sjA` (`sjAlignSplit`'s `isj`): the junction a
+    // boundary-crossing Gsj hit was split at, `None` for a real-genome hit.
+    #[allow(clippy::type_complexity)]
+    let expand_hit = |sa_pos: u64,
+                      strand: bool,
+                      length: usize|
+     -> [Option<(u64, usize, usize, u64, Option<u32>)>; 2] {
+        let raw_fwd = index.sa_pos_to_forward(sa_pos, strand, length);
+        if raw_fwd < n_genome_real {
+            return [Some((raw_fwd, 0, length, sa_pos, None)), None];
+        }
+        if sjdb_overhang == 0 || prepared.is_empty() {
+            return [None, None];
+        }
+        let mut decoded = crate::junction::sjdb_insert::decode_gsj_hit(
+            raw_fwd,
+            length,
+            n_genome_real,
+            sjdb_overhang,
+            prepared,
+        );
+        // Reverse-strand hits traverse the donor/acceptor halves in reverse
+        // read order: the leftmost forward bytes (donor flank) align to the
+        // last read bases. Swap the read offsets so each sub-seed's
+        // `read_pos = seed.read_pos + read_offset` lands at the right place
+        // in original-read coords.
+        if strand && decoded.len() == 2 {
+            let acceptor_len = decoded[1].2;
+            decoded[0].1 = acceptor_len;
+            decoded[1].1 = 0;
+        }
+        let sj_a = (decoded.len() == 2)
+            .then(|| ((raw_fwd - n_genome_real) / (2 * sjdb_overhang as u64 + 1)) as u32);
+        let mut out = [None, None];
+        for (slot, (real_fwd, read_off, sub_len)) in out.iter_mut().zip(decoded) {
+            let sub_sa_pos = if strand {
+                n_genome
+                    .saturating_sub(real_fwd)
+                    .saturating_sub(sub_len as u64)
+            } else {
+                real_fwd
+            };
+            *slot = Some((real_fwd, read_off, sub_len, sub_sa_pos, sj_a));
+        }
+        out
+    };
 
     let anchor_set: Vec<bool> = seeds
         .iter()
@@ -647,7 +657,7 @@ pub fn cluster_seeds(
                 continue;
             }
 
-            for (forward_pos, _read_off, sub_length, _sub_sa_pos) in
+            for (forward_pos, _read_off, sub_length, _sub_sa_pos, _sj_a) in
                 expand_hit(sa_pos, strand, full_length)
                     .into_iter()
                     .flatten()
@@ -767,26 +777,36 @@ pub fn cluster_seeds(
         return Vec::new();
     }
 
-    // Phase 3: Extend windows by ±win_flank_nbins (matches STAR's flanking extension)
-    // Update winBin for newly covered bins
+    // Phase 3: extend windows by win_flank_nbins on each side
+    // (`ReadAlign_stitchPieces.cpp:96-117`). Windows are processed in creation
+    // order and a flank bin is overwritten by every window that reaches it, so
+    // the last one wins; a flank never crosses into another chromosome.
+    let chr_start = &index.genome.chr_start;
+    let bin_chr = |bin: u64| chr_start.partition_point(|&s| s <= bin << win_bin_nbits) - 1;
+    let max_bin = (index.genome.n_genome >> win_bin_nbits) + 1;
     for (win_idx, window) in windows.iter_mut().enumerate() {
         if !window.alive {
             continue;
         }
-        let old_start = window.bin_start;
-        let old_end = window.bin_end;
-        let new_start = old_start.saturating_sub(win_flank_nbins as u64);
-        let new_end = old_end + win_flank_nbins as u64;
-        window.bin_start = new_start;
-        window.bin_end = new_end;
-
         let strand = window.is_reverse;
-        for bin in new_start..old_start {
-            win_bin.entry((strand, bin)).or_insert(win_idx);
+        let mut wb = window.bin_start;
+        for _ in 0..win_flank_nbins {
+            if wb == 0 || bin_chr(wb - 1) != window.chr_idx {
+                break;
+            }
+            wb -= 1;
+            win_bin.insert((strand, wb), win_idx);
         }
-        for bin in (old_end + 1)..=new_end {
-            win_bin.entry((strand, bin)).or_insert(win_idx);
+        window.bin_start = wb;
+        let mut wb = window.bin_end;
+        for _ in 0..win_flank_nbins {
+            if wb + 1 >= max_bin || bin_chr(wb + 1) != window.chr_idx {
+                break;
+            }
+            wb += 1;
+            win_bin.insert((strand, wb), win_idx);
         }
+        window.bin_end = wb;
     }
 
     // Phase 4: Assign ALL seeds to windows (matches STAR's stitchPieces Phase 3).
@@ -819,6 +839,8 @@ pub fn cluster_seeds(
         /// by the donor-side length for the acceptor half of a Gsj
         /// boundary-crossing hit.
         read_pos: usize,
+        /// STAR's WA_sjA (see `WindowAlignment::sj_a`).
+        sj_a: Option<u32>,
     }
 
     let mut win_candidates: Vec<Vec<WinCandidate>> =
@@ -837,7 +859,7 @@ pub fn cluster_seeds(
                 continue;
             }
 
-            for (forward_pos, read_off, sub_length, sub_sa_pos) in
+            for (forward_pos, read_off, sub_length, sub_sa_pos, sj_a) in
                 expand_hit(sa_pos, strand, full_length)
                     .into_iter()
                     .flatten()
@@ -872,86 +894,23 @@ pub fn cluster_seeds(
                     ps_rstart,
                     mate_id: seed.mate_id,
                     read_pos: derived_read_pos,
+                    sj_a,
                 });
             }
         }
     }
 
-    // Pre-dedup overlapping diagonals (order-independent, length wins):
-    // Two candidate entries on the same diagonal with overlapping read ranges represent
-    // the same alignment position — keep only the longest. This is what STAR achieves
-    // via sorted-order overlap detection (longer seed enters first, shorter blocked).
-    // Pre-computing this dedup ensures correct results regardless of discovery order,
-    // fixing window capacity overflow without changing capacity-eviction behavior
-    // for other reads (seeds on unique diagonals are unaffected).
-    //
-    // After pre-dedup, Phase 4 processes survivors in original discovery order.
-    // The overlap detection in the main Phase 4 loop below is still present but will
-    // never find an overlap (since pre-dedup already resolved all of them). It serves
-    // as a safety net for any edge cases not covered by pre-dedup.
+    // STAR (assignAlignToWindow) assigns candidates one by one in seed order;
+    // its overlap test (below) is asymmetric and order-dependent, so there is
+    // no order-independent pre-dedup here.
     let win_n = windows.len();
-    let mut win_blocked: Vec<Vec<bool>> = (0..win_n)
-        .map(|i| vec![false; win_candidates[i].len()])
-        .collect();
-
-    // Hoisted out of the per-window loop: the sort buffer and the diagonal map
-    // (with its hash table) are allocated once per read and reused across
-    // windows via `clear()` — previously this was O(windows) fresh allocations
-    // + hash-table rehashes per read (a measured allocator hotspot). Reused
-    // storage only; the results are identical.
-    let mut by_len: Vec<usize> = Vec::new();
-    let mut diag_ranges: FxHashMap<(i64, u8), Vec<(usize, usize)>> = FxHashMap::default();
-
-    for win_idx in 0..win_n {
-        let candidates = &win_candidates[win_idx];
-        if candidates.is_empty() {
-            continue;
-        }
-        // Sort indices by length descending so that the longest entry per diagonal
-        // is processed first (and blocks shorter overlapping entries on the same diagonal).
-        by_len.clear();
-        by_len.extend(0..candidates.len());
-        by_len.sort_by(|&a, &b| candidates[b].length.cmp(&candidates[a].length));
-
-        // For each (diagonal, mate_id) pair, track accepted [ps_rstart, ps_rend) ranges.
-        // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] before overlap test:
-        // seeds from different fragments are never treated as overlapping duplicates.
-        diag_ranges.clear();
-        for &ci in &by_len {
-            let cand = &candidates[ci];
-            let diag = cand.forward_pos as i64 - cand.ps_rstart as i64;
-            let ps_rend = cand.ps_rstart + cand.length;
-            let key = (diag, cand.mate_id);
-
-            let blocked = diag_ranges.get(&key).is_some_and(|ranges| {
-                ranges.iter().any(|&(rs, re)| {
-                    (cand.ps_rstart >= rs && cand.ps_rstart < re) || (ps_rend >= rs && ps_rend < re)
-                })
-            });
-
-            if blocked {
-                win_blocked[win_idx][ci] = true;
-            } else {
-                diag_ranges
-                    .entry(key)
-                    .or_default()
-                    .push((cand.ps_rstart, ps_rend));
-            }
-        }
-    }
-
-    // Process each window's candidates in original discovery order,
-    // skipping pre-dedup-blocked entries.
+    // Process each window's candidates in discovery (seed, SA) order.
     let mut too_many_anchors = false; // STAR: MARKER_TOO_MANY_ANCHORS_PER_WINDOW
     'outer: for win_idx in 0..win_n {
         if !windows[win_idx].alive {
             continue;
         }
-        for (ci, cand) in win_candidates[win_idx].iter().enumerate() {
-            if win_blocked[win_idx][ci] {
-                continue; // blocked by a longer overlapping entry on same diagonal
-            }
-
+        for cand in &win_candidates[win_idx] {
             let seed_idx = cand.seed_idx;
             let seed = &seeds[seed_idx];
             let length = cand.length;
@@ -980,8 +939,8 @@ pub fn cluster_seeds(
             let new_diag = forward_pos as i64 - new_ps_rstart as i64;
             let mut overlap_idx = None;
             for (i, wa) in window.alignments.iter().enumerate() {
-                if wa.mate_id != new_mate_id {
-                    continue; // STAR: only merge seeds from the same fragment
+                if wa.mate_id != new_mate_id || wa.sj_a != cand.sj_a {
+                    continue; // STAR: only merge seeds from the same fragment and sjA
                 }
                 let wa_ps_rstart = if window.is_reverse {
                     read_len - (wa.length + wa.read_pos)
@@ -1007,7 +966,7 @@ pub fn cluster_seeds(
                         } else {
                             wa.read_pos
                         };
-                        wa_ps < new_ps_rstart
+                        wa_ps <= new_ps_rstart
                     });
                     window.alignments.insert(
                         insert_pos,
@@ -1021,6 +980,7 @@ pub fn cluster_seeds(
                             is_anchor: is_anchor_seed,
                             mate_id: seed.mate_id,
                             pre_ext_score: length as i32,
+                            sj_a: cand.sj_a,
                         },
                     );
                 }
@@ -1075,7 +1035,7 @@ pub fn cluster_seeds(
                 } else {
                     wa.read_pos
                 };
-                wa_ps < new_ps_rstart
+                wa_ps <= new_ps_rstart
             });
             window.alignments.insert(
                 insert_pos,
@@ -1089,6 +1049,7 @@ pub fn cluster_seeds(
                     is_anchor: is_anchor_seed,
                     mate_id: seed.mate_id,
                     pre_ext_score: length as i32,
+                    sj_a: cand.sj_a,
                 },
             );
         }
@@ -1135,6 +1096,9 @@ pub(crate) struct ExonBlock {
     pub(crate) genome_end: u64,   // SA coordinate space (exclusive)
     /// Mate ID: 0=mate1, 1=mate2, 2=SE (STAR: EX_iFrag)
     pub(crate) mate_id: u8,
+    /// The gap before this exon is an annotated junction shorter than
+    /// alignIntronMin (STAR: canonSJ>=0 for a gap it would otherwise call a deletion).
+    pub(crate) sj_short: bool,
 }
 
 /// In-progress transcript during recursive search (cheap to clone)
@@ -1147,10 +1111,18 @@ pub(crate) struct WorkingTranscript {
     pub(crate) n_junction: u32,
     pub(crate) junction_motifs: Vec<crate::align::score::SpliceMotif>,
     pub(crate) junction_annotated: Vec<bool>,
+    /// STAR's `sjStr` per junction: the annotated strand of an sjdb junction,
+    /// else the motif's (0 undefined, 1 +, 2 -).
+    pub(crate) junction_strands: Vec<u8>,
     /// Per-junction repeat lengths (jjL, jjR) for overhang check at finalization.
     /// STAR's shiftSJ[isj][0] and shiftSJ[isj][1].
     pub(crate) junction_shifts: Vec<(u32, u32)>,
     pub(crate) n_anchor: u32,
+    /// STAR's `exons[nExons-1][EX_sjA]`: the sjA of the last stitched piece,
+    /// which gates the annotated simple-stitch path.
+    pub(crate) last_sj_a: Option<u32>,
+    /// STAR's gLength, set when the recursion finishes the transcript.
+    pub(crate) g_length: u64,
     // Tight bounds for extension at finalization
     pub(crate) read_start: usize,
     pub(crate) read_end: usize,
@@ -1168,8 +1140,11 @@ impl WorkingTranscript {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            junction_strands: Vec::new(),
             junction_shifts: Vec::new(),
             n_anchor: 0,
+            last_sj_a: None,
+            g_length: 0,
             read_start: 0,
             read_end: 0,
             genome_start: 0,
@@ -1267,7 +1242,7 @@ fn stitch_align_to_transcript(
             10_000, // DEF_readSeqLengthMax (STAR); SPACER stop applies before this limit
             wt.n_mismatch,
             n_match_m1,
-            scorer.n_mm_max,
+            scorer.mismatch_nmax_total(read_seq),
             scorer.p_mm_max,
             index,
             cluster.is_reverse,
@@ -1290,6 +1265,7 @@ fn stitch_align_to_transcript(
             genome_start: wa.sa_pos,
             genome_end: wa.sa_pos + wa.length as u64,
             mate_id: wa.mate_id,
+            sj_short: false,
         });
         new_wt.read_end = wa.read_pos + wa.length;
         new_wt.genome_end = wa.sa_pos + wa.length as u64;
@@ -1326,7 +1302,7 @@ fn stitch_align_to_transcript(
             extlen,
             n_mm_after_right,
             n_match_for_left,
-            scorer.n_mm_max,
+            scorer.mismatch_nmax_total(read_seq),
             scorer.p_mm_max,
             index,
             cluster.is_reverse,
@@ -1339,7 +1315,59 @@ fn stitch_align_to_transcript(
             new_wt.score += left_ext.max_score;
             new_wt.n_mismatch += left_ext.n_mismatch;
         }
+        new_wt.last_sj_a = wa.sj_a;
 
+        return Some(new_wt);
+    }
+
+    // STAR stitchAlignToTranscript.cpp:18-34: simple stitching across an sjdb
+    // junction. When A and B are the donor/acceptor pieces of one Gsj hit
+    // (same sjA), read-adjacent and genome-separated, the junction goes exactly
+    // at the annotated coordinates with no gap scan, no stitch-mismatch check
+    // and no alignSJoverhangMin check (alignSJDBoverhangMin applies later).
+    if let Some(sj) = wa.sj_a
+        && wt.last_sj_a == Some(sj)
+        && last_exon.mate_id == wa.mate_id
+        && wa.read_pos == last_exon.read_end
+        && last_exon.genome_end < wa.sa_pos
+        && let Some(pj) = index.prepared_junctions.get(sj as usize)
+    {
+        // Repeat shifts in stitch (SA) orientation: a reverse cluster walks the
+        // RC genome, so STAR's left/right shifts swap sides.
+        let (shift_l, shift_r) = if cluster.is_reverse {
+            (pj.shift_right, pj.shift_left)
+        } else {
+            (pj.shift_left, pj.shift_right)
+        };
+        let len_a = last_exon.read_end - last_exon.read_start;
+        if pj.motif == 0 && (wa.length <= shift_r as usize || len_a <= shift_l as usize) {
+            return None; // -1000006: too large repeats around non-canonical junction
+        }
+        let mut new_wt = wt.clone();
+        new_wt.exons.push(ExonBlock {
+            read_start: wa.read_pos,
+            read_end: wa.read_pos + wa.length,
+            genome_start: wa.sa_pos,
+            genome_end: wa.sa_pos + wa.length as u64,
+            mate_id: wa.mate_id,
+            sj_short: false,
+        });
+        new_wt.n_junction += 1;
+        new_wt
+            .junction_motifs
+            .push(crate::align::score::SpliceMotif::from_star_code(pj.motif));
+        new_wt.junction_annotated.push(true);
+        new_wt.junction_strands.push(pj.strand);
+        new_wt
+            .junction_shifts
+            .push((u32::from(shift_l), u32::from(shift_r)));
+        new_wt.score += wa.length as i32 + scorer.sjdb_score;
+        new_wt.read_end = wa.read_pos + wa.length;
+        new_wt.genome_end = wa.sa_pos + wa.length as u64;
+        new_wt.last_sj_a = Some(sj);
+        if wa.is_anchor {
+            new_wt.n_anchor += 1;
+        }
         return Some(new_wt);
     }
 
@@ -1358,55 +1386,29 @@ fn stitch_align_to_transcript(
         eff_length -= overlap;
     }
 
-    // Handle genome overlap
-    if last_exon.genome_end > eff_genome_pos && eff_genome_pos > last_exon.genome_start {
-        let g_overlap = (last_exon.genome_end - eff_genome_pos) as usize;
-        if g_overlap >= eff_length {
-            return None; // Fully consumed
-        }
-        eff_read_pos += g_overlap;
-        eff_genome_pos += g_overlap as u64;
-        eff_length -= g_overlap;
+    // STAR (stitchAlignToTranscript.cpp:53-54) only trims the read overlap
+    // above; B ending inside A on the genome is rejected (-1000002), and a
+    // remaining genome overlap (gGap < 0) is stitched as an insertion below.
+    if eff_genome_pos + eff_length as u64 <= last_exon.genome_end {
+        return None;
     }
 
     let read_gap = (eff_read_pos as i64) - (last_exon.read_end as i64);
     let genome_gap = (eff_genome_pos as i64) - (last_exon.genome_end as i64);
 
-    // Reject negative gaps
-    if read_gap < 0 || genome_gap < 0 {
-        return None;
-    }
-
     let mut new_wt = wt.clone();
     let mut d_score: i32 = 0;
     let mut gap_mm: u32 = 0;
 
-    if read_gap == 0 && genome_gap == 0 {
-        // Adjacent seeds — just extend the last exon
-        if let Some(last) = new_wt.exons.last_mut() {
-            last.read_end = eff_read_pos + eff_length;
-            last.genome_end = eff_genome_pos + eff_length as u64;
-        }
-    } else if read_gap == genome_gap {
-        // Equal gap: base-by-base scoring
-        let shared = read_gap as usize;
-        let (region_score, region_mm) = score_region(
-            read_seq,
-            last_exon.read_end,
-            last_exon.genome_end,
-            shared,
-            index,
-            cluster.is_reverse,
-        );
-        gap_mm = region_mm;
-        d_score += region_score;
-
-        // Extend last exon through the gap and the new seed
-        if let Some(last) = new_wt.exons.last_mut() {
-            last.read_end = eff_read_pos + eff_length;
-            last.genome_end = eff_genome_pos + eff_length as u64;
-        }
-    } else if genome_gap > read_gap {
+    if read_gap == genome_gap {
+        // STAR (stitchAlignToTranscript.cpp:78-93, 312-314) leaves jCan at 999
+        // when the read and genome gaps are equal (adjacent or gap-filled seeds
+        // on one diagonal), so its acceptance test `jCan<0 || (jCan<7 && ...)`
+        // fails (-1000007): two pieces of one diagonal are never stitched; the
+        // extension at the transcript ends covers that ground instead.
+        return None;
+    }
+    if genome_gap > read_gap {
         // Deletion or splice junction
         let del = (genome_gap - read_gap) as u32;
         let shared = read_gap as usize;
@@ -1418,36 +1420,33 @@ fn stitch_align_to_transcript(
             return None;
         }
 
-        // STAR stitchAlignToTranscript.cpp: reject splice when exon B is too short
-        // (nBstart < alignSJoverhangMin). Prevents tiny exons from creating spurious
-        // splice paths that waste recursion budget with large introns.
-        if is_splice && eff_length < scorer.align_sj_overhang_min as usize {
-            return None;
-        }
-
         // --- jR scanning for BOTH splice junctions and deletions (STAR-faithful) ---
         // STAR uses the same scanning code path for both cases; the only difference
         // is motif detection (splice) vs pure positional score (deletion).
         // donor_sa = exclusive end of exon A = STAR's gAend+1. jr_shift = STAR's jR.
         let donor_sa = last_exon.genome_end;
-        let (jr_shift, motif, motif_score, jj_l, jj_r) = scorer.find_best_junction_position_cached(
-            jcache,
-            read_seq,
-            last_exon.read_end,
-            donor_sa,
-            read_gap.max(0),
-            genome_gap,
-            &index.genome,
-            cluster.is_reverse,
-            index.genome.n_genome,
-            last_exon.read_end - last_exon.read_start,
-            eff_length,
-        );
+        let (mut jr_shift, motif, motif_score, mut jj_l, mut jj_r) = scorer
+            .find_best_junction_position_cached(
+                jcache,
+                read_seq,
+                last_exon.read_end,
+                donor_sa,
+                read_gap.max(0),
+                genome_gap,
+                &index.genome,
+                cluster.is_reverse,
+                index.genome.n_genome,
+                last_exon.read_end - last_exon.read_start,
+                eff_length,
+            );
 
+        if jr_shift == crate::align::score::JR_REJECTED {
+            return None; // STAR -1000005
+        }
         // Clamp shift: jr_shift = STAR's jR. Lower bound: can't consume entire exon A.
         // Upper bound: scan already limited to < shared+eff_length but clamp for safety.
         let prev_match_len = (last_exon.read_end - last_exon.read_start) as i32;
-        let jr_shift = jr_shift
+        jr_shift = jr_shift
             .max(-prev_match_len)
             .min((eff_length + shared) as i32);
 
@@ -1529,21 +1528,51 @@ fn stitch_align_to_transcript(
         d_score += shared_score;
 
         // --- Type-specific scoring and tracking ---
-        if is_splice {
-            // Check stitch mismatch limit
+        // STAR stitchAlignToTranscript.cpp:198-231: look the (flushed) gap up in
+        // the sjdb by its stored coordinates, deletions included. An annotated
+        // gap is a junction whatever its length; it takes the sjdb motif, repeat
+        // shifts and sjdbScore, and a non-canonical one is moved from its
+        // left-flushed position to the annotated one.
+        let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
+        let donor_fwd = index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
+        let acceptor_fwd = donor_fwd + del as u64 - 1;
+        let sjdb = junction_db.and_then(|db| db.sjdb_lookup(donor_fwd, acceptor_fwd));
+        let short_sj = !is_splice && sjdb.is_some();
+        if is_splice || short_sj {
+            let (motif, is_annotated) = if let Some(meta) = sjdb {
+                if meta.motif == 0 {
+                    let shift = i32::from(meta.shift_left);
+                    if eff_length as i32 <= shift || prev_match_len <= shift {
+                        return None; // -1000006
+                    }
+                    // Forward-genome "right" is SA-space left for a reverse cluster.
+                    jr_shift += if cluster.is_reverse { -shift } else { shift };
+                    // jR shifted past the end of B (STAR: rAend+jR >= rBend).
+                    if jr_shift >= (shared + eff_length) as i32 || prev_match_len + jr_shift < 1 {
+                        return None;
+                    }
+                }
+                (jj_l, jj_r) = if cluster.is_reverse {
+                    (u32::from(meta.shift_right), u32::from(meta.shift_left))
+                } else {
+                    (u32::from(meta.shift_left), u32::from(meta.shift_right))
+                };
+                (
+                    crate::align::score::SpliceMotif::from_star_code(meta.motif),
+                    true,
+                )
+            } else {
+                // Junction db without sjdb metadata (e.g. raw GTF coordinates).
+                let annotated = junction_db.is_some_and(|db| {
+                    (0..=2).any(|s| db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, s))
+                });
+                (motif, annotated)
+            };
+
+            // Check stitch mismatch limit (STAR uses the final, possibly sjdb, motif)
             if !scorer.stitch_mismatch_allowed(&motif, gap_mm) {
                 return None;
             }
-
-            let is_annotated = junction_db.is_some_and(|db| {
-                let junc_donor_sa = (donor_sa as i64 + jr_shift as i64) as u64;
-                let donor_fwd =
-                    index.sa_pos_to_forward(junc_donor_sa, cluster.is_reverse, del as usize);
-                let acceptor_fwd = donor_fwd + del as u64 - 1;
-                db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 0)
-                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 1)
-                    || db.is_annotated(cluster.chr_idx, donor_fwd, acceptor_fwd, 2)
-            });
 
             if is_annotated {
                 d_score += scorer.sjdb_score;
@@ -1554,6 +1583,9 @@ fn stitch_align_to_transcript(
             new_wt.n_junction += 1;
             new_wt.junction_motifs.push(motif);
             new_wt.junction_annotated.push(is_annotated);
+            new_wt
+                .junction_strands
+                .push(sjdb.map_or_else(|| motif.star_strand(), |m| m.strand));
             new_wt.junction_shifts.push((jj_l, jj_r));
         } else {
             // Deletion gap scoring
@@ -1583,6 +1615,7 @@ fn stitch_align_to_transcript(
             genome_start: b_genome_start,
             genome_end: b_genome_start + b_len as u64,
             mate_id: wa.mate_id,
+            sj_short: short_sj,
         });
     } else {
         // Insertion: read_gap > genome_gap
@@ -1627,10 +1660,9 @@ fn stitch_align_to_transcript(
                     }
                 }
 
-                // STAR default (alignInsertionFlush=None): strict > only.
-                // First maximum wins = leftmost insertion in current coordinate space.
-                // For flushRight mode (not yet implemented): Score1 >= maxScore1.
-                if score1 > max_score1 {
+                // STAR: strict > by default (first maximum = leftmost insertion);
+                // `--alignInsertionFlush Right` also takes ties (>=).
+                if score1 > max_score1 || (score1 == max_score1 && scorer.insertion_flush_right) {
                     max_score1 = score1;
                     jr = jr1 as i32;
                 }
@@ -1667,6 +1699,32 @@ fn stitch_align_to_transcript(
         }
         // shared == 0: simple insertion, no scanning needed, jr stays 0
 
+        // STAR stitchAlignToTranscript.cpp:293-301: flush the insertion right as
+        // far as the read keeps matching the genome. The bases it moves past were
+        // already scored as matches on the B side, so the score is unchanged.
+        if scorer.insertion_flush_right {
+            let genome_offset: u64 = if cluster.is_reverse {
+                index.genome.n_genome
+            } else {
+                0
+            };
+            // STAR: jR < rBend - rAend - Ins, i.e. B keeps at least one base.
+            let jr_limit = (eff_read_pos + eff_length - last_exon.read_end - ins) as i32;
+            while jr < jr_limit {
+                let r = read_seq[last_exon.read_end + jr as usize];
+                let g = index
+                    .genome
+                    .get_base(last_exon.genome_end + jr as u64 + genome_offset);
+                if g.is_none_or(|g| g == 4 || g != r) {
+                    break;
+                }
+                jr += 1;
+            }
+            if jr == jr_limit {
+                return None; // -1000009: nothing left of the B piece
+            }
+        }
+
         let ins_score = scorer.score_ins_open + scorer.score_ins_base * ins as i32;
         d_score += ins_score;
         new_wt.n_gap += 1;
@@ -1692,14 +1750,16 @@ fn stitch_align_to_transcript(
             genome_start: b_genome_start,
             genome_end: eff_genome_pos + eff_length as u64,
             mate_id: wa.mate_id,
+            sj_short: false,
         });
     }
 
     // Mismatch limit check
     let total_mm = new_wt.n_mismatch + gap_mm;
-    let total_len = new_wt.read_end.max(eff_read_pos + eff_length) - new_wt.read_start;
-    let mm_limit = ((scorer.p_mm_max * total_len as f64) as u32).min(scorer.n_mm_max);
-    if total_mm > mm_limit {
+    // STAR stitchAlignToTranscript.cpp:312: trA->nMM + nMM <= outFilterMismatchNmaxTotal.
+    // The per-length ratio (outFilterMismatchNoverLmax) is not applied while
+    // stitching; mappedFilter applies it to the final alignment.
+    if total_mm > scorer.mismatch_nmax_total(read_seq) {
         return None;
     }
 
@@ -1716,6 +1776,7 @@ fn stitch_align_to_transcript(
     if wa.is_anchor {
         new_wt.n_anchor += 1;
     }
+    new_wt.last_sj_a = wa.sj_a;
 
     Some(new_wt)
 }
@@ -1865,7 +1926,7 @@ pub(crate) fn finalize_transcript(
                 alignment_start,
                 wt.n_mismatch,
                 transcript_len,
-                scorer.n_mm_max,
+                scorer.mismatch_nmax_total(read_seq),
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
@@ -1884,7 +1945,7 @@ pub(crate) fn finalize_transcript(
                 read_seq.len() - alignment_end,
                 wt.n_mismatch + left.n_mismatch,
                 transcript_len_after_first,
-                scorer.n_mm_max,
+                scorer.mismatch_nmax_total(read_seq),
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
@@ -1905,7 +1966,7 @@ pub(crate) fn finalize_transcript(
                 read_seq.len() - alignment_end,
                 wt.n_mismatch,
                 transcript_len,
-                scorer.n_mm_max,
+                scorer.mismatch_nmax_total(read_seq),
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
@@ -1924,7 +1985,7 @@ pub(crate) fn finalize_transcript(
                 alignment_start,
                 wt.n_mismatch + right.n_mismatch,
                 transcript_len_after_first,
-                scorer.n_mm_max,
+                scorer.mismatch_nmax_total(read_seq),
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
@@ -1942,72 +2003,8 @@ pub(crate) fn finalize_transcript(
         return None;
     }
 
-    // STAR finalization check: exon lengths including repeat lengths (shiftSJ)
-    // For non-annotated junctions: exon_len >= alignSJoverhangMin + shiftSJ[side]
-    // For annotated junctions: exon_len >= alignSJDBoverhangMin
-    // The first exon length includes left extension, last exon includes right extension.
-    if wt.n_junction > 0 {
-        let mut junction_idx = 0usize;
-        for (isj, exon) in wt.exons.iter().enumerate() {
-            if isj >= wt.exons.len() - 1 {
-                break;
-            }
-            // Check if this gap between exon[isj] and exon[isj+1] is a junction
-            let next_exon = &wt.exons[isj + 1];
-            let genome_gap = next_exon.genome_start as i64 - exon.genome_end as i64;
-            let read_gap = next_exon.read_start as i64 - exon.read_end as i64;
-            let del = genome_gap - read_gap.max(0);
-            if del >= scorer.align_intron_min as i64 && junction_idx < wt.junction_shifts.len() {
-                // This is a junction — check exon lengths with repeat
-                let (shift_l, shift_r) = wt.junction_shifts[junction_idx];
-                let is_annotated = wt.junction_annotated[junction_idx];
-
-                // Left exon length (includes left extension for first exon)
-                let left_exon_len = if isj == 0 {
-                    (exon.read_end - exon.read_start) + left_extend.extend_len
-                } else {
-                    exon.read_end - exon.read_start
-                };
-
-                // Right exon length (includes right extension for last exon)
-                let right_exon_len = if isj + 1 == wt.exons.len() - 1 {
-                    (next_exon.read_end - next_exon.read_start) + right_extend.extend_len
-                } else {
-                    next_exon.read_end - next_exon.read_start
-                };
-
-                if is_annotated {
-                    let min_oh = scorer.align_sjdb_overhang_min as usize;
-                    if left_exon_len < min_oh || right_exon_len < min_oh {
-                        return None;
-                    }
-                } else {
-                    let min_oh_l = scorer.align_sj_overhang_min as usize + shift_l as usize;
-                    let min_oh_r = scorer.align_sj_overhang_min as usize + shift_r as usize;
-                    if left_exon_len < min_oh_l || right_exon_len < min_oh_r {
-                        return None;
-                    }
-                }
-                junction_idx += 1;
-            }
-        }
-    }
-
-    // STAR check: spliced mates must have mapped length >= alignSplicedMateMapLmin
-    // and >= alignSplicedMateMapLminOverLmate * readLength
-    if wt.n_junction > 0 {
-        let total_mapped =
-            left_extend.extend_len + (alignment_end - alignment_start) + right_extend.extend_len;
-        let min_from_fraction =
-            (scorer.align_spliced_mate_map_lmin_over_lmate * read_seq.len() as f64) as usize;
-        let min_mapped = std::cmp::max(
-            scorer.align_spliced_mate_map_lmin as usize,
-            min_from_fraction,
-        );
-        if total_mapped < min_mapped {
-            return None;
-        }
-    }
+    // Junction overhangs and spliced-mate mapped length are checked when the
+    // window records the transcript (`star_record_checks`), as in STAR.
 
     use cigar::op::{Kind, Op};
 
@@ -2049,8 +2046,9 @@ pub(crate) fn finalize_transcript(
                     append_match(&mut final_cigar, shared);
                 }
                 let del = (genome_gap - read_gap.max(0)) as usize;
-                if del >= scorer.align_intron_min as usize
-                    && del <= scorer.align_intron_max as usize
+                if exon.sj_short
+                    || (del >= scorer.align_intron_min as usize
+                        && del <= scorer.align_intron_max as usize)
                 {
                     final_cigar.push(Op::new(Kind::Skip, del));
                 } else {
@@ -2204,6 +2202,10 @@ pub(crate) fn finalize_transcript(
     let final_score = (adjusted_score + length_penalty).max(0);
 
     Some(Transcript {
+        nmm: wt.n_mismatch + left_extend.n_mismatch + right_extend.n_mismatch,
+        junction_strands: wt.junction_strands.clone(),
+        out_order: 0,
+        g_length: wt.g_length,
         chr_idx: cluster.chr_idx,
         genome_start: t_genome_start,
         genome_end: t_genome_end,
@@ -2217,6 +2219,218 @@ pub(crate) fn finalize_transcript(
         junction_motifs: wt.junction_motifs.clone(),
         junction_annotated: wt.junction_annotated.clone(),
     })
+}
+
+/// Kind of gap between two consecutive exons of a working transcript, as in
+/// STAR's `canonSJ` (>=0 junction, -1 deletion, -2 insertion, -3 mate gap).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExonGap {
+    /// Index into the per-junction vectors (`junction_*`).
+    Junction(usize),
+    Indel,
+    Mates,
+}
+
+fn exon_gaps(wt: &WorkingTranscript, scorer: &AlignmentScorer) -> Vec<ExonGap> {
+    let mut gaps = Vec::with_capacity(wt.exons.len().saturating_sub(1));
+    let mut junction_idx = 0usize;
+    for pair in wt.exons.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.mate_id != b.mate_id && a.mate_id != 2 && b.mate_id != 2 {
+            gaps.push(ExonGap::Mates);
+            continue;
+        }
+        let genome_gap = b.genome_start as i64 - a.genome_end as i64;
+        let read_gap = b.read_start as i64 - a.read_end as i64;
+        let del = genome_gap - read_gap.max(0);
+        if (del >= scorer.align_intron_min as i64 || b.sj_short)
+            && junction_idx < wt.junction_shifts.len()
+        {
+            gaps.push(ExonGap::Junction(junction_idx));
+            junction_idx += 1;
+        } else {
+            gaps.push(ExonGap::Indel);
+        }
+    }
+    gaps
+}
+
+/// The checks of STAR's `stitchWindowAligns` that reject a finished transcript
+/// before it is recorded: exon overhangs around junctions (annotated ones only
+/// when the short exon is not anchored by another annotated junction or an
+/// indel, `:96-108`) and the per-mate mapped length of spliced mates (`:155-166`).
+fn star_record_checks(wt: &WorkingTranscript, scorer: &AlignmentScorer, read_seq: &[u8]) -> bool {
+    let gaps = exon_gaps(wt, scorer);
+    if !mates_consistent(wt, &gaps, read_seq.len()) {
+        return false;
+    }
+    if wt.n_junction == 0 {
+        return true;
+    }
+    let len = |i: usize| wt.exons[i].read_end - wt.exons[i].read_start;
+    let sjdb_min = scorer.align_sjdb_overhang_min as usize;
+    let sj_min = scorer.align_sj_overhang_min as usize;
+    // "Anchors nothing": the transcript end, a mate gap, or an unannotated junction.
+    let weak = |g: Option<&ExonGap>| match g {
+        None | Some(ExonGap::Mates) => true,
+        Some(ExonGap::Junction(j)) => !wt.junction_annotated[*j],
+        Some(ExonGap::Indel) => false,
+    };
+    let n = wt.exons.len();
+    for isj in 0..gaps.len() {
+        let ExonGap::Junction(j) = gaps[isj] else {
+            continue;
+        };
+        if wt.junction_annotated[j] {
+            let prev = isj.checked_sub(1).map(|i| &gaps[i]);
+            if (len(isj) < sjdb_min && weak(prev))
+                || (len(isj + 1) < sjdb_min && weak(gaps.get(isj + 1)))
+            {
+                return false;
+            }
+        } else {
+            let (shift_l, shift_r) = wt.junction_shifts[j];
+            if len(isj) < sj_min + shift_l as usize || len(isj + 1) < sj_min + shift_r as usize {
+                return false;
+            }
+        }
+    }
+    if let Some(ExonGap::Junction(j)) = gaps.last()
+        && wt.junction_annotated[*j]
+        && len(n - 1) < sjdb_min
+    {
+        return false;
+    }
+
+    // Mapped length of each spliced mate. A paired stitch read is
+    // `[mate | spacer | mate]`; the mate of an exon is the side of the spacer
+    // it lies on.
+    let spacer = read_seq.iter().position(|&b| b == PE_SPACER_BASE);
+    let mate_len = |read_pos: usize| match spacer {
+        Some(sp) if read_pos > sp => read_seq.len() - sp - 1,
+        Some(sp) => sp,
+        None => read_seq.len(),
+    };
+    let (mut exl, mut nsj) = (0usize, 0usize);
+    for iex in 0..n {
+        exl += len(iex);
+        let gap = gaps.get(iex);
+        if iex == n - 1 || gap == Some(&ExonGap::Mates) {
+            let lmin = (scorer.align_spliced_mate_map_lmin_over_lmate
+                * mate_len(wt.exons[iex].read_start) as f64) as usize;
+            if nsj > 0 && (exl < scorer.align_spliced_mate_map_lmin as usize || exl < lmin) {
+                return false;
+            }
+            exl = 0;
+            nsj = 0;
+        } else if matches!(gap, Some(ExonGap::Junction(_))) {
+            nsj += 1;
+        }
+    }
+    true
+}
+
+/// STAR's checks on a transcript spanning both mates (`stitchWindowAligns.cpp:58-93`):
+/// no negative insert, and where the mates overlap neither may protrude past
+/// the other and their junctions in the overlap must coincide. Exon genome
+/// coordinates are in stitch space, where the pair reads left to right.
+fn mates_consistent(wt: &WorkingTranscript, gaps: &[ExonGap], l_read: usize) -> bool {
+    let ex = &wt.exons;
+    let n = ex.len();
+    if n < 2 || ex[0].mate_id == ex[n - 1].mate_id {
+        return true;
+    }
+    let g_end = |i: usize| ex[i].genome_end;
+    if g_end(n - 1) <= ex[0].genome_start {
+        return false; // negative insert size
+    }
+    let Some(i_m2) = gaps
+        .iter()
+        .position(|g| *g == ExonGap::Mates)
+        .map(|i| i + 1)
+    else {
+        return true;
+    };
+    if g_end(i_m2 - 1) > ex[i_m2].genome_start {
+        // Mates overlap (alignEndsProtrude nBasesMax = 0).
+        if ex[0].genome_start > ex[i_m2].genome_start + ex[0].read_start as u64 {
+            return false; // left mate starts after the right one
+        }
+        if g_end(i_m2 - 1) > ex[n - 1].genome_start + (l_read - ex[n - 1].read_start) as u64 {
+            return false; // left mate ends after the right one
+        }
+        // Junctions in the overlap must be the same in both mates.
+        let is_sj = |i: usize| matches!(gaps[i - 1], ExonGap::Junction(_));
+        let mut i1 = 1;
+        let i2_start = i_m2 + 1;
+        while i1 < i_m2 && ex[i1].genome_start < g_end(i2_start - 1) {
+            i1 += 1;
+        }
+        let mut i2 = i2_start;
+        while i1 < i_m2 && i2 < n {
+            if !is_sj(i1) {
+                i1 += 1;
+                continue;
+            }
+            if !is_sj(i2) {
+                i2 += 1;
+                continue;
+            }
+            if ex[i1].genome_start != ex[i2].genome_start || g_end(i1 - 1) != g_end(i2 - 1) {
+                return false;
+            }
+            i1 += 1;
+            i2 += 1;
+        }
+    }
+    true
+}
+
+/// STAR's window bookkeeping for a finished transcript
+/// (`stitchWindowAligns.cpp:206-268`): drop it if its aligned bases are all
+/// covered by a better transcript, remove recorded transcripts whose bases it
+/// covers, and insert it in (score desc, genomic length asc) order, keeping at
+/// most `max_transcripts`.
+fn record_window_transcript(
+    transcripts: &mut Vec<WorkingTranscript>,
+    wt: WorkingTranscript,
+    max_transcripts: usize,
+    ranked: impl Fn(&WorkingTranscript) -> i32,
+) {
+    let mapped = |t: &WorkingTranscript| -> u32 {
+        t.exons
+            .iter()
+            .map(|e| (e.read_end - e.read_start) as u32)
+            .sum()
+    };
+    let score = ranked(&wt);
+    let wt_mapped = mapped(&wt);
+    let mut i = 0;
+    while i < transcripts.len() {
+        let overlap = blocks_overlap(&wt.exons, &transcripts[i].exons);
+        let u_new = wt_mapped.saturating_sub(overlap);
+        let u_old = mapped(&transcripts[i]).saturating_sub(overlap);
+        let old_score = ranked(&transcripts[i]);
+        if u_new == 0 && score < old_score {
+            return; // covered by a better transcript
+        } else if u_old == 0 {
+            transcripts.remove(i); // covered by the new one
+        } else {
+            i += 1;
+        }
+    }
+    let g_len = |t: &WorkingTranscript| t.g_length;
+    let pos = transcripts
+        .iter()
+        .position(|t| {
+            let s = ranked(t);
+            score > s || (score == s && g_len(&wt) < g_len(t))
+        })
+        .unwrap_or(transcripts.len());
+    if pos < max_transcripts {
+        transcripts.insert(pos, wt);
+        transcripts.truncate(max_transcripts);
+    }
 }
 
 /// Recursive include/exclude stitcher (STAR's stitchWindowAligns).
@@ -2280,7 +2494,7 @@ fn stitch_recurse(
                         wt.read_start,
                         wt.n_mismatch,
                         wt.read_end - wt.read_start,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(read_seq),
                         scorer.p_mm_max,
                         index,
                         cluster.is_reverse,
@@ -2300,7 +2514,7 @@ fn stitch_recurse(
                         read_seq.len() - wt.read_end,
                         wt.n_mismatch,
                         wt.read_end - wt.read_start,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(read_seq),
                         scorer.p_mm_max,
                         index,
                         cluster.is_reverse,
@@ -2326,7 +2540,7 @@ fn stitch_recurse(
                         read_seq.len() - read_end_after,
                         mm_after_first,
                         len_after_first,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(read_seq),
                         scorer.p_mm_max,
                         index,
                         cluster.is_reverse,
@@ -2347,7 +2561,7 @@ fn stitch_recurse(
                         read_start_after,
                         mm_after_first,
                         len_after_first,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(read_seq),
                         scorer.p_mm_max,
                         index,
                         cluster.is_reverse,
@@ -2403,66 +2617,30 @@ fn stitch_recurse(
             // window's dedup (`stitchWindowAligns.cpp:146-180` vs `:337-381`): a
             // rejected transcript must not evict one it covers. For a pair the
             // junctions of both mates are on this one transcript.
-            if !scorer
-                .intron_filter
-                .passes(wt.junction_motifs.iter().zip(wt.junction_annotated.iter()))
-            {
+            if !scorer.intron_filter.passes(
+                wt.junction_motifs.iter().zip(wt.junction_annotated.iter()),
+                wt.junction_strands.iter().copied(),
+            ) {
                 return;
             }
 
-            // Dedup via blocks_overlap: drop if subset of existing higher-score transcript.
-            // Use same_structure guard: only dedup transcripts with same number of exon
-            // blocks. A non-spliced path should never be killed by a spliced one here
-            // because the spliced path may still be rejected by finalize_transcript
-            // (overhang check), leaving no valid transcript. STAR-faithful dedup of
-            // spliced-vs-unspliced is handled post-finalization below.
-            let mut dominated = false;
-            let mut remove_indices = Vec::new();
-            for (idx, existing) in transcripts.iter().enumerate() {
-                let overlap = blocks_overlap(&wt.exons, &existing.exons);
-                let wt_len: u32 = wt
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum();
-                let ex_len: u32 = existing
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum();
-
-                // Only dedup transcripts with same number of exon blocks (junctions).
-                let same_structure = wt.exons.len() == existing.exons.len();
-                if same_structure && overlap >= wt_len && existing.score >= wt.score {
-                    dominated = true;
-                    break;
-                }
-                if same_structure && overlap >= ex_len && wt.score >= existing.score {
-                    remove_indices.push(idx);
-                }
+            // STAR checks exon overhangs and per-mate mapped length here too,
+            // before recording (`stitchWindowAligns.cpp:96-108,155-166`), so a
+            // transcript finalize would reject never evicts one it covers.
+            // STAR: gLength = tG2 + 1 - gStart, the end of the last exon minus
+            // the start of the first, both after the extensions
+            // (stitchWindowAligns.cpp:94; tG2 moves with the 3' extension).
+            wt.g_length = wt.genome_end - wt.genome_start;
+            if !star_record_checks(&wt, scorer, read_seq) {
+                return;
             }
 
-            if !dominated {
-                // Remove subsets (iterate in reverse to preserve indices)
-                for &idx in remove_indices.iter().rev() {
-                    transcripts.swap_remove(idx);
-                }
-                if transcripts.len() < max_transcripts {
-                    transcripts.push(wt);
-                } else if let Some(worst_idx) = transcripts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, t)| t.score)
-                    .filter(|(_, t)| t.score < wt.score)
-                    .map(|(i, _)| i)
-                {
-                    // STAR-faithful eviction: keep the N best transcripts.
-                    // If the new WT scores better than the current worst, evict
-                    // the worst and insert the new one.
-                    transcripts.swap_remove(worst_idx);
-                    transcripts.push(wt);
-                }
-            }
+            // STAR records with `Score` after the genomic-length penalty
+            // (stitchWindowAligns.cpp:185-189) and dedups by covered bases.
+            let ranked = |t: &WorkingTranscript| {
+                (t.score + scorer.genomic_length_penalty(t.genome_end - t.genome_start)).max(0)
+            };
+            record_window_transcript(transcripts, wt, max_transcripts, ranked);
         }
         return;
     }
@@ -2479,8 +2657,10 @@ fn stitch_recurse(
             genome_start: wa.sa_pos,
             genome_end: wa.sa_pos + wa.length as u64,
             mate_id: wa.mate_id,
+            sj_short: false,
         });
         new_wt.score = wa.length as i32;
+        new_wt.last_sj_a = wa.sj_a;
         new_wt.read_start = wa.read_pos;
         new_wt.read_end = wa.read_pos + wa.length;
         new_wt.genome_start = wa.sa_pos;
@@ -2654,6 +2834,8 @@ pub(crate) fn split_combined_wt(
     let mut m1_jm: Vec<crate::align::score::SpliceMotif> = Vec::new();
     let mut m1_ja: Vec<bool> = Vec::new();
     let mut m1_js: Vec<(u32, u32)> = Vec::new();
+    let mut m1_jst: Vec<u8> = Vec::new();
+    let mut m2_jst: Vec<u8> = Vec::new();
     let mut m2_jm: Vec<crate::align::score::SpliceMotif> = Vec::new();
     let mut m2_ja: Vec<bool> = Vec::new();
     let mut m2_js: Vec<(u32, u32)> = Vec::new();
@@ -2682,17 +2864,19 @@ pub(crate) fn split_combined_wt(
             let genome_gap = next.genome_start as i64 - ex.genome_end as i64;
             let read_gap = next.read_start as i64 - ex.read_end as i64;
             let del = genome_gap - read_gap.max(0);
-            if del >= align_intron_min as i64 && ex.mate_id == next.mate_id {
+            if (del >= align_intron_min as i64 || next.sj_short) && ex.mate_id == next.mate_id {
                 // Intra-mate splice junction: assign to the owning mate
                 if junction_idx < wt.junction_motifs.len() {
                     if ex.mate_id == 0 {
                         m1_jm.push(wt.junction_motifs[junction_idx]);
                         m1_ja.push(wt.junction_annotated[junction_idx]);
                         m1_js.push(wt.junction_shifts[junction_idx]);
+                        m1_jst.push(wt.junction_strands[junction_idx]);
                     } else if ex.mate_id == 1 {
                         m2_jm.push(wt.junction_motifs[junction_idx]);
                         m2_ja.push(wt.junction_annotated[junction_idx]);
                         m2_js.push(wt.junction_shifts[junction_idx]);
+                        m2_jst.push(wt.junction_strands[junction_idx]);
                     }
                     junction_idx += 1;
                 }
@@ -2754,8 +2938,11 @@ pub(crate) fn split_combined_wt(
             n_junction: m1_jm.len() as u32,
             junction_motifs: m1_jm,
             junction_annotated: m1_ja,
+            junction_strands: m1_jst,
             junction_shifts: m1_js,
             n_anchor: 0,
+            last_sj_a: None,
+            g_length: wt.g_length,
             read_start: m1_read_start,
             read_end: m1_read_end,
             genome_start: m1_genome_start,
@@ -2769,8 +2956,11 @@ pub(crate) fn split_combined_wt(
             n_junction: m2_jm.len() as u32,
             junction_motifs: m2_jm,
             junction_annotated: m2_ja,
+            junction_strands: m2_jst,
             junction_shifts: m2_js,
             n_anchor: 0,
+            last_sj_a: None,
+            g_length: wt.g_length,
             read_start: m2_read_start,
             read_end: m2_read_end,
             genome_start: m2_genome_start,
@@ -2827,84 +3017,9 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
         }
     }
 
-    // STAR-faithful post-finalization dedup (stitchWindowAligns.cpp lines 337-355):
-    // After finalization, drop transcripts that are fully covered by a higher-scored one.
-    // This removes spurious unspliced secondaries that are subsets of spliced primaries.
-    // Performed AFTER finalize so only valid transcripts (passed overhang checks) participate.
-    {
-        // Compute overlap between two finalized Exon slices (same diagonal + read-space).
-        let exon_overlap =
-            |a: &[crate::align::transcript::Exon], b: &[crate::align::transcript::Exon]| -> u32 {
-                let mut ov = 0u32;
-                let mut i = 0;
-                let mut j = 0;
-                while i < a.len() && j < b.len() {
-                    let diag_a = a[i].genome_start as i64 - a[i].read_start as i64;
-                    let diag_b = b[j].genome_start as i64 - b[j].read_start as i64;
-                    if diag_a == diag_b {
-                        let r_start = a[i].read_start.max(b[j].read_start);
-                        let r_end = a[i].read_end.min(b[j].read_end);
-                        if r_start < r_end {
-                            ov += (r_end - r_start) as u32;
-                        }
-                    }
-                    if a[i].read_end <= b[j].read_end {
-                        i += 1;
-                    } else {
-                        j += 1;
-                    }
-                }
-                ov
-            };
-
-        let mut keep = vec![true; transcripts.len()];
-        for i in 0..transcripts.len() {
-            if !keep[i] {
-                continue;
-            }
-            for j in 0..transcripts.len() {
-                if i == j || !keep[j] {
-                    continue;
-                }
-                let overlap = exon_overlap(&transcripts[i].exons, &transcripts[j].exons);
-                let len_i: u32 = transcripts[i]
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum();
-                let len_j: u32 = transcripts[j]
-                    .exons
-                    .iter()
-                    .map(|e| (e.read_end - e.read_start) as u32)
-                    .sum();
-                let u_i = len_i.saturating_sub(overlap);
-                let u_j = len_j.saturating_sub(overlap);
-
-                if u_i == 0 && transcripts[i].score < transcripts[j].score {
-                    // i is fully covered by j AND has strictly worse score → i is redundant
-                    keep[i] = false;
-                    break;
-                } else if u_j == 0 && transcripts[j].score < transcripts[i].score {
-                    // j is fully covered by i AND has strictly worse score → j is redundant
-                    keep[j] = false;
-                }
-            }
-        }
-        let mut out = Vec::with_capacity(transcripts.len());
-        for (i, t) in transcripts.into_iter().enumerate() {
-            if keep[i] {
-                out.push(t);
-            }
-        }
-        transcripts = out;
-    }
-
-    // Sort by score descending, then shorter genomic span (STAR's gLength tiebreaker).
-    transcripts.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then((a.genome_end - a.genome_start).cmp(&(b.genome_end - b.genome_start)))
-    });
+    // STAR's window order: score descending, then smaller gLength; stable, so
+    // equal ones keep their recording order.
+    transcripts.sort_by(|a, b| b.score.cmp(&a.score).then(a.g_length.cmp(&b.g_length)));
     transcripts.truncate(max_transcripts_per_window);
 
     transcripts
@@ -2930,73 +3045,7 @@ pub(crate) fn stitch_seeds_core(
     // (at least one anchor must be included) prevents transcripts composed entirely
     // of repetitive seeds, matching STAR's WA_Anchor=2 "last anchor" logic.
     let mut wa_entries: Vec<WindowAlignment> = cluster.alignments.clone();
-
-    // Diagonal dedup: for each diagonal (genome_pos - ps_rstart), merge overlapping
-    // seeds into intervals, keeping only the longest seed per merged interval.
-    // This prevents combinatorial explosion in the recursive stitcher when many
-    // redundant seeds cover the same diagonal region.
-    // Uses positive-strand coordinates consistent with cluster_seeds overlap detection.
-    {
-        use rustc_hash::{FxHashMap, FxHashSet};
-        let read_len = read_seq.len();
-        let is_rev = cluster.is_reverse;
-        // For each (diagonal, mate_id) pair, find the longest seed per merged interval.
-        // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] before overlap test:
-        // seeds from different fragments are never treated as duplicates.
-        type DiagMateKey = (i64, u8);
-        type DiagSeeds = Vec<(usize, usize, usize)>;
-        let mut diag_seeds: FxHashMap<DiagMateKey, DiagSeeds> = FxHashMap::default();
-        for (idx, wa) in wa_entries.iter().enumerate() {
-            let ps = if is_rev {
-                read_len - (wa.length + wa.read_pos)
-            } else {
-                wa.read_pos
-            };
-            let diag = wa.genome_pos as i64 - ps as i64;
-            diag_seeds
-                .entry((diag, wa.mate_id))
-                .or_default()
-                .push((ps, ps + wa.length, idx));
-        }
-
-        let mut keep_indices = FxHashSet::default();
-        for (_diag, mut seeds) in diag_seeds {
-            // Sort by start position
-            seeds.sort_unstable();
-            // Merge intervals, keeping the index of the longest seed in each merged group
-            let mut merged_end = seeds[0].1;
-            let mut best_idx = seeds[0].2;
-            let mut best_len = seeds[0].1 - seeds[0].0;
-
-            for &(s, e, idx) in &seeds[1..] {
-                if s <= merged_end {
-                    // Overlapping — extend and track longest
-                    merged_end = merged_end.max(e);
-                    let len = e - s;
-                    if len > best_len {
-                        best_len = len;
-                        best_idx = idx;
-                    }
-                } else {
-                    // New interval — commit previous best
-                    keep_indices.insert(best_idx);
-                    merged_end = e;
-                    best_len = e - s;
-                    best_idx = idx;
-                }
-            }
-            // Commit last group
-            keep_indices.insert(best_idx);
-        }
-
-        // Retain only the kept indices
-        let mut idx = 0usize;
-        wa_entries.retain(|_| {
-            let keep = keep_indices.contains(&idx);
-            idx += 1;
-            keep
-        });
-    }
+    // STAR stitches the window's WA list as is: no diagonal dedup.
 
     // STAR-faithful coordinate conversion for stitching:
     // STAR stores WA_gStart in FORWARD genome coordinates (converting RC positions via
@@ -3042,7 +3091,7 @@ pub(crate) fn stitch_seeds_core(
     // Sort ascending by read_pos (positive-strand coordinates after conversion).
     // STAR's WA array is sorted by aRstart (positive-strand read position, ascending).
     // With forward genome coords, gaps are computed correctly for both strands.
-    wa_entries.sort_by(|a, b| a.read_pos.cmp(&b.read_pos).then(b.length.cmp(&a.length)));
+    wa_entries.sort_by_key(|wa| wa.read_pos); // stable: STAR keeps insertion order among equal rStart
 
     // Cap entries to prevent exponential blowup in the recursive stitcher.
     // With anchor-only filtering, this limit is rarely hit, but keep as a safety net.
@@ -3050,7 +3099,7 @@ pub(crate) fn stitch_seeds_core(
     if wa_entries.len() > MAX_WA_ENTRIES {
         wa_entries.sort_by_key(|wa| std::cmp::Reverse(wa.length));
         wa_entries.truncate(MAX_WA_ENTRIES);
-        wa_entries.sort_by(|a, b| a.read_pos.cmp(&b.read_pos).then(b.length.cmp(&a.length)));
+        wa_entries.sort_by_key(|wa| wa.read_pos); // stable: STAR keeps insertion order among equal rStart
     }
 
     if wa_entries.is_empty() {
@@ -3110,7 +3159,7 @@ pub(crate) fn stitch_seeds_core(
                         wa.read_pos,
                         0,
                         wa.length,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(stitch_read),
                         scorer.p_mm_max,
                         index,
                         false,
@@ -3129,7 +3178,7 @@ pub(crate) fn stitch_seeds_core(
                         stitch_read.len() - right_start,
                         left.n_mismatch,
                         right_len_prev,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(stitch_read),
                         scorer.p_mm_max,
                         index,
                         false,
@@ -3150,7 +3199,7 @@ pub(crate) fn stitch_seeds_core(
                         stitch_read.len() - right_start,
                         0,
                         wa.length,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(stitch_read),
                         scorer.p_mm_max,
                         index,
                         false,
@@ -3169,7 +3218,7 @@ pub(crate) fn stitch_seeds_core(
                         wa.read_pos,
                         right.n_mismatch,
                         left_len_prev,
-                        scorer.n_mm_max,
+                        scorer.mismatch_nmax_total(stitch_read),
                         scorer.p_mm_max,
                         index,
                         false,
@@ -3294,6 +3343,7 @@ mod tests {
             genome_start: 1_000,
             genome_end: 1_060,
             mate_id: 1,
+            sj_short: false,
         });
         wt.read_start = 61;
         wt.read_end = 121;
@@ -3317,6 +3367,53 @@ mod tests {
     }
 
     /// The mate that already starts at 0 must come through byte-identical.
+    fn wt_of(exons: &[(usize, usize, u64)], score: i32) -> WorkingTranscript {
+        let mut wt = WorkingTranscript::new();
+        for &(rs, re, gs) in exons {
+            wt.exons.push(ExonBlock {
+                read_start: rs,
+                read_end: re,
+                genome_start: gs,
+                genome_end: gs + (re - rs) as u64,
+                mate_id: 2,
+                sj_short: false,
+            });
+        }
+        wt.score = score;
+        wt.genome_start = wt.exons[0].genome_start;
+        wt.genome_end = wt.exons.last().unwrap().genome_end;
+        wt
+    }
+
+    /// STAR's window recording (stitchWindowAligns.cpp:206-268): a transcript
+    /// whose bases are all covered by a better one is dropped, recorded
+    /// transcripts it covers are removed whatever their score, and the rest
+    /// stay sorted by score.
+    #[test]
+    fn record_window_transcript_follows_star() {
+        let rank = |t: &WorkingTranscript| t.score;
+        let mut trs = Vec::new();
+        record_window_transcript(&mut trs, wt_of(&[(0, 100, 1000)], 100), 10, rank);
+        // Covered by the 100M and worse: dropped.
+        record_window_transcript(&mut trs, wt_of(&[(10, 90, 1010)], 80), 10, rank);
+        assert_eq!(trs.len(), 1);
+        // Elsewhere, worse: kept after the best.
+        record_window_transcript(&mut trs, wt_of(&[(0, 60, 9000)], 60), 10, rank);
+        assert_eq!(trs.iter().map(|t| t.score).collect::<Vec<_>>(), [100, 60]);
+        // A spliced transcript covering the 100M's bases removes it even
+        // though it scores lower (STAR's uOld == 0 branch).
+        record_window_transcript(
+            &mut trs,
+            wt_of(&[(0, 100, 1000), (100, 140, 5000)], 95),
+            10,
+            rank,
+        );
+        assert_eq!(trs.iter().map(|t| t.score).collect::<Vec<_>>(), [95, 60]);
+        // Capacity: the worst falls off.
+        record_window_transcript(&mut trs, wt_of(&[(0, 50, 20000)], 70), 2, rank);
+        assert_eq!(trs.iter().map(|t| t.score).collect::<Vec<_>>(), [95, 70]);
+    }
+
     #[test]
     fn rebase_single_mate_wt_is_identity_at_offset_zero() {
         let mut wt = WorkingTranscript::new();
@@ -3326,6 +3423,7 @@ mod tests {
             genome_start: 500,
             genome_end: 560,
             mate_id: 0,
+            sj_short: false,
         });
         wt.read_start = 0;
         wt.read_end = 60;
@@ -3457,6 +3555,7 @@ mod tests {
                 is_anchor: true,
                 mate_id: 2,
                 pre_ext_score: 5,
+                sj_a: None,
             },
             WindowAlignment {
                 seed_idx: 1,
@@ -3468,6 +3567,7 @@ mod tests {
                 is_anchor: true,
                 mate_id: 2,
                 pre_ext_score: 5,
+                sj_a: None,
             },
         ];
 
@@ -3747,6 +3847,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -3757,6 +3858,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: crate::align::score::IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Left overhang (prev.length) = 3, below min of 5
@@ -3792,6 +3894,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -3802,6 +3905,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: crate::align::score::IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Both overhangs >= 5

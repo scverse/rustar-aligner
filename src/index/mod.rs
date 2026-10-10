@@ -3,6 +3,7 @@ pub mod packed_array;
 pub mod packed_stream;
 pub mod sa_build;
 pub mod sa_index;
+pub mod sjdb_otf;
 pub mod suffix_array;
 
 use std::fs;
@@ -282,6 +283,9 @@ impl GenomeIndex {
         let n_genome_real = genome.n_genome;
 
         let mut raw: Vec<(usize, u64, u64, u8)> = Vec::new();
+        // Junctions before `n_gtf` come from the GTF (STAR priority 20), the
+        // rest from sjdbFileChrStartEnd (priority 10).
+        let mut n_gtf = 0usize;
         let mut transcriptome = None;
 
         if let Some(ref gtf_path) = params.sjdb_gtf_file {
@@ -313,6 +317,7 @@ impl GenomeIndex {
             )?;
             log::info!("Extracted {} annotated junctions from GTF", gtf_raw.len());
             raw.extend(gtf_raw);
+            n_gtf = raw.len();
             transcriptome = Some(tr);
         }
 
@@ -329,20 +334,22 @@ impl GenomeIndex {
         }
 
         let (junction_db, prepared_junctions) = if !raw.is_empty() {
-            let jdb = SpliceJunctionDb::from_raw_junctions(&raw);
-
             let prepared: Vec<PreparedJunction> = raw
                 .iter()
-                .map(|&(chr_idx, intron_start, intron_end, strand)| {
-                    sjdb_insert::prepare_junction(
-                        chr_idx,
-                        intron_start,
-                        intron_end,
-                        strand,
-                        &genome,
-                        n_genome_real,
-                    )
-                })
+                .enumerate()
+                .map(
+                    |(i, &(chr_idx, intron_start, intron_end, strand))| PreparedJunction {
+                        priority: if i < n_gtf { 20 } else { 10 },
+                        ..sjdb_insert::prepare_junction(
+                            chr_idx,
+                            intron_start,
+                            intron_end,
+                            strand,
+                            &genome,
+                            n_genome_real,
+                        )
+                    },
+                )
                 .collect();
             let prepared = sjdb_insert::sort_and_dedup(prepared);
 
@@ -361,7 +368,7 @@ impl GenomeIndex {
                 n_genome_real
             );
 
-            (jdb, prepared)
+            (SpliceJunctionDb::from_prepared(&prepared), prepared)
         } else {
             log::info!("No GTF or --sjdbFileChrStartEnd provided, all junctions will be novel");
             (SpliceJunctionDb::empty(), Vec::new())

@@ -32,8 +32,9 @@ pub fn parse_sjdb_chr_start_end(
                 continue;
             };
             let strand = match fields.get(3).and_then(|s| s.chars().next()) {
-                Some('+') => 1u8,
-                Some('-') => 2u8,
+                // STAR's sjdbLoadFromStream also takes SJ.out.tab's numeric codes.
+                Some('+' | '1') => 1u8,
+                Some('-' | '2') => 2u8,
                 _ => 0u8,
             };
             let chr_idx = chr_index(genome, fields[0], path)?;
@@ -85,6 +86,22 @@ mod tests {
 
         let raw = parse_sjdb_chr_start_end(std::slice::from_ref(&path), &genome).unwrap();
         assert_eq!(raw, vec![(0, 100, 199, 1), (1, 1050, 1149, 2)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parses_sj_out_tab_numeric_strands() {
+        // A 1st-pass SJ.out.tab, as STAR's sjdbLoadFromStream reads it.
+        let genome = tiny_genome();
+        let dir = std::env::temp_dir().join(format!("sjdb-sjout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("SJ.out.tab");
+        std::fs::write(&path, "chr1\t101\t200\t1\t1\t0\t3\t0\t30\nchr2\t51\t150\t2\t2\t0\t1\t0\t12\nchr2\t300\t400\t0\t0\t0\t1\t0\t9\n").unwrap();
+        let raw = parse_sjdb_chr_start_end(std::slice::from_ref(&path), &genome).unwrap();
+        assert_eq!(
+            raw,
+            vec![(0, 100, 199, 1), (1, 1050, 1149, 2), (1, 1299, 1399, 0)]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

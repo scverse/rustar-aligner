@@ -55,6 +55,23 @@ pub struct NovelJunctionKey {
 pub struct SpliceJunctionDb {
     /// Map: (chr_idx, intron_start, intron_end, strand) → annotated
     junctions: HashMap<JunctionKey, JunctionInfo>,
+    /// STAR's `mapGen.sjdb*` arrays, keyed on the stored `(sjdbStart, sjdbEnd)`
+    /// (`binarySearch2` in `stitchAlignToTranscript` matches on coordinates
+    /// only). Populated from prepared junctions; empty for a db built from raw
+    /// coordinates, in which case stitching falls back to `is_annotated`.
+    sjdb: HashMap<(u64, u64), SjdbMeta>,
+}
+
+/// STAR's per-junction sjdb arrays (`sjdbMotif`, `sjdbShiftLeft`,
+/// `sjdbShiftRight`, `sjdbStrand`) for one prepared junction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SjdbMeta {
+    /// STAR motif code (0 = non-canonical, 1-6 = canonical variants).
+    pub motif: u8,
+    pub shift_left: u8,
+    pub shift_right: u8,
+    /// STAR strand code (0 = unknown, 1 = +, 2 = -).
+    pub strand: u8,
 }
 
 impl SpliceJunctionDb {
@@ -62,7 +79,42 @@ impl SpliceJunctionDb {
     pub fn empty() -> Self {
         Self {
             junctions: HashMap::new(),
+            sjdb: HashMap::new(),
         }
+    }
+
+    /// Build the database from prepared (`sjdbPrepare`d) junctions, keyed on
+    /// the coordinates STAR stores in `mapGen.sjdbStart/End`: the original
+    /// coordinates for canonical motifs, the left-flushed ones for
+    /// non-canonical motifs. That is what the stitch scan looks up, since it
+    /// flushes non-canonical junctions left first.
+    pub fn from_prepared(prepared: &[sjdb_insert::PreparedJunction]) -> Self {
+        let mut db = Self::empty();
+        for j in prepared {
+            let (start, end) = (j.stored_start(), j.stored_end());
+            db.junctions.insert(
+                JunctionKey {
+                    chr_idx: j.chr_idx,
+                    intron_start: start,
+                    intron_end: end,
+                    strand: j.strand,
+                },
+                JunctionInfo { annotated: true },
+            );
+            db.sjdb.entry((start, end)).or_insert(SjdbMeta {
+                motif: j.motif,
+                shift_left: j.shift_left,
+                shift_right: j.shift_right,
+                strand: j.strand,
+            });
+        }
+        db
+    }
+
+    /// STAR's `binarySearch2(jS, jE, sjdbStart, sjdbEnd)`: the sjdb entry
+    /// whose stored intron coordinates are exactly `(start, end)`.
+    pub fn sjdb_lookup(&self, start: u64, end: u64) -> Option<SjdbMeta> {
+        self.sjdb.get(&(start, end)).copied()
     }
 
     /// Build junction database from GTF file with configurable GTF attribute names.
@@ -105,7 +157,10 @@ impl SpliceJunctionDb {
             };
             junctions.insert(key, JunctionInfo { annotated: true });
         }
-        Self { junctions }
+        Self {
+            junctions,
+            sjdb: HashMap::new(),
+        }
     }
 
     /// Check if a junction is annotated in the GTF.
@@ -324,6 +379,30 @@ mod tests {
         assert!(db.is_annotated(0, 100, 200, 1));
         assert!(db.is_annotated(0, 100, 200, 2));
         assert!(!db.is_annotated(0, 100, 200, 0)); // Unknown strand
+    }
+
+    #[test]
+    fn from_prepared_keys_on_stored_coords_with_sjdb_meta() {
+        let pj = |start_pos, end_pos, motif, shift_left| sjdb_insert::PreparedJunction {
+            chr_idx: 0,
+            start_pos,
+            end_pos,
+            motif,
+            shift_left,
+            shift_right: 1,
+            strand: 1,
+            src_strand: 1,
+            priority: 0,
+        };
+        // Canonical: stored = original (start_pos + shift_left).
+        // Non-canonical: stored = left-flushed start_pos.
+        let db = SpliceJunctionDb::from_prepared(&[pj(100, 199, 1, 2), pj(500, 599, 0, 3)]);
+        let canon = db.sjdb_lookup(102, 201).unwrap();
+        assert_eq!((canon.motif, canon.shift_left), (1, 2));
+        assert!(db.sjdb_lookup(100, 199).is_none());
+        let noncanon = db.sjdb_lookup(500, 599).unwrap();
+        assert_eq!((noncanon.motif, noncanon.shift_left), (0, 3));
+        assert!(db.is_annotated(0, 500, 599, 1));
     }
 
     #[test]

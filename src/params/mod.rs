@@ -858,6 +858,12 @@ pub struct Parameters {
     #[arg(long = "outFilterMismatchNoverLmax", default_value_t = 0.3)]
     pub out_filter_mismatch_nover_lmax: f64,
 
+    /// Max ratio of mismatches to *read* length (sum of mates). With
+    /// `outFilterMismatchNmax` it sets STAR's `outFilterMismatchNmaxTotal`, the
+    /// mismatch cap used while stitching and extending and by the mapped filter.
+    #[arg(long = "outFilterMismatchNoverReadLmax", default_value_t = 1.0)]
+    pub out_filter_mismatch_nover_read_lmax: f64,
+
     /// Min alignment score (absolute)
     #[arg(long = "outFilterScoreMin", default_value_t = 0)]
     pub out_filter_score_min: i32,
@@ -933,6 +939,12 @@ pub struct Parameters {
     /// `Extend5pOfReads12`, or `Extend3pOfRead1`.
     #[arg(long = "alignEndsType", default_value = "Local")]
     pub align_ends_type: String,
+
+    /// How to place an insertion inside a repeat: `None` (default, insertions
+    /// are not flushed) or `Right` (flush insertions to the right).
+    #[arg(long = "alignInsertionFlush", default_value = "None",
+          value_parser = clap::builder::PossibleValuesParser::new(["None", "Right"]))]
+    pub align_insertion_flush: String,
 
     /// Min overlap (bases) between mates required to trigger merge-and-realign; 0 = off
     #[arg(long = "peOverlapNbasesMin", default_value_t = 0)]
@@ -1469,6 +1481,13 @@ impl Parameters {
         }
     }
 
+    /// STAR's `outFilterMismatchNmaxTotal` for a read whose mates total
+    /// `read_len` bases (`ReadAlign_oneRead.cpp:78`).
+    pub fn mismatch_nmax_total(&self, read_len: usize) -> u32 {
+        let rel = (self.out_filter_mismatch_nover_read_lmax * read_len as f64) as u32;
+        self.out_filter_mismatch_nmax.min(rel)
+    }
+
     /// Compute the default window distance: 2^winBinNbits * winAnchorDistNbins.
     /// Used for max_cluster_dist and as default alignIntronMax (when 0).
     pub fn win_bin_window_dist(&self) -> u64 {
@@ -1503,8 +1522,9 @@ impl Parameters {
         // winBinNbits = floor(log2(max_span / 4) + 0.5)
         self.win_bin_nbits = ((max_span as f64 / 4.0).log2() + 0.5).floor() as u32;
 
-        // max with genome-based value: floor(log2(nGenome/40000 + 1) + 0.5)
-        let genome_based = ((n_genome as f64 / 40000.0 + 1.0).log2() + 0.5).floor() as u32;
+        // max with genome-based value: floor(log2(nGenome/40000 + 1) + 0.5), with
+        // STAR's integer division (`Genome_genomeLoad.cpp:388`).
+        let genome_based = (((n_genome / 40000 + 1) as f64).log2() + 0.5).floor() as u32;
         self.win_bin_nbits = self.win_bin_nbits.max(genome_based);
 
         // Cap at genomeChrBinNbits

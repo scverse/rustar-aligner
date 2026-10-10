@@ -114,6 +114,7 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
             shift_right,
             strand,
             src_strand: strand,
+            priority: 30,
         });
     }
 
@@ -278,6 +279,10 @@ pub struct PreparedJunction {
     /// Only meaningful during genomeGenerate dedup; set equal to
     /// `strand` when a junction is reloaded from `sjdbInfo.txt`.
     pub src_strand: u8,
+    /// STAR's `sjdbLoci.priority`: which source wins when two give the same
+    /// junction. 30 = the index's own junctions, 20 = GTF, 10 =
+    /// sjdbFileChrStartEnd, 0 = 1st-pass junctions of a two-pass run.
+    pub priority: u8,
 }
 
 impl PreparedJunction {
@@ -355,6 +360,7 @@ pub fn prepare_junction(
             1 | 2 => db_strand,
             _ => 0,
         },
+        priority: 0,
     }
 }
 
@@ -367,8 +373,7 @@ pub fn prepare_junction(
 /// coincide within a strand block are alternative representations of
 /// the same splice event inside a repeat; STAR keeps one — preferring
 /// canonical motifs, then the smallest left shift. (STAR also compares
-/// source priority here; every rustar source currently shares one
-/// priority, so those branches are omitted.)
+/// source priority here, before the motif and shift rules.)
 ///
 /// **Pass 2** (`sjdbPrepare.cpp:125-191`): re-sort survivors by their
 /// stored (motif-restored) coordinates and collapse entries that share
@@ -403,6 +408,13 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
                     && last.start_pos == j.start_pos
                     && last.end_pos == j.end_pos =>
             {
+                // sjdbPrepare.cpp:110-115: the higher priority source wins.
+                if j.priority != last.priority {
+                    if j.priority > last.priority {
+                        *last = j;
+                    }
+                    continue;
+                }
                 // sjdbPrepare.cpp:116-121 (equal priority): the new
                 // junction wins if it is canonical and the old one is
                 // not, or if both have the same canonicality and the
@@ -453,6 +465,10 @@ fn merge_cross_strand(old: &PreparedJunction, new: &PreparedJunction) -> Option<
     // sjdbPrepare.cpp:154-159 — STAR compares the RECORDED strand of the
     // old junction (`mapGen.sjdbStrand`, our derived `strand`) against the
     // RAW source strand of the new one (`sjdbLoci.str`, our `src_strand`).
+    // sjdbPrepare.cpp:148-153: the higher priority source wins.
+    if new.priority != old.priority {
+        return (new.priority > old.priority).then(|| new.clone());
+    }
     if old.strand > 0 && new.src_strand == 0 {
         return None; // new junction strand is not defined — keep old
     }
@@ -785,6 +801,7 @@ mod tests {
             shift_right: 0,
             strand,
             src_strand: strand,
+            priority: 0,
         }
     }
 
@@ -968,6 +985,7 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
                 src_strand: 1,
+                priority: 0,
             },
             // Non-canonical: stored = shifted (139_187..139_217).
             PreparedJunction {
@@ -979,6 +997,7 @@ mod tests {
                 shift_right: 0,
                 strand: 1,
                 src_strand: 1,
+                priority: 0,
             },
         ];
         write_sjdb_info_tab(tmp.path(), &junctions, 99).unwrap();
@@ -1004,6 +1023,7 @@ mod tests {
             shift_right: 0,
             strand: 1,
             src_strand: 1,
+            priority: 0,
         };
         // Non-canonical with shift_left=3 — STAR writes
         // `stored + shift_left + 1`, which is `original + 1`.
@@ -1016,6 +1036,7 @@ mod tests {
             shift_right: 0,
             strand: 0,
             src_strand: 0,
+            priority: 0,
         };
         write_sjdb_list_out_tab(tmp.path(), &[canon, noncan], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1047,6 +1068,7 @@ mod tests {
             shift_right: 0,
             strand: 2,
             src_strand: 2,
+            priority: 0,
         };
         write_sjdb_list_out_tab(tmp.path(), &[pj_b], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1218,6 +1240,7 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
                 src_strand: 1,
+                priority: 30,
             },
             PreparedJunction {
                 chr_idx: 0,
@@ -1228,6 +1251,7 @@ mod tests {
                 shift_right: 0,
                 strand: 0,
                 src_strand: 0,
+                priority: 30,
             },
         ];
         let tmp = tempfile::NamedTempFile::new().unwrap();

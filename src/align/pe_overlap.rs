@@ -131,7 +131,7 @@ fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 fn score_mate_exons(
     exons: &[Exon],
-    junctions: &[(SpliceMotif, bool)],
+    junctions: &[(SpliceMotif, bool, u8, u64)],
     mate_len: usize,
     native_read: &[u8],
     genome: &Genome,
@@ -159,12 +159,14 @@ fn score_mate_exons(
                 score += scorer.score_ins_open + scorer.score_ins_base * read_gap as i32;
                 n_gap += 1;
             } else if genome_gap > 0 {
-                if genome_gap as u32 >= scorer.align_intron_min {
+                // An annotated junction shorter than alignIntronMin is still a
+                // junction (STAR: canonSJ>=0); it is the next one at this exon.
+                let short_sj = junctions.get(jidx).is_some_and(|j| j.3 == ex.genome_start);
+                if genome_gap as u32 >= scorer.align_intron_min || short_sj {
                     cigar_ops.push(Op::new(Kind::Skip, genome_gap as usize));
                     let (motif, annotated) = junctions
                         .get(jidx)
-                        .copied()
-                        .unwrap_or((SpliceMotif::NonCanonical, false));
+                        .map_or((SpliceMotif::NonCanonical, false), |j| (j.0, j.1));
                     jidx += 1;
                     score += scorer
                         .score_annotated_junction(scorer.score_splice_junction(motif), annotated);
@@ -252,18 +254,47 @@ pub fn convert_merged_transcript_to_pe(
     // without touching genome coordinates), so this classification carries over unchanged to the
     // post-split per-mate exon lists.
     let n = merged.exons.len();
-    let mut gap_info: Vec<Option<(SpliceMotif, bool)>> = Vec::with_capacity(n.saturating_sub(1));
+    let mut gap_info: Vec<Option<(SpliceMotif, bool, u8, u64)>> =
+        Vec::with_capacity(n.saturating_sub(1));
     let mut orig_junction_idx = 0usize;
+    // Exon starts that follow an `N` shorter than alignIntronMin: annotated
+    // junctions STAR keeps as junctions however short.
+    let mut short_sj_ends: Vec<u64> = Vec::new();
+    let mut gpos = merged.genome_start;
+    for op in &merged.cigar {
+        match op.kind() {
+            Kind::Skip => {
+                gpos += op.len() as u64;
+                if (op.len() as u32) < scorer.align_intron_min {
+                    short_sj_ends.push(gpos);
+                }
+            }
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                gpos += op.len() as u64;
+            }
+            _ => {}
+        }
+    }
     for iex in 0..n.saturating_sub(1) {
         let cur = &merged.exons[iex];
         let next = &merged.exons[iex + 1];
         let read_gap = next.read_start as i64 - cur.read_end as i64;
         let genome_gap = next.genome_start as i64 - cur.genome_end as i64;
-        if read_gap == 0 && genome_gap >= scorer.align_intron_min as i64 {
+        if read_gap == 0
+            && (genome_gap >= scorer.align_intron_min as i64
+                || (genome_gap > 0 && short_sj_ends.contains(&next.genome_start)))
+        {
             let entry = if orig_junction_idx < merged.junction_motifs.len() {
+                let motif = merged.junction_motifs[orig_junction_idx];
                 Some((
-                    merged.junction_motifs[orig_junction_idx],
+                    motif,
                     merged.junction_annotated[orig_junction_idx],
+                    merged
+                        .junction_strands
+                        .get(orig_junction_idx)
+                        .copied()
+                        .unwrap_or_else(|| motif.star_strand()),
+                    next.genome_start,
                 ))
             } else {
                 None
@@ -279,7 +310,7 @@ pub fn convert_merged_transcript_to_pe(
     // mate index i_frag, not by the `imate` scan order below -- see module doc for why these
     // differ when `merged.is_reverse`).
     let mut out_exons: [Vec<Exon>; 2] = [Vec::new(), Vec::new()];
-    let mut out_junctions: [Vec<(SpliceMotif, bool)>; 2] = [Vec::new(), Vec::new()];
+    let mut out_junctions: [Vec<(SpliceMotif, bool, u8, u64)>; 2] = [Vec::new(), Vec::new()];
 
     for imate in 0..2usize {
         let i_frag = if imate == 0 { s } else { 1 - s };
@@ -352,6 +383,10 @@ pub fn convert_merged_transcript_to_pe(
         let genome_start = out_exons[i].iter().map(|e| e.genome_start).min().unwrap();
         let genome_end = out_exons[i].iter().map(|e| e.genome_end).max().unwrap();
         mates.push(Transcript {
+            nmm: 0,
+            junction_strands: out_junctions[i].iter().map(|j| j.2).collect(),
+            out_order: 0,
+            g_length: 0,
             chr_idx: merged.chr_idx,
             genome_start,
             genome_end,
@@ -362,8 +397,8 @@ pub fn convert_merged_transcript_to_pe(
             n_mismatch,
             n_gap,
             n_junction,
-            junction_motifs: out_junctions[i].iter().map(|(m, _)| *m).collect(),
-            junction_annotated: out_junctions[i].iter().map(|(_, a)| *a).collect(),
+            junction_motifs: out_junctions[i].iter().map(|j| j.0).collect(),
+            junction_annotated: out_junctions[i].iter().map(|j| j.1).collect(),
         });
     }
 
@@ -460,6 +495,10 @@ mod tests {
         // The merged read aligns perfectly, forward strand, one ungapped exon.
         let merged_len = merge.merged.len();
         let merged_tr = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: merged_len as u64,
@@ -532,6 +571,10 @@ mod tests {
         // Same perfect single-exon alignment, but the merged read maps to the REVERSE
         // strand (is_reverse = true).
         let merged_tr = Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: merged_len as u64,

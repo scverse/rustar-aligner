@@ -65,6 +65,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--outFilterMultimapScoreRange` | `1` | Score range for keeping multi-mappers within best score. |
 | `--outFilterMismatchNmax` | `10` | Max mismatches per pair. |
 | `--outFilterMismatchNoverLmax` | `0.3` | Max ratio of mismatches to mapped length. |
+| `--outFilterMismatchNoverReadLmax` | `1.0` | Max ratio of mismatches to read length (sum of mates); caps mismatches while stitching and in the mapped filter. |
 | `--outFilterScoreMin` | `0` | Min absolute alignment score. |
 | `--outFilterScoreMinOverLread` | `0.66` | Min alignment score normalized to read length. |
 | `--outFilterMatchNmin` | `0` | Min absolute matched bases. |
@@ -100,6 +101,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--alignSJoverhangMin` | `5` | Min overhang for novel splice junctions. |
 | `--alignSJDBoverhangMin` | `3` | Min overhang for annotated junctions. |
 | `--alignSJstitchMismatchNmax` | `0 -1 0 0` | Max mismatches for SJ stitching `[noncan, GC/AG, AT/AC, noncan]`. |
+| `--alignInsertionFlush` | `None` | Insertion placement in repeats: `None` or `Right` (flush insertions right). |
 
 ## Scoring penalties
 

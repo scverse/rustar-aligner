@@ -1376,6 +1376,10 @@ mod tests {
             .map(|&(_, l)| l)
             .sum();
         Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx: chr,
             genome_start: g_start,
             genome_end: g_start + g_len as u64,

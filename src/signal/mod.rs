@@ -182,6 +182,10 @@ mod tests {
 
     fn tr_fwd(chr_idx: usize, genome_start: u64, len: u64) -> Transcript {
         Transcript {
+            nmm: 0,
+            junction_strands: vec![],
+            out_order: 0,
+            g_length: 0,
             chr_idx,
             genome_start,
             genome_end: genome_start + len,

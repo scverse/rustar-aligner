@@ -794,14 +794,19 @@ impl SaIndex {
 
             if !is_absent {
                 // Found present entry — extract SA position
-                let sa_pos_mask = (1u64 << self.gstrand_bit) - 1;
+                // An SAi entry holds an SA index, which needs GstrandBit+1 bits
+                // (the SA of a genome over 2^31 bases has more than 2^32
+                // entries); the N and absent marks sit above it, at bits
+                // GstrandBit+1 and GstrandBit+2 (STAR's SAiMarkNbit and
+                // SAiMarkAbsentBit).
+                let sa_pos_mask = (1u64 << (self.gstrand_bit + 1)) - 1;
                 let sa_start = (entry & sa_pos_mask) as usize;
 
                 // Get upper bound from next k-mer at same level
                 let level_end = self.genome_sa_index_start[lind as usize];
                 let next_pos = self.genome_sa_index_start[(lind - 1) as usize] + ind + 1;
 
-                let (sa_end, bounds_tight) = if next_pos < level_end {
+                let (sa_end, i_sa2_good) = if next_pos < level_end {
                     let next_entry = self.data.read(next_pos as usize);
                     let next_absent = (next_entry >> (self.gstrand_bit + 2)) & 1 != 0;
                     if !next_absent {
@@ -812,8 +817,14 @@ impl SaIndex {
                 } else {
                     (n_sa, false)
                 };
+                // STAR (`maxMappableLength2strands`) trusts the first `lind`
+                // bases as matched only when the range end is exact
+                // (`iSA2good`) and the entry carries no N mark (`iSA1noN`): an
+                // N-marked entry means some suffix of the range hits N or a
+                // spacer within the prefix.
+                let i_sa1_no_n = (entry >> (self.gstrand_bit + 1)) & 1 == 0;
 
-                return Some((sa_start, sa_end, lind as usize, bounds_tight));
+                return Some((sa_start, sa_end, lind as usize, i_sa2_good && i_sa1_no_n));
             }
 
             lind -= 1;
@@ -847,7 +858,7 @@ impl SaIndex {
         }
 
         // Extract SA position
-        let sa_pos = entry & ((1u64 << self.gstrand_bit) - 1);
+        let sa_pos = entry & ((1u64 << (self.gstrand_bit + 1)) - 1);
         (sa_pos, true)
     }
 }

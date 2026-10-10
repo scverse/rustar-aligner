@@ -32,6 +32,9 @@ pub struct AlignmentScorer {
     pub n_mm_max: u32,
     /// Max ratio of mismatches to total alignment length (outFilterMismatchNoverLmax)
     pub p_mm_max: f64,
+    /// Max ratio of mismatches to read length (outFilterMismatchNoverReadLmax);
+    /// with `n_mm_max` it gives STAR's `outFilterMismatchNmaxTotal`.
+    pub n_mm_nover_read_lmax: f64,
     /// Minimum overhang for splice junctions (alignSJoverhangMin, default 5)
     pub align_sj_overhang_min: u32,
     /// Minimum overhang for annotated splice junctions (alignSJDBoverhangMin, default 3)
@@ -54,6 +57,8 @@ pub struct AlignmentScorer {
     pub align_ends_type: crate::params::AlignEndsType,
     /// STAR's stitch-time intron filters; see [`IntronFilter`].
     pub intron_filter: IntronFilter,
+    /// `--alignInsertionFlush Right` (STAR's `alignInsertionFlush.flushRight`).
+    pub insertion_flush_right: bool,
 }
 
 /// The three intron checks STAR applies when a transcript is finalized
@@ -84,16 +89,17 @@ impl IntronFilter {
     pub fn passes<'a>(
         &self,
         junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
+        strands: impl Iterator<Item = u8>,
     ) -> bool {
         use crate::params::{IntronMotifFilter, IntronStrandFilter};
-        // `intronMotifs[sjStr]` counts: STAR's sjStr is 0 for a non-canonical
-        // junction, else the motif's strand.
+        // `intronMotifs[sjStr]` counts: STAR's sjStr is the annotated strand of
+        // an sjdb junction, else the motif's (0 for non-canonical).
         let (mut n_junctions, mut plus, mut minus) = (0u32, 0u32, 0u32);
-        for (m, _) in junctions.clone() {
+        for s in strands {
             n_junctions += 1;
-            match m.implied_strand() {
-                Some('+') => plus += 1,
-                Some('-') => minus += 1,
+            match s {
+                1 => plus += 1,
+                2 => minus += 1,
                 _ => {}
             }
         }
@@ -134,6 +140,7 @@ impl AlignmentScorer {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -144,6 +151,7 @@ impl AlignmentScorer {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         }
     }
 
@@ -168,6 +176,7 @@ impl AlignmentScorer {
             ],
             n_mm_max: params.out_filter_mismatch_nmax,
             p_mm_max: params.out_filter_mismatch_nover_lmax,
+            n_mm_nover_read_lmax: params.out_filter_mismatch_nover_read_lmax,
             align_sj_overhang_min: params.align_sj_overhang_min,
             align_sjdb_overhang_min: params.align_sjdb_overhang_min,
             // STAR: when alignIntronMax==0 the check `Del>alignIntronMax && alignIntronMax>0`
@@ -189,6 +198,7 @@ impl AlignmentScorer {
                 strands: params.out_filter_intron_strands.clone(),
                 strand_field_intron_motif: params.out_sam_strand_field == "intronMotif",
             },
+            insertion_flush_right: params.align_insertion_flush == "Right",
         }
     }
 
@@ -199,6 +209,22 @@ impl AlignmentScorer {
             return 0;
         }
         ((genomic_span as f64).log2() * self.score_genomic_length_log2_scale - 0.5).ceil() as i32
+    }
+
+    /// STAR's `outFilterMismatchNmaxTotal` (`ReadAlign_oneRead.cpp:78`) for the
+    /// stitch read: `min(outFilterMismatchNmax, outFilterMismatchNoverReadLmax *
+    /// (readLength[0]+readLength[1]))`. A paired stitch read carries one spacer
+    /// base, which is not part of either mate's length.
+    pub fn mismatch_nmax_total(&self, read_seq: &[u8]) -> u32 {
+        let cap = |len: usize| ((self.n_mm_nover_read_lmax * len as f64) as u32).min(self.n_mm_max);
+        // Common case: the ratio cap is not binding even without the spacer.
+        let lower = cap(read_seq.len().saturating_sub(1));
+        if lower == self.n_mm_max {
+            return lower;
+        }
+        // A paired stitch read holds exactly one spacer.
+        let spacers = usize::from(read_seq.contains(&crate::align::stitch::PE_SPACER_BASE));
+        cap(read_seq.len() - spacers)
     }
 
     /// Annotated junctions score `sjdb_score`; unannotated junctions score `motif_score`.
@@ -451,10 +477,9 @@ impl AlignmentScorer {
             let g_up = seq.base((g_up_pos as u64 + genome_offset) as usize);
             let g_dn = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-            if g_up >= 4 || g_dn >= 4 {
-                break;
-            }
-            if read_base == g_up && read_base != g_dn {
+            // STAR (stitchAlignToTranscript.cpp:108): only the acceptor-side
+            // base must be A/C/G/T; an N does not stop the walk.
+            if read_base != g_dn && g_dn < 4 && read_base == g_up {
                 // Moving left costs: this base matches upstream but not downstream
                 score1 -= 1;
             }
@@ -498,12 +523,11 @@ impl AlignmentScorer {
                     let gu = seq.base((g_up_pos as u64 + genome_offset) as usize);
                     let gd = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-                    if gu < 4 && gd < 4 {
-                        if read_base == gu && read_base != gd {
-                            score1 += 1;
-                        } else if read_base != gu && read_base == gd {
-                            score1 -= 1;
-                        }
+                    // STAR (:116-117) compares the bases as they are, N included.
+                    if read_base == gu && read_base != gd {
+                        score1 += 1;
+                    } else if read_base != gu && read_base == gd {
+                        score1 -= 1;
                     }
                 }
             }
@@ -616,9 +640,11 @@ impl AlignmentScorer {
                 jj_r += jj_l;
                 jj_l = 0;
             }
-            // STAR: if (int(EX_L)+jR<1) return -1000005;
-            // Clamp: don't let exon A become zero-length (STAR rejects, we clamp)
-            best_jr = best_jr.max(1 - prev_exon_len as i32);
+            // STAR: if (int(EX_L)+jR<1) return -1000005: the flush may not empty
+            // exon A. Signalled to the caller with jR = JR_REJECTED.
+            if prev_exon_len as i32 + best_jr < 1 {
+                return (JR_REJECTED, best_motif, best_motif_score, 0, 0);
+            }
             // Re-check motif at flushed position
             if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
                 let donor_sa = (g_a_end_inc as i64 + best_jr as i64 + 1) as u64;
@@ -797,6 +823,10 @@ impl JunctionScanCache {
     }
 }
 
+/// `find_best_junction_position` result when STAR rejects the stitch because
+/// flushing the gap left would empty the previous exon (-1000005).
+pub(crate) const JR_REJECTED: i32 = i32::MIN;
+
 /// Splice junction motif types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpliceMotif {
@@ -817,6 +847,20 @@ pub enum SpliceMotif {
 }
 
 impl SpliceMotif {
+    /// Inverse of STAR's motif code (`sjdbMotif` / SJ.out.tab column 5):
+    /// 0 = non-canonical, 1-6 = GT/AG, CT/AC, GC/AG, CT/GC, AT/AC, GT/AT.
+    pub fn from_star_code(code: u8) -> Self {
+        match code {
+            1 => SpliceMotif::GtAg,
+            2 => SpliceMotif::CtAc,
+            3 => SpliceMotif::GcAg,
+            4 => SpliceMotif::CtGc,
+            5 => SpliceMotif::AtAc,
+            6 => SpliceMotif::GtAt,
+            _ => SpliceMotif::NonCanonical,
+        }
+    }
+
     /// Get the implied transcript strand from this motif.
     /// Forward-strand motifs (GT-AG, GC-AG, AT-AC) → Some('+')
     /// Reverse-strand motifs (CT-AC, CT-GC, GT-AT) → Some('-')
@@ -826,6 +870,16 @@ impl SpliceMotif {
             SpliceMotif::GtAg | SpliceMotif::GcAg | SpliceMotif::AtAc => Some('+'),
             SpliceMotif::CtAc | SpliceMotif::CtGc | SpliceMotif::GtAt => Some('-'),
             SpliceMotif::NonCanonical => None,
+        }
+    }
+
+    /// STAR's `sjStr` for an unannotated junction of this motif
+    /// (0 non-canonical, 1 +, 2 -).
+    pub fn star_strand(&self) -> u8 {
+        match self.implied_strand() {
+            Some('+') => 1,
+            Some('-') => 2,
+            _ => 0,
         }
     }
 
@@ -970,6 +1024,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -980,6 +1035,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -1016,6 +1072,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1026,6 +1083,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1061,6 +1119,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1071,6 +1130,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1104,6 +1164,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1114,6 +1175,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1140,6 +1202,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1150,6 +1213,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -1174,6 +1238,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1184,6 +1249,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -1216,6 +1282,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1226,6 +1293,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -1256,6 +1324,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1266,6 +1335,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1297,6 +1367,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1307,6 +1378,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1406,6 +1478,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1416,6 +1489,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1487,6 +1561,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 1000, // Small max for testing
@@ -1497,6 +1572,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1540,6 +1616,7 @@ mod tests {
             align_sj_stitch_mismatch_nmax: [0, -1, 0, 0],
             n_mm_max: 10,
             p_mm_max: 0.3,
+            n_mm_nover_read_lmax: 1.0,
             align_sj_overhang_min: 5,
             align_sjdb_overhang_min: 3,
             align_intron_max: 589_824,
@@ -1550,6 +1627,7 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            insertion_flush_right: false,
         }
     }
 

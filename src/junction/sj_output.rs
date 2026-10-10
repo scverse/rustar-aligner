@@ -182,73 +182,70 @@ impl SpliceJunctionStats {
         let unique_min = &params.out_sj_filter_count_unique_min;
         let total_min = &params.out_sj_filter_count_total_min;
         let dist_min = &params.out_sj_filter_dist_to_other_sjmin;
+        let intron_max_vs_reads = &params.out_sj_filter_intron_max_vs_read_n;
 
-        // Build distance-to-nearest-neighbor map
-        let min_dist_to_neighbor: Vec<u64> = {
-            let n = junctions.len();
-            let mut dists = vec![u64::MAX; n];
-            for i in 0..n {
-                if i > 0 && junctions[i].0.chr_idx == junctions[i - 1].0.chr_idx {
-                    let d = junctions[i]
-                        .0
-                        .intron_start
-                        .saturating_sub(junctions[i - 1].0.intron_end);
-                    dists[i] = dists[i].min(d);
-                    dists[i - 1] = dists[i - 1].min(d);
+        // STAR outputSJ.cpp:56-63: count, overhang and intron-length filters
+        // (annotated junctions pass). Junctions are in (start, end) order.
+        let passed: Vec<usize> = (0..junctions.len())
+            .filter(|&i| {
+                let (key, annotated, unique, multi, max_overhang) = &junctions[i];
+                if *annotated {
+                    return true;
                 }
-                if i + 1 < n && junctions[i].0.chr_idx == junctions[i + 1].0.chr_idx {
-                    let d = junctions[i + 1]
-                        .0
-                        .intron_start
-                        .saturating_sub(junctions[i].0.intron_end);
-                    dists[i] = dists[i].min(d);
-                }
-            }
-            dists
-        };
-
-        let mut surviving = HashSet::new();
-
-        for (idx, (key, annotated, unique, multi, max_overhang)) in junctions.iter().enumerate() {
-            // Annotated junctions bypass all outSJfilter* checks
-            if !annotated {
                 let cat = SpliceMotif::filter_category_from_encoded(key.motif);
-
-                if (*max_overhang as i32) < overhang_min[cat] {
-                    continue;
-                }
-                // STAR keeps a junction if EITHER the unique count OR the total
-                // (unique+multi) count meets its threshold — an OR, not an AND
-                // (STAR manual; confirmed against STAR source and STAR-rs
-                // `star_sj.rs`). Testing them as two independent drop-guards was
-                // an AND, which discarded every junction supported only by
-                // multi-mapping reads (unique==0) — the cause of rustar-aligner
-                // reporting far fewer novel junctions than STAR. Drop only when
-                // BOTH thresholds fail.
                 let total = unique + multi;
-                if (*unique as i32) < unique_min[cat] && (total as i32) < total_min[cat] {
-                    continue;
-                }
-                if dist_min[cat] > 0 && min_dist_to_neighbor[idx] < dist_min[cat] as u64 {
-                    continue;
-                }
-                let intron_len = key.intron_end.saturating_sub(key.intron_start);
-                let intron_max_thresholds = &params.out_sj_filter_intron_max_vs_read_n;
-                let max_intron_for_reads = if total >= 3 {
-                    intron_max_thresholds.get(2).copied().unwrap_or(200_000)
-                } else if total >= 2 {
-                    intron_max_thresholds.get(1).copied().unwrap_or(100_000)
-                } else {
-                    intron_max_thresholds.first().copied().unwrap_or(50_000)
-                };
-                if intron_len as i64 > max_intron_for_reads {
-                    continue;
-                }
-            }
+                let gap = key.intron_end + 1 - key.intron_start;
+                (*unique as i32 >= unique_min[cat] || total as i32 >= total_min[cat])
+                    && *max_overhang as i32 >= overhang_min[cat]
+                    && (total as usize > intron_max_vs_reads.len()
+                        || gap as i64 <= intron_max_vs_reads[total as usize - 1])
+            })
+            .collect();
 
-            surviving.insert(key.clone());
+        // STAR outputSJ.cpp:80-112: distance to the nearest other donor and the
+        // nearest other acceptor, among the junctions that passed above
+        // (annotated ones included as neighbours, but never filtered). The
+        // positions are genome-absolute, so neighbours across a chromosome
+        // boundary count, as in STAR.
+        let donor = |i: usize| junctions[i].0.intron_start;
+        let acceptor = |i: usize| junctions[i].0.intron_end + 1;
+        let min_dist = |pos: &[u64], k: usize| {
+            let left = if k > 0 { pos[k] - pos[k - 1] } else { pos[k] };
+            let right = if k + 1 < pos.len() {
+                pos[k + 1] - pos[k]
+            } else {
+                u64::MAX
+            };
+            left.min(right)
+        };
+        let dist_ok = |i: usize, d: u64| {
+            let cat = SpliceMotif::filter_category_from_encoded(junctions[i].0.motif);
+            d >= dist_min[cat].max(0) as u64
+        };
+        let donors: Vec<u64> = passed.iter().map(|&i| donor(i)).collect();
+        let mut keep: Vec<bool> = passed
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| dist_ok(i, min_dist(&donors, k)))
+            .collect();
+        let mut by_acceptor: Vec<usize> = (0..passed.len()).collect();
+        by_acceptor.sort_by_key(|&k| acceptor(passed[k]));
+        let acceptors: Vec<u64> = by_acceptor.iter().map(|&k| acceptor(passed[k])).collect();
+        for (pos, &k) in by_acceptor.iter().enumerate() {
+            let i = passed[k];
+            keep[k] = if junctions[i].1 {
+                true
+            } else {
+                keep[k] && dist_ok(i, min_dist(&acceptors, pos))
+            };
         }
 
+        let mut surviving = HashSet::new();
+        for (k, &i) in passed.iter().enumerate() {
+            if keep[k] {
+                surviving.insert(junctions[i].0.clone());
+            }
+        }
         surviving
     }
 

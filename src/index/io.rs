@@ -20,6 +20,7 @@ impl GenomeIndex {
     /// Reads Genome, SA, and SAindex files from the specified directory.
     pub fn load(genome_dir: &Path, params: &Parameters) -> Result<Self, Error> {
         log::info!("Loading genome from {}...", genome_dir.display());
+        check_genome_version(genome_dir, params)?;
 
         // Load Genome file
         let genome = load_genome(genome_dir, params)?;
@@ -60,36 +61,43 @@ impl GenomeIndex {
             (Vec::new(), 0)
         };
 
-        // Build the annotated-junction database consulted at stitch time.
-        //   - If a GTF is supplied at align time, parse it (STAR's on-the-fly path).
-        //   - Otherwise fall back to the junctions stored in the index
-        //     (sjdbInfo.txt). Without this fallback, the standard workflow —
-        //     build the index once with `--sjdbGTFfile`, then align with only
-        //     `--genomeDir` — would treat every junction as novel (the runtime
-        //     db would be empty), losing all `sjdbScore` bonuses and annotated
-        //     junction recognition. Keyed on the stored (post-sjdbPrepare) donor/
-        //     acceptor coordinates, matching what the stitch scan produces.
-        let junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            SpliceJunctionDb::from_gtf_configured(
+        // Align-time annotations (STAR's on-the-fly sjdbInsertJunctions):
+        // collected here, inserted into the genome once the index is assembled.
+        // STAR priorities: GTF 20, sjdbFileChrStartEnd 10.
+        let mut otf_raw: Vec<(usize, u64, u64, u8)> = Vec::new();
+        let mut otf_file_raw: Vec<(usize, u64, u64, u8)> = Vec::new();
+        if let Some(ref gtf_path) = params.sjdb_gtf_file {
+            let exons = crate::junction::gtf::parse_gtf_configured(
                 gtf_path,
-                &genome,
                 &params.sjdb_gtf_feature_exon,
                 &params.sjdb_gtf_chr_prefix,
+            )?;
+            otf_raw.extend(crate::junction::gtf::extract_junctions_configured(
+                exons,
+                &genome,
                 &params.sjdb_gtf_tag_exon_parent_transcript,
-            )?
-        } else if !prepared_junctions.is_empty() {
-            let raw: Vec<(usize, u64, u64, u8)> = prepared_junctions
-                .iter()
-                .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
-                .collect();
-            log::info!(
-                "No GTF at align time; loaded {} annotated junctions from index sjdbInfo.txt",
-                raw.len()
-            );
-            SpliceJunctionDb::from_raw_junctions(&raw)
-        } else {
-            log::info!("No GTF file provided, all junctions will be novel");
+            )?);
+        }
+        if !params.sjdb_file_chr_start_end.is_empty() {
+            otf_file_raw.extend(crate::junction::chr_start_end::parse_sjdb_chr_start_end(
+                &params.sjdb_file_chr_start_end,
+                &genome,
+            )?);
+        }
+
+        // The annotated-junction database consulted at stitch time comes from
+        // the index's junctions (sjdbInfo.txt), keyed on STAR's stored
+        // coordinates and carrying sjdbMotif/sjdbShift*/sjdbStrand. Without it
+        // the standard workflow (annotated index, `--genomeDir` only at
+        // mapping) would treat every junction as novel.
+        let junction_db = if prepared_junctions.is_empty() {
             SpliceJunctionDb::empty()
+        } else {
+            log::info!(
+                "Loaded {} annotated junctions from index sjdbInfo.txt",
+                prepared_junctions.len()
+            );
+            SpliceJunctionDb::from_prepared(&prepared_junctions)
         };
 
         log::info!(
@@ -138,7 +146,7 @@ impl GenomeIndex {
             );
         }
 
-        Ok(GenomeIndex {
+        let mut index = GenomeIndex {
             genome,
             suffix_array,
             sa_index,
@@ -146,8 +154,73 @@ impl GenomeIndex {
             transcriptome,
             prepared_junctions,
             sjdb_overhang,
-        })
+        };
+        if !otf_raw.is_empty() || !otf_file_raw.is_empty() {
+            log::info!(
+                "Inserting {} align-time annotated junctions into the genome",
+                otf_raw.len() + otf_file_raw.len()
+            );
+            let mut prepared = index.prepare_raw_junctions(&otf_raw, 20);
+            prepared.extend(index.prepare_raw_junctions(&otf_file_raw, 10));
+            crate::index::sjdb_otf::insert_junctions(&mut index, prepared, params.sjdb_overhang)?;
+        }
+        Ok(index)
     }
+}
+
+/// STAR's genome compatibility checks (`Genome_genomeLoad.cpp:56-101`): the
+/// index's `versionGenome` must be the one this STAR release writes (2.7.4a),
+/// and an annotated index from before `sjdbInsertSave` existed cannot take
+/// junctions inserted at mapping time.
+fn check_genome_version(genome_dir: &Path, params: &Parameters) -> Result<(), Error> {
+    const VERSION_GENOME: &str = "2.7.4a";
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = std::fs::read_to_string(&path).map_err(|_| {
+        Error::Index(format!(
+            "EXITING because of FATAL ERROR: could not open genome file {}\n\
+             SOLUTION: check that the path to genome files, specified in --genomeDir is \
+             correct and the files are present, and have user read permsissions",
+            path.display()
+        ))
+    })?;
+    let value = |key: &str| {
+        contents.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some(key)).then(|| f.next().unwrap_or("").to_string())
+        })
+    };
+    match value("versionGenome") {
+        None => {
+            return Err(Error::Index(
+                "EXITING because of FATAL ERROR: read no value for the versionGenome parameter \
+                 from genomeParameters.txt file\n\
+                 SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                    .to_string(),
+            ));
+        }
+        Some(v) if v != VERSION_GENOME => {
+            return Err(Error::Index(format!(
+                "EXITING because of FATAL ERROR: Genome version: {v} is INCOMPATIBLE with \
+                 running STAR version: 2.7.11b\n\
+                 SOLUTION: please re-generate genome from scratch with running version of STAR, \
+                 or with version: {VERSION_GENOME}"
+            )));
+        }
+        Some(_) => {}
+    }
+    let sjdb_insert = params.sjdb_gtf_file.is_some()
+        || !params.sjdb_file_chr_start_end.is_empty()
+        || params.twopass_mode == crate::params::TwopassMode::Basic;
+    if sjdb_insert && genome_dir.join("sjdbInfo.txt").exists() && value("sjdbInsertSave").is_none()
+    {
+        return Err(Error::Index(
+            "EXITING because of FATAL ERROR: old Genome is INCOMPATIBLE with on the fly junction \
+             insertion\n\
+             SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
@@ -358,6 +431,26 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// STAR refuses an index written for another genome format version.
+    #[test]
+    fn rejects_incompatible_genome_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
+        std::fs::write(
+            dir.path().join("genomeParameters.txt"),
+            "versionGenome\t2.7.1a\n",
+        )
+        .unwrap();
+        let err = check_genome_version(dir.path(), &params).unwrap_err();
+        assert!(err.to_string().contains("INCOMPATIBLE"), "{err}");
+        std::fs::write(
+            dir.path().join("genomeParameters.txt"),
+            "versionGenome\t2.7.4a\n",
+        )
+        .unwrap();
+        assert!(check_genome_version(dir.path(), &params).is_ok());
+    }
 
     #[test]
     fn load_generated_index() {
