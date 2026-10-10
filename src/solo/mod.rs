@@ -14,6 +14,7 @@ pub mod count;
 pub mod cr_annot;
 pub mod cr_cells;
 pub mod cr_dups;
+pub mod cr_embed;
 pub mod cr_trim;
 pub mod gene;
 pub mod h5;
