@@ -21,6 +21,7 @@ pub mod libcxx_rng;
 pub mod sgt;
 pub mod smartseq;
 pub mod transcript3p;
+pub mod web_summary;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
