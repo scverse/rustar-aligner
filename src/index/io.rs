@@ -34,7 +34,8 @@ impl GenomeIndex {
         log::info!("Loaded suffix array: {} entries", suffix_array.len());
 
         // Load SAindex file
-        let sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        let mut sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        sa_index.sparse_d = read_genome_sa_sparse_d(genome_dir)?;
         log::info!(
             "Loaded SA index: nbases={}, {} indices",
             sa_index.nbases,
@@ -97,35 +98,24 @@ impl GenomeIndex {
             junction_db.len()
         );
 
-        // Prefer STAR-compatible transcriptInfo.tab / exonInfo.tab /
-        // geneInfo.tab over re-parsing the GTF at align time. If the files
-        // aren't present (legacy rustar-aligner index), fall back to on-the-fly
-        // construction from the GTF when one is supplied — this matches
-        // STAR's behavior in `sjdbInsertJunctions.cpp` (re-parse and regenerate).
-        let transcriptome = if genome_dir.join("transcriptInfo.tab").exists() {
+        // STAR's Transcriptome constructor: a GTF given at mapping time is always
+        // used for the transcript/gene tables (Transcriptome.cpp trInfoDir =
+        // sjdbInsert.outDir, filled by loadGTF); otherwise they are read from
+        // the index directory (transcriptInfo.tab et al.).
+        let transcriptome = if let Some(ref gtf_path) = params.sjdb_gtf_file {
+            log::info!(
+                "Building transcriptome tables from the mapping-time GTF {}",
+                gtf_path.display()
+            );
+            Some(TranscriptomeIndex::from_mapping_gtf(
+                params, gtf_path, &genome,
+            )?)
+        } else if genome_dir.join("transcriptInfo.tab").exists() {
             log::info!(
                 "Loading transcriptome index files from {}",
                 genome_dir.display()
             );
             Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
-        } else if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            log::warn!(
-                "transcriptInfo.tab not found in {}; re-parsing GTF at align time",
-                genome_dir.display()
-            );
-            let exons = crate::junction::gtf::parse_gtf_configured(
-                gtf_path,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-            )?;
-            Some(TranscriptomeIndex::from_gtf_exons_configured(
-                &exons,
-                &genome,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-                &params.sjdb_gtf_tag_exon_parent_gene_name,
-                &params.sjdb_gtf_tag_exon_parent_gene_type,
-            )?)
         } else {
             None
         };
@@ -150,6 +140,22 @@ impl GenomeIndex {
     }
 }
 
+/// `genomeSAsparseD` and `genomeSAindexNbases` recorded in the index.
+pub(crate) fn read_sa_params(genome_dir: &Path, params: &Parameters) -> (u64, u32) {
+    let mut sparse_d = u64::from(params.genome_sa_sparse_d);
+    let mut nbases = params.genome_sa_index_nbases;
+    if let Ok(txt) = std::fs::read_to_string(genome_dir.join("genomeParameters.txt")) {
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("genomeSAsparseD\t") {
+                sparse_d = v.trim().parse().unwrap_or(sparse_d);
+            } else if let Some(v) = line.strip_prefix("genomeSAindexNbases\t") {
+                nbases = v.trim().parse().unwrap_or(nbases);
+            }
+        }
+    }
+    (sparse_d, nbases)
+}
+
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
 /// and return the first field (total genome byte count, including Gsj if
 /// sjdb was baked in). Returns `Ok(None)` if the file or line is absent,
@@ -170,6 +176,25 @@ fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
         }
     }
     Ok(None)
+}
+
+/// The suffix-array stride the index was built with (`genomeSAsparseD` in
+/// genomeParameters.txt), 1 when absent. The seed search needs it: with a
+/// sparse SA only every `D`-th position is a suffix, so STAR searches `D`
+/// shifted starts (`maxMappableLength2strands`, `iDist` loop).
+fn read_genome_sa_sparse_d(genome_dir: &Path) -> Result<u64, Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => return Err(Error::io(e, &path)),
+    };
+    Ok(contents
+        .lines()
+        .find_map(|line| line.strip_prefix("genomeSAsparseD\t"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1))
 }
 
 /// Load genome from disk.
@@ -350,6 +375,7 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
         data,
         word_length,
         gstrand_bit,
+        sparse_d: 1,
     })
 }
 

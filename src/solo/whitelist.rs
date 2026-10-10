@@ -100,6 +100,15 @@ pub struct CbMatchType {
     pub pseudocounts: bool,
 }
 
+impl CbMatchType {
+    /// STAR's `CBmatchWL.oneExact`: true for every match type except the
+    /// pseudocount ones (`ParametersSolo.cpp`). A barcode corrected to a single
+    /// whitelist entry then only counts if that entry was also seen exactly.
+    pub fn one_exact(self) -> bool {
+        !self.pseudocounts
+    }
+}
+
 impl FromStr for CbMatchType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -173,6 +182,42 @@ pub enum CbMatch {
     NinCb,
     /// >1 whitelist match but `mm1_multi` not enabled (cbMatch=-3).
     MultMatchRejected,
+}
+
+impl CbMatch {
+    /// STAR's `cbMatch` code for this outcome, as reported in the `sM` SAM tag
+    /// (`SoloReadBarcode_getCBandUMI.cpp:9-90`). Multi-match carries the number
+    /// of whitelist candidates.
+    pub fn star_code(&self) -> i32 {
+        match self {
+            Self::Exact(_) => 0,
+            Self::Corrected(_) => 1,
+            Self::Multi(cands) => cands.len() as i32,
+            Self::NoMatch => -1,
+            Self::NinCb => -2,
+            Self::MultMatchRejected => -3,
+        }
+    }
+
+    /// Whitelist index when the barcode resolved to a single cell.
+    pub fn resolved_index(&self) -> Option<u32> {
+        match self {
+            Self::Exact(i) | Self::Corrected(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
+impl UmiCheck {
+    /// STAR's `umiCheck` code, which overwrites `cbMatch` (and so the `sM` tag)
+    /// when the UMI is rejected. A valid UMI leaves the CB code in place.
+    pub fn star_code(&self) -> Option<i32> {
+        match self {
+            Self::Ok(_) => None,
+            Self::NinUmi => Some(-23),
+            Self::Homopolymer => Some(-24),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

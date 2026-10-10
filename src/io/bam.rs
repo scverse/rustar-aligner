@@ -251,7 +251,15 @@ impl CoordinateSorter {
     }
 
     /// Merge every spill run and the in-memory tail into `out` as a sorted BAM.
-    fn write_sorted<W: Write>(&mut self, out: W, destination: &str) -> Result<(), Error> {
+    ///
+    /// `finalize`, when given, is applied to each record just before it is
+    /// written to `out` (never to the intermediate runs).
+    fn write_sorted<W: Write>(
+        &mut self,
+        out: W,
+        destination: &str,
+        mut finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
+    ) -> Result<(), Error> {
         let spilled_runs = self.runs.len();
         self.reduce_runs()?;
         self.records.sort_by_key(sort_key);
@@ -262,13 +270,16 @@ impl CoordinateSorter {
 
         let written = if self.runs.is_empty() {
             // Nothing spilled: identical to the previous in-memory-only path.
-            for record in &self.records {
+            for record in &mut self.records {
+                if let Some(finalize) = finalize.as_mut() {
+                    finalize(record);
+                }
                 writer.write_alignment_record(&self.header, record)?;
             }
             self.records.len() as u64
         } else {
             let runs = std::mem::take(&mut self.runs);
-            let written = self.merge(&runs, Some(&self.records), &mut writer)?;
+            let written = self.merge(&runs, Some(&self.records), &mut writer, finalize)?;
             drop(runs);
             written
         };
@@ -312,7 +323,7 @@ impl CoordinateSorter {
                     BufWriter::new(temp.as_file()),
                     self.compression,
                 ));
-                self.merge(&group, None, &mut writer)?;
+                self.merge(&group, None, &mut writer, None)?;
                 writer.try_finish()?;
                 writer.into_inner().into_inner().flush()?;
                 // Dropping `group` here deletes the consumed runs, so scratch use
@@ -336,6 +347,7 @@ impl CoordinateSorter {
         runs: &[tempfile::TempPath],
         tail: Option<&[RecordBuf]>,
         writer: &mut bam::io::Writer<bgzf::io::Writer<W>>,
+        mut finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
     ) -> Result<u64, Error> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
@@ -370,9 +382,12 @@ impl CoordinateSorter {
 
         let mut written = 0u64;
         while let Some(Reverse((_, run))) = heap.pop() {
-            let record = heads[run]
+            let mut record = heads[run]
                 .take()
                 .ok_or_else(|| Error::Alignment("BAM sort merge lost a record".to_string()))?;
+            if let Some(finalize) = finalize.as_mut() {
+                finalize(&mut record);
+            }
             writer.write_alignment_record(&self.header, &record)?;
             written += 1;
 
@@ -416,6 +431,18 @@ fn read_run_record<R: std::io::Read>(
 pub struct SortedBamWriter {
     sorter: CoordinateSorter,
     output_path: std::path::PathBuf,
+    /// `--soloOutLayout CellRanger`: the `@RG`/`@CO` header lines and the `.bai`.
+    cellranger: Option<CellRangerBam>,
+}
+
+/// What a CellRanger-layout `possorted_genome_bam.bam` adds to the plain sorted
+/// BAM: one `@RG` per (flowcell, lane) seen in the read names, the
+/// `10x_bam_to_fastq` and `library_info` comments, and a `.bai` index.
+struct CellRangerBam {
+    sample: String,
+    /// `(flowcell, lane)` of the last record, to skip the id build per record.
+    last: (Vec<u8>, Vec<u8>),
+    rg_ids: std::collections::BTreeSet<String>,
 }
 
 impl BamWriter {
@@ -498,22 +525,104 @@ impl SortedBamWriter {
         Ok(Self {
             sorter: CoordinateSorter::new(header, params),
             output_path: output_path.to_path_buf(),
+            cellranger: None,
         })
+    }
+
+    /// Write the header lines `cellranger count` puts in its BAM and build the
+    /// `.bai` next to the file once it is sorted. `sample` names the library
+    /// in the `@RG` ids.
+    #[must_use]
+    pub fn with_cellranger_layout(mut self, sample: &str) -> Self {
+        self.cellranger = Some(CellRangerBam {
+            sample: sample.to_string(),
+            last: (Vec::new(), Vec::new()),
+            rg_ids: std::collections::BTreeSet::new(),
+        });
+        self
     }
 
     /// Buffer records, spilling a sorted run when the RAM budget is reached.
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
+        if let Some(cr) = self.cellranger.as_mut() {
+            for rec in batch {
+                let Some(name) = rec.name() else { continue };
+                let mut f = name.split(|&b| b == b':').skip(2);
+                let key = (f.next().unwrap_or_default(), f.next().unwrap_or_default());
+                if key.0 != cr.last.0.as_slice() || key.1 != cr.last.1.as_slice() {
+                    cr.last = (key.0.to_vec(), key.1.to_vec());
+                    cr.rg_ids
+                        .insert(crate::io::sam::cr_read_group_id(&cr.sample, name.as_ref()));
+                }
+            }
+        }
         self.sorter.push_batch(batch)
     }
 
     /// Merge every run plus the in-memory tail into a coordinate-sorted BAM.
     pub fn finish(&mut self) -> Result<(), Error> {
+        self.write_file(None)
+    }
+
+    /// [`finish`](Self::finish), passing each record through `finalize` as it
+    /// leaves the merge. STARsolo's `CB`/`UB` tags are only known after the
+    /// counting pass, so they are filled here rather than when the record is
+    /// built; STAR likewise adds them while writing the sorted bins.
+    pub fn finish_with(&mut self, finalize: &mut dyn FnMut(&mut RecordBuf)) -> Result<(), Error> {
+        self.write_file(Some(finalize))
+    }
+
+    fn write_file(
+        &mut self,
+        finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
+    ) -> Result<(), Error> {
+        if let Some(cr) = &self.cellranger {
+            use sam::header::record::value::map::tag::Other;
+            use sam::header::record::value::{Map, map::ReadGroup};
+            let header = &mut self.sorter.header;
+            // cellranger's BAM header is `@HD VN:1.4 SO:coordinate`.
+            if let Some(hd) = header.header_mut() {
+                *hd.version_mut() = sam::header::record::value::map::header::Version::new(1, 4);
+            }
+            for id in &cr.rg_ids {
+                let mut rg = Map::<ReadGroup>::default();
+                let fields = [
+                    (*b"SM", cr.sample.clone()),
+                    (*b"LB", "0.1".to_string()),
+                    (*b"PU", id.clone()),
+                    (*b"PL", "ILLUMINA".to_string()),
+                ];
+                for (tag, value) in fields {
+                    let tag: Other<_> = Other::try_from(tag).expect("two-letter tag");
+                    rg.other_fields_mut().insert(tag, value.into());
+                }
+                header.read_groups_mut().insert(id.as_str().into(), rg);
+            }
+            let comments = header.comments_mut();
+            comments.push("10x_bam_to_fastq:R1(CR:CY,UR:UY)".into());
+            comments.push("10x_bam_to_fastq:R2(SEQ:QUAL)".into());
+            comments.push(
+                r#"library_info:{"library_id":0,"library_type":"Gene Expression","gem_group":1,"target_set_name":null}"#
+                    .into(),
+            );
+        }
         let file = File::create(&self.output_path)
             .map_err(|source| Error::io(source, &self.output_path))?;
         self.sorter.write_sorted(
             BufWriter::new(file),
             &self.output_path.display().to_string(),
-        )
+            finalize,
+        )?;
+        if self.cellranger.is_some() {
+            let mut bai = self.output_path.clone().into_os_string();
+            bai.push(".bai");
+            let bai = std::path::PathBuf::from(bai);
+            let index =
+                bam::fs::index(&self.output_path).map_err(|e| Error::io(e, &self.output_path))?;
+            bam::bai::fs::write(&bai, &index).map_err(|e| Error::io(e, &bai))?;
+            log::info!("Wrote BAM index {}", bai.display());
+        }
+        Ok(())
     }
 }
 
@@ -702,7 +811,14 @@ impl SortedBamStdoutWriter {
 
     pub fn finish(&mut self) -> Result<(), Error> {
         self.sorter
-            .write_sorted(BufWriter::new(std::io::stdout()), "stdout")
+            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", None)
+    }
+
+    /// [`finish`](Self::finish), passing each record through `finalize` as it
+    /// is written (see [`SortedBamWriter::finish_with`]).
+    pub fn finish_with(&mut self, finalize: &mut dyn FnMut(&mut RecordBuf)) -> Result<(), Error> {
+        self.sorter
+            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", Some(finalize))
     }
 }
 
@@ -759,6 +875,7 @@ mod tests {
             &read_qual,
             &params,
             crate::stats::UnmappedReason::Other,
+            crate::stats::BestTr::default(),
         )
         .unwrap();
 
@@ -782,6 +899,7 @@ mod tests {
             &[],
             &params,
             crate::stats::UnmappedReason::Other,
+            crate::stats::BestTr::default(),
         )
         .unwrap();
         let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -826,6 +944,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let read_name = "read1";
@@ -904,6 +1023,7 @@ mod tests {
                 &[30, 30, 30, 30],
                 &params,
                 crate::stats::UnmappedReason::Other,
+                crate::stats::BestTr::default(),
             )
             .unwrap(),
             crate::io::sam::SamWriter::build_unmapped_record(
@@ -912,6 +1032,7 @@ mod tests {
                 &[30, 30, 30, 30],
                 &params,
                 crate::stats::UnmappedReason::Other,
+                crate::stats::BestTr::default(),
             )
             .unwrap(),
         ];

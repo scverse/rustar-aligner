@@ -29,7 +29,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). |
+| `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). A `--soloType` run appends the barcode read as the last file: `cDNA_read barcode_read`, or `cDNA_read1 cDNA_read2 barcode_read` for paired-end cDNA. |
 | `--readFilesCommand` | — | Decompression command, e.g. `zcat` for `.gz`. |
 | `--readMapNumber` | `-1` | Number of reads to map (`-1` = all). |
 | `--clip5pNbases` | `0` | Bases to clip from the 5' end of each mate. |
@@ -50,7 +50,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--outSAMstrandField` | `None` | `None` or `intronMotif` (sets XS tag from junction motifs). |
-| `--outSAMattributes` | `Standard` | Tags to include: `Standard`, `All`, `None`, or an explicit list (e.g. `NH HI AS NM nM MD`). |
+| `--outSAMattributes` | `Standard` | Tags to include: `Standard`, `All`, `None`, or an explicit list (e.g. `NH HI AS NM nM MD`). The STARsolo tags `CR CY UR UY CB UB GX GN gx gn sM sS sQ sF` are also accepted, and (as in STAR) written to BAM output only; `CB`/`UB` additionally need `--outSAMtype BAM SortedByCoordinate`. |
 | `--outSAMattrRGline` | `-` | Read group line(s). Multiple blocks separated by a literal `,`. |
 | `--outSAMunmapped` | `None` | Unmapped reads in SAM: `None`, `Within`, or `Within KeepPairs`. |
 | `--outSAMmapqUnique` | `255` | MAPQ value for uniquely-mapping reads. |

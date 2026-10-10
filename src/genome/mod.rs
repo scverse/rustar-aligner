@@ -401,6 +401,25 @@ impl Genome {
         self.n_genome = new_n;
     }
 
+    /// The real genome without any appended `Gsj` buffer: the state STAR's
+    /// `sjdbInsertJunctions` starts from when it replaces the junctions of the
+    /// loaded genome (`sjdbBuildIndex.cpp`, "remove old junctions").
+    #[must_use]
+    pub fn without_sjdb(&self) -> Genome {
+        let n = self.n_genome_real as usize;
+        let mut seq = vec![GENOME_SPACING_CHAR; 2 * n];
+        seq[..n].copy_from_slice(&self.sequence.as_slice()[..n]);
+        for i in 0..n {
+            let base = seq[i];
+            seq[2 * n - 1 - i] = if base < 4 { 3 - base } else { base };
+        }
+        Genome {
+            sequence: seq.into(),
+            n_genome: self.n_genome_real,
+            ..self.clone()
+        }
+    }
+
     /// Access a base from the genome (forward or reverse strand).
     ///
     /// # Arguments

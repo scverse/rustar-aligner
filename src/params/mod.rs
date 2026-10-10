@@ -24,7 +24,9 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
+pub use sam::{
+    MAX_ATTRS, OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttr, SamAttributes,
+};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -526,8 +528,9 @@ pub struct Parameters {
     pub genome_transform_vcf: Option<PathBuf>,
 
     // ── Read files ──────────────────────────────────────────────────────
-    /// Input read file(s); second file is mate 2 for paired-end
-    #[arg(long = "readFilesIn", num_args = 1..=2)]
+    /// Input read file(s): mate 1, then mate 2 for paired-end. A solo run adds
+    /// the barcode read as the last file (`cDNA_read [cDNA_read2] barcode_read`).
+    #[arg(long = "readFilesIn", num_args = 1..=3)]
     pub read_files_in: Vec<PathBuf>,
 
     /// Command to decompress input files (e.g. "zcat" for .gz)
@@ -1301,6 +1304,15 @@ pub struct Parameters {
     pub solo_cluster_cb_file: Option<PathBuf>,
 
     /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR, TopCells.
+    /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR,
+    /// TopCells, OrdMag.
+    ///
+    /// `OrdMag` is CellRanger's own initial cell call and is **not a STAR
+    /// method**: the same quantile-over-ratio rule as `CellRanger2.2`, but with
+    /// the expected cell count searched for rather than fixed at 3 000. Its
+    /// arguments are `maxExpectedCells quantile ratio`, default
+    /// `45000 0.99 10`. `EmptyDrops_CR` now uses it for its initial set, which
+    /// is the order CellRanger runs the two steps in.
     #[arg(long = "soloCellFilter", num_args = 1.., default_values_t = vec!["CellRanger2.2".to_string(), "3000".to_string(), "0.99".to_string(), "10".to_string()])]
     pub solo_cell_filter: Vec<String>,
 
@@ -1320,6 +1332,44 @@ pub struct Parameters {
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
 
+    /// Which barcodes the **raw** matrix has columns for. **Not a STAR
+    /// parameter**; a rustar-aligner addition, default `Whitelist`, which is
+    /// what STARsolo writes.
+    ///
+    /// `Whitelist` gives one column per whitelist barcode — 3.7 million of them
+    /// for 10x v3, whether or not a read ever carried them. `Observed` gives
+    /// one column per barcode that actually holds a count, which is what
+    /// CellRanger's `raw_feature_bc_matrix` contains, and turns a
+    /// hundreds-of-megabytes `barcodes.tsv` into a few kilobytes.
+    ///
+    /// The counts are identical either way; only the columns present differ.
+    #[arg(long = "soloOutRawBarcodes", default_value = "Whitelist",
+          value_parser = ["Whitelist", "Observed"])]
+    pub solo_out_raw_barcodes: String,
+
+    /// Shape of the solo matrix output on disk. **Not a STAR parameter**; a
+    /// rustar-aligner addition, default `STARsolo`, which changes nothing.
+    ///
+    /// `CellRanger` lays the same numbers out the way `cellranger count` does,
+    /// so a tool written against CellRanger's `outs/` reads a rustar run
+    /// unmodified. It implies, unless the corresponding flag is given
+    /// explicitly:
+    ///
+    /// * directories `raw_feature_bc_matrix/` and `filtered_feature_bc_matrix/`
+    ///   instead of `raw/` and `filtered/`;
+    /// * a `-1` GEM-well suffix on every barcode;
+    /// * gzip on all three files (`--soloOutGzip yes`);
+    /// * `--soloOutRawBarcodes Observed`, since CellRanger's raw matrix has one
+    ///   column per observed barcode, not one per whitelist entry;
+    /// * the output directory `outs/` instead of `Solo.out/`, with no
+    ///   per-feature subdirectory when exactly one feature is requested.
+    ///
+    /// Counts are untouched. Only where the bytes land, and how the barcodes
+    /// are spelled, changes.
+    #[arg(long = "soloOutLayout", default_value = "STARsolo",
+          value_parser = ["STARsolo", "CellRanger"])]
+    pub solo_out_layout: String,
+
     /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
     /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
     /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
@@ -1328,6 +1378,23 @@ pub struct Parameters {
     /// `spliced`/`unspliced`, with no `ambiguous.mtx`.
     #[arg(long = "soloVelocytoAmbiguous", default_value = "yes")]
     pub solo_velocyto_ambiguous: String,
+
+    /// CellRanger-style HDF5 count matrices (rustar extension beyond STARsolo).
+    /// `yes` additionally writes `raw_feature_bc_matrix.h5` (and
+    /// `filtered_feature_bc_matrix.h5` when cells were called) in each
+    /// `Gene`/`GeneFull` feature directory, next to `raw/` and `filtered/`, in
+    /// the CellRanger v3 layout that `scanpy.read_10x_h5` and `Seurat::Read10X_h5`
+    /// load. The MatrixMarket output is unchanged. Default `no`. Needs a binary
+    /// built with the `hdf5-out` cargo feature.
+    #[arg(long = "soloOutH5", default_value = "no")]
+    pub solo_out_h5: String,
+
+    /// Sample (library) name that `--soloOutLayout CellRanger` records in the
+    /// `.h5` attributes (`library_ids`), the BAM `@RG` ids and the
+    /// `molecule_info.h5` library table. CellRanger takes it from `--id`.
+    /// rustar extension beyond STARsolo.
+    #[arg(long = "soloOutSampleID", default_value = "sample")]
+    pub solo_out_sample_id: String,
 
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
@@ -1370,6 +1437,64 @@ impl Parameters {
     /// solo / quant-only runs that only need the count matrix.
     pub fn emits_alignments(&self) -> bool {
         !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
+    }
+
+    /// Whether the primary alignment output is BAM (file or stdout).
+    ///
+    /// STAR emits the STARsolo barcode/gene tags (`CR CY UR UY CB UB GX GN sM sS
+    /// sQ`) in BAM records only, `ReadAlign_outputTranscriptSAM.cpp` drops them
+    /// from the SAM text path.
+    pub fn bam_output(&self) -> bool {
+        // `--outStd` replaces the file output, so it decides the format: an
+        // `--outStd SAM` run writes SAM text whatever `--outSAMtype` says.
+        match self.out_std {
+            OutStd::Sam => false,
+            OutStd::BamUnsorted | OutStd::BamSortedByCoordinate => true,
+            OutStd::None => self.out_sam_type.format == OutSamFormat::Bam,
+        }
+    }
+
+    /// Whether a coordinate-sorted BAM is produced (file or stdout), STAR's
+    /// `outBAMcoord`. `CB`/`UB` can only be written there, since both are known
+    /// only after the solo counting pass.
+    pub fn bam_sorted_output(&self) -> bool {
+        match self.out_std {
+            OutStd::Sam | OutStd::BamUnsorted => false,
+            OutStd::BamSortedByCoordinate => true,
+            OutStd::None => {
+                self.out_sam_type.format == OutSamFormat::Bam
+                    && self.out_sam_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate)
+            }
+        }
+    }
+
+    /// The STARsolo tags this run actually emits: those requested via
+    /// `--outSAMattributes` that reach a BAM record. Empty for SAM text output,
+    /// which STAR never decorates with them.
+    pub fn solo_sam_tags(&self) -> SamAttributes {
+        if self.bam_output() {
+            self.out_sam_attributes & SamAttributes::SOLO_TAGS
+        } else {
+            SamAttributes::empty()
+        }
+    }
+
+    /// Whether the run has to track STAR's readInfo, the per-read (cell,
+    /// corrected UMI) pair that UMI collapsing fills and the sorted-BAM writer
+    /// turns into `CB`/`UB`. `CB_samTagOut` corrects the barcode inline instead,
+    /// and does no collapsing at all.
+    pub fn solo_read_info_needed(&self) -> bool {
+        self.solo_type != SoloType::CbSamTagOut
+            && self
+                .solo_sam_tags()
+                .intersects(SamAttributes::CB | SamAttributes::UB)
+    }
+
+    /// Whether the whole barcode read has to be kept around (the `sS`/`sQ` tags
+    /// are the only consumers).
+    pub fn solo_keeps_barcode_read(&self) -> bool {
+        self.solo_sam_tags()
+            .intersects(SamAttributes::SS | SamAttributes::SQ)
     }
 
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
@@ -1561,6 +1686,9 @@ impl Parameters {
         let matches = command.clone().get_matches_from(args.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
+        apply_cellranger_defaults_on_10x(&mut params, &matches);
+        apply_cellranger_layout(&mut params, &matches);
+
         params.command_line = {
             let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
             shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
@@ -1612,6 +1740,16 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--readFilesIn is required when --runMode alignReads",
+            ));
+        }
+
+        // A third read file only means anything to a solo run, where it is the
+        // barcode read (`ParametersSolo.cpp:124-132`).
+        if params.read_files_in.len() > 2 && !params.solo_enabled() {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--readFilesIn takes at most two files (mate 1, mate 2); a third file is \
+                 the barcode read of a --soloType run",
             ));
         }
 
@@ -1771,13 +1909,9 @@ impl Parameters {
             ));
         }
 
-        // quantMode GeneCounts requires a GTF file
-        if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
-            return Err(command.error(
-                ErrorKind::MissingRequiredArgument,
-                "--quantMode GeneCounts requires --sjdbGTFfile",
-            ));
-        }
+        // quantMode GeneCounts needs a gene model: --sjdbGTFfile here, or the
+        // annotation tables of a GTF-built index (checked when the index is
+        // loaded, as STAR's Transcriptome constructor does).
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
@@ -1791,6 +1925,37 @@ impl Parameters {
         params
             .rg_ids()
             .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
+
+        // STARsolo tags exist only in BAM records: STAR refuses them without BAM
+        // output (`samAttrRequiresBAM`, Parameters_samAttributes.cpp:226-241)
+        // rather than dropping them. STAR tests `sF` through the `sS` flag, and
+        // does not test `gx`/`gn` at all, so neither is listed on its own here.
+        if !params.bam_output() {
+            for (attr, tag) in [
+                (SamAttributes::CR, "CR"),
+                (SamAttributes::CY, "CY"),
+                (SamAttributes::UR, "UR"),
+                (SamAttributes::UY, "UY"),
+                (SamAttributes::CB, "CB"),
+                (SamAttributes::UB, "UB"),
+                (SamAttributes::SM, "sM"),
+                (SamAttributes::SS, "sS"),
+                (SamAttributes::SQ, "sQ"),
+                (SamAttributes::GX, "GX"),
+                (SamAttributes::GN, "GN"),
+            ] {
+                if params.out_sam_attributes.contains(attr) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--outSAMattributes contains {tag} tag, which requires BAM output; \
+                             re-run with --outSAMtype BAM Unsorted (and/or) SortedByCoordinate, \
+                             or without {tag} in --outSAMattributes"
+                        ),
+                    ));
+                }
+            }
+        }
 
         // Fold runtime-derived bits into out_sam_attributes so writers can read
         // it directly without re-computing. Mirrors STAR Parameters_samAttributes.cpp.
@@ -1957,16 +2122,21 @@ impl Parameters {
                     "--soloType SmartSeq requires --readFilesManifest (a TSV of read1<TAB>read2<TAB>cellID per cell)",
                 ));
             }
-            // CB_UMI_Simple needs exactly two read files: cDNA + barcode read.
+            // Barcode-read chemistries take `cDNA_read [cDNA_read2] barcode_read`:
+            // two files single-end, three when the cDNA is paired-end.
+            // `--soloBarcodeMate 1` is the exception (barcode on mate 1, two cDNA
+            // files, no barcode file), handled below.
             if matches!(
                 params.solo_type,
                 SoloType::CbUmiSimple | SoloType::CbUmiComplex | SoloType::CbSamTagOut
-            ) && params.read_files_in.len() != 2
+            ) && params.solo_barcode_mate == 0
+                && !matches!(params.read_files_in.len(), 2 | 3)
             {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     format!(
-                        "--soloType {} requires exactly two --readFilesIn files (cDNA read then barcode read); got {}",
+                        "--soloType {} requires two --readFilesIn files (cDNA read then barcode read), \
+                         or three for paired-end cDNA (cDNA read 1, cDNA read 2, barcode read); got {}",
                         params.solo_type,
                         params.read_files_in.len()
                     ),
@@ -1981,6 +2151,15 @@ impl Parameters {
                         return Err(command.error(
                             ErrorKind::InvalidValue,
                             "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
+                        ));
+                    }
+                    if params.read_files_in.len() != 2 {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "--soloBarcodeMate 1 requires exactly two --readFilesIn cDNA mate files; got {}",
+                                params.read_files_in.len()
+                            ),
                         ));
                     }
                     // The barcode region of that mate is not cDNA, and nothing
@@ -2022,6 +2201,67 @@ impl Parameters {
                     ));
                 }
             }
+            // CB / UB SAM tags (ParametersSolo.cpp:403-435). `CB_samTagOut`
+            // corrects the barcode as the read is processed, so it needs neither
+            // a sorted BAM nor a gene feature, but it has no UMI collapsing,
+            // hence no UB.
+            let cb_ub = params
+                .out_sam_attributes
+                .intersects(SamAttributes::CB | SamAttributes::UB);
+            if params.solo_type == SoloType::CbSamTagOut {
+                if params.out_sam_attributes.contains(SamAttributes::UB) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "UB attribute (corrected UMI) in --outSAMattributes cannot be used with \
+                         --soloType CB_samTagOut; use UR (uncorrected UMI) instead",
+                    ));
+                }
+            } else if cb_ub {
+                if !params.bam_sorted_output() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "CB and/or UB attributes in --outSAMattributes can only be output in the \
+                         sorted BAM file; re-run with --outSAMtype BAM SortedByCoordinate",
+                    ));
+                }
+                // STAR fills readInfo from the FIRST feature on the --soloFeatures
+                // list, which therefore has to be a gene-level one.
+                let first_feature = params.solo_features.first().map(String::as_str);
+                if !matches!(
+                    first_feature,
+                    Some("Gene" | "GeneFull" | "GeneFull_Ex50pAS" | "GeneFull_ExonOverIntron")
+                ) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "CB and/or UB attributes in --outSAMattributes require the first \
+                         --soloFeatures entry to be Gene, GeneFull, GeneFull_Ex50pAS, or \
+                         GeneFull_ExonOverIntron",
+                    ));
+                }
+            }
+            // `CB_samTagOut` only corrects the barcode against the whitelist, so
+            // the posterior-based multi-match modes have nothing to resolve
+            // (`ParametersSolo.cpp:678`), and there is no counting to spread
+            // multi-gene reads over (`ParametersSolo.cpp:483`).
+            if params.solo_type == SoloType::CbSamTagOut {
+                if !matches!(params.solo_cb_match_wl_type.as_str(), "Exact" | "1MM") {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloCBmatchWLtype {} does not work with --soloType CB_samTagOut; \
+                             use Exact or 1MM",
+                            params.solo_cb_match_wl_type
+                        ),
+                    ));
+                }
+                if params.solo_multi_mappers.iter().any(|m| m != "Unique") {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "multimapping options do not work for --soloType CB_samTagOut; \
+                         use --soloMultiMappers Unique",
+                    ));
+                }
+            }
             // soloMultiMappers values.
             for m in &params.solo_multi_mappers {
                 if !matches!(
@@ -2036,18 +2276,8 @@ impl Parameters {
                     ));
                 }
             }
-            // Gene-level features need a gene model (SJ does not — junctions come
-            // from the alignments).
-            let needs_gtf = params
-                .solo_features
-                .iter()
-                .any(|f| f == "Gene" || f == "GeneFull" || f == "Velocyto");
-            if needs_gtf && params.sjdb_gtf_file.is_none() {
-                return Err(command.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
-                ));
-            }
+            // Gene-level features need a gene model (SJ does not), from
+            // --sjdbGTFfile or the index tables; checked when the index is loaded.
             // CB length / UMI length sanity.
             if params.solo_type == SoloType::CbUmiSimple
                 && (params.solo_cb_len == 0 || params.solo_umi_len == 0)
@@ -2168,6 +2398,26 @@ impl Parameters {
                     ),
                 ));
             }
+            // --soloOutH5: yes/no, and `yes` only when the writer is compiled in.
+            match params.solo_out_h5.as_str() {
+                "no" => {}
+                "yes" if crate::solo::h5::is_available() => {}
+                "yes" => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloOutH5 yes needs the `{}` cargo feature, which this binary was built without",
+                            crate::solo::h5::CARGO_FEATURE
+                        ),
+                    ));
+                }
+                other => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!("unknown --soloOutH5 '{other}'; expected yes or no"),
+                    ));
+                }
+            }
             // A whitelist is required for any correction beyond None (SmartSeq
             // has no cell barcodes at all, so the rule does not apply).
             if params.solo_type != SoloType::SmartSeq
@@ -2211,6 +2461,11 @@ impl Parameters {
         self.solo_type != SoloType::None
     }
 
+    /// True when `--soloOutH5 yes` asks for the CellRanger-style `.h5` matrices.
+    pub fn solo_out_h5(&self) -> bool {
+        self.solo_out_h5 == "yes"
+    }
+
     /// Path to the cDNA (transcript) read file. For solo runs this is the
     /// FIRST `--readFilesIn` file (STAR convention: `cDNA_read barcode_read`).
     /// Returns `None` if no read files are configured.
@@ -2218,11 +2473,13 @@ impl Parameters {
         self.read_files_in.first()
     }
 
-    /// Path to the barcode (CB+UMI) read file — the SECOND `--readFilesIn`
-    /// file when solo is enabled. `None` if absent.
+    /// Path to the barcode (CB+UMI) read file: the LAST `--readFilesIn` file
+    /// when solo is enabled (`cDNA_read [cDNA_read2] barcode_read`). `None` if
+    /// absent, or when the barcode sits on mate 1 instead.
     pub fn barcode_read_file(&self) -> Option<&PathBuf> {
-        if self.solo_enabled() {
-            self.read_files_in.get(1)
+        if self.solo_enabled() && !self.solo_barcode_on_mate1() {
+            self.read_files_in
+                .get(self.read_files_in.len().checked_sub(1)?)
         } else {
             None
         }
@@ -2232,6 +2489,13 @@ impl Parameters {
     /// prefix of mate 1 and both `--readFilesIn` files are cDNA mates.
     pub fn solo_barcode_on_mate1(&self) -> bool {
         self.solo_enabled() && self.solo_barcode_mate == 1
+    }
+
+    /// True when the solo run aligns a cDNA mate PAIR: either the barcode is on
+    /// mate 1 (`--soloBarcodeMate 1`, two files) or a third `--readFilesIn` file
+    /// carries the barcode read (STAR's `cDNA_read1 cDNA_read2 barcode_read`).
+    pub fn solo_paired_cdna(&self) -> bool {
+        self.solo_barcode_on_mate1() || (self.solo_enabled() && self.read_files_in.len() == 3)
     }
 
     /// The two cDNA mate files (mate 1, mate 2) for a `--soloBarcodeMate 1` run.
@@ -2301,8 +2565,454 @@ impl Parameters {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The flags STAR documents for matching CellRanger 4.x/5.x
+/// (`docs/STARsolo.md`), applied by default when the run is a 10x one.
+const CELLRANGER_DEFAULTS: [(&str, &str); 8] = [
+    ("clip_adapter_type", "CellRanger4"),
+    ("out_filter_score_min", "30"),
+    ("solo_cb_match_wl_type", "1MM_multi_Nbase_pseudocounts"),
+    ("solo_umi_filtering", "MultiGeneUMI_CR"),
+    ("solo_umi_dedup", "1MM_CR"),
+    // Not a STAR flag: the output layout, so a 10x run lands where a tool
+    // written against `cellranger count` expects to find it.
+    ("solo_out_layout", "CellRanger"),
+    // CellRanger has counted intronic reads toward the gene since v7.0.
+    // STARsolo's `Gene` is exonic-only, which on human data is 30% below
+    // CellRanger; `GeneFull` is the equivalent of its default.
+    ("solo_features", "GeneFull"),
+    ("solo_cell_filter", "EmptyDrops_CR"),
+];
+
+/// Does this look like a 10x Chromium run?
+///
+/// `CB_UMI_Simple` with a whitelist, a 16-base cell barcode, and a UMI of 10
+/// (v2) or 12 (v3) bases. That is the geometry of every 10x 3'/5' gene
+/// expression chemistry, and nothing else in common use shares it.
+fn looks_like_10x(params: &Parameters) -> bool {
+    params.solo_type == SoloType::CbUmiSimple
+        && params.solo_cb_len == 16
+        && (params.solo_umi_len == 10 || params.solo_umi_len == 12)
+        && params
+            .solo_cb_whitelist
+            .first()
+            .is_some_and(|w| w != "None" && w != "-")
+}
+
+/// On a 10x run, default to CellRanger's behaviour rather than STARsolo's.
+///
+/// **This diverges from STAR by default**, which is why it is confined to a
+/// geometry that is unambiguously 10x, and why every flag it changes is
+/// logged. A flag given on the command line always wins, so the change is
+/// invisible to anyone who states what they want.
+///
+/// The rationale is that a user aligning 10x data and comparing against
+/// CellRanger currently gets a successful run and different numbers, with
+/// nothing pointing at the five flags that explain the difference. Measured on
+/// a 20 000-read fixture, those flags move the count matrix from 8.9% away
+/// from CellRanger to 0.03%.
+///
+/// Recorded in `DIVERGENCE.md`; it needs maintainer sign-off.
+fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::ArgMatches) {
+    use clap::parser::ValueSource;
+
+    if !looks_like_10x(params) {
+        return;
+    }
+
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+    let mut applied: Vec<&str> = Vec::new();
+    for (id, value) in CELLRANGER_DEFAULTS {
+        if given(id) {
+            continue;
+        }
+        // MultiGeneUMI_CR decides ownership from the corrected-UMI map that
+        // only the CellRanger dedup builds, and STAR refuses the pair
+        // otherwise. So when the user has picked a different dedup, this
+        // default stays out of the way rather than composing into a
+        // combination the validation then rejects.
+        if id == "solo_umi_filtering"
+            && given("solo_umi_dedup")
+            && params.solo_umi_dedup.first().map(String::as_str) != Some("1MM_CR")
+        {
+            continue;
+        }
+        match id {
+            "clip_adapter_type" => params.clip_adapter_type = value.to_string(),
+            "out_filter_score_min" => params.out_filter_score_min = 30,
+            "solo_cb_match_wl_type" => params.solo_cb_match_wl_type = value.to_string(),
+            "solo_umi_filtering" => params.solo_umi_filtering = vec![value.to_string()],
+            "solo_umi_dedup" => params.solo_umi_dedup = vec![value.to_string()],
+            "solo_out_layout" => params.solo_out_layout = value.to_string(),
+            "solo_features" => params.solo_features = vec![value.to_string()],
+            // CellRanger 10's cell call is OrdMag plus the EmptyDrops-style
+            // rescue of non-ambient barcodes, which is `EmptyDrops_CR`; the
+            // arguments are STAR's documented ones for CellRanger >= 3.
+            "solo_cell_filter" => {
+                params.solo_cell_filter = [
+                    "EmptyDrops_CR",
+                    "3000",
+                    "0.99",
+                    "10",
+                    "45000",
+                    "90000",
+                    "500",
+                    "0.01",
+                    "20000",
+                    "0.01",
+                    "10000",
+                ]
+                .map(String::from)
+                .to_vec();
+            }
+            _ => continue,
+        }
+        applied.push(value);
+    }
+
+    if !applied.is_empty() {
+        log::info!(
+            "10x geometry detected (CB {} + UMI {} with a whitelist): defaulting to \
+             CellRanger behaviour [{}]. Pass the flags explicitly to override; this \
+             differs from STARsolo's defaults.",
+            params.solo_cb_len,
+            params.solo_umi_len,
+            applied.join(", ")
+        );
+    }
+}
+
+/// `--soloOutLayout CellRanger` implies three existing flags and the output
+/// directory name. Each is still overridable: a flag named on the command line
+/// keeps its value, so the layout can be adopted piecemeal.
+///
+/// Runs after `apply_cellranger_defaults_on_10x`, so it sees the layout whether
+/// it was asked for or inferred from 10x geometry.
+fn apply_cellranger_layout(params: &mut Parameters, matches: &clap::ArgMatches) {
+    use clap::parser::ValueSource;
+
+    if params.solo_out_layout != "CellRanger" {
+        return;
+    }
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+    // CellRanger's BAM names the raw and corrected barcode and UMI of every read.
+    if params.bam_sorted_output() {
+        params.out_sam_attributes |= SamAttributes::CR
+            | SamAttributes::CY
+            | SamAttributes::UR
+            | SamAttributes::UY
+            | SamAttributes::CB
+            | SamAttributes::UB;
+    }
+    if !given("solo_out_gzip") {
+        params.solo_out_gzip = "yes".to_string();
+    }
+    if !given("solo_out_raw_barcodes") {
+        params.solo_out_raw_barcodes = "Observed".to_string();
+    }
+    if !given("solo_out_file_names")
+        && let Some(dir) = params.solo_out_file_names.first_mut()
+    {
+        // CellRanger writes its matrices under `outs/`, not `Solo.out/`.
+        *dir = "outs/".to_string();
+    }
+    // `possorted_genome_bam.bam` carries cellranger's tag set and the unmapped
+    // reads (`outSAMunmapped Within`); the tags come from the same names the
+    // user would otherwise list in `--outSAMattributes`.
+    if params.solo_type == SoloType::CbUmiSimple && params.bam_sorted_output() {
+        params.out_sam_attributes |= SamAttributes::NH
+            | SamAttributes::HI
+            | SamAttributes::AS
+            | SamAttributes::NMM
+            | SamAttributes::CR
+            | SamAttributes::CY
+            | SamAttributes::UR
+            | SamAttributes::UY
+            | SamAttributes::CB
+            | SamAttributes::UB
+            | SamAttributes::GX
+            | SamAttributes::GN;
+        if params.out_sam_unmapped == OutSamUnmapped::None {
+            params.out_sam_unmapped = OutSamUnmapped::Within;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// 10x geometry with a whitelist gets CellRanger's five flags without the
+    /// user naming any of them. This is a deliberate divergence from STARsolo's
+    /// defaults, so the test states the whole set rather than spot-checking one.
+    #[test]
+    fn ten_x_geometry_defaults_to_cellranger_behaviour() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+        ])
+        .unwrap();
+        assert_eq!(p.clip_adapter_type, "CellRanger4");
+        assert_eq!(p.out_filter_score_min, 30);
+        assert_eq!(p.solo_cb_match_wl_type, "1MM_multi_Nbase_pseudocounts");
+        assert_eq!(p.solo_umi_filtering, vec!["MultiGeneUMI_CR".to_string()]);
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
+        assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_features, vec!["GeneFull".to_string()]);
+        assert_eq!(
+            p.solo_cell_filter.first().map(String::as_str),
+            Some("EmptyDrops_CR")
+        );
+    }
+
+    /// `--soloFeatures` given explicitly wins, so a user who wants STARsolo's
+    /// exonic-only counting on 10x data still gets it.
+    #[test]
+    fn an_explicit_solo_features_beats_the_10x_intron_default() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Gene",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_features, vec!["Gene".to_string()]);
+        // The rest of the CellRanger defaults still apply.
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
+    }
+
+    /// `--soloOutLayout CellRanger` pulls three existing flags and the output
+    /// directory with it, so the layout is one decision rather than four.
+    #[test]
+    fn cellranger_layout_implies_gzip_observed_barcodes_and_outs_dir() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "12",
+            "--soloUMIstart",
+            "13",
+            "--soloUMIlen",
+            "10",
+            "--soloOutLayout",
+            "CellRanger",
+        ])
+        .unwrap();
+        // 12-base CB, so the 10x autodetection is not what set this.
+        assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_out_gzip, "yes");
+        assert_eq!(p.solo_out_raw_barcodes, "Observed");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "outs/");
+    }
+
+    /// The layout is adoptable piecemeal: each flag it implies is still
+    /// overridable on the command line.
+    #[test]
+    fn an_explicit_flag_beats_what_the_cellranger_layout_implies() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloOutGzip",
+            "no",
+            "--soloOutRawBarcodes",
+            "Whitelist",
+            "--soloOutFileNames",
+            "Solo.out/",
+            "features.tsv",
+            "barcodes.tsv",
+            "matrix.mtx",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_out_gzip, "no");
+        assert_eq!(p.solo_out_raw_barcodes, "Whitelist");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "Solo.out/");
+    }
+
+    /// The default is STARsolo's layout: no `-1`, no `outs/`, no gzip.
+    #[test]
+    fn non_10x_geometry_keeps_the_starsolo_layout() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "12",
+            "--soloUMIstart",
+            "13",
+            "--soloUMIlen",
+            "10",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_out_layout, "STARsolo");
+        assert_eq!(p.solo_out_gzip, "no");
+        assert_eq!(p.solo_out_raw_barcodes, "Whitelist");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "Solo.out/");
+    }
+
+    /// A flag given on the command line always wins, including when the value
+    /// asked for is STARsolo's own default. Without this the divergence would
+    /// be inescapable, which is a different and much worse thing than a
+    /// divergent default.
+    #[test]
+    fn an_explicit_flag_beats_the_10x_default() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloUMIdedup",
+            "1MM_All",
+            "--clipAdapterType",
+            "Hamming",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_All".to_string()]);
+        assert_eq!(p.clip_adapter_type, "Hamming");
+        // The ones not named still take the CellRanger value.
+        assert_eq!(p.out_filter_score_min, 30);
+    }
+
+    /// Geometry that is not 10x is left alone: a 12-base barcode is not any
+    /// Chromium chemistry, so nothing is overridden.
+    #[test]
+    fn non_10x_geometry_keeps_starsolo_defaults() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "12",
+            "--soloUMIstart",
+            "13",
+            "--soloUMIlen",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(p.clip_adapter_type, "Hamming");
+        assert_eq!(p.out_filter_score_min, 0);
+        assert_eq!(p.solo_cb_match_wl_type, "1MM_multi");
+    }
+
+    /// No whitelist means no 10x run, whatever the lengths say. (Without a
+    /// whitelist the CB-match type must be Exact anyway, which is unrelated
+    /// validation that predates this and is stated here so the test reads.)
+    #[test]
+    fn ten_x_lengths_without_a_whitelist_keep_starsolo_defaults() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloCBmatchWLtype",
+            "Exact",
+        ])
+        .unwrap();
+        assert_eq!(p.clip_adapter_type, "Hamming");
+        assert_eq!(p.out_filter_score_min, 0);
+    }
     use super::*;
 
     /// Helper: parse a STAR-style command line (without program name).
@@ -3143,6 +3853,15 @@ mod tests {
             "genes.gtf",
             "--soloCBwhitelist",
             "wl.txt",
+            // Deliberately not 10x geometry: on a 10x run this build defaults
+            // the dedup to 1MM_CR, which would satisfy the rule on its own and
+            // hide what this test is about (see the 10x case at the end).
+            "--soloCBlen",
+            "12",
+            "--soloUMIlen",
+            "8",
+            "--soloUMIstart",
+            "13",
             "--soloUMIfiltering",
             "MultiGeneUMI_CR",
         ];
@@ -3164,6 +3883,24 @@ mod tests {
         multi.extend_from_slice(&["--soloUMIdedup", "1MM_CR", "Exact"]);
         assert!(try_parse(&multi).is_err());
 
+        // On 10x geometry the CellRanger defaults supply 1MM_CR themselves, so
+        // the same flags are accepted rather than refused.
+        let tenx = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloUMIfiltering",
+            "MultiGeneUMI_CR",
+        ];
+        let p = try_parse(&tenx).expect("10x defaults supply the CellRanger dedup");
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
+
         // The pairing rule applies only to MultiGeneUMI_CR.
         assert!(
             try_parse(&[
@@ -3181,6 +3918,151 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// The STARsolo barcode tags parse into their own flags
+    /// (`Parameters_samAttributes.cpp:111-165`).
+    #[test]
+    fn solo_sam_attributes_parse() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--outSAMattributes",
+            "NH",
+            "HI",
+            "CR",
+            "CY",
+            "UR",
+            "UY",
+            "sM",
+            "sS",
+            "sQ",
+            "GX",
+            "GN",
+        ])
+        .unwrap();
+        let a = p.out_sam_attributes;
+        for flag in [
+            SamAttributes::CR,
+            SamAttributes::CY,
+            SamAttributes::UR,
+            SamAttributes::UY,
+            SamAttributes::SM,
+            SamAttributes::SS,
+            SamAttributes::SQ,
+            SamAttributes::GX,
+            SamAttributes::GN,
+        ] {
+            assert!(a.contains(flag), "missing {flag:?}");
+        }
+        // Not in the preset sets.
+        assert!(!SamAttributes::ALL.intersects(SamAttributes::SOLO_TAGS));
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "Cb"]).is_err());
+    }
+
+    /// `CB`/`UB` are filled when the sorted BAM is written, so STAR refuses them
+    /// with any other output type, and refuses `UB` outright for `CB_samTagOut`
+    /// (no UMI collapsing there). `ParametersSolo.cpp:403-435`.
+    #[test]
+    fn solo_attributes_require_bam_output() {
+        for tag in ["CR", "UR", "CB", "sM", "sS", "GX", "GN"] {
+            let err = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", tag])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires BAM output"), "{tag}: {err}");
+        }
+        // gx/gn are not in STAR's samAttrRequiresBAM list.
+        let unsorted = ["--outSAMtype", "BAM", "Unsorted"];
+        let mut args = vec!["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "GX"];
+        args.extend_from_slice(&unsorted);
+        assert!(try_parse(&args).is_ok());
+    }
+
+    #[test]
+    fn cb_ub_attributes_require_a_sorted_bam_and_a_gene_feature() {
+        let solo = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBwhitelist",
+            "wl.txt",
+        ];
+        let with = |extra: &[&str]| {
+            let mut v = solo.to_vec();
+            v.extend_from_slice(extra);
+            try_parse(&v)
+        };
+
+        let sorted = ["--outSAMtype", "BAM", "SortedByCoordinate"];
+        let mut ok = solo.to_vec();
+        ok.extend_from_slice(&sorted);
+        ok.extend_from_slice(&["--outSAMattributes", "NH", "CB", "UB"]);
+        assert!(try_parse(&ok).is_ok());
+
+        // SAM text and unsorted BAM: refused.
+        assert!(with(&["--outSAMattributes", "NH", "CB"]).is_err());
+        assert!(
+            with(&[
+                "--outSAMtype",
+                "BAM",
+                "Unsorted",
+                "--outSAMattributes",
+                "NH",
+                "UB"
+            ])
+            .is_err()
+        );
+
+        // `--outStd SAM` replaces the sorted BAM with SAM text, which STAR
+        // never tags: refused, even though --outSAMtype still says sorted BAM.
+        let mut std_sam = solo.to_vec();
+        std_sam.extend_from_slice(&sorted);
+        std_sam.extend_from_slice(&["--outStd", "SAM", "--outSAMattributes", "NH", "CB"]);
+        assert!(try_parse(&std_sam).is_err());
+
+        // Sorted BAM but a non-gene first feature: refused.
+        let mut sj_first = solo.to_vec();
+        sj_first.extend_from_slice(&sorted);
+        sj_first.extend_from_slice(&[
+            "--soloFeatures",
+            "SJ",
+            "Gene",
+            "--outSAMattributes",
+            "NH",
+            "CB",
+        ]);
+        assert!(try_parse(&sj_first).is_err());
+
+        // CB_samTagOut corrects the barcode inline: CB needs no sorted BAM, and
+        // UB does not exist at all. (Its only allowed match types are Exact and
+        // 1MM, so the 1MM_multi default has to be overridden.)
+        let tag_out = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_samTagOut",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBmatchWLtype",
+            "1MM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ];
+        let mut cb_only = tag_out.to_vec();
+        cb_only.extend_from_slice(&["--outSAMattributes", "NH", "CB"]);
+        assert!(try_parse(&cb_only).is_ok());
+        let mut with_ub = tag_out.to_vec();
+        with_ub.extend_from_slice(&["--outSAMattributes", "NH", "UB"]);
+        assert!(try_parse(&with_ub).is_err());
     }
 
     #[test]

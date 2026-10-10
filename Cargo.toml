@@ -64,9 +64,28 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
+# Deterministic SIMD overlap aligner for the CellRanger4 5' TSO clip (STAR
+# links Opal for this). Pure Rust, zero dependencies, bit-identical across
+# backends. 0.2 is the first release with `Database::scan_all`, the per-target
+# scan the batched clip path needs.
+hyalite = "0.2"
+# --- CellRanger-style HDF5 output (--soloOutH5 yes) -------------------------
+# Pure-Rust HDF5 writer: no libhdf5, no cmake, no build script (#270, following
+# #177, which ruled out the C-backed crates). Optional and off by default, so
+# the default build gains no dependency; enable with `--features hdf5-out`.
+hdf5-pure = { version = "0.47", optional = true }
+
+[features]
+default = []
+# `raw_feature_bc_matrix.h5` / `filtered_feature_bc_matrix.h5` next to the
+# STARsolo MatrixMarket directories.
+hdf5-out = ["dep:hdf5-pure"]
 
 [dev-dependencies]
 assert_cmd = "2"
+# Already a runtime dependency at the same version; listed here so the
+# integration tests can read the gzipped CellRanger-layout matrix files.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 predicates = "3"
 
 [build-dependencies]

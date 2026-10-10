@@ -2,14 +2,14 @@
 use crate::align::score::AlignmentScorer;
 use crate::align::seed::Seed;
 use crate::align::stitch::{
-    PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
-    stitch_seeds_with_jdb_debug,
+    PE_SPACER_BASE, WindowRecord, cluster_seeds, finalize_transcript, split_combined_wt,
+    stitch_seeds_core, stitch_seeds_with_jdb_debug,
 };
 use crate::align::transcript::{Exon, Transcript};
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::{MultimapperOrder, Parameters};
-use crate::stats::UnmappedReason;
+use crate::stats::{BestTr, UnmappedReason};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Derive a deterministic per-read RNG seed from `run_rng_seed` + the read name.
@@ -23,6 +23,47 @@ pub(crate) fn per_read_seed(run_rng_seed: u64, read_name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     read_name.hash(&mut hasher);
     run_rng_seed.wrapping_mul(hasher.finish().wrapping_add(1))
+}
+/// STAR's multimapper order and primary (`ReadAlign_multMapSelect.cpp` and the
+/// `trBest` choice of `ReadAlign_stitchPieces.cpp`), default `--outMultimapperOrder
+/// Old_2.4`. `items` arrive in window order (`trMult`), which is the order STAR writes
+/// them in; the primary is `trBest`: the best score, then the shortest genomic span,
+/// then the first window. With `--outSAMmultNmax` set, the best-scoring alignments are
+/// first swapped to the top in window order and the first one is the primary.
+///
+/// On return each item's `star_order` is its rank in STAR's output order (the `HI`
+/// order of the genomic records, and the transcriptome order), and the primary is
+/// `items[0]`.
+fn star_mult_map_order<T>(
+    items: &mut Vec<T>,
+    score: impl Fn(&T) -> i32,
+    g_length: impl Fn(&T) -> u64,
+    star_order: impl Fn(&mut T) -> &mut u32,
+    mult_nmax_set: bool,
+) {
+    let Some(max_score) = items.iter().map(&score).max() else {
+        return;
+    };
+    let primary = if mult_nmax_set {
+        let mut n_best = 0;
+        for i in 0..items.len() {
+            if score(&items[i]) == max_score {
+                items.swap(i, n_best);
+                n_best += 1;
+            }
+        }
+        0
+    } else {
+        (0..items.len())
+            .filter(|&i| score(&items[i]) == max_score)
+            .min_by_key(|&i| (g_length(&items[i]), i))
+            .unwrap_or(0)
+    };
+    for (rank, item) in items.iter_mut().enumerate() {
+        *star_order(item) = rank as u32;
+    }
+    let best = items.remove(primary);
+    items.insert(0, best);
 }
 
 /// Shuffle the prefix of `items` whose `score_fn` equals the first element's score.
@@ -101,6 +142,7 @@ pub type AlignReadResult = (
     Vec<crate::chimeric::ChimericAlignment>,
     usize,
     Option<UnmappedReason>,
+    BestTr,
 );
 
 /// Paired-end alignment result
@@ -121,6 +163,11 @@ pub struct PairedAlignment {
     /// Combined pair score: sum of per-mate finalized scores (each includes genomic length penalty).
     /// Used for multi-mapper score-range ranking and mappedFilter quality check.
     pub combined_wt_score: i32,
+    /// Position of this pair in STAR's alignment order (`trMult`: window
+    /// creation order, then the order inside the window). The genomic output
+    /// sorts pairs by score and position; the transcriptome output follows
+    /// this rank, as STAR's does. Set once the pair list is final.
+    pub star_order: u32,
 }
 
 impl PairedAlignment {
@@ -164,8 +211,55 @@ impl PairedAlignment {
             n_junction: m1.n_junction + m2.n_junction,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
+}
+
+/// STAR's within-window transcript dedup (`stitchWindowAligns.cpp`) for the
+/// pairs found in one window, `pairs[start..]`: drop a pair whose blocks, on
+/// both mates, are all covered by another pair with a strictly higher score.
+/// STAR applies it to the combined two-mate transcript, so the overlap and the
+/// mapped length are summed over both mates. Without it, a lower-scoring
+/// sub-alignment at the same locus (`66M9S` beside `66M2I7M`) is reported as
+/// an extra multimapper.
+fn drop_covered_pairs(pairs: &mut Vec<PairedAlignment>, start: usize) {
+    use crate::align::stitch::finalized_exon_overlap;
+    let window = &pairs[start..];
+    let mapped = |p: &PairedAlignment| -> u32 {
+        [&p.mate1_transcript, &p.mate2_transcript]
+            .iter()
+            .flat_map(|t| t.exons.iter())
+            .map(|e| (e.read_end - e.read_start) as u32)
+            .sum()
+    };
+    let mut keep = vec![true; window.len()];
+    for i in 0..window.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in 0..window.len() {
+            if i == j || !keep[j] {
+                continue;
+            }
+            let (a, b) = (&window[i], &window[j]);
+            let overlap =
+                finalized_exon_overlap(&a.mate1_transcript.exons, &b.mate1_transcript.exons)
+                    + finalized_exon_overlap(&a.mate2_transcript.exons, &b.mate2_transcript.exons);
+            if mapped(a) <= overlap && a.combined_wt_score < b.combined_wt_score {
+                keep[i] = false;
+                break;
+            } else if mapped(b) <= overlap && b.combined_wt_score < a.combined_wt_score {
+                keep[j] = false;
+            }
+        }
+    }
+    let mut idx = 0;
+    pairs.retain(|_| {
+        let k = idx < start || keep[idx - start];
+        idx += 1;
+        k
+    });
 }
 
 /// Result of paired-end alignment, covering all mapping outcomes.
@@ -267,7 +361,13 @@ fn align_read_inner(
         if debug_read {
             eprintln!("[DEBUG {read_name}] No seeds found — unmapped");
         }
-        return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            0,
+            Some(UnmappedReason::Other),
+            BestTr::default(),
+        ));
     }
 
     // Step 2: Cluster seeds (STAR's bin-based windowing)
@@ -328,7 +428,13 @@ fn align_read_inner(
         if debug_read {
             eprintln!("[DEBUG {read_name}] No clusters — unmapped");
         }
-        return Ok((Vec::new(), Vec::new(), 0, Some(UnmappedReason::Other)));
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            0,
+            Some(UnmappedReason::Other),
+            BestTr::default(),
+        ));
     }
 
     // Cap total clusters (alignWindowsPerReadNmax)
@@ -353,9 +459,14 @@ fn align_read_inner(
         Some(&index.junction_db)
     };
 
+    let mut window_record = WindowRecord::new(
+        params.out_filter_multimap_score_range,
+        params.chim_segment_min > 0,
+    );
     for (ci, cluster) in clusters.iter().enumerate() {
         let debug_name = if debug_read { read_name } else { "" };
         let cluster_transcripts = stitch_seeds_with_jdb_debug(
+            &mut window_record,
             cluster,
             read_seq,
             index,
@@ -432,41 +543,58 @@ fn align_read_inner(
         });
     }
 
-    // Deterministic primary tie-break (score, then a fixed positional order).
-    transcripts.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then_with(|| a.n_junction.cmp(&b.n_junction))
-            .then_with(|| a.chr_idx.cmp(&b.chr_idx))
-            .then_with(|| a.genome_start.cmp(&b.genome_start))
-            .then_with(|| a.is_reverse.cmp(&b.is_reverse))
+    // STAR's `trBest` (ReadAlign_stitchPieces.cpp), taken in discovery order before
+    // the positional sort below: greater score, or equal score and shorter genomic
+    // length. Its score and mismatches go on the unmapped records.
+    let mut best_in_order: Option<&Transcript> = None;
+    for t in &transcripts {
+        if best_in_order.is_none_or(|b| {
+            t.score > b.score
+                || (t.score == b.score
+                    && t.genome_end - t.genome_start < b.genome_end - b.genome_start)
+        }) {
+            best_in_order = Some(t);
+        }
+    }
+    let best_tr = best_in_order.map_or_else(BestTr::default, |t| BestTr {
+        score: t.score,
+        n_mm: t.n_mismatch,
     });
 
-    // Primary selection — STAR's multMapSelect (ReadAlign_multMapSelect.cpp).
-    //
-    // STAR's DEFAULT (`--outMultimapperOrder Old_2.4`) does NOT consult the RNG
-    // for primary selection; it marks the deterministic best alignment primary.
-    // Only `--outMultimapperOrder Random` shuffles. Previously rustar-aligner
-    // shuffled unconditionally, which randomised the primary among equal-score
-    // loci and diverged from STAR's deterministic choice. Gate the shuffle on
-    // the Random mode so the default is deterministic and STAR-faithful.
-    //
-    // Under Random, we shuffle the tied top-score prefix with a per-read seed
-    // (deterministic per read → thread-count invariant).
+    // STAR's multMapSelect (ReadAlign_multMapSelect.cpp): score range, then the
+    // output order and the primary.
+    if !transcripts.is_empty() {
+        let max_score = transcripts.iter().map(|t| t.score).max().unwrap_or(0);
+        let score_threshold = max_score - params.out_filter_multimap_score_range;
+        transcripts.retain(|t| t.score >= score_threshold);
+    }
     if params.out_multimapper_order == MultimapperOrder::Random {
+        // Under Random, the tied top-score prefix is shuffled with a per-read seed
+        // (deterministic per read, so thread-count invariant).
+        transcripts.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.n_junction.cmp(&b.n_junction))
+                .then_with(|| a.chr_idx.cmp(&b.chr_idx))
+                .then_with(|| a.genome_start.cmp(&b.genome_start))
+                .then_with(|| a.is_reverse.cmp(&b.is_reverse))
+        });
         shuffle_tied_prefix(
             &mut transcripts,
             |t| t.score,
             per_read_seed(params.run_rng_seed, read_name),
         );
-    }
-
-    // Score-range filter: keep only alignments within outFilterMultimapScoreRange of the best.
-    // (STAR's multMapSelect step — must run before quality filters.)
-    if !transcripts.is_empty() {
-        let max_score = transcripts[0].score;
-        let score_threshold = max_score - params.out_filter_multimap_score_range;
-        transcripts.retain(|t| t.score >= score_threshold);
+        for (rank, t) in transcripts.iter_mut().enumerate() {
+            t.star_order = rank as u32;
+        }
+    } else {
+        star_mult_map_order(
+            &mut transcripts,
+            |t| t.score,
+            |t| t.genome_end - t.genome_start,
+            |t| &mut t.star_order,
+            params.out_sam_mult_nmax >= 0,
+        );
     }
 
     // Step 4: STAR's mappedFilter (`ReadAlign_mappedFilter.cpp`), which runs after
@@ -577,6 +705,7 @@ fn align_read_inner(
         chimeric_alignments,
         n_for_mapq,
         unmapped_reason,
+        best_tr,
     ))
 }
 
@@ -585,6 +714,7 @@ type PairedAlignResult = (
     Vec<crate::chimeric::ChimericAlignment>,
     usize,
     Option<UnmappedReason>,
+    BestTr,
 );
 
 /// Align paired-end reads using STAR's combined-read approach.
@@ -652,8 +782,9 @@ pub fn align_paired_read(
         params,
         debug_name,
     )?;
-    let mut m2_seeds = Seed::find_seeds(
+    let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
+        len1 + 1,
         index,
         params.seed_map_min,
         params,
@@ -686,10 +817,24 @@ pub fn align_paired_read(
     // "other" (`nW==0`), not "too short"; a pair our pairing step later
     // rejects still counts, since STAR's `trAll` has it.
     let mut any_transcript = false;
+    // STAR's `trBest` over every window transcript, pairs and single mates alike
+    // (higher score wins; the first one on a tie): its score and mismatches go on
+    // the unmapped records.
+    let mut best_tr: Option<(BestTr, u64)> = None;
+    let mut pe_overlap_replaced = false;
+    let mut note_best = |score: i32, n_mm: u32, g_length: u64| {
+        // STAR (ReadAlign_stitchPieces.cpp): greater score, or equal score and
+        // shorter genomic length.
+        if best_tr.is_none_or(|(b, gl)| score > b.score || (score == b.score && g_length < gl)) {
+            best_tr = Some((BestTr { score, n_mm }, g_length));
+        }
+    };
 
     // Stitch combined clusters, split WTs by mate_id, finalize each half
+    let mut window_record = WindowRecord::new(params.out_filter_multimap_score_range, chim_on);
     for cluster in clusters.iter().take(params.align_windows_per_read_nmax) {
         let (wts, stitch_cluster, stitch_is_reverse, stitch_read) = stitch_seeds_core(
+            &mut window_record,
             cluster,
             &combined_read,
             index,
@@ -702,6 +847,7 @@ pub fn align_paired_read(
         let mut chim_window: Vec<crate::chimeric::WinTr> = Vec::new();
         let str_ = u8::from(stitch_is_reverse);
 
+        let window_pairs_start = joint_pairs.len();
         for wt in &wts {
             let split_result =
                 split_combined_wt(wt, len1, len2, stitch_is_reverse, scorer.align_intron_min);
@@ -763,9 +909,27 @@ pub fn align_paired_read(
                     t2.is_reverse = true;
                 }
 
-                let combined_span =
-                    t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start);
+                // STAR's genomic-length penalty spans the first exon's start to the LAST
+                // exon's end (`stitchWindowAligns.cpp:301-304`). When the mates overlap
+                // and the second one ends before the first, that is not the pair's extent.
+                let combined_span = match (wt.exons.first(), wt.exons.last()) {
+                    (Some(first), Some(last)) => last.genome_end - first.genome_start,
+                    _ => t1.genome_end.max(t2.genome_end) - t1.genome_start.min(t2.genome_start),
+                };
                 let combined_wt_score = wt.score + scorer.genomic_length_penalty(combined_span);
+                // trBest keeps STAR's own score and length: the penalty is taken over
+                // first exon start to last exon end in transcript order, which differs
+                // from the span of the two mates when they overlap or protrude
+                // (stitchWindowAligns.cpp, scoreGenomicLength).
+                let star_g_length = match (wt.exons.first(), wt.exons.last()) {
+                    (Some(f), Some(l)) => l.genome_end.saturating_sub(f.genome_start),
+                    _ => combined_span,
+                };
+                note_best(
+                    wt.score + scorer.genomic_length_penalty(star_g_length),
+                    t1.n_mismatch + t2.n_mismatch,
+                    star_g_length,
+                );
 
                 let pair = try_pair_transcripts(
                     &t1,
@@ -842,6 +1006,7 @@ pub fn align_paired_read(
                     ) {
                         t.is_reverse = stitch_is_reverse;
                         any_transcript = true;
+                        note_best(t.score, t.n_mismatch, t.genome_end - t.genome_start);
                         if chim_on {
                             chim_window.extend(crate::chimeric::WinTr::single(
                                 &t,
@@ -881,6 +1046,7 @@ pub fn align_paired_read(
                     ) {
                         t.is_reverse = !stitch_is_reverse;
                         any_transcript = true;
+                        note_best(t.score, t.n_mismatch, t.genome_end - t.genome_start);
                         if chim_on {
                             chim_window.extend(crate::chimeric::WinTr::single(
                                 &t,
@@ -900,6 +1066,7 @@ pub fn align_paired_read(
                 }
             }
         }
+        drop_covered_pairs(&mut joint_pairs, window_pairs_start);
         if chim_on {
             chim_windows.push(chim_window);
         }
@@ -950,7 +1117,7 @@ pub fn align_paired_read(
             merge_params.out_filter_match_nmin = 0;
             merge_params.out_filter_match_nmin_over_lread = 0.0;
             merge_params.out_filter_score_min_over_lread = 0.0;
-            let (merged_transcripts, _merged_chim, _n_mapq, _unmapped) =
+            let (merged_transcripts, _merged_chim, _n_mapq, _unmapped, _best) =
                 align_read_inner(&merge.merged, read_name, index, &merge_params, false)?;
             let mut converted: Vec<PairedAlignment> = Vec::new();
             for t in &merged_transcripts {
@@ -981,9 +1148,11 @@ pub fn align_paired_read(
                     is_proper_pair,
                     insert_size,
                     combined_wt_score,
+                    star_order: 0,
                 });
             }
             if !converted.is_empty() {
+                pe_overlap_replaced = true;
                 joint_pairs = converted;
             }
         }
@@ -1091,35 +1260,59 @@ pub fn align_paired_read(
         joint_pairs.retain(|pa| pa.combined_wt_score >= score_threshold);
     }
 
-    // Deterministic primary tie-break (combined score, then a fixed positional
-    // order on mate1).
-    joint_pairs.sort_by(|a, b| {
-        b.combined_wt_score.cmp(&a.combined_wt_score).then_with(|| {
-            (
-                a.mate1_transcript.chr_idx,
-                a.mate1_transcript.genome_start,
-                a.mate1_transcript.is_reverse,
-            )
-                .cmp(&(
-                    b.mate1_transcript.chr_idx,
-                    b.mate1_transcript.genome_start,
-                    b.mate1_transcript.is_reverse,
-                ))
-        })
-    });
-
-    // Primary selection — STAR's multMapSelect. STAR's default does not use the
-    // RNG for the primary; only `--outMultimapperOrder Random` shuffles. Gate
-    // the (previously unconditional) shuffle so the default is deterministic
-    // and STAR-faithful; under Random, shuffle the tied top-score prefix with a
-    // per-read seed (deterministic per read → thread-count invariant).
     if params.out_multimapper_order == MultimapperOrder::Random {
+        // Under Random, the tied top-score prefix is shuffled with a per-read seed
+        // (deterministic per read, so thread-count invariant).
+        joint_pairs.sort_by(|a, b| {
+            b.combined_wt_score.cmp(&a.combined_wt_score).then_with(|| {
+                (
+                    a.mate1_transcript.chr_idx,
+                    a.mate1_transcript.genome_start,
+                    a.mate1_transcript.is_reverse,
+                )
+                    .cmp(&(
+                        b.mate1_transcript.chr_idx,
+                        b.mate1_transcript.genome_start,
+                        b.mate1_transcript.is_reverse,
+                    ))
+            })
+        });
         shuffle_tied_prefix(
             &mut joint_pairs,
             |pa| pa.combined_wt_score,
             per_read_seed(params.run_rng_seed, read_name),
         );
+        for (rank, pair) in joint_pairs.iter_mut().enumerate() {
+            pair.star_order = rank as u32;
+        }
+    } else {
+        star_mult_map_order(
+            &mut joint_pairs,
+            |pa| pa.combined_wt_score,
+            |pa| {
+                let (m1, m2) = (&pa.mate1_transcript, &pa.mate2_transcript);
+                m1.genome_end.max(m2.genome_end) - m1.genome_start.min(m2.genome_start)
+            },
+            |pa| &mut pa.star_order,
+            params.out_sam_mult_nmax >= 0,
+        );
     }
+
+    // `--peOverlapNbasesMin` may have replaced the pairs: fold the final ones into
+    // trBest too (the best pair is STAR's trBest whenever a pair exists).
+    for p in joint_pairs.iter().filter(|_| pe_overlap_replaced) {
+        let score = p.combined_wt_score;
+        if best_tr.is_none_or(|(b, _)| score > b.score) {
+            best_tr = Some((
+                BestTr {
+                    score,
+                    n_mm: p.mate1_transcript.n_mismatch + p.mate2_transcript.n_mismatch,
+                },
+                0,
+            ));
+        }
+    }
+    let best_tr = best_tr.map_or_else(BestTr::default, |(b, _)| b);
 
     // Step 4: quality filter (mappedFilter). The best pair is STAR's `trBest`
     // whenever a pair exists (a single mate cannot clear the combined-length
@@ -1132,7 +1325,7 @@ pub fn align_paired_read(
         &index.genome,
         params,
     ) {
-        return Ok((Vec::new(), pe_chimeric, 0, Some(reason)));
+        return Ok((Vec::new(), pe_chimeric, 0, Some(reason), best_tr));
     }
 
     // Step 5: too-many-loci — STAR checks `multi` AFTER mappedFilter, only when the
@@ -1146,6 +1339,7 @@ pub fn align_paired_read(
             pe_chimeric,
             n_loci,
             Some(UnmappedReason::TooManyLoci),
+            best_tr,
         ));
     }
 
@@ -1155,7 +1349,7 @@ pub fn align_paired_read(
             .into_iter()
             .map(|pa| PairedAlignmentResult::BothMapped(Box::new(pa)))
             .collect();
-        return Ok((results, pe_chimeric, pe_mapq_n, None));
+        return Ok((results, pe_chimeric, pe_mapq_n, None, best_tr));
     }
 
     // Half-mapped fallback: report the best-scoring single-mate transcript.
@@ -1181,6 +1375,7 @@ pub fn align_paired_read(
             pe_chimeric,
             1,
             None,
+            best_tr,
         )),
         (None, Some(t2)) => Ok((
             vec![PairedAlignmentResult::HalfMapped {
@@ -1190,6 +1385,7 @@ pub fn align_paired_read(
             pe_chimeric,
             1,
             None,
+            best_tr,
         )),
         (Some(t1), Some(t2)) => {
             // Both have single-mate alignments but couldn't form a valid pair.
@@ -1203,6 +1399,7 @@ pub fn align_paired_read(
                     pe_chimeric,
                     1,
                     None,
+                    best_tr,
                 ))
             } else {
                 Ok((
@@ -1213,6 +1410,7 @@ pub fn align_paired_read(
                     pe_chimeric,
                     1,
                     None,
+                    best_tr,
                 ))
             }
         }
@@ -1228,7 +1426,7 @@ pub fn align_paired_read(
             } else {
                 UnmappedReason::TooShort
             };
-            Ok((Vec::new(), pe_chimeric, 0, Some(reason)))
+            Ok((Vec::new(), pe_chimeric, 0, Some(reason), best_tr))
         }
     }
 }
@@ -1255,7 +1453,7 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Determine left mate (smaller genome_start) and right mate for distance/consistency checks
+    // Determine left mate (smaller genome_start) and right mate for distance checks
     let (left, right) = if t1.genome_start <= t2.genome_start {
         (t1, t2)
     } else {
@@ -1267,15 +1465,13 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Genomic span check: use alignMatesGapMax if set, else fall back to win_bin_window_dist
-    // (STAR's effective limit when alignMatesGapMax=0 is the window distance ~589kb)
+    // Genomic span check, only when alignMatesGapMax is set. With the default 0 STAR
+    // has no span limit beyond the window itself (stitchAlignToTranscript tests
+    // alignMatesGapMax only when it is > 0), so a pair whose span exceeds
+    // winBinNbits*winAnchorDistNbins (~589 kb) is still valid if both mates sit in
+    // one window.
     let span = right.genome_end - left.genome_start;
-    let max_span = if params.align_mates_gap_max > 0 {
-        params.align_mates_gap_max as u64
-    } else {
-        params.win_bin_window_dist()
-    };
-    if span > max_span {
+    if params.align_mates_gap_max > 0 && span > params.align_mates_gap_max as u64 {
         return None;
     }
 
@@ -1285,7 +1481,9 @@ fn try_pair_transcripts(
     }
 
     // Junction consistency in overlap region
-    if !pe_junctions_consistent(left, right) {
+    // STAR's order is the stitching frame: mate1 first on the forward strand.
+    let (first, second) = if t1.is_reverse { (t2, t1) } else { (t1, t2) };
+    if !pe_junctions_consistent(first, second) {
         return None;
     }
 
@@ -1300,6 +1498,7 @@ fn try_pair_transcripts(
         is_proper_pair,
         insert_size,
         combined_wt_score,
+        star_order: 0,
     })
 }
 
@@ -1413,63 +1612,94 @@ fn filter_paired_transcripts(
     None
 }
 
-/// Extract splice junctions from a Transcript's CIGAR as (donor, acceptor) pairs.
-/// Junction coords are in genomic space (0-based). Junctions only exist where CigarOp::RefSkip is.
-fn extract_junctions_from_cigar(t: &Transcript) -> Vec<(u64, u64)> {
-    let mut junctions = Vec::new();
+/// A transcript's exons as `(genome_start, genome_end)` runs, plus for each gap
+/// between consecutive exons whether it is a splice junction (`N`) rather than an
+/// indel. STAR's exon list splits at every gap (`canonSJ >= 0` marks junctions).
+fn exon_runs_and_gaps(t: &Transcript) -> (Vec<(u64, u64)>, Vec<bool>) {
+    use noodles::sam::alignment::record::cigar::op::Kind;
+    let mut exons: Vec<(u64, u64)> = Vec::new();
+    let mut gaps: Vec<bool> = Vec::new();
     let mut genome_pos = t.genome_start;
+    // True when the next aligned base starts a new exon (after a gap op).
+    let mut pending_gap: Option<bool> = None;
     for op in &t.cigar {
-        use noodles::sam::alignment::record::cigar::op::Kind;
         match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                match pending_gap.take() {
+                    Some(is_junction) => {
+                        gaps.push(is_junction);
+                        exons.push((genome_pos, genome_pos));
+                    }
+                    None if exons.is_empty() => exons.push((genome_pos, genome_pos)),
+                    None => {}
+                }
                 genome_pos += op.len() as u64;
+                if let Some(last) = exons.last_mut() {
+                    last.1 = genome_pos;
+                }
+            }
+            Kind::Deletion => {
+                genome_pos += op.len() as u64;
+                pending_gap = Some(pending_gap.unwrap_or(false));
             }
             Kind::Skip => {
-                let donor = genome_pos;
-                let acceptor = genome_pos + op.len() as u64;
-                junctions.push((donor, acceptor));
-                genome_pos = acceptor;
+                genome_pos += op.len() as u64;
+                pending_gap = Some(true);
             }
-            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            Kind::Insertion => {
+                pending_gap = Some(pending_gap.unwrap_or(false));
+            }
+            Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
-    junctions
+    (exons, gaps)
 }
 
-/// D5: Check junction consistency in the overlapping region of paired-end mates.
-/// When mates overlap in the genome, every splice junction in the overlap from the
-/// left mate must appear in the right mate, and vice versa.
-/// Implements STAR stitchWindowAligns.cpp check after overlap detection.
+/// Junction consistency of overlapping mates, STAR's check in
+/// `stitchWindowAligns.cpp` ("check for junctions consistency").
 ///
-/// `left` is the mate with the lower genome_start, `right` is the other mate.
-pub(crate) fn pe_junctions_consistent(left: &Transcript, right: &Transcript) -> bool {
-    // Overlapping region: [overlap_start, overlap_end)
-    let overlap_start = left.genome_start.max(right.genome_start);
-    let overlap_end = left.genome_end.min(right.genome_end);
-    if overlap_start >= overlap_end {
-        return true; // No overlap — nothing to check
+/// `first` is the mate that comes first in the stitching frame (mate1 on the
+/// forward strand, mate2 on the reverse strand), `second` the other. When the
+/// last exon of `first` runs past the start of `second`, the junctions of
+/// `first` from the first one that lies past the end of `second`'s first exon
+/// are compared pairwise, in order, with the junctions of `second`, and must be
+/// identical. The walk ends as soon as either mate runs out of junctions, so a
+/// junction of `first` that `second` simply reads through (an unspliced mate
+/// across the intron) is accepted, as STAR does.
+pub(crate) fn pe_junctions_consistent(first: &Transcript, second: &Transcript) -> bool {
+    let (e1, g1) = exon_runs_and_gaps(first);
+    let (e2, g2) = exon_runs_and_gaps(second);
+    let (Some(last1), Some(first2)) = (e1.last(), e2.first()) else {
+        return true;
+    };
+    // Mates do not overlap: nothing to compare.
+    if last1.1 <= first2.0 {
+        return true;
     }
-
-    let left_juncs = extract_junctions_from_cigar(left);
-    let right_juncs = extract_junctions_from_cigar(right);
-
-    // Every junction from left that falls within the overlap must be in right too
-    for (donor, acceptor) in &left_juncs {
-        if *donor >= overlap_start
-            && *acceptor <= overlap_end
-            && !right_juncs.iter().any(|(d, a)| d == donor && a == acceptor)
-        {
+    // First junction (gap) of `first` whose right exon starts past the end of
+    // `second`'s first exon.
+    let mut i1 = 1usize;
+    while i1 < e1.len() {
+        if e1[i1].0 >= first2.1 {
+            break;
+        }
+        i1 += 1;
+    }
+    let mut i2 = 1usize;
+    while i1 < e1.len() && i2 < e2.len() {
+        if !g1[i1 - 1] {
+            i1 += 1;
+            continue;
+        }
+        if !g2[i2 - 1] {
+            i2 += 1;
+            continue;
+        }
+        if e1[i1].0 != e2[i2].0 || e1[i1 - 1].1 != e2[i2 - 1].1 {
             return false;
         }
-    }
-    // Every junction from right that falls within the overlap must be in left too
-    for (donor, acceptor) in &right_juncs {
-        if *donor >= overlap_start
-            && *acceptor <= overlap_end
-            && !left_juncs.iter().any(|(d, a)| d == donor && a == acceptor)
-        {
-            return false;
-        }
+        i1 += 1;
+        i2 += 1;
     }
     true
 }
@@ -1531,6 +1761,7 @@ mod tests {
             genome_sa_index_start: vec![0],
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         };
 
         GenomeIndex {
@@ -1566,6 +1797,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
         let pair = PairedAlignment {
             mate1_transcript: make_tr(1000, 1100, 0, 100),
@@ -1575,6 +1807,7 @@ mod tests {
             is_proper_pair: true,
             insert_size: 400,
             combined_wt_score: 200,
+            star_order: 0,
         };
         let combined = pair.combined_transcript_for_projection();
         assert_eq!(combined.exons.len(), 2);
@@ -1596,7 +1829,7 @@ mod tests {
         let result = align_read(&read_seq, "READ_001", &index, &params);
         assert!(result.is_ok());
 
-        let (transcripts, chimeras, n_for_mapq, unmapped_reason) = result.unwrap();
+        let (transcripts, chimeras, n_for_mapq, unmapped_reason, _best) = result.unwrap();
         assert_eq!(transcripts.len(), 0); // No alignment
         assert_eq!(chimeras.len(), 0); // No chimeric alignments
         assert_eq!(n_for_mapq, 0);
@@ -1627,6 +1860,30 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn drop_covered_pairs_removes_lower_scoring_subsets_within_the_window() {
+        let pair = |m1_len: usize, score: i32| PairedAlignment {
+            mate1_transcript: tx_at(1000, m1_len, false),
+            mate2_transcript: tx_at(1200, 75, true),
+            mate1_region: (0, m1_len),
+            mate2_region: (0, 75),
+            is_proper_pair: true,
+            insert_size: 275,
+            combined_wt_score: score,
+            star_order: 0,
+        };
+        // pairs[0] is from an earlier window: never compared.
+        let mut pairs = vec![pair(66, 100), pair(75, 141), pair(66, 140), pair(66, 141)];
+        drop_covered_pairs(&mut pairs, 1);
+        let kept: Vec<(usize, i32)> = pairs
+            .iter()
+            .map(|p| (p.mate1_region.1, p.combined_wt_score))
+            .collect();
+        // (66, 140) is covered by (75, 141) with a lower score: dropped.
+        // (66, 141) is covered but scores the same: kept, as in STAR.
+        assert_eq!(kept, vec![(66, 100), (75, 141), (66, 141)]);
+    }
+
     /// A gapless forward or reverse transcript over the test genome.
     fn tx_at(start: u64, len: usize, is_reverse: bool) -> Transcript {
         Transcript {
@@ -1648,6 +1905,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: Vec::new(),
             junction_annotated: Vec::new(),
+            star_order: 0,
         }
     }
 
@@ -1753,7 +2011,7 @@ mod tests {
         let result = align_read(&read_seq, "READ_004", &index, &params);
         assert!(result.is_ok());
 
-        let (transcripts, _chimeras, _n_for_mapq, _reason) = result.unwrap();
+        let (transcripts, _chimeras, _n_for_mapq, _reason, _best) = result.unwrap();
         assert!(transcripts.len() <= 5);
     }
 
@@ -1768,7 +2026,7 @@ mod tests {
 
         let result = align_paired_read(&mate1, &mate2, "test", &index, &params);
         assert!(result.is_ok());
-        let (paired_alns, _chimeric, n_for_mapq, unmapped_reason) = result.unwrap();
+        let (paired_alns, _chimeric, n_for_mapq, unmapped_reason, _best) = result.unwrap();
         assert_eq!(paired_alns.len(), 0);
         assert_eq!(n_for_mapq, 0);
         assert!(unmapped_reason.is_some());
@@ -1801,6 +2059,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1822,6 +2081,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 300bp, within default limit (auto mode = unlimited)
@@ -1855,6 +2115,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1876,6 +2137,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Distance = 400bp, exceeds limit of 100bp
@@ -1907,6 +2169,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -1928,6 +2191,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -1960,6 +2224,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Create a transcript with consistent strand motifs (all + strand)
@@ -1982,6 +2247,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::GcAg], // both + strand
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Note: STAR's RemoveInconsistentStrands filters transcripts where
@@ -2060,6 +2326,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let t2 = Transcript {
@@ -2081,6 +2348,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         let tlen = calculate_insert_size(&t1, &t2);
@@ -2121,6 +2389,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Case 1: NonCanonical + unannotated → should be filtered
@@ -2175,7 +2444,7 @@ mod tests {
         let mate1 = vec![4, 4, 4, 4, 4, 4, 4, 4];
         let mate2 = vec![4, 4, 4, 4, 4, 4, 4, 4];
 
-        let (results, _chimeric, n_for_mapq, unmapped_reason) =
+        let (results, _chimeric, n_for_mapq, unmapped_reason, _best) =
             align_paired_read(&mate1, &mate2, "test", &index, &params).unwrap();
         assert!(results.is_empty(), "Both unmapped should return empty Vec");
         assert_eq!(n_for_mapq, 0);
@@ -2206,6 +2475,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         };
 
         // Test BothMapped variant
@@ -2217,6 +2487,7 @@ mod tests {
             is_proper_pair: true,
             insert_size: 200,
             combined_wt_score: 0,
+            star_order: 0,
         }));
         assert!(matches!(both, PairedAlignmentResult::BothMapped(_)));
 
@@ -2234,6 +2505,34 @@ mod tests {
         {
             assert!(mate1_is_mapped);
         }
+    }
+
+    #[test]
+    fn star_mult_map_order_keeps_window_order_and_picks_tr_best() {
+        // (score, gLength, star_order): windows in order A, B, C, D.
+        let mut items = vec![(89, 91, 0u32), (89, 90, 0), (88, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, false);
+        // trBest is the first best score with the shortest span (window B).
+        assert_eq!(items[0], (89, 90, 1));
+        // Output order stays the window order.
+        let mut out = items.clone();
+        out.sort_by_key(|t| t.2);
+        assert_eq!(
+            out,
+            vec![(89, 91, 0), (89, 90, 1), (88, 91, 2), (89, 90, 3)]
+        );
+    }
+
+    #[test]
+    fn star_mult_map_order_with_mult_nmax_swaps_best_to_top() {
+        let mut items = vec![(88, 91, 0u32), (89, 91, 0), (87, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, true);
+        // Best-scoring alignments swapped to the top in window order; the first is primary.
+        // (STAR swaps in place: [88, 89a, 87, 89b] -> [89a, 88, 87, 89b] -> [89a, 89b, 87, 88].)
+        assert_eq!(
+            items,
+            vec![(89, 91, 0), (89, 90, 1), (87, 91, 2), (88, 91, 3)]
+        );
     }
 
     #[test]
@@ -2284,5 +2583,57 @@ mod tests {
         let before = items.clone();
         shuffle_tied_prefix(&mut items, |t| t.0, 42);
         assert_eq!(items, before);
+    }
+    fn cigar_transcript(
+        start: u64,
+        ops: &[(cigar::op::Kind, usize)],
+        is_reverse: bool,
+    ) -> Transcript {
+        use cigar::op::{Kind, Op};
+        let cigar: Vec<Op> = ops.iter().map(|&(k, l)| Op::new(k, l)).collect();
+        let ref_len: u64 = ops
+            .iter()
+            .filter(|(k, _)| matches!(k, Kind::Match | Kind::Deletion | Kind::Skip))
+            .map(|&(_, l)| l as u64)
+            .sum();
+        Transcript {
+            chr_idx: 0,
+            genome_start: start,
+            genome_end: start + ref_len,
+            is_reverse,
+            exons: vec![],
+            cigar,
+            score: 100,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            star_order: 0,
+        }
+    }
+
+    #[test]
+    fn pe_junction_consistency_follows_star_walk() {
+        use cigar::op::Kind::{Match, Skip, SoftClip};
+        // Mate A splices (100M 200N 50M); mate B reads straight through the
+        // intron (150M). STAR's walk ends when B has no junction left, so the
+        // pair is accepted (stitchWindowAligns.cpp, "check for junctions
+        // consistency").
+        let spliced = cigar_transcript(1000, &[(Match, 100), (Skip, 200), (Match, 50)], false);
+        let through = cigar_transcript(1040, &[(Match, 150), (SoftClip, 10)], true);
+        assert!(pe_junctions_consistent(&spliced, &through));
+
+        // Same junction in both mates: consistent.
+        let spliced_b = cigar_transcript(1040, &[(Match, 60), (Skip, 200), (Match, 50)], true);
+        assert!(pe_junctions_consistent(&spliced, &spliced_b));
+
+        // Different junction in the overlap: inconsistent.
+        let other = cigar_transcript(1040, &[(Match, 60), (Skip, 210), (Match, 50)], true);
+        assert!(!pe_junctions_consistent(&spliced, &other));
+
+        // Mates that do not overlap are never compared.
+        let far = cigar_transcript(2000, &[(Match, 60), (Skip, 210), (Match, 50)], true);
+        assert!(pe_junctions_consistent(&spliced, &far));
     }
 }

@@ -18,6 +18,19 @@ pub enum UnmappedReason {
     TooManyMismatches,
     /// Too many multi-mapping loci (nTr > outFilterMultimapNmax)
     TooManyLoci,
+    /// One mate of a paired read is mapped (STAR's `unmapType` 4); only the
+    /// unmapped mate's record carries it.
+    HalfMapped,
+}
+
+/// STAR's `trBest` score and mismatch count (`maxScore`, `nMM`), written as `AS`
+/// and `nM` on the unmapped records of a read that had a best transcript
+/// (`ReadAlign_outputTranscriptSAM.cpp`, unmapped branch). Zero when the read had
+/// no transcript at all (`trInit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BestTr {
+    pub score: i32,
+    pub n_mm: u32,
 }
 
 /// Tracks alignment statistics for a read mapping run
@@ -203,8 +216,9 @@ impl AlignmentStats {
             UnmappedReason::TooShort => {
                 self.unmapped_short.fetch_add(1, Ordering::Relaxed);
             }
-            UnmappedReason::TooManyLoci => {
-                // Tracked via record_alignment's too_many_loci path, not here
+            UnmappedReason::TooManyLoci | UnmappedReason::HalfMapped => {
+                // Too many loci: tracked via record_alignment's too_many_loci path.
+                // Half mapped: counted as mapped, the pair has a mapped mate.
             }
             UnmappedReason::Other => {
                 self.unmapped_other.fetch_add(1, Ordering::Relaxed);
@@ -331,52 +345,6 @@ impl AlignmentStats {
     /// Get total number of reads processed
     pub fn total_reads(&self) -> u64 {
         self.total_reads.load(Ordering::Relaxed)
-    }
-
-    /// Undo a mapped read record for BySJout filtering.
-    /// Moves one read from uniquely_mapped (or multi_mapped) to unmapped.
-    /// Since we don't know which category the read was in, we try unique first
-    /// (most reads are uniquely mapped), then multi.
-    pub fn undo_mapped_record_bysj(&self) {
-        // Try to decrement uniquely_mapped first
-        let mut current = self.uniquely_mapped.load(Ordering::Relaxed);
-        loop {
-            if current == 0 {
-                break;
-            }
-            match self.uniquely_mapped.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.unmapped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(x) => current = x,
-            }
-        }
-
-        // If no unique reads, try multi_mapped
-        let mut current = self.multi_mapped.load(Ordering::Relaxed);
-        loop {
-            if current == 0 {
-                break;
-            }
-            match self.multi_mapped.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.unmapped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(x) => current = x,
-            }
-        }
     }
 
     /// Write STAR-compatible Log.final.out file
@@ -732,44 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn test_undo_mapped_record_bysj_unique() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(1, 10); // unique
-        stats.record_alignment(1, 10); // unique
-
-        stats.undo_mapped_record_bysj();
-
-        assert_eq!(stats.total_reads.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.uniquely_mapped.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_undo_mapped_record_bysj_multi() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(5, 10); // multi
-
-        stats.undo_mapped_record_bysj();
-
-        // No unique reads, so multi should be decremented
-        assert_eq!(stats.multi_mapped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_undo_mapped_record_bysj_noop_when_empty() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(0, 10); // unmapped
-
-        stats.undo_mapped_record_bysj();
-
-        // Should be a no-op (no mapped reads to undo)
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.uniquely_mapped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.multi_mapped.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn test_record_transcript_stats() {
         use crate::align::score::SpliceMotif;
         use crate::align::transcript::Exon;
@@ -806,6 +736,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![true],
+            star_order: 0,
         };
 
         stats.record_transcript_stats(&transcript);
@@ -926,6 +857,7 @@ mod tests {
                 SpliceMotif::NonCanonical, // motif[0]
             ],
             junction_annotated: vec![true, false, true, false],
+            star_order: 0,
         };
 
         stats.record_transcript_stats(&transcript);

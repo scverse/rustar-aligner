@@ -11,6 +11,43 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- `--soloOutLayout CellRanger` writes the rest of CellRanger's `outs/` files next to the
+  matrices: `raw_feature_bc_matrix.h5` and `filtered_feature_bc_matrix.h5` in
+  CellRanger's HDF5 layout (root attributes, genome column, string widths, chunking
+  and compression), `molecule_info.h5` (file version 6: `barcode_idx`, `feature_idx`,
+  `umi`, `count`, `gem_group`, `library_idx`, `umi_type`, `barcodes`, `features/`,
+  `barcode_info/`, `library_info`, `metrics_json`), and, with
+  `--outSAMtype BAM SortedByCoordinate`, `possorted_genome_bam.bam` plus its `.bai`
+  with CellRanger's header (`@RG` per flowcell and lane, `10x_bam_to_fastq` and
+  `library_info` comments) and record tags in CellRanger's order. The `.h5` files
+  need `--soloOutH5 yes` and a `hdf5-out` build. New `--soloOutSampleID` names the
+  library in the attributes and read-group ids.
+
+- `--soloOutLayout CellRanger` annotates, counts and calls cells the way `cellranger count`
+  10.0.0 does, ported from its source (`tx_annotation`, `mark_dups`, `cell_calling`)
+  using the transcriptome in the index. Each alignment gets `RE`, `TX`, `AN`, `GX`, `GN`,
+  `fx` and `xf`; a multi-mapped read is rescued to MAPQ 255 (`mm:i:1`) when its
+  transcriptomic alignments name one gene; UMIs are corrected, low-support-filtered and
+  de-duplicated as CellRanger does, the other reads of a molecule carrying the duplicate
+  flag; cells are CellRanger's `ordmag` call plus the non-ambient rescue, with NumPy's
+  generators reproduced so the same 1,221 barcodes come out. The raw matrix lists every
+  detected barcode, `CB` is set on every read whose barcode resolves and `UB` on every
+  read with a valid UMI, `molecule_info.h5` carries `umi_type`, and
+  `metrics_summary.csv` uses CellRanger's definitions (`Reads Mapped Confidently to
+  Transcriptome` no longer prints 0.0%). A 10x run now defaults to `--soloCellFilter
+  EmptyDrops_CR`.
+
+### Bug fixes
+
+- Window formation and per-window dedup follow STAR (long splices with the default
+  `alignIntronMax 0`): a pair spanning more than `winBinNbits*winAnchorDistNbins`
+  is no longer rejected, window flanks stop at the chromosome boundary, the window
+  merge scan stops at the first window it meets, and transcripts are deduplicated
+  and ordered as in `stitchWindowAligns`, after STAR's overhang and mate-placement
+  checks.
+
 ### Other changes
 
 - noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
@@ -44,6 +81,83 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`--clipAdapterType CellRanger4` now matches STAR exactly**, both halves of the
+  clip. The 5' TSO trim is an overlap alignment against the first 91 bases of the
+  read, replicating `ClipCR4`'s Opal call (ACGTN alphabet; match +1, mismatch -2,
+  any-vs-N -2, N-vs-N 0; gap open = gap extend = 2; overlap mode with end
+  tracking), followed by STAR's acceptance gate
+  `S<20 || (S==20 && L>26) || (S==21 && L>30)`. The 3' trim is STAR's scored
+  `polyTail3p` scan, replacing a "trailing run of A >= 8" approximation that was
+  wrong in both directions (a read ending in 10 A's was trimmed by 10 where STAR
+  trims 0; `A*15 + C + A*15` was trimmed by 15 where STAR trims 31). The poly-A
+  transcription is taken from Benjamin Demaille's #148 and moved onto the solo
+  path, which is where `CellRanger4` is actually reached; #148's `clip_mate`
+  wiring is not used and that PR is superseded.
+
+  The overlap alignment comes from [`hyalite`](https://crates.io/crates/hyalite)
+  0.2 — a new dependency, pure Rust with no dependencies of its own. Reads are
+  scanned a batch at a time via `Database::scan_all`, mirroring STAR's
+  `ClipMate::clipChunk`, which aligns the adapter against a chunk of reads in one
+  Opal call.
+
+  Both halves are gated against STAR's own C++: `tests/data/cr4_opal_oracle.cpp`
+  links STAR's `opal.cpp` and reproduces `ClipCR4` + `ClipMate::clipChunk`
+  verbatim, and the committed `cr4_opal_oracle.tsv` is its output over 938 reads
+  chosen to straddle both decision boundaries. `cr4_tso_matches_star_opal_oracle`
+  checks every one against the scalar path, a forced-SIMD path, and the
+  production batch path.
+
+  Measured on 10x mouse chr19 with both tools under `--clipAdapterType
+  CellRanger4`: clip-amount differences against STARsolo drop from 154 to **0**,
+  and the soft-clipped share moves from 39% (STAR 41%) to 34.9% (STAR 35.0%).
+  Default SE/PE alignment is untouched, as `CellRanger4` is opt-in: SE 8788/8926
+  and PE 8390 both-mapped / 0 half-mapped, both unchanged.
+
+  Known limitation: `CellRanger4` combined with a non-zero `--clip5pNbases` /
+  `--clip3pNbases` misplaces most reads by `clip5pNbases`. That is a pre-existing
+  bug, not introduced here, and is tracked separately; `CellRanger4` on its own
+  and the fixed clips on their own are both unaffected.
+
+- **STARsolo per-read barcode SAM tags (Phase 14.7).** `--outSAMattributes`
+  now accepts `CR CY UR UY CB UB gx gn sM sS sQ sF` next to the existing
+  `GX GN`, and emits them in BAM output only, as STAR does.
+
+  - `CR`/`CY`/`UR`/`UY` (raw barcode and UMI with their qualities), `sM`
+    (STAR's `cbMatch` assessment code) and `sS`/`sQ` (the whole barcode read)
+    are written as each read is processed, on mapped and unmapped records
+    alike, for both the single-end and the `--soloBarcodeMate 1` solo path.
+  - `CB` (corrected barcode) and `UB` (collapsed UMI) come from STAR's
+    readInfo: UMI collapsing records what each read was counted as, and the
+    buffered records are rewritten before the sort. Reads that were not
+    counted get `-`, as in STAR. Both tags therefore require
+    `--outSAMtype BAM SortedByCoordinate` and a gene-level first
+    `--soloFeatures` entry, which is now validated.
+  - `--soloType CB_samTagOut` is implemented: whitelist correction into `CB`
+    with no gene model, no UMI collapsing and no `Solo.out` output. As in
+    STAR, it rejects `UB` and accepts only `Exact`/`1MM` for
+    `--soloCBmatchWLtype`.
+  - `gx`/`gn` name every gene of the alignment they sit on (`;`-joined), and
+    `sF` reports `(overlap type, genes for the read)`, falling back to
+    `(-1, -1)` on a sense-strand read whose alignment has no gene of its own.
+    All the gene tags now reach the paired-end solo path too, where a mate pair
+    counts as one alignment.
+  - `--soloUMIdedup 1MM_Directional`/`1MM_Directional_UMItools` now count
+    distinct corrected UMIs off STAR's absorb chain
+    (`umiArrayCorrect_Directional`) rather than counting unabsorbed UMIs; the
+    two agree except where a chain is longer than one step.
+
+- **Paired-end cDNA with a separate barcode read.** `--readFilesIn` accepts
+  STAR's three-file solo layout (`cDNA_read1 cDNA_read2 barcode_read`), so
+  paired-end cDNA now works with a separate barcode read for every barcode
+  chemistry, `CB_samTagOut` included. A third file without `--soloType` is
+  refused rather than ignored.
+
+- **`--soloBarcodeReadLength` is honoured.** As in STAR, the default expects the
+  barcode read to be exactly CB+UMI long and treats any other length as a fatal
+  input error naming the read; `0` turns the check off and pads a short read
+  with `N` (quality `H`), which then scores as an N-containing barcode instead
+  of being dropped silently.
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
@@ -65,6 +179,22 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Annotated junctions are stitched like STAR when a seed crosses them, and
+  paired-end windows drop covered sub-alignments.** A seed that crosses an
+  inserted (Gsj) junction is split into donor and acceptor halves. Window
+  dedup merged the acceptor half into a genomic seed on the same diagonal
+  (STAR keys it on the junction index, `WA_sjA`); the stitcher rejected a
+  splice whose second exon was shorter than `alignSJoverhangMin` before
+  checking whether the junction was annotated (`alignSJDBoverhangMin` is 3);
+  and the two halves went through the junction scan, which on a junction
+  whose boundary base repeats can settle on an equally scored unannotated
+  position (STAR stitches them through the annotated junction directly). For
+  pairs, a lower-scoring pair whose blocks are all covered by another pair
+  in the same window was reported as an extra multimapper (`66M9S` beside
+  `66M2I7M`); STAR drops it, as the single-end path already did. On 2M
+  GEUVADIS ERR188021 pairs against chr21, 402 reads now get STAR's exact
+  alignment and 4 lose it; annotated splices go from 7,957 to 8,197 (STAR:
+  8,203). Runtime +2.5%.
 - **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
   `alignBAM`). The chimera now replaces the read's normal alignment, as in
   STAR: one segment as a normal record and the other as a supplementary
@@ -153,6 +283,54 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- On 10x geometry, `--soloFeatures` now defaults to `GeneFull` rather than
+  `Gene`: CellRanger has counted intronic reads toward the gene since v7.0.
+  Measured on 10x's `pbmc_1k_v3`, exonic-only counting is 30.5% below
+  CellRanger and `GeneFull` brings it to 1.6%. **This changes default counts
+  on 10x runs**; naming `--soloFeatures` explicitly still wins. See
+  `DIVERGENCE.md` §1.3.
+
+- `--soloCellFilter OrdMag` implements CellRanger's cell call: the same
+  quantile-over-ratio rule as `CellRanger2.2`, but searching for the expected
+  cell count by minimising `(OrdMag(x) - x)^2 / x` instead of fixing it at
+  3 000. `EmptyDrops_CR` now uses it for its initial cell set, which is the
+  order CellRanger runs the two steps in; `CellRanger2.2` is unchanged and
+  remains the default. See `DIVERGENCE.md` §3.5.
+
+- Under `--soloOutLayout CellRanger`, `metrics_summary.csv` is written with
+  CellRanger 10.0.0's 20 metrics, in its order and value formats. STARsolo's
+  `Summary.csv` is unchanged and still written alongside. Twelve of the 20
+  match a real `cellranger count` run exactly on the test fixture; the
+  interpretation behind the other eight is in `DIVERGENCE.md` §3.4.
+
+- `--soloOutLayout CellRanger` writes the solo matrices in the shape
+  `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
+  `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
+  on every barcode and one raw column per observed barcode. It implies
+  `--soloOutGzip yes`, `--soloOutRawBarcodes Observed` and an `outs/`
+  output directory, each still overridable on the command line. Counts are
+  unchanged. It is the default on 10x geometry, which **changes where
+  output files are written** on those runs; see `DIVERGENCE.md` §3.3.
+
+- On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
+  UMI), the five CellRanger-matching flags now **default** to their
+  CellRanger values. Any flag named on the command line wins, and the
+  substitution is logged. **This changes default output on 10x runs** and
+  diverges from STARsolo; see `DIVERGENCE.md` §1.3.
+
+- `--soloOutRawBarcodes Observed` writes the raw matrix with one column
+  per *observed* barcode instead of one per whitelist barcode, matching
+  what CellRanger's `raw_feature_bc_matrix` contains. Counts are
+  unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
+  **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
+
+- STARsolo cell-barcode correction now applies STAR's `cbMinP` posterior
+  threshold (0.975, single precision), caps the mismatch quality at `QSmax`
+  (33), and enforces `oneExact`: under every `--soloCBmatchWLtype` except the
+  pseudocount ones, a barcode corrected to a single whitelist entry counts
+  only if some read matched that entry exactly. Without these,
+  `1MM_multi_Nbase_pseudocounts` produced the same matrix as the default
+  `1MM_multi` (#172).
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and

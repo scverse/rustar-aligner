@@ -260,7 +260,7 @@ pub fn wasp_type(
         } else {
             modified
         };
-        let (trs, _chim, _n_for_mapq, _reason) =
+        let (trs, _chim, _n_for_mapq, _reason, _best) =
             align_read(&remap_read, read_name, index, remap_params)?;
         if trs.is_empty() {
             return Ok(4); // remap unmapped or too-many-loci
@@ -490,7 +490,7 @@ pub fn wasp_type_pe(
             mod2
         };
 
-        let (results, _chim, _n_for_mapq, _reason) =
+        let (results, _chim, _n_for_mapq, _reason, _best) =
             align_paired_read(&remap1, &remap2, read_name, index, remap_params)?;
         let both: Vec<&PairedAlignment> = results
             .iter()
@@ -608,6 +608,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            star_order: 0,
         }
     }
 
