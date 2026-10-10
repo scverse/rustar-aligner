@@ -585,7 +585,7 @@ fn run_smartseq(
                     }
                     batch.par_iter().for_each(|read| {
                         stats.record_read_bases(read.sequence.len() as u64);
-                        let Ok((transcripts, _chim, n_for_mapq, reason)) =
+                        let Ok((transcripts, _chim, n_for_mapq, reason, _best)) =
                             align_read(&read.sequence, &read.name, index, params)
                         else {
                             return;
@@ -627,7 +627,7 @@ fn run_smartseq(
                         stats.record_read_bases(
                             (pr.mate1.sequence.len() + pr.mate2.sequence.len()) as u64,
                         );
-                        let Ok((results, _chim, n_for_mapq, reason)) = align_paired_read(
+                        let Ok((results, _chim, n_for_mapq, reason, _best)) = align_paired_read(
                             &pr.mate1.sequence,
                             &pr.mate2.sequence,
                             &pr.name,
@@ -1828,6 +1828,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 &read.quality,
                                 params,
                                 crate::stats::UnmappedReason::Other,
+                                crate::stats::BestTr::default(),
                             )?;
                             buffer.push(record);
                         }
@@ -1853,14 +1854,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     }
 
                     // Align read (CPU-intensive, pure function)
-                    let (transcripts, chimeric_results, n_for_mapq, unmapped_reason) = match stage2
-                    {
-                        Some(s) => crate::align::stitch::with_bysj_novel_filter(
-                            Arc::clone(&s.novel),
-                            || align_read(&clipped_seq, &read.name, &index, params),
-                        ),
-                        None => align_read(&clipped_seq, &read.name, &index, params),
-                    }?;
+                    let (transcripts, chimeric_results, n_for_mapq, unmapped_reason, best_tr) =
+                        match stage2 {
+                            Some(s) => crate::align::stitch::with_bysj_novel_filter(
+                                Arc::clone(&s.novel),
+                                || align_read(&clipped_seq, &read.name, &index, params),
+                            ),
+                            None => align_read(&clipped_seq, &read.name, &index, params),
+                        }?;
 
                     // Collect chimeric alignments if enabled
                     if params.chim_segment_min > 0 && stage2.is_none() {
@@ -1988,6 +1989,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     &read.quality,
                                     params,
                                     unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                    best_tr,
                                 )?;
                                 buffer.push(record);
                             }
@@ -2495,7 +2497,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
 
-                            if clipped_seq.is_empty() {
+                            // CellRanger writes a fully trimmed read as an unmapped record
+                            // (below); STARsolo drops it.
+                            if clipped_seq.is_empty() && !cr_trim_on {
                                 stats.record_alignment(0, max_multimaps);
                                 stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                                 // No alignment → barcode still counts toward stats (unmapped → no gene).
@@ -2524,8 +2528,18 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 });
                             }
 
-                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
-                                align_read(&clipped_seq, &read.name, &index, params)?;
+                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason, best_tr) =
+                                if clipped_seq.is_empty() {
+                                    (
+                                        Vec::new(),
+                                        Vec::new(),
+                                        0,
+                                        Some(crate::stats::UnmappedReason::Other),
+                                        crate::stats::BestTr::default(),
+                                    )
+                                } else {
+                                    align_read(&clipped_seq, &read.name, &index, params)?
+                                };
 
                             let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
                                 n_for_mapq
@@ -2606,14 +2620,41 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             if emit_sam {
                                 if transcripts.is_empty() {
                                     if output_unmapped {
-                                        let record = SamWriter::build_unmapped_record(
+                                        // CellRanger keeps the whole read on an unmapped
+                                        // record, with its trim tags; a read trimmed to
+                                        // nothing never reached the aligner and carries
+                                        // no aligner tags.
+                                        let (useq, uqual) = if cr_trim_on {
+                                            (&read.sequence, &read.quality)
+                                        } else {
+                                            (&clipped_seq, &clipped_qual)
+                                        };
+                                        let mut record = SamWriter::build_unmapped_record(
                                             &out_read_name,
-                                            &clipped_seq,
-                                            &clipped_qual,
+                                            useq,
+                                            uqual,
                                             params,
                                             unmapped_reason
                                                 .unwrap_or(crate::stats::UnmappedReason::Other),
+                                            best_tr,
                                         )?;
+                                        if let Some(t) = cr_trim {
+                                            if clipped_seq.is_empty() {
+                                                for tag in [*b"NH", *b"HI", *b"AS", *b"nM", *b"uT"] {
+                                                    record.data_mut().remove(
+                                                        &noodles::sam::alignment::record::data::field::Tag::new(
+                                                            tag[0], tag[1],
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                            crate::io::sam::add_cr_annotation_tags(
+                                                std::slice::from_mut(&mut record),
+                                                None,
+                                                t.tso,
+                                                t.polya,
+                                            );
+                                        }
                                         buffer.push(record);
                                     }
                                 } else if transcripts.len() <= max_multimaps {
@@ -2940,7 +2981,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
 
-                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason) =
+                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_paired_read(
                                     &m1_seq,
                                     &m2_seq,
@@ -3096,6 +3137,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                         params,
                                         unmapped_reason
                                             .unwrap_or(crate::stats::UnmappedReason::Other),
+                                        best_tr,
                                     )?;
                                     for record in records {
                                         buffer.push(record);
@@ -3445,6 +3487,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 &paired_read.mate2.quality,
                                 params,
                                 crate::stats::UnmappedReason::Other,
+                                crate::stats::BestTr::default(),
                             )?;
                             for record in records {
                                 buffer.push(record);
@@ -3479,7 +3522,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
 
                     // Align paired read (CPU-intensive)
-                    let (results, pe_chimeric, n_for_mapq, unmapped_reason) = match stage2 {
+                    let (results, pe_chimeric, n_for_mapq, unmapped_reason, best_tr) = match stage2
+                    {
                         Some(s) => crate::align::stitch::with_bysj_novel_filter(
                             Arc::clone(&s.novel),
                             || {
@@ -3677,6 +3721,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 &paired_read.mate2.quality,
                                 params,
                                 unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                best_tr,
                             )?;
                             for record in records {
                                 buffer.push(record);

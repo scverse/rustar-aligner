@@ -875,6 +875,7 @@ mod tests {
             &read_qual,
             &params,
             crate::stats::UnmappedReason::Other,
+            crate::stats::BestTr::default(),
         )
         .unwrap();
 
@@ -898,6 +899,7 @@ mod tests {
             &[],
             &params,
             crate::stats::UnmappedReason::Other,
+            crate::stats::BestTr::default(),
         )
         .unwrap();
         let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
@@ -1021,6 +1023,7 @@ mod tests {
                 &[30, 30, 30, 30],
                 &params,
                 crate::stats::UnmappedReason::Other,
+                crate::stats::BestTr::default(),
             )
             .unwrap(),
             crate::io::sam::SamWriter::build_unmapped_record(
@@ -1029,6 +1032,7 @@ mod tests {
                 &[30, 30, 30, 30],
                 &params,
                 crate::stats::UnmappedReason::Other,
+                crate::stats::BestTr::default(),
             )
             .unwrap(),
         ];
