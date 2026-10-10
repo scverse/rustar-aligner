@@ -2094,6 +2094,14 @@ pub fn write_gene_matrix(
         } else {
             called_cells(&mstats.cells, &params.solo_cell_filter)
         };
+        // Depth curve for web_summary.html, while the molecules are still here.
+        let depth_curve = (cr_layout && fi == 0 && ctx.want_molecules).then(|| {
+            crate::solo::web_summary::saturation_curve(
+                &mstats.molecules,
+                called.as_deref().unwrap_or(&[]),
+                total_reads,
+            )
+        });
         if fi == 0 && ctx.want_molecules {
             *ctx.molecules.lock().unwrap() = Some(MoleculeTable {
                 molecules: std::mem::take(&mut mstats.molecules),
@@ -2231,6 +2239,16 @@ pub fn write_gene_matrix(
                 "STARsolo: wrote {}",
                 feature_dir.join("metrics_summary.csv").display()
             );
+            // The page reads back what was just written, so it shows the same
+            // values as metrics_summary.csv and the matrices.
+            let web = feature_dir.join("web_summary.html");
+            crate::solo::web_summary::write_web_summary_from_outs(
+                &feature_dir,
+                &web,
+                &crate::solo::web_summary::RunInfo::from_params(params),
+                depth_curve.as_deref(),
+            )?;
+            log::info!("STARsolo: wrote {}", web.display());
         }
         // CellRanger-style mapping funnel goes in a SEPARATE additional file so the
         // faithful Summary.csv is never altered (PR #90 review: keep this release a
