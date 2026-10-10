@@ -2417,6 +2417,34 @@ mod tests {
     }
 
     #[test]
+    fn star_mult_map_order_keeps_window_order_and_picks_tr_best() {
+        // (score, gLength, star_order): windows in order A, B, C, D.
+        let mut items = vec![(89, 91, 0u32), (89, 90, 0), (88, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, false);
+        // trBest is the first best score with the shortest span (window B).
+        assert_eq!(items[0], (89, 90, 1));
+        // Output order stays the window order.
+        let mut out = items.clone();
+        out.sort_by_key(|t| t.2);
+        assert_eq!(
+            out,
+            vec![(89, 91, 0), (89, 90, 1), (88, 91, 2), (89, 90, 3)]
+        );
+    }
+
+    #[test]
+    fn star_mult_map_order_with_mult_nmax_swaps_best_to_top() {
+        let mut items = vec![(88, 91, 0u32), (89, 91, 0), (87, 91, 0), (89, 90, 0)];
+        star_mult_map_order(&mut items, |t| t.0, |t| t.1, |t| &mut t.2, true);
+        // Best-scoring alignments swapped to the top in window order; the first is primary.
+        // (STAR swaps in place: [88, 89a, 87, 89b] -> [89a, 88, 87, 89b] -> [89a, 89b, 87, 88].)
+        assert_eq!(
+            items,
+            vec![(89, 91, 0), (89, 90, 1), (87, 91, 2), (88, 91, 3)]
+        );
+    }
+
+    #[test]
     fn shuffle_tied_prefix_is_deterministic() {
         // Same seed + same input → same permutation on reruns.
         let items: Vec<(i32, u32)> = (0..8).map(|i| (100, i)).collect();
