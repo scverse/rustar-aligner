@@ -4,13 +4,13 @@
 //! This is an independent implementation, written from the behaviour of `cellranger
 //! count` 10.0.0 (the `ts`/`pa` tags of its BAM on pbmc_1k_v3) and from cutadapt's
 //! published adapter model, not from 10x's code. Measured on 2.3 million reads of that
-//! BAM, the poly(A) lengths agree on every read and the TSO lengths on all but 23.
+//! BAM, the poly(A) lengths agree on every read and the TSO lengths on all but 2.
 //!
 //! - TSO (`AAGCAGTGGTATCAACGCAGAGTACATGGG`), a 5' adapter found anywhere: the adapter
 //!   aligns semi-globally to the read (its prefix may hang off the read's 5' end, it may
 //!   start anywhere in the read and must end inside it), scoring +1 per match and -2 per
 //!   mismatch or indel. The best-scoring alignment (the leftmost end on ties) with at most
-//!   10% errors over the aligned adapter bases is kept when it scores at least 20; the
+//!   10% errors over the alignment columns (adapter bases plus read insertions) is kept when it scores at least 20; the
 //!   read is trimmed up to the alignment's end.
 //! - Poly(A), a 3' adapter that must reach the read end: cutadapt's choice among the read
 //!   suffixes with at most 10% errors, the most `A` matches and then the fewest errors;
@@ -71,7 +71,7 @@ pub fn trim(read: &[u8]) -> CrTrim {
 
 /// End of the TSO in the read (0 when no TSO qualifies).
 fn tso_end(read: &[u8]) -> usize {
-    // Cell: (score, errors, adapter bases aligned).
+    // Cell: (score, errors, alignment columns).
     type Cell = (i32, i32, i32);
     const NONE: Cell = (i32::MIN / 2, 0, 0);
     let (adapter_len, n) = (TSO.len(), read.len());
@@ -94,7 +94,7 @@ fn tso_end(read: &[u8]) -> usize {
                 d.2 + 1,
             );
             c = pick(c, (prev[j].0 + GAP, prev[j].1 + 1, prev[j].2 + 1));
-            c = pick(c, (cur[j - 1].0 + GAP, cur[j - 1].1 + 1, cur[j - 1].2));
+            c = pick(c, (cur[j - 1].0 + GAP, cur[j - 1].1 + 1, cur[j - 1].2 + 1));
             cur[j] = c;
         }
         std::mem::swap(&mut prev, &mut cur);
