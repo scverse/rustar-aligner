@@ -459,13 +459,21 @@ impl CrModel {
         })
     }
 
-    /// Annotate a read from all its alignments (`transcripts` in the aligner's
-    /// order; the first is STAR's primary).
+    /// Annotate a read from all its alignments (`transcripts[0]` is STAR's primary).
+    /// The annotations, and `primary`, follow STAR's output order (`star_order`),
+    /// which is the order of the genomic records and the one CellRanger's rescue
+    /// walks (`tx_annotation::read::rescue_alignments_se`).
     pub fn annotate_read(&self, transcripts: &[Transcript]) -> Option<ReadAnnot> {
         if transcripts.is_empty() {
             return None;
         }
-        let alns: Vec<AlnAnnot> = transcripts.iter().map(|t| self.annotate(t)).collect();
+        let mut order: Vec<usize> = (0..transcripts.len()).collect();
+        order.sort_by_key(|&i| (transcripts[i].star_order, i));
+        let star_primary = order.iter().position(|&i| i == 0).unwrap_or(0);
+        let alns: Vec<AlnAnnot> = order
+            .iter()
+            .map(|&i| self.annotate(&transcripts[i]))
+            .collect();
         let (primary, conf) = if alns.len() == 1 {
             (0, true)
         } else {
@@ -482,7 +490,7 @@ impl CrModel {
                     .unwrap_or(0);
                 (first, true)
             } else {
-                (0, false)
+                (star_primary, false)
             }
         };
         let genes = alns[primary].tx_genes(self);
