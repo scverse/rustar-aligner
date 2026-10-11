@@ -506,6 +506,27 @@ fn build_matrix_body(
     ))
 }
 
+/// The whitelist indices that actually appear as a column in the streamed
+/// matrix body, ascending.
+///
+/// Reads the body once rather than tracking the set during counting, so the
+/// default path pays nothing for a feature it does not use.
+fn observed_barcodes(body: &tempfile::NamedTempFile) -> Result<Vec<u32>, Error> {
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        // "<gene> <cb1based> <count>", the layout `finalize_matrix` also parses.
+        if let Some(cb1) = line.split(' ').nth(1)
+            && let Ok(cb) = cb1.parse::<u32>()
+        {
+            seen.insert(cb.saturating_sub(1));
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 /// Write a final `matrix.mtx[.gz]` = MatrixMarket header + (optionally
 /// cb-remapped/filtered) body. With `remap = None` the body is copied verbatim
 /// (raw); with `Some(map)` only columns in the map survive, renumbered to the
@@ -1392,20 +1413,45 @@ pub fn write_gene_matrix(
             &ctx.gene_ann.gene_names,
             gzip,
         )?;
-        write_barcodes(
-            &raw_dir.join(&barcodes_name),
-            &ctx.whitelist,
-            sorted.len(),
-            gzip,
-        )?;
+        // `--soloOutRawBarcodes Observed` narrows the raw matrix to the
+        // barcodes that actually carry a count, which is what CellRanger's
+        // `raw_feature_bc_matrix` holds. STARsolo's raw matrix has a column per
+        // whitelist barcode, so the default keeps that.
+        let observed: Option<Vec<u32>> = if params.solo_out_raw_barcodes == "Observed" {
+            Some(observed_barcodes(&body)?)
+        } else {
+            None
+        };
+        let (raw_cols, raw_remap) = match &observed {
+            Some(cbs) => {
+                let map: HashMap<u32, u32> = cbs
+                    .iter()
+                    .enumerate()
+                    .map(|(col, &cb)| (cb, col as u32 + 1))
+                    .collect();
+                (cbs.len(), Some(map))
+            }
+            None => (sorted.len(), None),
+        };
+        match &observed {
+            Some(cbs) => {
+                write_barcodes_subset(&raw_dir.join(&barcodes_name), &ctx.whitelist, cbs, gzip)?;
+            }
+            None => write_barcodes(
+                &raw_dir.join(&barcodes_name),
+                &ctx.whitelist,
+                sorted.len(),
+                gzip,
+            )?,
+        }
         finalize_matrix(
             &body,
             &raw_dir.join(&matrix_name),
             gzip,
             n_genes,
-            sorted.len(),
+            raw_cols,
             mstats.nnz,
-            None,
+            raw_remap.as_ref(),
         )?;
         log::info!(
             "STARsolo: wrote {}/raw matrix ({} genes × {} barcodes, {} entries){}",
