@@ -105,10 +105,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-
-# `obsm`/`varm` DataFrames only get their index (the `obs`/`var` names) stamped
-# on by anndata-rs `ig/set_index`, which is what the solo Zarr writer relies on.
-# Drop this section once that lands in a crates.io release.
-[patch.crates-io]
-anndata = { path = "../anndata-rs/anndata" }
-anndata-zarr = { path = "../anndata-rs/anndata-zarr" }
