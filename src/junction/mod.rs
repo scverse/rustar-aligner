@@ -6,7 +6,13 @@
 /// - Junction lookup during alignment (annotated vs novel)
 /// - Junction statistics collection for SJ.out.tab output
 pub(crate) mod chr_start_end;
+#[cfg(not(feature = "bench"))]
 pub(crate) mod gtf;
+// See `align::simd_scan`: exposed only for `benches/`, which builds a gene
+// annotation from in-memory GTF records rather than from a file on disk.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod gtf;
 mod sj_output;
 pub mod sjdb_insert;
 

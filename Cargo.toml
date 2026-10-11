@@ -65,9 +65,24 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_se
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
 
+[features]
+# Exposes a few internals to `benches/` without widening the published API.
+# Enabled automatically for `cargo bench` through dev-dependencies below.
+bench = []
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# Benchmark harness. Divan over criterion for the questions that prompted it
+# (#204): it reports allocation counts next to wall time, which is what the
+# suffix-array and interval evaluations are actually comparing, and a run
+# takes seconds rather than minutes. See DEPENDENCIES.md.
+divan = "0.1"
+rustar-aligner = { path = ".", features = ["bench"] }
+
+[[bench]]
+name = "hot_paths"
+harness = false
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
