@@ -136,6 +136,30 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 **Impact.** Past libc++'s load factor the map rehashes, and the order then depends on the bucket count, which depends on how many distinct barcodes were seen; beyond that size the order diverges. The **values never do** — only which line they appear on. Reading the file by barcode rather than by position is unaffected either way.
 
 **Source.** `src/solo/cell_reads.rs`, locked by `rows_are_emitted_in_reverse_first_appearance_order`. STAR: `SoloFeature_statsOutput.cpp`.
+### 3.2 `--soloOutRawBarcodes Observed` (opt-in, non-STAR)
+
+**What STAR does.** STARsolo's raw matrix has one column per whitelist
+barcode, whether or not any read carried it. For 10x v3 that is 3 686 400
+columns and a 62 MB `barcodes.tsv`, nearly all of it zeros.
+
+**What rustar-aligner does.** The same, by default. `--soloOutRawBarcodes
+Observed` narrows the raw matrix to the barcodes that actually hold a count,
+which is what CellRanger's `raw_feature_bc_matrix` contains. On a 200-cell
+fixture that is 200 columns and a 3.4 kB `barcodes.tsv`.
+
+**Why.** Someone comparing our raw matrix against CellRanger's finds no
+overlapping keys at all, because the two files mean different things by "raw".
+The flag makes the comparison possible without changing what STARsolo users
+get.
+
+**Impact.** The counts are identical either way — same entries, same values,
+verified on the fixture — only the columns present differ. This is a non-STAR
+flag and needs maintainer sign-off; it is off by default so STARsolo parity is
+untouched.
+
+**Source.** `src/solo/count.rs` (`observed_barcodes`), `src/params/mod.rs`
+(`solo_out_raw_barcodes`). CellRanger: `outs/raw_feature_bc_matrix/` from a
+`cellranger count` run, observed directly rather than taken from its source.
 
 ---
 
