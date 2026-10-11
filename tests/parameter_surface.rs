@@ -98,8 +98,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "alignTranscriptsPerReadNmax",
     "outFilterMismatchNoverReadLmax",
     "seedNoneLociPerWindow",
-    // Long reads.
-    "winReadCoverageBasesMin",
     // Chimeric multimapping.
     // CellRanger4 adapter clipping.
     "clip5pAdapterMMp",
