@@ -64,6 +64,17 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_set (purge_delay); see main.rs
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
+# --- CellRanger-style HDF5 output (--soloOutH5 yes) -------------------------
+# Pure-Rust HDF5 writer: no libhdf5, no cmake, no build script (#270, following
+# #177, which ruled out the C-backed crates). Optional and off by default, so
+# the default build gains no dependency; enable with `--features hdf5-out`.
+hdf5-pure = { version = "0.47", optional = true }
+
+[features]
+default = []
+# `raw_feature_bc_matrix.h5` / `filtered_feature_bc_matrix.h5` next to the
+# STARsolo MatrixMarket directories.
+hdf5-out = ["dep:hdf5-pure"]
 
 [dev-dependencies]
 assert_cmd = "2"

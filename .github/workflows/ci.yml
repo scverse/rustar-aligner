@@ -96,6 +96,12 @@ jobs:
 
       - run: cargo clippy --all-targets -- -D warnings
 
+      # Optional features are off by default, so lint and test them explicitly.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test the hdf5-out feature
+        run: cargo test --features hdf5-out h5
+
   msrv:
     name: MSRV check
     runs-on: ubuntu-latest
