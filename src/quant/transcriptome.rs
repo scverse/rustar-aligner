@@ -152,6 +152,10 @@ pub struct TranscriptomeIndex {
     pub tr_starts_sorted: Vec<u64>,
     /// Running max of `tr_end` along `tr_order` (STAR's `trEmax`).
     pub tr_end_max_sorted: Vec<u64>,
+    /// Each transcript's position in GTF order, which STAR writes as the
+    /// transcript of `exonGeTrInfo.tab` (`GTF_transcriptGeneSJ.cpp:51`). The
+    /// identity unless [`Self::into_star_order`] reordered the transcripts.
+    pub tr_insertion_idx: Vec<u32>,
 }
 
 impl TranscriptomeIndex {
@@ -354,10 +358,69 @@ impl TranscriptomeIndex {
             tr_exons: tr_exons_vec,
             tr_length,
             tr_exi,
+            tr_insertion_idx: (0..tr_order.len() as u32).collect(),
             tr_order,
             tr_starts_sorted,
             tr_end_max_sorted,
         })
+    }
+
+    /// The mapping-time gene model: parse `--sjdbGTFfile` and build the tables in STAR's
+    /// transcript order. The single entry point for every mapping-time consumer
+    /// (TranscriptomeSAM, solo transcript features), so they all see the same order.
+    pub fn from_mapping_gtf(
+        params: &crate::params::Parameters,
+        gtf_path: &Path,
+        genome: &Genome,
+    ) -> Result<Self, Error> {
+        let exons = crate::junction::gtf::parse_gtf_configured(
+            gtf_path,
+            &params.sjdb_gtf_feature_exon,
+            &params.sjdb_gtf_chr_prefix,
+        )?;
+        Ok(Self::from_gtf_exons_configured(
+            &exons,
+            genome,
+            &params.sjdb_gtf_tag_exon_parent_transcript,
+            &params.sjdb_gtf_tag_exon_parent_gene,
+            &params.sjdb_gtf_tag_exon_parent_gene_name,
+            &params.sjdb_gtf_tag_exon_parent_gene_type,
+        )?
+        .into_star_order())
+    }
+
+    /// Reorder the per-transcript vectors into STAR's transcript order: sorted by
+    /// `(start, end)` with ties by first appearance in the GTF (GTF_transcriptGeneSJ.cpp,
+    /// qsort of extrLoci). This is the order of `transcriptInfo.tab`, hence of the
+    /// transcriptome BAM header, so a GTF-built index used at mapping time equals one
+    /// loaded from the tables. The GTF positions are kept in `tr_insertion_idx`
+    /// for `exonGeTrInfo.tab`.
+    #[must_use]
+    pub fn into_star_order(mut self) -> Self {
+        fn permute<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
+            *v = perm.iter().map(|&i| v[i].clone()).collect();
+        }
+        let perm = std::mem::take(&mut self.tr_order);
+        permute(&mut self.tr_ids, &perm);
+        permute(&mut self.tr_chr_idx, &perm);
+        permute(&mut self.tr_strand, &perm);
+        permute(&mut self.tr_gene_idx, &perm);
+        permute(&mut self.tr_start, &perm);
+        permute(&mut self.tr_end, &perm);
+        permute(&mut self.tr_exons, &perm);
+        permute(&mut self.tr_length, &perm);
+        permute(&mut self.tr_insertion_idx, &perm);
+        let n = perm.len();
+        self.tr_order = (0..n).collect();
+        let mut cum = 0u32;
+        self.tr_exi = (0..n)
+            .map(|i| {
+                let c = cum;
+                cum = cum.saturating_add(self.tr_exons[i].len() as u32);
+                c
+            })
+            .collect();
+        self
     }
 
     /// Build from already-parsed GTF exon records using default STAR attribute names.
@@ -469,6 +532,7 @@ impl TranscriptomeIndex {
             tr_exons,
             tr_length,
             tr_exi,
+            tr_insertion_idx: (0..tr_order.len() as u32).collect(),
             tr_order,
             tr_starts_sorted,
             tr_end_max_sorted,
@@ -657,7 +721,7 @@ impl TranscriptomeIndex {
                     ex.genome_end.saturating_sub(1),
                     strand,
                     gene_idx,
-                    tr_idx as u32,
+                    self.tr_insertion_idx[tr_idx],
                 ));
             }
         }
@@ -2102,6 +2166,35 @@ mod tests {
         // tr_exi by insertion position: T_late (insertion 0, sort pos 1) = 1,
         // T_early (insertion 1, sort pos 0) = 0.
         assert_eq!(idx.tr_exi, vec![1, 0]);
+    }
+
+    #[test]
+    fn into_star_order_sorts_transcripts_like_transcript_info_tab() {
+        let genome = make_genome();
+        let exons = vec![
+            make_exon("chr1", 501, 600, '+', "G1", "T_late"),
+            make_exon("chr1", 101, 200, '+', "G2", "T_early"),
+            make_exon("chr1", 301, 400, '+', "G2", "T_early"),
+        ];
+        let idx = TranscriptomeIndex::from_gtf_exons(&exons, &genome)
+            .unwrap()
+            .into_star_order();
+        assert_eq!(
+            idx.tr_ids,
+            vec!["T_early".to_string(), "T_late".to_string()]
+        );
+        assert_eq!(idx.tr_order, vec![0, 1]);
+        assert_eq!(idx.tr_exi, vec![0, 2]);
+        assert_eq!(idx.tr_gene_idx, vec![1, 0]);
+        // exonGeTrInfo.tab keeps the GTF position of each transcript (STAR).
+        assert_eq!(idx.tr_insertion_idx, vec![1, 0]);
+        let dir = tempfile::tempdir().unwrap();
+        idx.write_exon_ge_tr_info(dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join("exonGeTrInfo.tab")).unwrap();
+        assert_eq!(
+            body,
+            "3\n100\t199\t1\t1\t1\n300\t399\t1\t1\t1\n500\t599\t1\t0\t0\n"
+        );
     }
 
     #[test]

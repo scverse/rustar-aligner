@@ -3,7 +3,7 @@ title: Gene quantification
 description: Generate gene-level read counts and transcriptome-coordinate SAM during alignment.
 ---
 
-rustar-aligner can produce two flavours of quantification output during alignment, controlled by `--quantMode`. Both require a GTF file.
+rustar-aligner can produce two flavours of quantification output during alignment, controlled by `--quantMode`. Both need a gene annotation: the tables of an index built with `--sjdbGTFfile`, or `--sjdbGTFfile` at alignment time. With neither, the run stops with STAR's "could not open ... geneInfo.tab" error.
 
 ## Gene-level counts (`GeneCounts`)
 
@@ -81,9 +81,9 @@ This emits `ReadsPerGene.out.tab` *and* `Aligned.toTranscriptome.out.bam` in add
 
 ## Index-time vs alignment-time
 
-For best speed, supply `--sjdbGTFfile` at `--runMode genomeGenerate` time and the transcript-level data structures get persisted into the genome directory. Then at alignment time you only need `--quantMode TranscriptomeSAM` (or `GeneCounts`); rustar-aligner reuses the persisted annotations.
+For best speed, supply `--sjdbGTFfile` at `--runMode genomeGenerate` time and the transcript-level data structures get persisted into the genome directory. Then at alignment time you only need `--quantMode TranscriptomeSAM` (or `GeneCounts`, or STARsolo's gene features); rustar-aligner reuses the persisted annotations.
 
-If you supply `--sjdbGTFfile` at alignment time, its junctions are inserted into the genome and its transcript info is used, even if the index has its own, as in STAR. This is done on every run, so it adds startup time.
+If you supply `--sjdbGTFfile` at alignment time, its junctions are inserted into the genome and its transcript and gene info is used, even if the index has its own, as in STAR. The transcripts are put in STAR's order, so the transcriptome BAM's `@SQ` lines are the same as from an index built with that GTF. This is done on every run, so it adds startup time.
 
 ## Strandedness summary
 

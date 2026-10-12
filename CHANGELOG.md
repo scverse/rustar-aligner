@@ -44,6 +44,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- `--sjdbGTFfile` accepts a gzipped GTF, detected by its first bytes, at
+  `genomeGenerate`, at mapping and in `--runMode liftOver` (from
+  @BenjaminDEMAILLE's #319). STAR reads plain text only (DIVERGENCE.md §4.4);
+  plain-text GTFs are read as before, and the outputs are the same either way.
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
@@ -65,6 +69,21 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **The gene model comes from the index tables when no `--sjdbGTFfile` is
+  given at mapping** (from @BenjaminDEMAILLE's #308). STAR reads
+  `geneInfo.tab` and the transcript tables from `--genomeDir`
+  (`Transcriptome.cpp:13-18`) and only stops when they are missing;
+  rustar-aligner required `--sjdbGTFfile` for `--quantMode GeneCounts` and
+  STARsolo `Gene`/`GeneFull`/`Velocyto` even on an index built with a GTF. On
+  the yeast 10k reads with the annotated index and no GTF, `ReadsPerGene.out.tab`
+  is identical to STAR's, SE and PE. With no annotation at all the run stops
+  with STAR's "could not open ... geneInfo.tab" message.
+- **A GTF given at mapping gives STAR's transcript order** (from #313).
+  Transcripts are sorted by start, then end, then GTF order
+  (`GTF_transcriptGeneSJ.cpp`), as in `transcriptInfo.tab`, so the
+  transcriptome BAM's `@SQ` lines now match STAR's; they were in GTF order.
+  `exonGeTrInfo.tab` in `<prefix>_STARgenome/` keeps STAR's GTF-order
+  transcript numbers (#313 as submitted wrote the sorted ones).
 - **SAM/BAM records and headers match STAR's** (from @BenjaminDEMAILLE's #306,
   #309, #310, #314, #297 and #305). On the yeast 10k reads, SE and PE, every
   record and every header line other than the two that name the program

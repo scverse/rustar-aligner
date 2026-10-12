@@ -139,7 +139,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--sjdbGTFfile` | — | GTF file with exon annotations. |
+| `--sjdbGTFfile` | — | GTF file with exon annotations; may be gzipped (STAR needs plain text). |
 | `--sjdbGTFchrPrefix` | `""` | Prefix to add to chromosome names from GTF (e.g. `chr`). |
 | `--sjdbGTFfeatureExon` | `exon` | GTF feature type to use as exon. |
 | `--sjdbGTFtagExonParentTranscript` | `transcript_id` | GTF attribute for transcript ID. |

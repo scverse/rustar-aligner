@@ -157,11 +157,11 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
 
-### 4.1 Transcriptome tables built on the fly
+### 4.1 Transcriptome tables built on the fly (GTF given at mapping time)
 
-With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<prefix>_STARgenome/` and then reads them back (`Transcriptome.cpp:13`). rustar-aligner writes the same tables but builds its in-memory transcript index directly from the GTF. Without a GTF at mapping, both read the index's `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`. The output is intended to be the same.
+With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<prefix>_STARgenome/` and then reads them back (`Transcriptome.cpp:13`). rustar-aligner writes the same tables but builds its in-memory transcript index and gene model directly from the GTF. Without a GTF at mapping, both read the index's `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`, for `--quantMode TranscriptomeSAM` / `GeneCounts`, STARsolo `Gene` / `GeneFull` / `Velocyto` / SmartSeq and the `GX`/`GN` tags, and exit with STAR's "could not open ... geneInfo.tab" error when neither a GTF nor the tables exist. The output is intended to be the same.
 
-**Source.** `src/index/io.rs` (`GenomeIndex::load`), `src/quant/transcriptome.rs`.
+**Source.** `src/index/io.rs` (`GenomeIndex::load`), `src/quant/transcriptome.rs`, `src/quant/mod.rs` (`resolve_gene_annotation`).
 
 ### 4.2 In-tree RNG generator
 
@@ -178,6 +178,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 **Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
 
 **Source.** `src/io/bam.rs` (`CoordinateSorter`).
+
+### 4.4 Gzipped GTF files
+
+**What STAR does.** `--sjdbGTFfile` is read as plain text; a gzipped GTF fails to parse.
+
+**What rustar-aligner does.** A GTF whose first two bytes are the gzip magic (`1f 8b`) is decompressed while it is read, at `genomeGenerate`, at mapping and in `--runMode liftOver`; the file name does not matter, and multi-member gzip is read to the end. A plain-text GTF is read as before.
+
+**Why.** Annotations are often shipped compressed (10x references: `genes/genes.gtf.gz`), and decompressing them first adds a step and a large file for no change in the result.
+
+**Impact.** None on output: the same GTF gzipped or not gives identical indexes, `_STARgenome/` tables, alignments, `ReadsPerGene.out.tab` and transcriptome BAM. Only a run STAR would reject is accepted.
+
+**Source.** `src/junction/gtf.rs` (`open_annotation`).
 
 ## 5. Known residual single-read differences
 

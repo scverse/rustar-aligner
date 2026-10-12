@@ -78,20 +78,11 @@ impl GenomeIndex {
         };
 
         // A GTF given at mapping is always the source of transcript info
-        // (`Transcriptome.cpp:13`); otherwise the index's tables are used.
+        // (`Transcriptome.cpp:13`), in STAR's transcript order; otherwise the
+        // index's tables are used.
         let transcriptome = if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            let exons = crate::junction::gtf::parse_gtf_configured(
-                gtf_path,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-            )?;
-            Some(TranscriptomeIndex::from_gtf_exons_configured(
-                &exons,
-                &genome,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-                &params.sjdb_gtf_tag_exon_parent_gene_name,
-                &params.sjdb_gtf_tag_exon_parent_gene_type,
+            Some(TranscriptomeIndex::from_mapping_gtf(
+                params, gtf_path, &genome,
             )?)
         } else if genome_dir.join("transcriptInfo.tab").exists() {
             log::info!(
