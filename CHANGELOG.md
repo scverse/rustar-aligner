@@ -13,11 +13,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- MSRV raised from Rust 1.89 to 1.91.
+
 - noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
   direct `noodles-bgzf` dependency exists only to enable its `libdeflate`
   feature; bumping one without the other puts two copies in the tree, and
   noodles then writes BAM through the copy without libdeflate. BAM output is
-  byte-identical before and after. (0.117 needs Rust 1.91, above the 1.89 MSRV.)
+  byte-identical before and after. (0.117 needs Rust 1.91.)
 
 - Production genome indexing now enables caps-sa 0.7's bounded geometric LCP
   memoization through its stable policy API. On the complete ruSTAR-shaped
