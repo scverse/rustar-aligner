@@ -24,7 +24,7 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
+pub use sam::{OutSamFormat, OutSamType, OutSamUnmapped, SamAttr, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -1353,6 +1353,12 @@ pub struct Parameters {
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,
+
+    /// The command line as STAR records it (`Parameters.cpp`, `commandLine`):
+    /// the arguments joined by single spaces, a value argument containing
+    /// white space wrapped in double quotes. Written to the `@CO` header line.
+    #[arg(skip)]
+    pub star_command_line: Option<String>,
 }
 
 impl Parameters {
@@ -1372,11 +1378,11 @@ impl Parameters {
     }
 
     /// Whether the run produces per-read alignment records (SAM/BAM). False only
-    /// for `--outSAMtype None` written to a file (no `--outStd`): the alignment
+    /// for `--outSAMtype None` (STAR writes nothing to `--outStd` then either): the alignment
     /// loops then skip building SAM records entirely, which is a large saving for
     /// solo / quant-only runs that only need the count matrix.
     pub fn emits_alignments(&self) -> bool {
-        !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
+        self.out_sam_type.format != OutSamFormat::None
     }
 
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
@@ -1568,6 +1574,20 @@ impl Parameters {
         let matches = command.clone().get_matches_from(args.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
+        params.star_command_line = Some(
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let a = a.to_string_lossy();
+                    if i > 0 && !a.starts_with("--") && a.contains([' ', '\t']) {
+                        format!("\"{a}\"")
+                    } else {
+                        a.into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         params.command_line = {
             let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
             shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
@@ -1746,17 +1766,13 @@ impl Parameters {
                     }
                 }
             }
-            if params.chim_out_within_bam() {
-                // WithinBAM needs BAM output (`:76-81`), and adds the NM attribute
-                // that the SA tag reads (`:99-102`).
-                if params.out_sam_type.format != OutSamFormat::Bam {
-                    return Err(command.error(
-                        ErrorKind::InvalidValue,
-                        "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
-                         or SortedByCoordinate",
-                    ));
-                }
-                params.out_sam_attributes |= SamAttributes::NM;
+            if params.chim_out_within_bam() && params.out_sam_type.format != OutSamFormat::Bam {
+                // WithinBAM needs BAM output (`:76-81`).
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
+                     or SortedByCoordinate",
+                ));
             }
         }
 
@@ -1804,15 +1820,22 @@ impl Parameters {
         if params.rg_line_set() {
             params.out_sam_attributes |= SamAttributes::RG;
         }
-        // XS is only emitted in intronMotif mode (Parameters_samAttributes.cpp:172-179).
-        // intronMotif forces XS on; anything else strips XS even if explicitly listed.
-        if params.out_sam_strand_field == "intronMotif" {
+        // Parameters_samAttributes.cpp: an explicit XS turns on
+        // --outSAMstrandField intronMotif (which also drops spliced
+        // alignments with an undefined strand); intronMotif appends XS when it
+        // is not listed.
+        if params.out_sam_attributes.contains(SamAttributes::XS) {
+            if params.out_sam_strand_field != "intronMotif" {
+                log::info!(
+                    "--outSAMattributes contains XS, therefore rustar-aligner will use --outSAMstrandField intronMotif"
+                );
+                params.out_sam_strand_field = "intronMotif".into();
+            }
+        } else if params.out_sam_strand_field == "intronMotif" {
             log::info!(
                 "--outSAMstrandField=intronMotif, therefore rustar-aligner will output XS attribute"
             );
             params.out_sam_attributes |= SamAttributes::XS;
-        } else {
-            params.out_sam_attributes.remove(SamAttributes::XS);
         }
 
         // --alignEndsType: reject unknown/unimplemented values up front.
@@ -2197,7 +2220,71 @@ impl Parameters {
                     "--waspOutputMode SAMtag requires --varVCFfile",
                 ));
             }
+            // `Parameters.cpp:882-887`.
+            if params.out_sam_type.format != OutSamFormat::Bam {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--waspOutputMode requires output to BAM file: re-run with \
+                     --outSAMtype BAM ...",
+                ));
+            }
             params.out_sam_attributes |= SamAttributes::VW;
+        }
+
+        // `Parameters_samAttributes.cpp:187-199`: vA/vG need the VCF, vW the WASP mode.
+        if params.var_vcf_file.is_none()
+            && params
+                .out_sam_attributes
+                .intersects(SamAttributes::VA | SamAttributes::VG)
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--outSAMattributes contains vA and/or vG tag(s), but --varVCFfile is not set",
+            ));
+        }
+        if params.wasp_output_mode != WaspOutputMode::SAMtag
+            && params.out_sam_attributes.contains(SamAttributes::VW)
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--outSAMattributes contains vW tag, but --waspOutputMode is not set",
+            ));
+        }
+
+        // STAR's samAttrRequiresBAM (`Parameters_samAttributes.cpp:225-242,251-259`):
+        // these tags exist only in BAM output, checked in STAR's order.
+        if params.run_mode() == RunMode::AlignReads
+            && params.out_sam_type.format != OutSamFormat::Bam
+        {
+            for (attr, name) in [
+                (SamAttributes::CH, "ch"),
+                (SamAttributes::VG, "vG"),
+                (SamAttributes::VA, "vA"),
+                (SamAttributes::VW, "vW"),
+                (SamAttributes::GX, "GX"),
+                (SamAttributes::GN, "GN"),
+            ] {
+                if params.out_sam_attributes.contains(attr) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--outSAMattributes contains {name} tag, which requires BAM output. \
+                             Re-run with --outSAMtype BAM Unsorted (and/or SortedByCoordinate), \
+                             or without the {name} tag in --outSAMattributes"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // WithinBAM adds the NM attribute that the SA tag reads
+        // (`ParametersChimeric_initialize.cpp:99-102`). STAR does it in
+        // `pCh.initialize` (`STAR.cpp:188`), after RG, XS and vW are appended,
+        // so NM comes after them.
+        // With `--chimSegmentMin 0` the chimeric parameters are not read at all
+        // (`ParametersChimeric_initialize.cpp:13-14`).
+        if params.chim_segment_min > 0 && params.chim_out_within_bam() {
+            params.out_sam_attributes |= SamAttributes::NM;
         }
 
         Ok(params)
@@ -2465,10 +2552,7 @@ mod tests {
         assert_eq!(p.read_files_command, Some("zcat".to_string()));
         assert_eq!(p.run_thread_n, NonZeroUsize::new(16).unwrap());
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(
-            p.out_sam_type.sort_order,
-            Some(OutSamSortOrder::SortedByCoordinate)
-        );
+        assert!(p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
         assert_eq!(p.out_file_name_prefix, "/out/sample1_");
         assert_eq!(p.out_filter_multimap_nmax, 20);
         assert_eq!(p.align_intron_max, 1_000_000);
@@ -2640,11 +2724,30 @@ mod tests {
     fn out_sam_type_parsing() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Sam);
-        assert_eq!(p.out_sam_type.sort_order, None);
+        assert!(!p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Unsorted"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(p.out_sam_type.sort_order, Some(OutSamSortOrder::Unsorted));
+        assert!(p.out_sam_type.bam_unsorted && !p.out_sam_type.bam_sorted);
+
+        for order in [
+            ["Unsorted", "SortedByCoordinate"],
+            ["SortedByCoordinate", "Unsorted"],
+        ] {
+            let p = try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMtype",
+                "BAM",
+                order[0],
+                order[1],
+            ])
+            .unwrap();
+            assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
+            assert!(p.out_sam_type.bam_unsorted && p.out_sam_type.bam_sorted);
+        }
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Bogus"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM", "Unsorted"]).is_err());
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "None"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::None);
@@ -2725,6 +2828,76 @@ mod tests {
         assert!(with(&["--chimOutType", "SeparateSAMold"]).is_err());
         // Without chimeric detection the value is not checked, as in STAR.
         assert!(try_parse(&["--readFilesIn", "r.fq", "--chimOutType", "WithinBAM"]).is_ok());
+    }
+
+    #[test]
+    fn bam_only_tags_and_wasp_are_refused_with_sam_output() {
+        // STAR: `Parameters.cpp:882-887` (WASP), `Parameters_samAttributes.cpp:187-199`
+        // (vA/vG need the VCF, vW the WASP mode) and `:225-242` (BAM-only tags).
+        let err = |args: &[&str]| try_parse(args).unwrap_err().to_string();
+        let base = ["--readFilesIn", "r.fq"];
+        let with = |extra: &[&'static str]| -> Vec<&str> {
+            base.iter().copied().chain(extra.iter().copied()).collect()
+        };
+        assert!(
+            err(&with(&[
+                "--waspOutputMode",
+                "SAMtag",
+                "--varVCFfile",
+                "v.vcf"
+            ]))
+            .contains("requires output to BAM")
+        );
+        assert!(err(&with(&["--outSAMattributes", "NH", "vA"])).contains("--varVCFfile"));
+        assert!(err(&with(&["--outSAMattributes", "NH", "vW"])).contains("--waspOutputMode"));
+        assert!(err(&with(&["--outSAMattributes", "NH", "GX"])).contains("GX tag"));
+        assert!(
+            try_parse(&with(&[
+                "--outSAMattributes",
+                "NH",
+                "GX",
+                "--outSAMtype",
+                "BAM",
+                "Unsorted"
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn within_bam_nm_comes_after_rg_xs_and_vw() {
+        // STAR appends RG, XS and vW in samAttributes() and NM later, in
+        // pCh.initialize (`STAR.cpp:188`).
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--chimSegmentMin",
+            "12",
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMattrRGline",
+            "ID:g1",
+            "--outSAMstrandField",
+            "intronMotif",
+        ])
+        .unwrap();
+        let order: Vec<SamAttr> = p.out_sam_attributes.iter().collect();
+        assert_eq!(
+            order,
+            [
+                SamAttr::NH,
+                SamAttr::HI,
+                SamAttr::AS,
+                SamAttr::NMM,
+                SamAttr::RG,
+                SamAttr::XS,
+                SamAttr::NM
+            ]
+        );
     }
 
     #[test]
@@ -3225,9 +3398,8 @@ mod tests {
     }
 
     #[test]
-    fn xs_without_intron_motif_is_stripped() {
-        // Explicit XS in attrs without --outSAMstrandField intronMotif: XS gets stripped.
-        // Users must set both to get XS output.
+    fn xs_without_intron_motif_enables_intron_motif() {
+        // Explicit XS in attrs turns on intronMotif, as STAR.
         let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
@@ -3237,8 +3409,8 @@ mod tests {
             "XS",
         ])
         .unwrap();
-        assert_eq!(p.out_sam_strand_field, "None");
-        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+        assert_eq!(p.out_sam_strand_field, "intronMotif");
+        assert!(p.out_sam_attributes.contains(SamAttributes::XS));
     }
 
     #[test]
@@ -3251,7 +3423,16 @@ mod tests {
     #[test]
     fn xs_stripped_from_all_preset_without_intron_motif() {
         // "All" includes XS but it is stripped unless intronMotif is also set.
-        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
     }

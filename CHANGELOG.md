@@ -65,6 +65,41 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **SAM/BAM records and headers match STAR's** (from @BenjaminDEMAILLE's #306,
+  #309, #310, #314, #297 and #305). On the yeast 10k reads, SE and PE, every
+  record and every header line other than the two that name the program
+  (DIVERGENCE.md §3.3) is now identical to STAR's in all the configurations
+  tried: default, `--outSAMunmapped Within` (and `KeepPairs`), a custom
+  `--outSAMattributes` order, `All` in BAM, `intronMotif`, an explicit `XS`,
+  read groups, `--chimOutType WithinBAM`, both BAM outputs, and user `@HD`,
+  `@PG` and comment-file headers. Default records were already identical; the
+  default header changes from `@HD VN:1.6` to STAR's `VN:1.4`.
+  - Optional tags are written in `--outSAMattributes` order, then RG, XS, vW,
+    then NM for WithinBAM (`Parameters_samAttributes.cpp`, `STAR.cpp:188`);
+    tags outside the list, such as `SA`, follow them. Unmapped records always
+    carry `NH HI AS nM uT` then `RG`, and the transcriptome BAM `NH HI` then
+    `RG`. Unspliced alignments get `jM:B:c,-1` and `jI:B:i,-1`. (#306)
+  - `MC` (mate CIGAR) and `ch` (WithinBAM chimeric records) are accepted, and
+    `All` is STAR's `NH HI AS nM NM MD jM jI MC ch`. (#309)
+  - Unmapped records take `AS` and `nM` from STAR's best transcript, MAPQ 0,
+    `uT:A:4` for the unmapped mate of a half-mapped pair, and STAR's mate
+    fields. (#310)
+  - `XS` in `--outSAMattributes` turns on `--outSAMstrandField intronMotif`,
+    as in STAR, instead of being dropped; a pair's XS comes from both mates'
+    junctions, with the annotated strand for sjdb junctions. (#314)
+  - The header follows STAR's layout and text (`samHeaders.cpp`), including
+    the transcriptome BAM's `@SQ`/`@RG`-only header. (#297)
+  - `--outSAMtype BAM Unsorted SortedByCoordinate` writes both files, and
+    `--outStd` sends only the matching output to stdout. (#305)
+- `NM:i` counts a base where the read or the genome is N as a mismatch, as
+  STAR's `samAttrNM_MD` does (`ReadAlign_alignBAM.cpp:9-46`); it was built
+  from `nM`, which leaves those out. MD now also writes an N read base on an
+  N genome base as a mismatch.
+- Options STAR refuses with SAM output are now refused too: `ch`, `vA`, `vG`,
+  `vW`, `GX` and `GN` in `--outSAMattributes` (so `All`), and
+  `--waspOutputMode SAMtag` (`Parameters_samAttributes.cpp:225-242`,
+  `Parameters.cpp:882-887`). `vA`/`vG` without `--varVCFfile` and `vW` without
+  `--waspOutputMode` are refused as in STAR (`:187-199`).
 - **`SJ.out.tab` is filtered as STAR's `outputSJ` does** (from
   @BenjaminDEMAILLE's #316, `outputSJ.cpp:59-120`). The intron-length limit
   of `--outSJfilterIntronMaxVsReadN` was off by one and still applied above

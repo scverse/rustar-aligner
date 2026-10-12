@@ -206,6 +206,29 @@ impl AlignmentWriter for NoQsWriter {
     }
 }
 
+/// Feeds the same records to several writers (`--outSAMtype BAM Unsorted
+/// SortedByCoordinate`: STAR writes every record to both BAM outputs).
+struct TeeWriter(Vec<Box<dyn AlignmentWriter>>);
+
+impl AlignmentWriter for TeeWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        for w in &mut self.0 {
+            w.write_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), error::Error> {
+        for w in &mut self.0 {
+            w.finish()?;
+        }
+        Ok(())
+    }
+}
+
 /// Null writer that discards all output (for two-pass mode pass 1)
 struct NullWriter;
 
@@ -565,7 +588,7 @@ fn run_smartseq(
                     }
                     batch.par_iter().for_each(|read| {
                         stats.record_read_bases(read.sequence.len() as u64);
-                        let Ok((transcripts, _chim, n_for_mapq, reason)) =
+                        let Ok((transcripts, _chim, n_for_mapq, reason, _best)) =
                             align_read(&read.sequence, &read.name, index, params)
                         else {
                             return;
@@ -607,7 +630,7 @@ fn run_smartseq(
                         stats.record_read_bases(
                             (pr.mate1.sequence.len() + pr.mate2.sequence.len()) as u64,
                         );
-                        let Ok((results, _chim, n_for_mapq, reason)) = align_paired_read(
+                        let Ok((results, _chim, n_for_mapq, reason, _best)) = align_paired_read(
                             &pr.mate1.sequence,
                             &pr.mate2.sequence,
                             &pr.name,
@@ -721,11 +744,15 @@ fn run_single_pass(
         };
 
     // 4. Route to SAM or BAM output based on --outSAMtype / --outStd
-    use crate::params::{OutSamSortOrder, OutStd};
+    use crate::params::OutStd;
 
     let out_type = &params.out_sam_type;
 
-    // Build boxed writer — stdout takes precedence over file output.
+    // Build the boxed writer. As in STAR (Parameters.cpp), `--outStd` redirects
+    // only the output of the matching kind (SAM, BAM_Unsorted or
+    // BAM_SortedByCoordinate) to stdout; every other requested output still goes
+    // to its file. `BAM Unsorted SortedByCoordinate` opens both BAM outputs and
+    // feeds them the same records through a tee.
     // `--outSAMmode None` asks for no alignment output at all; everything else
     // (SJ.out.tab, Log.final.out, counts) is still produced, so the alignment
     // is still run and only the records are dropped.
@@ -733,30 +760,15 @@ fn run_single_pass(
         info!("--outSAMmode None: no alignment records will be written");
         Box::new(NullWriter)
     } else {
-        match params.out_std {
-            OutStd::Sam => {
-                info!("Writing SAM to stdout (--outStd SAM)");
-                Box::new(crate::io::sam::SamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::BamUnsorted => {
-                info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
-                Box::new(crate::io::bam::BamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::BamSortedByCoordinate => {
-                info!("Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)");
-                Box::new(crate::io::bam::SortedBamStdoutWriter::create(
-                    &index.genome,
-                    params,
-                )?)
-            }
-            OutStd::None => match out_type.format {
-                OutSamFormat::Sam => {
+        match out_type.format {
+            OutSamFormat::Sam => {
+                if params.out_std == OutStd::Sam {
+                    info!("Writing SAM to stdout (--outStd SAM)");
+                    Box::new(crate::io::sam::SamStdoutWriter::create(
+                        &index.genome,
+                        params,
+                    )?)
+                } else {
                     let output_path = params.output_path("Aligned.out.sam");
                     info!("Writing SAM to {}", output_path.display());
                     if let Some(parent) = output_path.parent() {
@@ -764,32 +776,57 @@ fn run_single_pass(
                     }
                     Box::new(SamWriter::create(&output_path, &index.genome, params)?)
                 }
-                OutSamFormat::Bam => {
-                    let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
-                    let output_path = if sorted {
-                        params.output_path("Aligned.sortedByCoord.out.bam")
+            }
+            OutSamFormat::Bam => {
+                let mut outputs: Vec<Box<dyn AlignmentWriter>> = Vec::new();
+                if out_type.bam_unsorted {
+                    outputs.push(if params.out_std == OutStd::BamUnsorted {
+                        info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
+                        Box::new(crate::io::bam::BamStdoutWriter::create(
+                            &index.genome,
+                            params,
+                        )?)
                     } else {
-                        params.output_path("Aligned.out.bam")
-                    };
-                    info!("Writing BAM to {}", output_path.display());
-                    if let Some(parent) = output_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    if sorted {
+                        let output_path = params.output_path("Aligned.out.bam");
+                        info!("Writing BAM to {}", output_path.display());
+                        if let Some(parent) = output_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        Box::new(BamWriter::create(&output_path, &index.genome, params)?)
+                    });
+                }
+                if out_type.bam_sorted {
+                    outputs.push(if params.out_std == OutStd::BamSortedByCoordinate {
+                        info!(
+                            "Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)"
+                        );
+                        Box::new(crate::io::bam::SortedBamStdoutWriter::create(
+                            &index.genome,
+                            params,
+                        )?)
+                    } else {
+                        let output_path = params.output_path("Aligned.sortedByCoord.out.bam");
+                        info!("Writing BAM to {}", output_path.display());
+                        if let Some(parent) = output_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
                         Box::new(SortedBamWriter::create(
                             &output_path,
                             &index.genome,
                             params,
                         )?)
-                    } else {
-                        Box::new(BamWriter::create(&output_path, &index.genome, params)?)
-                    }
+                    });
                 }
-                OutSamFormat::None => {
-                    info!("--outSAMtype None: skipping alignment output (count/quant only)");
-                    Box::new(NullWriter)
+                if outputs.len() == 1 {
+                    outputs.remove(0)
+                } else {
+                    Box::new(TeeWriter(outputs))
                 }
-            },
+            }
+            OutSamFormat::None => {
+                info!("--outSAMtype None: skipping alignment output (count/quant only)");
+                Box::new(NullWriter)
+            }
         }
     };
 
@@ -1731,7 +1768,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     let (clipped_seq, clipped_qual) =
                         clip_read(&read.sequence, &read.quality, clip5p, clip3p);
 
-                    let mut buffer = BufferedSamRecords::new();
+                    let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                     let mut chimeric_alns = Vec::new();
                     let tr_local = tr.as_ref().map(Arc::clone);
 
@@ -1756,6 +1793,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 &read.quality,
                                 params,
                                 crate::stats::UnmappedReason::Other,
+                                crate::stats::BestTr::default(),
                             )?;
                             buffer.push(record);
                         }
@@ -1781,14 +1819,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     }
 
                     // Align read (CPU-intensive, pure function)
-                    let (transcripts, chimeric_results, n_for_mapq, unmapped_reason) = match stage2
-                    {
-                        Some(s) => crate::align::stitch::with_bysj_novel_filter(
-                            Arc::clone(&s.novel),
-                            || align_read(&clipped_seq, &read.name, &index, params),
-                        ),
-                        None => align_read(&clipped_seq, &read.name, &index, params),
-                    }?;
+                    let (transcripts, chimeric_results, n_for_mapq, unmapped_reason, best_tr) =
+                        match stage2 {
+                            Some(s) => crate::align::stitch::with_bysj_novel_filter(
+                                Arc::clone(&s.novel),
+                                || align_read(&clipped_seq, &read.name, &index, params),
+                            ),
+                            None => align_read(&clipped_seq, &read.name, &index, params),
+                        }?;
 
                     // Collect chimeric alignments if enabled
                     if params.chim_segment_min > 0 && stage2.is_none() {
@@ -1916,6 +1954,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     &read.quality,
                                     params,
                                     unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                    best_tr,
                                 )?;
                                 buffer.push(record);
                             }
@@ -2370,7 +2409,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // Nbases; used to soft-clip all trimmed bases (STARsolo convention).
                             let total_clip5p = cr4_5p + clip5p;
                             let total_clip3p = cr4_3p + clip3p;
-                            let mut buffer = BufferedSamRecords::new();
+                            let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
 
                             if clipped_seq.is_empty() {
@@ -2387,7 +2426,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 });
                             }
 
-                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
+                            let (transcripts, _chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_read(&clipped_seq, &read.name, &index, params)?;
 
                             let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
@@ -2439,6 +2478,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                             params,
                                             unmapped_reason
                                                 .unwrap_or(crate::stats::UnmappedReason::Other),
+                                            best_tr,
                                         )?;
                                         buffer.push(record);
                                     }
@@ -2669,10 +2709,10 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 clip5p_m2,
                                 clip3p_m2,
                             );
-                            let mut buffer = BufferedSamRecords::new();
+                            let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
 
-                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason) =
+                            let (results, _pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_paired_read(
                                     &m1_seq,
                                     &m2_seq,
@@ -2793,6 +2833,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                         params,
                                         unmapped_reason
                                             .unwrap_or(crate::stats::UnmappedReason::Other),
+                                        best_tr,
                                     )?;
                                     for record in records {
                                         buffer.push(record);
@@ -3060,7 +3101,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         m2_clip3p,
                     );
 
-                    let mut buffer = BufferedSamRecords::new();
+                    let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                     let tr_local = tr.as_ref().map(Arc::clone);
 
                     // Record read bases for Log.final.out (both mates)
@@ -3085,6 +3126,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 &paired_read.mate2.quality,
                                 params,
                                 crate::stats::UnmappedReason::Other,
+                                crate::stats::BestTr::default(),
                             )?;
                             for record in records {
                                 buffer.push(record);
@@ -3119,7 +3161,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
 
                     // Align paired read (CPU-intensive)
-                    let (results, pe_chimeric, n_for_mapq, unmapped_reason) = match stage2 {
+                    let (results, pe_chimeric, n_for_mapq, unmapped_reason, best_tr) = match stage2
+                    {
                         Some(s) => crate::align::stitch::with_bysj_novel_filter(
                             Arc::clone(&s.novel),
                             || {
@@ -3317,6 +3360,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 &paired_read.mate2.quality,
                                 params,
                                 unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                                best_tr,
                             )?;
                             for record in records {
                                 buffer.push(record);

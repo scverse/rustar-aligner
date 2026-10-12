@@ -34,6 +34,9 @@ pub struct Transcript {
     /// written in this order; the primary is the first in the list. Set when
     /// the alignment list is final.
     pub output_rank: u32,
+    /// STAR's `sjStr` per junction: the annotated strand of an sjdb junction,
+    /// else the motif's strand; 1 = +, 2 = -, 0 = undefined.
+    pub junction_strand: Vec<u8>,
 }
 
 /// An exon segment in a transcript.
@@ -186,6 +189,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         assert_eq!(transcript.cigar_string(), "50M100N50M");
@@ -234,6 +238,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Query: 45 + 3 + 2 + 50 = 100
@@ -283,6 +288,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();
@@ -307,6 +313,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();
@@ -331,6 +338,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let [left, right] = transcript.count_soft_clips();

@@ -139,6 +139,20 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
+### 3.3 SAM/BAM header program lines
+
+**What STAR does.** The header names STAR: `@PG ID:STAR PN:STAR VN:2.7.11b CL:<commandLineFull>` (`samHeaders.cpp:64`), where `commandLineFull` is STAR's re-formatted parameter list, and `@CO user command line: <command line>` (`:84`).
+
+**What rustar-aligner does.** The same two lines, in the same place, name rustar-aligner: `@PG ID:rustar-aligner PN:rustar-aligner VN:<version> CL:<command line>` and `@CO user command line: <command line>`. Every other header line follows STAR's layout and text, including `@HD VN:1.4`, a user `@HD`/`@PG`, the comment file and `@RG` (`samHeaders.cpp:29-100`).
+
+**Why.** The program record says which program wrote the file; claiming to be STAR would be wrong, and the command line differs anyway (`argv[0]`, spacing).
+
+**Impact.** On the yeast 10k runs (SE and PE, SAM, unsorted, sorted and both BAMs, user `@HD`/`@PG`, comment file, read groups) the headers are identical to STAR's apart from these two lines. A tool that detects the aligner from `PN:STAR` will not recognise the file as STAR's.
+
+**Source.** `src/io/sam.rs` (header text), `src/io/bam.rs`.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.

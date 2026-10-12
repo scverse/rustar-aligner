@@ -510,9 +510,21 @@ fn align_bam(
         if attrs.contains(SamAttributes::MD) {
             data.insert(Tag::new(b'M', b'D'), Value::String(md.into()));
         }
+        // Every chimeric record has alignType <= -10 (`ReadAlign_alignBAM.cpp:376-381`).
+        if attrs.contains(SamAttributes::CH) {
+            data.insert(Tag::new(b'c', b'h'), Value::Character(b'1'));
+        }
         maybe_insert_rg_tag(&mut rec, rg_owned.as_deref());
         apply_sam_flag_or_and(&mut rec, params);
         out.push(rec);
+    }
+    // `MC` when this alignment holds both mates (`ReadAlign_alignBAM.cpp:382-387`);
+    // two-mate chimeric records are never hard-clipped, so the record CIGARs are
+    // STAR's `calcCIGAR` strings.
+    if attrs.contains(SamAttributes::MC)
+        && let [r1, r2] = out.as_mut_slice()
+    {
+        crate::io::sam::insert_mate_cigar_tags(r1, r2);
     }
     Ok(out)
 }

@@ -13,9 +13,11 @@ For the examples below, assume `--outFileNamePrefix sample_`. Replace `sample_` 
 
 Default output. SAM-format alignment file with header and records. Written when `--outSAMtype SAM` (the default).
 
+The header follows STAR's layout: `@HD VN:1.4` (or the `--outSAMheaderHD` line as given), the `@SQ` lines, the `--outSAMheaderPG` line if any, the program's own `@PG`, the lines of `--outSAMheaderCommentFile` (blank lines skipped), the `@RG` lines, and `@CO user command line: ...`. A coordinate-sorted BAM appends `SO:coordinate` to the `@HD` line. The transcriptome BAM's header has only `@SQ` and `@RG` lines.
+
 ### `sample_Aligned.out.bam`
 
-Unsorted BAM equivalent of `Aligned.out.sam`. Written when `--outSAMtype BAM Unsorted`.
+Unsorted BAM equivalent of `Aligned.out.sam`. Written when `--outSAMtype BAM Unsorted` (also together with the sorted BAM: `--outSAMtype BAM Unsorted SortedByCoordinate`).
 
 ### `sample_Aligned.sortedByCoord.out.bam`
 
