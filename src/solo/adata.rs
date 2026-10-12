@@ -166,25 +166,7 @@ mod zarr {
         let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
         let funnel = crate::solo::count::MappingFunnel::collect(ctx, align_stats);
 
-        let solo_dir = params
-            .solo_out_file_names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Solo.out/".to_string());
-        let stem = params
-            .solo_out_file_names
-            .get(3)
-            .map_or("matrix", |m| {
-                Path::new(m)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("matrix")
-            })
-            .to_string();
-        let path = params.output_path(&format!("{solo_dir}{stem}.zarr"));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
-        }
+        let path = store_path(params)?;
         // Without the sj modality there is nothing to wrap: gex is the store root.
         let should_write_mudata = ctx.sj_enabled && sj_stats.is_some();
         // The store root. `Zarr::new` wipes any previous store at this path.
@@ -391,6 +373,102 @@ mod zarr {
         Ok(())
     }
 
+    // Lives here rather than in `smartseq.rs` to reach the store helpers.
+    impl crate::solo::smartseq::SmartSeqCounts {
+        /// `--soloType SmartSeq` as a plain AnnData store: manifest cells × genes,
+        /// read counts in `layers/Gene` (no UMIs, so `n_umis` is the read count).
+        /// Every manifest cell is a cell — the MTX writer has no `filtered/` either —
+        /// so `is_cell` is all true; `soloCellFiltering` can still re-call it.
+        pub fn write_scverse(
+            &self,
+            gene_ids: &[String],
+            gene_names: &[String],
+            params: &crate::params::Parameters,
+        ) -> Result<std::path::PathBuf, Error> {
+            let counts = self;
+            let n_obs = counts.cell_ids.len();
+            let cells: Vec<CellCounts> = counts
+                .counts
+                .iter()
+                .enumerate()
+                .map(|(cb, m)| {
+                    let mut entries: Vec<(u32, u64)> =
+                        m.lock().unwrap().iter().map(|(&g, &c)| (g, c)).collect();
+                    entries.sort_unstable_by_key(|&(g, _)| g);
+                    CellCounts {
+                        cb: cb as u32,
+                        n_reads: entries.iter().map(|&(_, c)| c).sum(),
+                        entries,
+                    }
+                })
+                .collect();
+            let matrix = cells_to_csr(&cells, n_obs, counts.n_genes)?;
+            drop(cells);
+            let stats = row_stats(&matrix);
+            let all: Vec<u32> = (0..n_obs as u32).collect();
+
+            let path = store_path(params)?;
+            let store = Zarr::new(&path).map_err(zarr_err)?;
+            let adata = AnnData::<Zarr>::new(&path).map_err(zarr_err)?;
+            adata.set_var(gene_frame(gene_names)?).map_err(zarr_err)?;
+            adata
+                .set_var_names(DataFrameIndex::from(gene_ids.to_vec()))
+                .map_err(zarr_err)?;
+            adata
+                .set_obs_names(DataFrameIndex::from(counts.cell_ids.clone()))
+                .map_err(zarr_err)?;
+            adata
+                .obsm()
+                .add("stats_Gene", stats_frame(&stats, &all, n_obs)?)
+                .map_err(zarr_err)?;
+            adata.layers().add("Gene", matrix).map_err(zarr_err)?;
+            adata.uns().add("run_info", run_info()).map_err(zarr_err)?;
+            adata.close().map_err(zarr_err)?;
+            let mut root = store.open_group("/").map_err(zarr_err)?;
+            set_encoding(&mut root, "anndata", ANNDATA_VERSION)?;
+            Ok(path)
+        }
+    }
+
+    /// `Solo.out/<matrix stem>.zarr` under the output prefix, parent created.
+    fn store_path(params: &crate::params::Parameters) -> Result<std::path::PathBuf, Error> {
+        let solo_dir = params
+            .solo_out_file_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Solo.out/".to_string());
+        let stem = params.solo_out_file_names.get(3).map_or("matrix", |m| {
+            Path::new(m)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("matrix")
+        });
+        let path = params.output_path(&format!("{solo_dir}{stem}.zarr"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
+        }
+        Ok(path)
+    }
+
+    /// Per-row totals of a cells × features matrix, for rows with any counts.
+    /// Reads and UMIs are both the row sum (the matrix keeps no read count).
+    fn row_stats(matrix: &CsrMatrix<u64>) -> Vec<CellStat> {
+        matrix
+            .row_iter()
+            .enumerate()
+            .map(|(cb, row)| {
+                let n_umis = row.values().iter().sum();
+                CellStat {
+                    cb: cb as u32,
+                    n_reads: n_umis,
+                    n_umis,
+                    n_genes: row.nnz() as u32,
+                }
+            })
+            .filter(|s| s.n_umis > 0)
+            .collect()
+    }
+
     /// Columns of the stats frames that hold counts, not a cell call; the
     /// re-call must not clobber them.
     const STATS_COUNT_COLUMNS: [&str; 3] = ["n_reads", "n_umis", "n_features"];
@@ -443,20 +521,7 @@ mod zarr {
                     })?;
 
                 // Cell calling only reads per-barcode UMI totals.
-                let stats: Vec<CellStat> = matrix
-                    .row_iter()
-                    .enumerate()
-                    .map(|(cb, row)| {
-                        let n_umis = row.values().iter().sum();
-                        CellStat {
-                            cb: cb as u32,
-                            n_reads: n_umis,
-                            n_umis,
-                            n_genes: row.nnz() as u32,
-                        }
-                    })
-                    .filter(|s| s.n_umis > 0)
-                    .collect();
+                let stats = row_stats(&matrix);
                 let called = call_cells(&stats, &matrix, matrix.ncols(), params)?;
 
                 let mut is_cell = vec![false; matrix.nrows()];

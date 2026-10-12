@@ -540,8 +540,9 @@ fn write_solo_output(
 }
 
 /// `--soloType SmartSeq`: align each manifest cell's reads and count reads per
-/// gene (no barcodes, no UMIs). Writes `Solo.out/Gene/raw/` (genes × cells) and
-/// returns the alignment stats.
+/// gene (no barcodes, no UMIs). Writes `Solo.out/Gene/raw/` (genes × cells), or
+/// `Solo.out/matrix.zarr` with `--soloOutputFormat scverse`, and returns the
+/// alignment stats.
 fn run_smartseq(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
@@ -675,6 +676,21 @@ fn run_smartseq(
                 }
             }
         }
+    }
+
+    #[cfg(feature = "scverse-out")]
+    if crate::solo::OutputFormat::parse(&params.solo_output_format)
+        == Some(crate::solo::OutputFormat::scverse)
+    {
+        let path = counts.write_scverse(&gene_ann.gene_ids, &gene_ann.gene_names, params)?;
+        info!(
+            "STARsolo SmartSeq: wrote {} ({} cells × {} genes)",
+            path.display(),
+            cells.len(),
+            gene_ann.n_genes(),
+        );
+        stats.print_summary();
+        return Ok(stats);
     }
 
     let solo_dir = params

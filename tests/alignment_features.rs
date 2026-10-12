@@ -1903,6 +1903,78 @@ fn test_starsolo_smartseq() {
     assert!(entries.contains(&"1 2 3"), "expected CellB G1=3:\n{matrix}");
 }
 
+/// SmartSeq with `--soloOutputFormat scverse`: a plain AnnData store indexed by
+/// the manifest cell IDs, read counts in `layers/Gene`.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_smartseq_zarr() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use nalgebra_sparse::CsrMatrix;
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let exon1 = &genome[10000..10050];
+    let write_cell = |name: &str, n: usize| -> PathBuf {
+        let p = tmpdir.path().join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        for i in 0..n {
+            writeln!(f, "@{name}_{i}").unwrap();
+            f.write_all(exon1).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+        p
+    };
+    let a = write_cell("cellA.fq", 5);
+    let b = write_cell("cellB.fq", 3);
+    let manifest = tmpdir.path().join("manifest.tsv");
+    fs::write(
+        &manifest,
+        format!("{}\t-\tCellA\n{}\t-\tCellB\n", a.display(), b.display()),
+    )
+    .unwrap();
+
+    let output_dir = tmpdir.path().join("out_ss");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--soloType",
+            "SmartSeq",
+            "--readFilesManifest",
+            manifest.to_str().unwrap(),
+            "--soloStrand",
+            "Forward",
+            "--soloOutputFormat",
+            "scverse",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let store = output_dir.join("Solo.out").join("matrix.zarr");
+    assert!(!output_dir.join("Solo.out/Gene/raw").exists());
+    let (obs, obsm) = obs_and_obsm_index(&store, "stats_Gene");
+    assert_eq!(obs, ["CellA", "CellB"]);
+    assert_eq!(obsm, obs);
+    let adata = AnnData::<Zarr>::open(Zarr::open(&store).unwrap()).unwrap();
+    let gene: CsrMatrix<u64> = adata.layers().get_item("Gene").unwrap().unwrap();
+    let t: Vec<_> = gene.triplet_iter().map(|(r, c, &v)| (r, c, v)).collect();
+    assert_eq!(t, [(0, 0, 5), (1, 0, 3)]);
+}
+
 // ---------------------------------------------------------------------------
 // Test 9d-PE — STARsolo SmartSeq paired-end (fragment counts)
 //
