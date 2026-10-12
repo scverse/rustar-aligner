@@ -808,6 +808,7 @@ mod tests {
 
         // Create a simple transcript
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 104,

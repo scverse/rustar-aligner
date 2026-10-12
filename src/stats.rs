@@ -779,6 +779,7 @@ mod tests {
 
         // Build a transcript with known CIGAR: 5S 45M 3I 2M 100N 50M 2D 5M
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 1000,
             genome_end: 1204,
@@ -903,6 +904,7 @@ mod tests {
 
         // Transcript with multiple junction types
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 1000,
             genome_end: 2000,

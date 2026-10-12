@@ -364,6 +364,7 @@ mod tests {
 
     fn read_at(start: u64, end: u64, is_reverse: bool) -> Transcript {
         Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: start,
             genome_end: end,

@@ -53,6 +53,11 @@ pub struct SaIndex {
 
     /// Strand bit position (from SA)
     pub gstrand_bit: u32,
+
+    /// `genomeSAsparseD` of the suffix array this index fronts: only every
+    /// `sparse_d`-th genome position is a suffix, so the seed search tries
+    /// `sparse_d` shifted starts (STAR's `iDist` loop). 1 for a dense SA.
+    pub sparse_d: u64,
 }
 
 impl SaIndex {
@@ -505,6 +510,7 @@ impl SaIndex {
             data,
             word_length: sai_word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
     }
 
@@ -627,6 +633,7 @@ impl SaIndex {
             data,
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
     }
 }
@@ -653,8 +660,9 @@ impl SaIndex {
     ///   - sa_start: first SA index in range
     ///   - sa_end_exclusive: past-the-end SA index
     ///   - matched_level: how many bases the SAindex resolved
-    ///   - bounds_tight: both bounds came from present SAindex entries
-    ///     (safe to skip first matched_level bases in binary search)
+    ///   - bounds_tight: STAR's `iSA2good && iSA1noN`: the upper bound came from
+    ///     a present SAindex entry and the range holds no N-flagged suffix (safe
+    ///     to skip first matched_level bases in binary search)
     ///
     /// Returns None if no prefix exists in the index (all levels absent).
     pub fn hierarchical_lookup(
@@ -692,11 +700,17 @@ impl SaIndex {
                 let level_end = self.genome_sa_index_start[lind as usize];
                 let next_pos = self.genome_sa_index_start[(lind - 1) as usize] + ind + 1;
 
+                // STAR `iSA1noN`: a prefix flagged `SAiMarkNmaskC` is followed in the
+                // SA by suffixes that hit an N inside the first `lind` bases. They
+                // sit inside [sa_start, sa_end) without sharing the prefix, so the
+                // `lind` bases cannot be assumed matched (maxMappableLength2strands.cpp
+                // :73-98: such a range is searched with maxL=0).
+                let has_n = (entry >> (self.gstrand_bit + 1)) & 1 != 0;
                 let (sa_end, bounds_tight) = if next_pos < level_end {
                     let next_entry = self.data.read(next_pos as usize);
                     let next_absent = (next_entry >> (self.gstrand_bit + 2)) & 1 != 0;
                     if !next_absent {
-                        ((next_entry & sa_pos_mask) as usize, true)
+                        ((next_entry & sa_pos_mask) as usize, !has_n)
                     } else {
                         (n_sa, false)
                     }
@@ -886,6 +900,34 @@ mod tests {
     }
 
     #[test]
+    fn hierarchical_lookup_n_flagged_prefix_is_not_tight() {
+        // Suffixes that hit an N inside the first `nbases` bases sort inside the range
+        // of a flagged prefix without sharing it. STAR (iSA1noN) must then search that
+        // range from base 0, so the lookup may not report tight bounds.
+        let (sai, n_sa) = make_test_index_with_sa("ACGTNACGTTACGNACGATTACGGGTNAC", 2, 3);
+        let mut flagged = 0;
+        for lind in 1..=3u32 {
+            for kmer in 0..(1u64 << (2 * lind)) {
+                let pos = sai.genome_sa_index_start[(lind - 1) as usize] + kmer;
+                let entry = sai.data.read(pos as usize);
+                let absent = (entry >> (sai.gstrand_bit + 2)) & 1 != 0;
+                let has_n = (entry >> (sai.gstrand_bit + 1)) & 1 != 0;
+                if absent || !has_n {
+                    continue;
+                }
+                flagged += 1;
+                let (_, _, level, tight) = sai.hierarchical_lookup(kmer, lind, n_sa).unwrap();
+                assert_eq!(level as u32, lind);
+                assert!(
+                    !tight,
+                    "N-flagged prefix {kmer:b} at level {lind} reported tight"
+                );
+            }
+        }
+        assert!(flagged > 0, "test genome must produce an N-flagged prefix");
+    }
+
+    #[test]
     fn hierarchical_lookup_tight_vs_nontight() {
         // Genome "ACGTACGT" with sa_nbases=2: many 2-mers present
         // AC(01), CG(12), GT(23) and their RC: AC(01), CG(12), GT(23)
@@ -932,6 +974,7 @@ mod tests {
             data,
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         };
 
         assert_eq!(sai.lookup(1, 1), (c_start, true));

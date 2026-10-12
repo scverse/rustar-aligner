@@ -144,7 +144,12 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`output_rank`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in output_order(transcripts, |t| t.output_rank)
+            .take(max_output)
+            .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -157,6 +162,7 @@ impl SamWriter {
                 params.out_sam_attr_ih_start,
                 attrs,
             )?;
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
             apply_sam_flag_or_and(&mut record, params);
             apply_primary_flag(&mut record, transcript.score, best_score, params);
@@ -286,7 +292,12 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`output_rank`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in output_order(transcripts, |t| t.output_rank)
+            .take(max_output)
+            .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -310,6 +321,7 @@ impl SamWriter {
                     transcript.is_reverse,
                 );
             }
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
             apply_sam_flag_or_and(&mut record, params);
             apply_primary_flag(&mut record, transcript.score, best_score, params);
@@ -381,7 +393,11 @@ impl SamWriter {
             .max()
             .unwrap_or(i32::MIN);
 
-        for (pair_idx, paired_aln) in paired_alignments.iter().take(max_output).enumerate() {
+        for (pair_idx, (is_primary, paired_aln)) in
+            output_order(paired_alignments, |p| p.output_rank)
+                .take(max_output)
+                .enumerate()
+        {
             let hit_index = pair_idx + 1; // 1-based
             // STAR reports the pre-split combined WT score (with length penalty) as AS.
             // This is stored as combined_wt_score, matching STAR's primaryScore.
@@ -413,6 +429,7 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec1, !is_primary);
             maybe_insert_rg_tag(&mut rec1, rg_id);
             apply_sam_flag_or_and(&mut rec1, params);
             apply_primary_flag(&mut rec1, combined_score, best_score, params);
@@ -444,6 +461,7 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec2, !is_primary);
             maybe_insert_rg_tag(&mut rec2, rg_id);
             apply_sam_flag_or_and(&mut rec2, params);
             apply_primary_flag(&mut rec2, combined_score, best_score, params);
@@ -1123,6 +1141,24 @@ pub(crate) fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters)
     let and_bits = params.out_sam_flag_and.min(u16::MAX as u32) as u16;
     let bits = u16::from(record.flags());
     *record.flags_mut() = sam::alignment::record::Flags::from((bits & and_bits) | or_bits);
+}
+
+/// Alignments in STAR's output order (ascending `output_rank`), each with whether it is
+/// the primary (`items[0]`, STAR's `trBest`).
+fn output_order<T>(
+    items: &[T],
+    output_rank: impl Fn(&T) -> u32,
+) -> impl Iterator<Item = (bool, &T)> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| (output_rank(&items[i]), i));
+    order.into_iter().map(move |i| (i == 0, &items[i]))
+}
+
+/// Set or clear the SECONDARY flag.
+fn set_secondary(record: &mut RecordBuf, secondary: bool) {
+    let mut flags = record.flags();
+    flags.set(sam::alignment::record::Flags::SECONDARY, secondary);
+    *record.flags_mut() = flags;
 }
 
 /// `--outSAMprimaryFlag AllBestScore`: clear the SECONDARY bit on every alignment tied for the
@@ -1887,6 +1923,7 @@ mod tests {
         let mut writer = SamWriter::create(tmpfile.path(), &genome, &params).unwrap();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2035,6 +2072,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 10,
             genome_end: 60,
@@ -2090,6 +2128,7 @@ mod tests {
 
         let projected = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 4,
@@ -2104,6 +2143,7 @@ mod tests {
                 junction_annotated: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 6,
@@ -2152,6 +2192,7 @@ mod tests {
         let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let projected = vec![Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2236,6 +2277,7 @@ mod tests {
         let genome = make_test_genome();
 
         let mate1_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2257,6 +2299,7 @@ mod tests {
         };
 
         let mate2_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -2352,6 +2395,7 @@ mod tests {
 
         // Mate1 at position 0 (chr_start=0, so per-chr pos = 1)
         let this_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2374,6 +2418,7 @@ mod tests {
 
         // Mate2 at position 4 (chr_start=0, so per-chr pos = 5)
         let mate_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -2450,6 +2495,7 @@ mod tests {
         let chr_idx = 7;
 
         let t1 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 100,
             genome_end: 130,
@@ -2471,6 +2517,7 @@ mod tests {
         };
 
         let t2 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 200,
             genome_end: 230,
@@ -2528,6 +2575,7 @@ mod tests {
         let chr_idx = 3;
 
         let t1 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 200,
             genome_end: 230,
@@ -2549,6 +2597,7 @@ mod tests {
         };
 
         let t2 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 100,
             genome_end: 130,
@@ -2588,6 +2637,7 @@ mod tests {
 
         // Transcript with 2 mismatches and a 3bp deletion → NM = 2 + 3 = 5
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 60,
@@ -2710,6 +2760,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 10,
             genome_end: 60,
@@ -2763,6 +2814,7 @@ mod tests {
 
         let transcripts = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 50,
@@ -2777,6 +2829,7 @@ mod tests {
                 junction_annotated: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 52,
@@ -2791,6 +2844,7 @@ mod tests {
                 junction_annotated: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 4,
                 genome_end: 54,
@@ -2849,6 +2903,7 @@ mod tests {
         ]);
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -2899,6 +2954,7 @@ mod tests {
         ]);
 
         let mk = |genome_start: u64, score: i32| Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start,
             genome_end: genome_start + 50,
@@ -2957,6 +3013,7 @@ mod tests {
 
         let transcripts = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 50,
@@ -2971,6 +3028,7 @@ mod tests {
                 junction_annotated: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 52,
@@ -3024,6 +3082,7 @@ mod tests {
         // Mode 1 (default) just returns whatever the caller already computed (opaque here).
         // Mode 2 uses the per-mate max/min span (100) and signs by genomic leftmost (mate1).
         let mate1 = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 200,
@@ -3075,6 +3134,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3124,6 +3184,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3169,6 +3230,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3218,6 +3280,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 300,
@@ -3269,6 +3332,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3326,6 +3390,7 @@ mod tests {
 
         let transcripts: Vec<Transcript> = (0..5)
             .map(|i| Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: i as u64,
                 genome_end: (i + 50) as u64,
@@ -3394,6 +3459,7 @@ mod tests {
     fn test_build_jm_tag_basic() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3422,6 +3488,7 @@ mod tests {
     fn test_build_jm_tag_annotated() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3450,6 +3517,7 @@ mod tests {
     fn test_build_jm_tag_empty() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3471,6 +3539,7 @@ mod tests {
     fn test_build_jm_tag_multiple_junctions() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 400,
@@ -3501,6 +3570,7 @@ mod tests {
     fn test_build_ji_tag_basic() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 325,
@@ -3530,6 +3600,7 @@ mod tests {
     fn test_build_ji_tag_empty() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3553,6 +3624,7 @@ mod tests {
         // Genome: ACGTACGT (A=0,C=1,G=2,T=3)
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3579,6 +3651,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3606,6 +3679,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 6,
@@ -3636,6 +3710,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3666,6 +3741,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 2, // Starts at G
             genome_end: 6,
@@ -3697,6 +3773,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3748,6 +3825,7 @@ mod tests {
 
         // Mate1: forward, chr 0, pos 0
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3770,6 +3848,7 @@ mod tests {
 
         // Mate2: reverse, chr 0, pos 4
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -3855,6 +3934,7 @@ mod tests {
 
         // Mate1: score=100, 0 mismatches, no junctions
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3877,6 +3957,7 @@ mod tests {
 
         // Mate2: score=80, 2 mismatches, 1 deletion
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -3982,6 +4063,7 @@ mod tests {
 
         // Both mates forward
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4003,6 +4085,7 @@ mod tests {
         };
 
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -4081,6 +4164,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4159,6 +4243,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4234,6 +4319,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4368,6 +4454,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 60,
@@ -4424,6 +4511,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 103,
@@ -4508,6 +4596,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4580,6 +4669,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 2,
             genome_end: 6,
@@ -4665,6 +4755,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4738,6 +4829,7 @@ mod tests {
     fn spliced_gtag_transcript() -> Transcript {
         use cigar::op::{Kind, Op};
         Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,

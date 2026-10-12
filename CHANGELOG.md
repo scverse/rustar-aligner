@@ -65,6 +65,66 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Alignment matches STAR 2.7.11b record for record on the yeast benchmarks.**
+  Against STAR on ERR12389696, every SAM line is identical, flags, `HI` order
+  and tags included: 10k SE 9,723 and PE 18,604 lines, 100k SE 97,748 and PE
+  188,260 (previously 9,377, 17,912, 93,889 and 180,541). On human chr21
+  (chr21 + GENCODE, GEUVADIS ERR188021 pairs that STAR maps uniquely to chr21),
+  59,885 of 59,910 pairs get STAR's alignment set (was 57,843) and single-end
+  71,405 of 71,413 lines match (was 58,161). Chimeric `Chimeric.out.junction`
+  and `WithinBAM` output match STAR line for line on yeast 10k SE and PE.
+  Alignment is 20% (SE) to 39% (PE) faster. The changes:
+
+  - **Seeding.** Padding sorts above every base in the suffix-array binary
+    search (`SuffixArrayFuns.cpp:26-53`). An `N`-flagged SAindex prefix is not
+    tight (`iSA1noN`, `ReadAlign_maxMappableLength2strands.cpp:73-98`). A
+    chain is searched only while more than `seedMapMin` bases remain
+    (`ReadAlign_mapOneRead.cpp:65`), and the reverse pass skips its first
+    start when the forward pass mapped the whole piece (`flagDirMap`). Every
+    MMP that maps at most `seedMultimapNmax` times is stored, however short
+    (`ReadAlign_storeAligns.cpp`).
+  - **`--genomeSAsparseD` indexes are searched as STAR searches them**: each
+    seed position tries `min(pieceLength, sparseD)` shifted starts and keeps
+    the longest (`ReadAlign_maxMappableLength2strands.cpp`). Only one start
+    was tried, so reads went unmapped or misplaced on any sparse index. Yeast
+    10k against a `--genomeSAsparseD 3` index: SE 8,668 → 8,926 of 8,926 reads
+    with STAR's alignment set, PE 8,165 → 8,388 of 8,388.
+  - **Windows.** Seeds are assigned to windows keyed on the junction index for
+    annotated-junction halves (`WA_sjA`, `ReadAlign_assignAlignToWindow.cpp`),
+    with overlaps resolved in STAR's order, and a seed with the same read start
+    as an existing one placed after it. Window formation handles long splices
+    with the default `alignIntronMax 0`; window flanks stop at the chromosome
+    boundary and overwrite earlier windows' bins, as STAR's `winBin` does
+    (`ReadAlign_stitchPieces.cpp:96-111`).
+  - **Stitching.** Seeds on the same diagonal are never stitched
+    (`stitchAlignToTranscript.cpp:315,350`); insertions are built between
+    overlapping seeds; two halves of one annotated junction are stitched
+    through it without a junction scan (`stitchAlignToTranscript.cpp:18-34`);
+    a short second exon no longer ends the stitch before the junction scan,
+    which can give it its bases back; a non-canonical or deletion flush that
+    would empty an exon is rejected (`-1000005`); stitched mismatches are
+    capped by `outFilterMismatchNmax` alone (the ratio is `mappedFilter`'s);
+    and the recursion is no longer cut at 100,000 calls (a 10M guard remains).
+  - **Recording transcripts in a window.** STAR's paired-end
+    junction-consistency walk (`stitchWindowAligns.cpp:179-219`); the
+    genomic-length penalty spans the first exon's start to the last exon's
+    end (`:221-225`); STAR's score gate, which records a transcript only within
+    `--outFilterMultimapScoreRange` of the window's best or of its mate's best
+    for the read, or always with chimeric detection on (`:232-250`); then
+    STAR's window dedup in discovery order (`:260-302`). Two older non-STAR
+    dedups (single-end post-finalization, paired-end covered pairs) are
+    removed; with STAR's rule in the stitcher they changed nothing.
+  - **Multimapper order and primary.** Alignments are written in STAR's
+    `trMult` (window) order, and the primary is STAR's `trBest`: best score,
+    then shorter genomic span, then the earlier window
+    (`ReadAlign_multMapSelect.cpp:58-91`, `ReadAlign_stitchPieces.cpp:328-329`).
+    With `--outSAMmultNmax` set, the best-scoring alignments move to the top
+    and the first is primary. We sorted by score and coordinate, so `HI`
+    order and the primary differed from STAR on most multimappers.
+  - **Chimeric detection takes the stitcher's windows as recorded.** It re-ran
+    the window dedup in score order, which could evict a transcript STAR keeps
+    (the dedup is order-dependent), including a chimeric partner.
+
 - **SAindex lookups no longer truncate SA indices at 2^32.** An `SAindex`
   entry holds an SA index in `GstrandBit + 1` bits, with the N and absent
   marks above it (STAR `Genome_genomeLoad.cpp:161-167`); the seed lookup
@@ -98,7 +158,6 @@ Sections commonly used: Features, Bug fixes, Other changes.
   writes it (`trOut.nMM`, like `AS`). We wrote each mate's own count, which
   differed from STAR on 42% of yeast PE pairs; no comparison script checked
   tags.
-
 - **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
   both ends of a single match block** (e.g. `1S97M2S`). With the default
   `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the

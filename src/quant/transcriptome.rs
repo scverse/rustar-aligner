@@ -1122,6 +1122,7 @@ fn align_to_one_transcript(
     let proj_end = proj_exons.last().map_or(0, |e| e.genome_end);
 
     Some(Transcript {
+        output_rank: 0,
         chr_idx: tr_idx,
         genome_start: proj_start,
         genome_end: proj_end,
@@ -2035,6 +2036,7 @@ mod tests {
         let gs = proj_exons.first().map_or(0, |e| e.genome_start);
         let ge = proj_exons.last().map_or(0, |e| e.genome_end);
         Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: gs,
             genome_end: ge,

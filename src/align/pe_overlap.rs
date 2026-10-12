@@ -352,6 +352,7 @@ pub fn convert_merged_transcript_to_pe(
         let genome_start = out_exons[i].iter().map(|e| e.genome_start).min().unwrap();
         let genome_end = out_exons[i].iter().map(|e| e.genome_end).max().unwrap();
         mates.push(Transcript {
+            output_rank: 0,
             chr_idx: merged.chr_idx,
             genome_start,
             genome_end,
@@ -460,6 +461,7 @@ mod tests {
         // The merged read aligns perfectly, forward strand, one ungapped exon.
         let merged_len = merge.merged.len();
         let merged_tr = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: merged_len as u64,
@@ -532,6 +534,7 @@ mod tests {
         // Same perfect single-exon alignment, but the merged read maps to the REVERSE
         // strand (is_reverse = true).
         let merged_tr = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: merged_len as u64,

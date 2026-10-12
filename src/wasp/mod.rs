@@ -590,6 +590,7 @@ mod tests {
 
     fn tr_fwd_50m(genome_start: u64) -> Transcript {
         Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start,
             genome_end: genome_start + 50,
