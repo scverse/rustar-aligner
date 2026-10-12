@@ -81,7 +81,7 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         RunMode::AlignReads => align_reads(params),
         RunMode::InputAlignmentsFromBAM => bam_dedup::run(params),
         RunMode::LiftOver => liftover::run(params),
-        RunMode::SoloCellFiltering => crate::solo::count::run_cell_filtering(params),
+        RunMode::SoloCellFiltering => crate::solo::mtx_market::run_cell_filtering(params),
     }
 }
 

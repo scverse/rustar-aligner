@@ -14,17 +14,19 @@ pub mod cell_reads;
 pub mod count;
 pub mod gene;
 pub mod libcxx_rng;
+pub mod mtx_market;
 pub mod sgt;
 pub mod smartseq;
 pub mod transcript3p;
 pub mod whitelist;
 
 pub use adata::OutputFormat;
-pub use count::{UmiDedup, UmiFiltering, write_matrix_market};
+pub use count::{UmiDedup, UmiFiltering};
 pub use gene::{
     GeneAssignment, Region, SoloFeature, SoloStrand, VelocytoCategory, assign_gene_se,
     classify_read, velocyto_category,
 };
+pub use mtx_market::write_matrix_market;
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
 };
