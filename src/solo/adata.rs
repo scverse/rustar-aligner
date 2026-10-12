@@ -6,8 +6,7 @@
 //!
 //! ```text
 //! Solo.out/matrix.zarr/            encoding-type = mudata
-//!   uns/summary/<Feature>/…        the Summary.csv statistics, unformatted
-//!   uns/cell_reads_not_in_passlist CellReads.stats' CBnotInPasslist dataframe (--soloCellReadStats CB)
+//!   uns/run_info                   aligner version + command line
 //!   mod/                           mod-order = [gex, sj]
 //!     gex/                         cells × genes, no X
 //!       layers/{Gene,GeneFull}     one per --soloFeatures gene feature
@@ -17,11 +16,14 @@
 //!       var (gene_id + gene_name, feature_types)
 //!       obsm/stats_<Feature>       per-barcode reads/UMIs/genes + is_cell
 //!                                  (+ the CellReads.stats counters with --soloCellReadStats CB)
+//!       uns/summary/<Feature>/…    the Summary.csv statistics, unformatted
+//!       uns/cellranger_summary     CellRanger.summary.csv (Gene + GeneFull)
+//!       uns/cell_reads_not_in_passlist  CellReads.stats' CBnotInPasslist row
 //!     sj/                          cells × junctions (X only)
 //! ```
 //!
 //! Without `--soloFeatures SJ` there is no second modality to wrap, so the
-//! store is plain AnnData: `gex`'s contents (and the root `uns`) sit at
+//! store is plain AnnData: `gex`'s contents (plus `uns/run_info`) sit at
 //! `matrix.zarr/` itself, with no `mod/` and no mudata attributes.
 //!
 //! Three things are deliberate. **`obs` is the full whitelist**, identical in every
@@ -286,42 +288,43 @@ mod zarr {
             }
         }
 
-        // Root `uns`: on the mudata root, or on gex itself when it is the root.
-        let mut uns: HashMap<String, Data> = HashMap::default();
-        uns.insert(
-            "summary".to_string(),
-            Mapping::from(
-                summaries
-                    .into_iter()
-                    .map(|(k, v)| (k, Data::from(v)))
-                    .collect::<std::collections::HashMap<_, _>>(),
+        // gex's `uns`: the summaries are per gene feature, and the passlist-miss
+        // row belongs with the read counters in gex's stats frames. Only
+        // `run_info` describes the whole run, so it alone goes on the root.
+        gex.uns()
+            .add(
+                "summary",
+                Mapping::from(
+                    summaries
+                        .into_iter()
+                        .map(|(k, v)| (k, Data::from(v)))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ),
             )
-            .into(),
-        );
+            .map_err(zarr_err)?;
         if let Some(cr) = funnel.cellranger_summary() {
-            uns.insert("cellranger_summary".to_string(), cellranger_map(&cr).into());
+            gex.uns()
+                .add("cellranger_summary", cellranger_map(&cr))
+                .map_err(zarr_err)?;
         }
-        uns.insert("run_info".to_string(), run_info().into());
         // The file's `CBnotInPasslist` row: reads that never reached a barcode,
         // so they have no `obs` row to live in.
         if let Some((_, no_cb)) = &cell_reads {
-            uns.insert(
-                "cell_reads_not_in_passlist".to_string(),
-                Mapping::from(
-                    CellReadStats::COLUMNS
-                        .iter()
-                        .zip(no_cb)
-                        .map(|(k, &v)| ((*k).to_string(), Data::from(v)))
-                        .collect::<std::collections::HashMap<_, _>>(),
+            gex.uns()
+                .add(
+                    "cell_reads_not_in_passlist",
+                    Mapping::from(
+                        CellReadStats::COLUMNS
+                            .iter()
+                            .zip(no_cb)
+                            .map(|(k, &v)| ((*k).to_string(), Data::from(v)))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    ),
                 )
-                .into(),
-            );
+                .map_err(zarr_err)?;
         }
-
         if !should_write_mudata {
-            for (k, v) in uns.drain() {
-                gex.uns().add(&k, v).map_err(zarr_err)?;
-            }
+            gex.uns().add("run_info", run_info()).map_err(zarr_err)?;
         }
         gex.close().map_err(zarr_err)?;
         let mut modalities: Vec<&str> = vec!["gex"];
@@ -379,12 +382,8 @@ mod zarr {
         }
 
         // -- the mudata scaffolding: root uns, group attributes, mod-order --
-        anndata::data::Writable::write(
-            &Mapping::from(uns.into_iter().collect::<std::collections::HashMap<_, _>>()),
-            &store,
-            "uns",
-        )
-        .map_err(zarr_err)?;
+        anndata::data::Writable::write(&map([("run_info", Data::from(run_info()))]), &store, "uns")
+            .map_err(zarr_err)?;
 
         for m in &modalities {
             let mut g = store.open_group(&format!("mod/{m}")).map_err(zarr_err)?;

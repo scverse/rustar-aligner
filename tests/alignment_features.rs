@@ -1422,14 +1422,14 @@ fn test_starsolo_output_format_zarr() {
             "missing obsm/stats_{feature}"
         );
         assert!(
-            store.join(format!("uns/summary/{feature}")).exists()
-                || store
-                    .join(format!("uns/summary/{feature}/zarr.json"))
-                    .exists(),
-            "missing uns/summary/{feature}"
+            store
+                .join(format!("mod/gex/uns/summary/{feature}"))
+                .exists(),
+            "missing mod/gex/uns/summary/{feature}"
         );
     }
     assert!(store.join("mod/sj/obsm/stats_SJ").exists());
+    assert!(store.join("uns/run_info").exists(), "run_info is run-level");
 
     // Every obsm frame is indexed by the barcodes — a polars DataFrame carries no
     // index of its own, and Python AnnData rejects the frame if it does not match
