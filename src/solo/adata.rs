@@ -187,6 +187,7 @@ mod zarr {
         let obs_index = DataFrameIndex::from(
             (0..n_obs)
                 .map(|i| {
+                    buf.clear();
                     ctx.whitelist.unpack_barcode_into(i as u32, &mut buf);
                     String::from_utf8_lossy(&buf).into_owned()
                 })
