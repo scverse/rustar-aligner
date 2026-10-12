@@ -34,6 +34,7 @@ memmap2 = "0.9"
 byteorder = "1"
 noodles = { version = "0.116", features = ["fastq", "sam", "bam", "bgzf"] }
 bstr = "1"
+nalgebra-sparse = { version = "0.11", optional = true }
 # Use the pure-Rust `zlib-rs` backend instead of flate2's default `miniz_oxide`:
 # ~2-3x faster inflate/deflate on the FASTQ decode + BGZF (BAM) paths, with no C
 # toolchain dependency. Backend is chosen at build time; API is unchanged.
@@ -65,9 +66,28 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_se
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
 
+# --- AnnData/MuData output (--soloOutputFormat scverse) -----------------------
+# scverse/anndata-rs. Optional because the tree is heavy (polars for the
+# obs/var DataFrames, zarrs for the scverse v3 store). `--no-default-features`
+# gives back the lean aligner-only build; `--soloOutputFormat` then only
+# accepts `MTX`.
+#
+# `nalgebra-sparse` / `polars` are pinned to the versions anndata 0.7 depends
+# on — the `CsrMatrix` and `DataFrame` we hand to it must be the *same* types.
+anndata = { git = "https://github.com/scverse/anndata-rs.git", branch = "ig/set_index", optional = true }
+anndata-zarr = { git = "https://github.com/scverse/anndata-rs.git", branch = "ig/set_index", optional = true }
+polars = { version = "0.53", default-features = false, optional = true }
+
+[features]
+default = ["scverse-out"]
+# Shared plumbing for AnnData backend.
+scverse-out = ["dep:anndata", "dep:nalgebra-sparse", "dep:polars", "dep:anndata-zarr"]
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# Reading back the hand-written scverse group metadata in the MuData output test.
+serde_json = "1"
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

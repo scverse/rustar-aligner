@@ -127,6 +127,45 @@ impl CellReadStats {
         Self::fold(&mut self.no_cb, flag);
     }
 
+    /// The fifteen counters as columns over whitelist indices `0..n_obs`
+    /// (zeros for barcodes no read reached), named by [`Self::COLUMNS`] — the
+    /// scverse writer's view of the file's cell rows. Row order is the index,
+    /// so D24 does not apply.
+    pub fn columns(&self, n_obs: usize) -> [Vec<u64>; 15] {
+        let mut cols: [Vec<u64>; 15] = std::array::from_fn(|_| vec![0; n_obs]);
+        for (&cb, v) in &self.cells {
+            for (col, &x) in cols.iter_mut().zip(v) {
+                col[cb as usize] = x;
+            }
+        }
+        cols
+    }
+
+    /// The `CBnotInPasslist` row's counters, in [`Self::COLUMNS`] order.
+    pub fn not_in_passlist(&self) -> &[u64; 15] {
+        &self.no_cb
+    }
+
+    /// Snake-case names of the fifteen counters, in `fold` order (the file's
+    /// `cbMatch`…`countedM` header).
+    pub const COLUMNS: [&'static str; 15] = [
+        "cb_match",
+        "cb_perfect",
+        "cb_mm_unique",
+        "cb_mm_multiple",
+        "genome_u",
+        "genome_m",
+        "feature_u",
+        "feature_m",
+        "exonic",
+        "intronic",
+        "exonic_as",
+        "intronic_as",
+        "mito",
+        "counted_u",
+        "counted_m",
+    ];
+
     /// Render the file. `umi_gene` gives each cell its final
     /// `(nUMIunique, nGenesUnique)`; a cell absent from it prints zeros.
     /// `barcode_of` renders a whitelist index as its barcode string.
@@ -243,6 +282,27 @@ mod tests {
         assert_eq!(row[1], "5");
         assert_eq!(row[5], "5", "genomeU");
         assert_eq!(&row[16..], ["0", "0", "0", "0"], "no UMI columns for it");
+    }
+
+    /// The column view carries the same counters as the file, by whitelist
+    /// index, and leaves unseen barcodes and the passlist-miss row out of it.
+    #[test]
+    fn columns_match_the_rendered_rows() {
+        let mut st = CellReadStats::new();
+        st.add_cell(2, &flag_perfect_counted());
+        st.add_cell(2, &flag_perfect_counted());
+        st.add_no_cb(&CellReadFlag::default());
+        let cols = st.columns(4);
+        let col = |name| {
+            &cols[CellReadStats::COLUMNS
+                .iter()
+                .position(|&c| c == name)
+                .unwrap()]
+        };
+        assert_eq!(col("cb_match"), &[0, 0, 2, 0]);
+        assert_eq!(col("counted_u"), &[0, 0, 2, 0]);
+        assert_eq!(col("genome_m"), &[0, 0, 0, 0]);
+        assert_eq!(st.not_in_passlist()[0], 1);
     }
 
     /// D24: rows come out in reverse first-appearance order, which is what

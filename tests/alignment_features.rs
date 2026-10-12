@@ -1362,6 +1362,344 @@ fn test_starsolo_summary_split() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9a2 — STARsolo --soloOutputFormat scverse (MuData store)
+//
+// The same spliced reads as test 9b, but with every feature on and the counts
+// written as one MuData store instead of MatrixMarket: a `gex` modality with
+// Gene as X and GeneFull/spliced/unspliced/ambiguous as layers, a
+// junction-indexed `sj` modality, and the MuData scaffolding around them.
+// ---------------------------------------------------------------------------
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_output_format_zarr() {
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"], &[]);
+    let solo = store.parent().unwrap();
+    assert!(store.is_dir(), "no MuData store at {}", store.display());
+    assert!(!solo.join("Gene").join("raw").join("matrix.mtx").exists());
+
+    // MuData scaffolding: root + `mod` group metadata written by hand.
+    let root: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(root["attributes"]["encoding-type"], "mudata");
+    assert_eq!(root["node_type"], "group");
+    let mods: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("mod/zarr.json")).unwrap()).unwrap();
+    assert_eq!(
+        mods["attributes"]["mod-order"],
+        serde_json::json!(["gex", "sj"])
+    );
+
+    // Both modalities are AnnData groups with the expected arrays.
+    for m in ["gex", "sj"] {
+        let g: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(store.join(format!("mod/{m}/zarr.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(g["attributes"]["encoding-type"], "anndata", "modality {m}");
+        for elem in ["obs", "var"] {
+            assert!(
+                store.join(format!("mod/{m}/{elem}")).exists(),
+                "modality {m} is missing {elem}"
+            );
+        }
+    }
+    // No feature is privileged as X: every one of them is a named layer,
+    // each with a CSC twin.
+    for m in ["gex", "sj"] {
+        assert!(
+            !store.join(format!("mod/{m}/X")).exists(),
+            "{m} must not have an X — the features are layers"
+        );
+    }
+    for (m, layer) in [
+        ("gex", "Gene"),
+        ("gex", "GeneFull"),
+        ("gex", "spliced"),
+        ("gex", "unspliced"),
+        ("gex", "ambiguous"),
+        ("sj", "SJ"),
+    ] {
+        for key in [layer.to_string(), format!("{layer}_CSC")] {
+            assert!(
+                store.join(format!("mod/{m}/layers/{key}")).exists(),
+                "missing {m} layer {key}"
+            );
+        }
+    }
+    for feature in ["Gene", "GeneFull"] {
+        assert!(
+            store.join(format!("mod/gex/obsm/stats_{feature}")).exists(),
+            "missing obsm/stats_{feature}"
+        );
+        assert!(
+            store
+                .join(format!("mod/gex/uns/summary/{feature}"))
+                .exists(),
+            "missing mod/gex/uns/summary/{feature}"
+        );
+    }
+    assert!(store.join("mod/sj/obsm/stats_SJ").exists());
+    assert!(store.join("uns/run_info").exists(), "run_info is run-level");
+
+    // Every obsm frame is indexed by the barcodes — a polars DataFrame carries no
+    // index of its own, and Python AnnData rejects the frame if it does not match
+    // obs_names.
+    for (m, frame) in [
+        ("gex", "stats_Gene"),
+        ("gex", "stats_GeneFull"),
+        ("sj", "stats_SJ"),
+    ] {
+        let (obs, obsm) = obs_and_obsm_index(&store.join("mod").join(m), frame);
+        assert!(
+            obs.len() == 3 && obs[0] == cb,
+            "unexpected obs_names: {obs:?}"
+        );
+        assert_eq!(
+            obsm, obs,
+            "mod/{m}/obsm/{frame} is not indexed by obs_names"
+        );
+    }
+}
+
+/// Run STARsolo with `--soloOutputFormat scverse` on six spliced reads of one
+/// whitelisted barcode; returns the tempdir guard, the store path and the barcode.
+/// `extra` is appended to the command line.
+#[cfg(feature = "scverse-out")]
+fn run_solo_zarr(features: &[&str], extra: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi = "ACGTACGTAC";
+    // Spliced read: 25 bp from the end of Exon1 + 25 bp from the start of Exon2.
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..6 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(&spliced).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_zarr");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+        ])
+        .args(features)
+        .args([
+            "--soloStrand",
+            "Forward",
+            "--soloOutputFormat",
+            "scverse",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .args(extra)
+        .assert()
+        .success();
+
+    let store = output_dir.join("Solo.out").join("matrix.zarr");
+    (tmpdir, store, cb)
+}
+
+// Without SJ there is one modality, so the store is plain AnnData at the root.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_output_format_zarr_no_sj() {
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"], &[]);
+    let root: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
+    assert_eq!(root["attributes"]["encoding-type"], "anndata");
+    assert!(
+        !store.join("mod").exists(),
+        "no MuData scaffolding without SJ"
+    );
+    for layer in ["Gene", "GeneFull"] {
+        assert!(
+            store.join(format!("layers/{layer}")).exists(),
+            "missing layer {layer}"
+        );
+        assert!(store.join(format!("uns/summary/{layer}")).exists());
+    }
+    let (obs, obsm) = obs_and_obsm_index(&store, "stats_Gene");
+    assert!(
+        obs.len() == 3 && obs[0] == cb,
+        "unexpected obs_names: {obs:?}"
+    );
+    assert_eq!(obsm, obs);
+}
+
+/// `soloCellFiltering` on a scverse store adds the new call as its own column
+/// of every stats frame and leaves the run's `is_cell` alone, the way the
+/// MatrixMarket mode leaves `raw/` alone and writes the call elsewhere.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_run_mode_solo_cell_filtering_on_a_scverse_store() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use polars::prelude::DataFrame;
+
+    let (_tmpdir, store, _cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ"], &[]);
+    let frame = |m: &str, key: &str| -> DataFrame {
+        let adata = AnnData::<Zarr>::open(Zarr::open(store.join("mod").join(m)).unwrap()).unwrap();
+        adata.obsm().get_item(key).unwrap().unwrap()
+    };
+    let is_cell_before = frame("gex", "stats_Gene")
+        .column("is_cell")
+        .unwrap()
+        .clone();
+
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "is_cell_top1",
+            "--soloCellFilter",
+            "TopCells",
+            "1",
+        ])
+        .assert()
+        .success();
+
+    for (m, key) in [
+        ("gex", "stats_Gene"),
+        ("gex", "stats_GeneFull"),
+        ("sj", "stats_SJ"),
+    ] {
+        let df = frame(m, key);
+        let called: Vec<Option<bool>> = df
+            .column("is_cell_top1")
+            .unwrap_or_else(|_| panic!("mod/{m}/obsm/{key} has no new column"))
+            .bool()
+            .unwrap()
+            .into_iter()
+            .collect();
+        // Only the first whitelist barcode has reads.
+        assert_eq!(called, [Some(true), Some(false), Some(false)], "{m}/{key}");
+    }
+    assert_eq!(
+        frame("gex", "stats_Gene").column("is_cell").unwrap(),
+        &is_cell_before,
+        "the run's own call is untouched"
+    );
+    // The frame is still indexed by obs_names after the rewrite.
+    let (obs, obsm) = obs_and_obsm_index(&store.join("mod").join("gex"), "stats_Gene");
+    assert_eq!(obsm, obs);
+
+    // Count columns are not a valid target.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "n_umis",
+        ])
+        .assert()
+        .failure();
+}
+
+/// `--soloCellReadStats CB` with scverse output: the `CellReads.stats` counters
+/// land as columns of every gene feature's stats frame, the passlist-miss row
+/// in `uns`, and `soloCellFiltering` refuses to overwrite them.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_cell_read_stats_in_scverse_store() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use polars::prelude::DataFrame;
+
+    let (_tmpdir, store, _cb) =
+        run_solo_zarr(&["Gene", "GeneFull"], &["--soloCellReadStats", "CB"]);
+    let adata = AnnData::<Zarr>::open(Zarr::open(&store).unwrap()).unwrap();
+    for key in ["stats_Gene", "stats_GeneFull"] {
+        let df: DataFrame = adata.obsm().get_item(key).unwrap().unwrap();
+        let col = |name: &str| -> Vec<Option<u64>> {
+            df.column(name)
+                .unwrap_or_else(|_| panic!("obsm/{key} has no {name}"))
+                .u64()
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        // All six reads carry the first barcode, exactly, and map uniquely.
+        for name in ["cb_match", "cb_perfect", "genome_u"] {
+            assert_eq!(col(name), [Some(6), Some(0), Some(0)], "{key}/{name}");
+        }
+        assert_eq!(col("cb_mm_unique"), [Some(0); 3], "{key}/cb_mm_unique");
+    }
+    drop(adata);
+    assert!(
+        store.join("uns/cell_reads_not_in_passlist").exists(),
+        "missing uns/cell_reads_not_in_passlist"
+    );
+
+    // The counters are not a valid target for a re-call.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "cb_match",
+        ])
+        .assert()
+        .failure();
+}
+
+/// `(obs_names, index of obsm/<key>)` of one modality, read back from disk.
+#[cfg(feature = "scverse-out")]
+fn obs_and_obsm_index(modality: &std::path::Path, key: &str) -> (Vec<String>, Vec<String>) {
+    use anndata::Backend;
+    use anndata::backend::{DataContainer, GroupOp};
+    use anndata::container::DataFrameElem;
+    use anndata_zarr::Zarr;
+
+    let index = |c| {
+        DataFrameElem::<Zarr>::try_from(c)
+            .unwrap()
+            .inner()
+            .index
+            .clone()
+            .into_vec()
+    };
+    let store = Zarr::open(modality).unwrap();
+    let obsm = store.open_group("obsm").unwrap();
+    (
+        index(DataContainer::open(&store, "obs").unwrap()),
+        index(DataContainer::open(&obsm, key).unwrap()),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Test 9b — STARsolo SJ (splice-junction) feature
 //
 // Spliced cDNA reads (last 25 bp of Exon1 + first 25 bp of Exon2) cross the
@@ -1622,6 +1960,78 @@ fn test_starsolo_smartseq() {
         .collect();
     assert!(entries.contains(&"1 1 5"), "expected CellA G1=5:\n{matrix}");
     assert!(entries.contains(&"1 2 3"), "expected CellB G1=3:\n{matrix}");
+}
+
+/// SmartSeq with `--soloOutputFormat scverse`: a plain AnnData store indexed by
+/// the manifest cell IDs, read counts in `layers/Gene`.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_smartseq_zarr() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use nalgebra_sparse::CsrMatrix;
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let exon1 = &genome[10000..10050];
+    let write_cell = |name: &str, n: usize| -> PathBuf {
+        let p = tmpdir.path().join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        for i in 0..n {
+            writeln!(f, "@{name}_{i}").unwrap();
+            f.write_all(exon1).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+        p
+    };
+    let a = write_cell("cellA.fq", 5);
+    let b = write_cell("cellB.fq", 3);
+    let manifest = tmpdir.path().join("manifest.tsv");
+    fs::write(
+        &manifest,
+        format!("{}\t-\tCellA\n{}\t-\tCellB\n", a.display(), b.display()),
+    )
+    .unwrap();
+
+    let output_dir = tmpdir.path().join("out_ss");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--soloType",
+            "SmartSeq",
+            "--readFilesManifest",
+            manifest.to_str().unwrap(),
+            "--soloStrand",
+            "Forward",
+            "--soloOutputFormat",
+            "scverse",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let store = output_dir.join("Solo.out").join("matrix.zarr");
+    assert!(!output_dir.join("Solo.out/Gene/raw").exists());
+    let (obs, obsm) = obs_and_obsm_index(&store, "stats_Gene");
+    assert_eq!(obs, ["CellA", "CellB"]);
+    assert_eq!(obsm, obs);
+    let adata = AnnData::<Zarr>::open(Zarr::open(&store).unwrap()).unwrap();
+    let gene: CsrMatrix<u64> = adata.layers().get_item("Gene").unwrap().unwrap();
+    let t: Vec<_> = gene.triplet_iter().map(|(r, c, &v)| (r, c, v)).collect();
+    assert_eq!(t, [(0, 0, 5), (1, 0, 3)]);
 }
 
 // ---------------------------------------------------------------------------

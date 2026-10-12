@@ -98,14 +98,14 @@ impl SmartSeqCounts {
 
         // features.tsv (CellRanger v3 layout: id, name, "Gene Expression").
         // Column 2 is the GTF gene_name (gene_id fallback baked into gene_names).
-        crate::solo::count::write_file(&raw_dir.join("features.tsv"), gzip, |w| {
+        crate::solo::mtx_market::write_file(&raw_dir.join("features.tsv"), gzip, |w| {
             for (id, name) in gene_ids.iter().zip(gene_names.iter()) {
                 writeln!(w, "{id}\t{name}\tGene Expression").map_err(|e| Error::io(e, raw_dir))?;
             }
             Ok(())
         })?;
         // barcodes.tsv = the manifest cell IDs (one per matrix column).
-        crate::solo::count::write_file(&raw_dir.join("barcodes.tsv"), gzip, |w| {
+        crate::solo::mtx_market::write_file(&raw_dir.join("barcodes.tsv"), gzip, |w| {
             for cid in &self.cell_ids {
                 writeln!(w, "{cid}").map_err(|e| Error::io(e, raw_dir))?;
             }
@@ -119,7 +119,7 @@ impl SmartSeqCounts {
         for c in &self.counts {
             nnz += c.lock().unwrap().len();
         }
-        crate::solo::count::write_file(&path, gzip, |w| {
+        crate::solo::mtx_market::write_file(&path, gzip, |w| {
             writeln!(w, "%%MatrixMarket matrix coordinate integer general")
                 .map_err(|e| Error::io(e, &path))?;
             writeln!(w, "%").map_err(|e| Error::io(e, &path))?;

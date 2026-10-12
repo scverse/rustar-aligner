@@ -471,7 +471,9 @@ pub struct Parameters {
     // ── Run ─────────────────────────────────────────────────────────────
     /// Run mode, plus its arguments. `--runMode soloCellFiltering` takes two
     /// more tokens: the raw count-matrix directory and the output prefix
-    /// (STAR `SoloFeature_loadRawMatrix.cpp`).
+    /// (STAR `SoloFeature_loadRawMatrix.cpp`), or a `--soloOutputFormat
+    /// scverse` store and the name of the `obsm/stats_*` column to write the
+    /// new cell call into.
     #[arg(long = "runMode", num_args = 1.., default_values_t = vec!["alignReads".to_string()])]
     pub run_mode_in: Vec<String>,
 
@@ -1327,6 +1329,16 @@ pub struct Parameters {
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
 
+    /// Container format for the solo count matrices (rustar extension beyond
+    /// STARsolo). `MTX` (default) is STARsolo's `raw/`+`filtered/` MatrixMarket
+    /// triplet. `scverse` writes one sharded scverse v3 MuData store,
+    /// `<soloOutFileNames[0]>/<matrix stem>.zarr`, holding every feature as a
+    /// layer of a `gex` modality plus a junction-indexed `sj` modality — cells ×
+    /// features (AnnData's obs × var orientation, the transpose of `.mtx`).
+    /// One format per run: the two writers each consume the count records.
+    #[arg(long = "soloOutputFormat", default_value = "MTX")]
+    pub solo_output_format: String,
+
     /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
     /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
     /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
@@ -1610,7 +1622,9 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::WrongNumberOfValues,
                 "--runMode soloCellFiltering needs the raw count-matrix directory and the \
-                 output prefix: --runMode soloCellFiltering /path/to/raw/ /path/to/out/prefix",
+                 output prefix (--runMode soloCellFiltering /path/to/raw/ /path/to/out/prefix), \
+                 or a scverse store and a column name \
+                 (--runMode soloCellFiltering /path/to/matrix.zarr is_cell_new)",
             ));
         }
 
@@ -2061,6 +2075,38 @@ impl Parameters {
                         ),
                     ));
                 }
+            }
+            // soloOutputFormat value (and whether this build has the backend).
+            let f = &params.solo_output_format;
+            match crate::solo::OutputFormat::parse(f) {
+                Some(fmt) if fmt.is_available() => {}
+                Some(fmt) => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloOutputFormat {f} needs the `{}` cargo feature, which this binary was built without",
+                            fmt.cargo_feature(),
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!("unsupported --soloOutputFormat '{f}'; expected MTX or scverse"),
+                    ));
+                }
+            }
+            // Gene-level features need a gene model (SJ does not — junctions come
+            // from the alignments).
+            let needs_gtf = params
+                .solo_features
+                .iter()
+                .any(|f| f == "Gene" || f == "GeneFull" || f == "Velocyto");
+            if needs_gtf && params.sjdb_gtf_file.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
+                ));
             }
             // Gene-level features need a gene model (SJ does not), from
             // --sjdbGTFfile or the index tables; checked when the index is loaded.

@@ -238,7 +238,7 @@ usable single-cell output.
   when no candidate has positive weight.
 - **`build_matrix`** groups reads by `(cell, gene)` into UMI→multiplicity maps
   (resolved multi-CB records folded in), then dedups each.
-- **`write_gene_matrix`** writes `Solo.out/Gene/raw/`:
+- **`write_matrix_market`** writes `Solo.out/Gene/raw/`:
   - `matrix.mtx` — `%%MatrixMarket matrix coordinate integer general`; dims
     `nFeatures nBarcodes nEntries`; entries `gene+1 cell+1 count` (1-based),
     iterated in cell-column order.

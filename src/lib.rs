@@ -81,7 +81,13 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         RunMode::AlignReads => align_reads(params),
         RunMode::InputAlignmentsFromBAM => bam_dedup::run(params),
         RunMode::LiftOver => liftover::run(params),
-        RunMode::SoloCellFiltering => crate::solo::count::run_cell_filtering(params),
+        RunMode::SoloCellFiltering => {
+            if crate::solo::adata::is_scverse_store(std::path::Path::new(&params.run_mode_in[1])) {
+                crate::solo::adata::run_cell_filtering(params)
+            } else {
+                crate::solo::mtx_market::run_cell_filtering(params)
+            }
+        }
     }
 }
 
@@ -507,13 +513,36 @@ fn write_solo_output(
             recorder.n_multi_records(),
         );
     }
-    crate::solo::write_gene_matrix(sctx, params, stats, Some(&**sj_stats), &index.genome)?;
+    // Validated in `Parameters::validate`, so an unknown/unavailable format
+    // never reaches here.
+    match crate::solo::OutputFormat::parse(&params.solo_output_format) {
+        #[cfg(feature = "scverse-out")]
+        Some(crate::solo::OutputFormat::scverse) => {
+            crate::solo::adata::write_scverse(
+                sctx,
+                params,
+                stats,
+                Some(&**sj_stats),
+                &index.genome,
+            )?;
+        }
+        _ => {
+            crate::solo::write_matrix_market(
+                sctx,
+                params,
+                stats,
+                Some(&**sj_stats),
+                &index.genome,
+            )?;
+        }
+    }
     Ok(())
 }
 
 /// `--soloType SmartSeq`: align each manifest cell's reads and count reads per
-/// gene (no barcodes, no UMIs). Writes `Solo.out/Gene/raw/` (genes × cells) and
-/// returns the alignment stats.
+/// gene (no barcodes, no UMIs). Writes `Solo.out/Gene/raw/` (genes × cells), or
+/// `Solo.out/matrix.zarr` with `--soloOutputFormat scverse`, and returns the
+/// alignment stats.
 fn run_smartseq(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
@@ -647,6 +676,21 @@ fn run_smartseq(
                 }
             }
         }
+    }
+
+    #[cfg(feature = "scverse-out")]
+    if crate::solo::OutputFormat::parse(&params.solo_output_format)
+        == Some(crate::solo::OutputFormat::scverse)
+    {
+        let path = counts.write_scverse(&gene_ann.gene_ids, &gene_ann.gene_names, params)?;
+        info!(
+            "STARsolo SmartSeq: wrote {} ({} cells × {} genes)",
+            path.display(),
+            cells.len(),
+            gene_ann.n_genes(),
+        );
+        stats.print_summary();
+        return Ok(stats);
     }
 
     let solo_dir = params
