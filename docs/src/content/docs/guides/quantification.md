@@ -83,7 +83,7 @@ This emits `ReadsPerGene.out.tab` *and* `Aligned.toTranscriptome.out.bam` in add
 
 For best speed, supply `--sjdbGTFfile` at `--runMode genomeGenerate` time and the transcript-level data structures get persisted into the genome directory. Then at alignment time you only need `--quantMode TranscriptomeSAM` (or `GeneCounts`); rustar-aligner reuses the persisted annotations.
 
-If you supply `--sjdbGTFfile` only at alignment time, transcript info is rebuilt on the fly each run. This works but adds startup cost.
+If you supply `--sjdbGTFfile` at alignment time, its junctions are inserted into the genome and its transcript info is used, even if the index has its own, as in STAR. This is done on every run, so it adds startup time.
 
 ## Strandedness summary
 

@@ -231,10 +231,11 @@ pub(crate) fn build_impl(
     let n_sa_kept: usize = if sparse_d == 1 {
         slice.par_iter().filter(|&&b| b < 4).count()
     } else {
+        let n_real = genome.n_genome_real;
         slice
             .par_iter()
             .enumerate()
-            .filter(|&(i, &b)| b < 4 && (i as u64).is_multiple_of(sparse_d))
+            .filter(|&(i, &b)| b < 4 && sparse_keep(i as u64, n_genome as u64, n_real, sparse_d))
             .count()
     };
 
@@ -290,6 +291,33 @@ where
     let gstrand_mask = (1u64 << gstrand_bit) - 1;
     let n_kept = build_streaming_impl(genome, force_sentinel, temp_dir, sparse_d, emit)?;
     Ok((gstrand_bit, gstrand_mask, n_kept))
+}
+
+/// STAR's sparse-SA keep rule for the suffix at doubled (fwd+RC) position
+/// `pos` of a genome of `n_genome` bases whose first `n_real` are the real
+/// genome and the rest the junction (Gsj) buffer.
+///
+/// STAR builds the SA of the real genome first, striding the start
+/// coordinate `ii` by `gSAsparseD` (`Genome_genomeGenerate.cpp:184`) and
+/// storing the mirrored position `2*nGenome-1-ii` (`:316`); the junction
+/// suffixes are inserted afterwards, all of them (`sjdbBuildIndex.cpp:47`).
+/// So a real-genome suffix is kept by its position in the real genome alone,
+/// and every junction suffix is kept. Non-ACGT starts are filtered by the
+/// caller. Without junctions (`n_real == n_genome`) this is the plain stride.
+pub(crate) fn sparse_keep(pos: u64, n_genome: u64, n_real: u64, sparse_d: u64) -> bool {
+    if sparse_d == 1 {
+        return true;
+    }
+    let n_gsj = n_genome - n_real;
+    // Position in the real genome's doubled coordinate, or None in Gsj.
+    let real_pos = if pos < n_real {
+        pos
+    } else if pos < n_genome + n_gsj {
+        return true;
+    } else {
+        pos - 2 * n_gsj
+    };
+    (2 * n_real - 1 - real_pos).is_multiple_of(sparse_d)
 }
 
 /// Shared implementation behind both [`build_impl`] (in-memory
@@ -349,10 +377,11 @@ where
             .filter(|&&b| b < 4)
             .count()
     } else {
+        let n_real = genome.n_genome_real;
         genome.sequence.as_slice()[..n2]
             .par_iter()
             .enumerate()
-            .filter(|&(i, &b)| b < 4 && (i as u64).is_multiple_of(sparse_d))
+            .filter(|&(i, &b)| b < 4 && sparse_keep(i as u64, n_genome as u64, n_real, sparse_d))
             .count()
     };
     log::info!("sa_build: {n_sa_kept} entries after ACGT + sparse-d={sparse_d} filter");
@@ -369,17 +398,12 @@ where
     // `try_*` APIs propagate this callback error immediately, so
     // SA-file write failures abort the build instead of running to
     // completion and reporting afterwards.
-    let two_n_minus_1 = 2 * n_genome_u64 - 1;
+    let n_real_u64 = genome.n_genome_real;
     let mut pack_one = |orig_pos: u64| -> Result<(), Error> {
-        // Sparse SA: keep only every `sparse_d`-th suffix by STAR's *start*
-        // coordinate `ii` (`Genome_genomeGenerate.cpp:184` strides `ii`, keeping
-        // `ii % gSAsparseD == 0`). STAR then stores the MIRRORED position
-        // `w = 2*nGenome-1-ii` (line 281), which is exactly the `orig_pos` handed
-        // here — so the stride test must invert the mirror: `ii = 2*nGenome-1-w`.
-        // Filtering `orig_pos` directly would keep the wrong parity. caps-sa still
-        // visits every sorted ACGT suffix; dropping off-stride ones preserves the
-        // sorted order of the kept subset. (No-op when sparse_d == 1.)
-        if sparse_d > 1 && !(two_n_minus_1 - orig_pos).is_multiple_of(sparse_d) {
+        // Sparse SA: STAR's keep rule (see `sparse_keep`). caps-sa still
+        // visits every sorted ACGT suffix; dropping the others preserves the
+        // sorted order of the kept subset.
+        if !sparse_keep(orig_pos, n_genome_u64, n_real_u64, sparse_d) {
             return Ok(());
         }
         let packed_value = if (orig_pos as usize) < n_genome {

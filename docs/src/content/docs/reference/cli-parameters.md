@@ -145,6 +145,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--sjdbGTFtagExonParentTranscript` | `transcript_id` | GTF attribute for transcript ID. |
 | `--sjdbGTFtagExonParentGene` | `gene_id` | GTF attribute for gene ID. |
 | `--sjdbOverhang` | `100` | Overhang length around junctions in the index. Set to `read_length - 1`. |
+| `--sjdbInsertSave` | `Basic` | After junctions are inserted at mapping (GTF at mapping or two-pass): `Basic` writes the junction and transcript tables to `<prefix>_STARgenome/`, `All` also writes Genome, SA and SAindex. |
 | `--sjdbScore` | `2` | Extra score for alignments crossing annotated junctions. |
 
 ## Quantification

@@ -143,9 +143,9 @@ These differ in *how* a result is produced, not *what* is produced. They are doc
 
 ### 4.1 Transcriptome tables built on the fly
 
-For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exon map directly from the input GTF at run time, instead of loading STAR's persisted `transcriptInfo.tab` / `exonInfo.tab` files. The projection logic mirrors STAR's `Transcriptome_quantAlign.cpp`; the output (`Aligned.toTranscriptome.out.bam`) is intended to be equivalent.
+With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<prefix>_STARgenome/` and then reads them back (`Transcriptome.cpp:13`). rustar-aligner writes the same tables but builds its in-memory transcript index directly from the GTF. Without a GTF at mapping, both read the index's `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`. The output is intended to be the same.
 
-**Source.** `src/quant/transcriptome.rs`.
+**Source.** `src/index/io.rs` (`GenomeIndex::load`), `src/quant/transcriptome.rs`.
 
 ### 4.2 In-tree RNG generator
 

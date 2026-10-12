@@ -93,7 +93,9 @@ Written when `--outReadsUnmapped Fastx` is set. FASTQ output of every read that 
 
 ## Two-pass mode
 
-In two-pass mode (`--twopassMode Basic`), pass 1 produces an internal `_STARpass1/SJ.out.tab` that's used to seed pass 2. The final `sample_SJ.out.tab` reflects pass 2's discoveries; pass 1's intermediate file is not retained by default.
+In two-pass mode (`--twopassMode Basic`), pass 1 writes `sample__STARpass1/SJ.out.tab` and `sample__STARpass1/Log.final.out`; the junctions in that `SJ.out.tab` are inserted into the genome for pass 2. The final `sample_SJ.out.tab` comes from pass 2.
+
+Whenever junctions are inserted at mapping (two-pass, or `--sjdbGTFfile` / `--sjdbFileChrStartEnd` at mapping), `sample__STARgenome/` gets `sjdbInfo.txt` and `sjdbList.out.tab`, the transcript tables when a GTF was given, and with `--sjdbInsertSave All` the extended Genome, SA and SAindex.
 
 ## Standard output
 

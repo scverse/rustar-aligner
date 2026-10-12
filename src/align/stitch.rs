@@ -3772,6 +3772,7 @@ mod tests {
             shift_right: 0,
             strand: 0,
             src_strand: 0,
+            priority: 20,
         }];
         index.junction_db = SpliceJunctionDb::from_raw_junctions(&[(0, 19, 48, 0)]);
 

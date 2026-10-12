@@ -65,6 +65,50 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Junctions given at mapping, and two-pass junctions, are inserted into the
+  genome as STAR does.** With `--sjdbGTFfile` or `--sjdbFileChrStartEnd` at
+  mapping, or `--twopassMode Basic`, STAR inserts the junctions into the loaded
+  genome: their flanks are appended (Gsj), their suffixes are binary-searched
+  into the suffix array, and the SAindex is updated (`sjdbInsertJunctions.cpp`,
+  `sjdbBuildIndex.cpp`). rustar-aligner only added them to the stitch-time
+  lookup, at their unshifted GTF coordinates, so seeds never crossed a new
+  junction. It now ports STAR's insertion, taken from @BenjaminDEMAILLE's #322
+  (`src/index/sjdb_otf.rs`), with plumbing from his #312 and #317:
+
+  - Junctions are merged with the genome's own and deduplicated with STAR's
+    source priorities (genome 30, GTF 20, `--sjdbFileChrStartEnd` 10, first
+    pass 0; `sjdbPrepare.cpp:108-170`). Across strands the priority is compared
+    with the previous sorted junction, as STAR does.
+  - `<prefix>_STARgenome/` gets `sjdbInfo.txt`, `sjdbList.out.tab` and, for a
+    GTF, the transcript tables; new `--sjdbInsertSave All` also writes Genome,
+    SA, SAindex, `genomeParameters.txt` and the chromosome tables.
+  - A GTF given at mapping is the source of transcript info even when the
+    index has its own tables (`Transcriptome.cpp:13`).
+  - Pass 1 runs with STAR's reduced settings (`twoPassRunPass1.cpp:17-49`),
+    writes `_STARpass1/SJ.out.tab` and `_STARpass1/Log.final.out`, and all of
+    its `SJ.out.tab` is inserted (`sjdbInsertJunctions.cpp:24-35`). The
+    separate pass-1 junction filter is removed.
+  - `--limitSjdbInsertNsj` and `--sjdbOverhang 0` are fatal as in STAR.
+
+  Yeast 10k (`$DATA`, unannotated index, default options plus
+  `--sjdbGTFfile`): Genome, SA, SAindex and every `_STARgenome` table are
+  byte-identical to STAR's. Every SAM line matches, SE 9,724 and PE 18,600
+  (main: 9,701 and 18,532). Human chr21 PE with the GENCODE chr21 GTF at
+  mapping: 119,820 of 119,820 lines (STAR-mapped clean set, see
+  CONTRIBUTING). Two-pass: given STAR's own pass-1 `SJ.out.tab`, the pass-2
+  genome is byte-identical to STAR's, yeast and human. End to end, yeast SE
+  two-pass matches 9,717 of 9,722 lines (main: 9,558) and PE 18,588 of
+  18,596 (main: 18,142). The rest comes from the pass-1 `SJ.out.tab` filter,
+  which still differs from STAR's `outputSJ` (yeast 70 of 72 junction lines).
+
+- **Sparse annotated indexes match STAR's.** With `--genomeSAsparseD` above 1
+  and annotation at `genomeGenerate`, STAR thins only the real genome's
+  suffixes and inserts every junction suffix (`sjdbBuildIndex.cpp:47`). We
+  applied the stride to the junction buffer too, and to reverse-strand
+  positions shifted by it, so the SA and SAindex differed from STAR's. Yeast
+  with `--genomeSAsparseD 3` and the GTF is now byte-identical. Unannotated and
+  dense indexes are unchanged; sparse annotated indexes need regenerating.
+
 - **Alignment matches STAR 2.7.11b record for record on the yeast benchmarks.**
   Against STAR on ERR12389696, every SAM line is identical, flags, `HI` order
   and tags included: 10k SE 9,723 and PE 18,604 lines, 100k SE 97,748 and PE

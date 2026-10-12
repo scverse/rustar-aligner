@@ -108,7 +108,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
     "genomeType",
-    "sjdbInsertSave",
     // STARsolo barcode chemistry.
     "soloAdapterMismatchesNmax",
     "soloAdapterSequence",

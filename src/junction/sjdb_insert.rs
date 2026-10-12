@@ -114,6 +114,7 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
             shift_right,
             strand,
             src_strand: strand,
+            priority: 30,
         });
     }
 
@@ -278,6 +279,10 @@ pub struct PreparedJunction {
     /// Only meaningful during genomeGenerate dedup; set equal to
     /// `strand` when a junction is reloaded from `sjdbInfo.txt`.
     pub src_strand: u8,
+    /// STAR's `sjdbLoci.priority`: which source wins when two give the same
+    /// junction. 30 = the index's own junctions, 20 = GTF, 10 =
+    /// sjdbFileChrStartEnd, 0 = 1st-pass junctions of a two-pass run.
+    pub priority: u8,
 }
 
 impl PreparedJunction {
@@ -355,6 +360,7 @@ pub fn prepare_junction(
             1 | 2 => db_strand,
             _ => 0,
         },
+        priority: 0,
     }
 }
 
@@ -367,8 +373,7 @@ pub fn prepare_junction(
 /// coincide within a strand block are alternative representations of
 /// the same splice event inside a repeat; STAR keeps one — preferring
 /// canonical motifs, then the smallest left shift. (STAR also compares
-/// source priority here; every rustar source currently shares one
-/// priority, so those branches are omitted.)
+/// source priority here, before the motif and shift rules.)
 ///
 /// **Pass 2** (`sjdbPrepare.cpp:125-191`): re-sort survivors by their
 /// stored (motif-restored) coordinates and collapse entries that share
@@ -403,6 +408,13 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
                     && last.start_pos == j.start_pos
                     && last.end_pos == j.end_pos =>
             {
+                // sjdbPrepare.cpp:110-115: the higher priority source wins.
+                if j.priority != last.priority {
+                    if j.priority > last.priority {
+                        *last = j;
+                    }
+                    continue;
+                }
                 // sjdbPrepare.cpp:116-121 (equal priority): the new
                 // junction wins if it is canonical and the old one is
                 // not, or if both have the same canonicality and the
@@ -426,19 +438,24 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
     });
 
     let mut out: Vec<PreparedJunction> = Vec::with_capacity(junctions.len());
+    // STAR compares priorities with the previous junction of the sorted list
+    // (`isj0 = sjdbSort[(ii-1)*3+2]`, sjdbPrepare.cpp:146), kept or not.
+    let mut prev_priority = 0u8;
     for j in junctions {
+        let priority = j.priority;
         match out.last() {
             Some(last)
                 if last.stored_start() == j.stored_start()
                     && last.stored_end() == j.stored_end() =>
             {
-                if let Some(winner) = merge_cross_strand(last, &j) {
+                if let Some(winner) = merge_cross_strand(last, &j, prev_priority) {
                     *out.last_mut().unwrap() = winner;
                 }
                 // else: keep `last` unchanged.
             }
             _ => out.push(j),
         }
+        prev_priority = priority;
     }
     out
 }
@@ -449,7 +466,16 @@ pub fn sort_and_dedup(mut junctions: Vec<PreparedJunction>) -> Vec<PreparedJunct
 /// existing entry but force its strand to 0 in-place (handled by the
 /// caller via a special-case — represented here as returning a cloned
 /// `old` with strand=0).
-fn merge_cross_strand(old: &PreparedJunction, new: &PreparedJunction) -> Option<PreparedJunction> {
+fn merge_cross_strand(
+    old: &PreparedJunction,
+    new: &PreparedJunction,
+    prev_priority: u8,
+) -> Option<PreparedJunction> {
+    // sjdbPrepare.cpp:148-153: the higher priority source wins, against the
+    // priority of the previous sorted junction (`prev_priority`).
+    if new.priority != prev_priority {
+        return (new.priority > prev_priority).then(|| new.clone());
+    }
     // sjdbPrepare.cpp:154-159 — STAR compares the RECORDED strand of the
     // old junction (`mapGen.sjdbStrand`, our derived `strand`) against the
     // RAW source strand of the new one (`sjdbLoci.str`, our `src_strand`).
@@ -785,6 +811,7 @@ mod tests {
             shift_right: 0,
             strand,
             src_strand: strand,
+            priority: 0,
         }
     }
 
@@ -968,6 +995,7 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
                 src_strand: 1,
+                priority: 0,
             },
             // Non-canonical: stored = shifted (139_187..139_217).
             PreparedJunction {
@@ -979,6 +1007,7 @@ mod tests {
                 shift_right: 0,
                 strand: 1,
                 src_strand: 1,
+                priority: 0,
             },
         ];
         write_sjdb_info_tab(tmp.path(), &junctions, 99).unwrap();
@@ -1004,6 +1033,7 @@ mod tests {
             shift_right: 0,
             strand: 1,
             src_strand: 1,
+            priority: 0,
         };
         // Non-canonical with shift_left=3 — STAR writes
         // `stored + shift_left + 1`, which is `original + 1`.
@@ -1016,6 +1046,7 @@ mod tests {
             shift_right: 0,
             strand: 0,
             src_strand: 0,
+            priority: 0,
         };
         write_sjdb_list_out_tab(tmp.path(), &[canon, noncan], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1047,6 +1078,7 @@ mod tests {
             shift_right: 0,
             strand: 2,
             src_strand: 2,
+            priority: 0,
         };
         write_sjdb_list_out_tab(tmp.path(), &[pj_b], &genome).unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1218,6 +1250,7 @@ mod tests {
                 shift_right: 1,
                 strand: 1,
                 src_strand: 1,
+                priority: 30,
             },
             PreparedJunction {
                 chr_idx: 0,
@@ -1228,6 +1261,7 @@ mod tests {
                 shift_right: 0,
                 strand: 0,
                 src_strand: 0,
+                priority: 30,
             },
         ];
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1235,5 +1269,48 @@ mod tests {
         let parsed = read_sjdb_info_tab(tmp.path(), &genome).unwrap();
         assert_eq!(parsed.sjdb_overhang, 100);
         assert_eq!(parsed.junctions, junctions);
+    }
+
+    fn prio_junction(src_strand: u8, motif: u8, priority: u8) -> PreparedJunction {
+        PreparedJunction {
+            chr_idx: 0,
+            start_pos: 100,
+            end_pos: 200,
+            motif,
+            shift_left: 0,
+            shift_right: 0,
+            strand: src_strand,
+            src_strand,
+            priority,
+        }
+    }
+
+    #[test]
+    fn priority_beats_motif_and_shift_in_dedup() {
+        // The same junction from two sources: non-canonical at priority 30 (the
+        // genome's own) and canonical at priority 0 (first pass). STAR keeps
+        // the higher priority, in either order (sjdbPrepare.cpp:110-116).
+        let kept = sort_and_dedup(vec![prio_junction(1, 0, 30), prio_junction(1, 1, 0)]);
+        assert_eq!((kept.len(), kept[0].motif), (1, 0));
+        let kept = sort_and_dedup(vec![prio_junction(1, 1, 0), prio_junction(1, 0, 30)]);
+        assert_eq!((kept.len(), kept[0].motif), (1, 0));
+        // Equal priority: the canonical one wins.
+        let kept = sort_and_dedup(vec![prio_junction(1, 0, 5), prio_junction(1, 1, 5)]);
+        assert_eq!(kept[0].motif, 1);
+    }
+
+    #[test]
+    fn cross_strand_priority_is_compared_with_previous_sorted_junction() {
+        // One locus on '+' (priority 10, kept), '-' (priority 0, dropped) and
+        // '.' (priority 5). STAR compares '.' with the '-' entry just before it
+        // in the sorted list (sjdbPrepare.cpp:146-153), not with the kept '+'
+        // one, so the '.' junction replaces it.
+        let kept = sort_and_dedup(vec![
+            prio_junction(1, 1, 10),
+            prio_junction(2, 1, 0),
+            prio_junction(0, 1, 5),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!((kept[0].src_strand, kept[0].priority), (0, 5));
     }
 }

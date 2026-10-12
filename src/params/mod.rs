@@ -1113,6 +1113,13 @@ pub struct Parameters {
     #[arg(long = "sjdbOverhang", default_value_t = 100)]
     pub sjdb_overhang: u32,
 
+    /// What to save of the genome after junctions are inserted at mapping:
+    /// `Basic` (junction and annotation tables) or `All` (also Genome, SA,
+    /// SAindex), written to `<prefix>_STARgenome/`. As in STAR, any value other
+    /// than `All` behaves as `Basic` (`sjdbInsertJunctions.cpp:69`).
+    #[arg(long = "sjdbInsertSave", default_value = "Basic")]
+    pub sjdb_insert_save: String,
+
     /// Extra score for alignments crossing annotated junctions
     #[arg(long = "sjdbScore", default_value_t = 2)]
     pub sjdb_score: i32,

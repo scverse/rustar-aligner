@@ -61,59 +61,24 @@ impl GenomeIndex {
             (Vec::new(), 0)
         };
 
-        // Build the annotated-junction database consulted at stitch time.
-        //   - If a GTF is supplied at align time, parse it (STAR's on-the-fly path).
-        //   - Otherwise fall back to the junctions stored in the index
-        //     (sjdbInfo.txt). Without this fallback, the standard workflow —
-        //     build the index once with `--sjdbGTFfile`, then align with only
-        //     `--genomeDir` — would treat every junction as novel (the runtime
-        //     db would be empty), losing all `sjdbScore` bonuses and annotated
-        //     junction recognition. Keyed on the stored (post-sjdbPrepare) donor/
-        //     acceptor coordinates, matching what the stitch scan produces.
-        let junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            SpliceJunctionDb::from_gtf_configured(
-                gtf_path,
-                &genome,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-            )?
-        } else if !prepared_junctions.is_empty() {
-            let raw: Vec<(usize, u64, u64, u8)> = prepared_junctions
-                .iter()
-                .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
-                .collect();
-            log::info!(
-                "No GTF at align time; loaded {} annotated junctions from index sjdbInfo.txt",
-                raw.len()
-            );
-            SpliceJunctionDb::from_raw_junctions(&raw)
-        } else {
-            log::info!("No GTF file provided, all junctions will be novel");
+        // The annotated-junction database consulted at stitch time comes from
+        // the index's own junctions (sjdbInfo.txt). Without it the standard
+        // workflow (annotated index, `--genomeDir` only at mapping) would
+        // treat every junction as novel.
+        let junction_db = if prepared_junctions.is_empty() {
+            log::info!("No junctions in the index");
             SpliceJunctionDb::empty()
+        } else {
+            log::info!(
+                "Loaded {} annotated junctions from index sjdbInfo.txt",
+                prepared_junctions.len()
+            );
+            SpliceJunctionDb::from_prepared(&prepared_junctions)
         };
 
-        log::info!(
-            "Junction database loaded: {} annotated junctions",
-            junction_db.len()
-        );
-
-        // Prefer STAR-compatible transcriptInfo.tab / exonInfo.tab /
-        // geneInfo.tab over re-parsing the GTF at align time. If the files
-        // aren't present (legacy rustar-aligner index), fall back to on-the-fly
-        // construction from the GTF when one is supplied — this matches
-        // STAR's behavior in `sjdbInsertJunctions.cpp` (re-parse and regenerate).
-        let transcriptome = if genome_dir.join("transcriptInfo.tab").exists() {
-            log::info!(
-                "Loading transcriptome index files from {}",
-                genome_dir.display()
-            );
-            Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
-        } else if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            log::warn!(
-                "transcriptInfo.tab not found in {}; re-parsing GTF at align time",
-                genome_dir.display()
-            );
+        // A GTF given at mapping is always the source of transcript info
+        // (`Transcriptome.cpp:13`); otherwise the index's tables are used.
+        let transcriptome = if let Some(ref gtf_path) = params.sjdb_gtf_file {
             let exons = crate::junction::gtf::parse_gtf_configured(
                 gtf_path,
                 &params.sjdb_gtf_feature_exon,
@@ -127,6 +92,12 @@ impl GenomeIndex {
                 &params.sjdb_gtf_tag_exon_parent_gene_name,
                 &params.sjdb_gtf_tag_exon_parent_gene_type,
             )?)
+        } else if genome_dir.join("transcriptInfo.tab").exists() {
+            log::info!(
+                "Loading transcriptome index files from {}",
+                genome_dir.display()
+            );
+            Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
         } else {
             None
         };
@@ -139,7 +110,7 @@ impl GenomeIndex {
             );
         }
 
-        Ok(GenomeIndex {
+        let mut index = GenomeIndex {
             genome,
             suffix_array,
             sa_index,
@@ -147,7 +118,42 @@ impl GenomeIndex {
             transcriptome,
             prepared_junctions,
             sjdb_overhang,
-        })
+        };
+
+        // Annotation given at mapping: STAR inserts its junctions into the
+        // loaded genome (`sjdbInsertJunctions.cpp:38-44`, `sjdbInsert.pass1`),
+        // `--sjdbFileChrStartEnd` first (priority 10, `sjdbLoadFromFiles.cpp:19`),
+        // then the GTF (priority 20, `GTF_transcriptGeneSJ.cpp:173`).
+        if params.sjdb_gtf_file.is_some() || !params.sjdb_file_chr_start_end.is_empty() {
+            let mut prepared = Vec::new();
+            if !params.sjdb_file_chr_start_end.is_empty() {
+                let raw = crate::junction::chr_start_end::parse_sjdb_chr_start_end(
+                    &params.sjdb_file_chr_start_end,
+                    &index.genome,
+                )?;
+                prepared.extend(index.prepare_raw_junctions(&raw, 10));
+            }
+            if let Some(ref gtf_path) = params.sjdb_gtf_file {
+                let exons = crate::junction::gtf::parse_gtf_configured(
+                    gtf_path,
+                    &params.sjdb_gtf_feature_exon,
+                    &params.sjdb_gtf_chr_prefix,
+                )?;
+                let raw = crate::junction::gtf::extract_junctions_configured(
+                    exons,
+                    &index.genome,
+                    &params.sjdb_gtf_tag_exon_parent_transcript,
+                )?;
+                prepared.extend(index.prepare_raw_junctions(&raw, 20));
+            }
+            log::info!(
+                "Inserting {} junctions given at mapping into the genome",
+                prepared.len()
+            );
+            crate::index::sjdb_otf::insert_junctions(&mut index, prepared, params)?;
+            index.write_inserted_genome(params, params.sjdb_gtf_file.is_some())?;
+        }
+        Ok(index)
     }
 }
 

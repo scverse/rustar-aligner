@@ -606,7 +606,8 @@ impl Genome {
             .map_err(|e| Error::io(e, &path))?;
         writeln!(f, "sjdbGTFtagExonParentGene\tgene_id").map_err(|e| Error::io(e, &path))?;
 
-        writeln!(f, "sjdbInsertSave\tBasic").map_err(|e| Error::io(e, &path))?;
+        writeln!(f, "sjdbInsertSave\t{}", params.sjdb_insert_save)
+            .map_err(|e| Error::io(e, &path))?;
 
         // genomeFileSizes: tab before the FIRST value, spaces between
         // subsequent values (STAR's pattern of `<< "\t"` then `<< " "`).
