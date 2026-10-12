@@ -471,7 +471,9 @@ pub struct Parameters {
     // ── Run ─────────────────────────────────────────────────────────────
     /// Run mode, plus its arguments. `--runMode soloCellFiltering` takes two
     /// more tokens: the raw count-matrix directory and the output prefix
-    /// (STAR `SoloFeature_loadRawMatrix.cpp`).
+    /// (STAR `SoloFeature_loadRawMatrix.cpp`), or a `--soloOutputFormat
+    /// scverse` store and the name of the `obsm/stats_*` column to write the
+    /// new cell call into.
     #[arg(long = "runMode", num_args = 1.., default_values_t = vec!["alignReads".to_string()])]
     pub run_mode_in: Vec<String>,
 
@@ -1620,7 +1622,9 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::WrongNumberOfValues,
                 "--runMode soloCellFiltering needs the raw count-matrix directory and the \
-                 output prefix: --runMode soloCellFiltering /path/to/raw/ /path/to/out/prefix",
+                 output prefix (--runMode soloCellFiltering /path/to/raw/ /path/to/out/prefix), \
+                 or a scverse store and a column name \
+                 (--runMode soloCellFiltering /path/to/matrix.zarr is_cell_new)",
             ));
         }
 

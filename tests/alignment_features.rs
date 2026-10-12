@@ -1546,6 +1546,76 @@ fn test_starsolo_output_format_zarr_no_sj() {
     assert_eq!(obsm, obs);
 }
 
+/// `soloCellFiltering` on a scverse store adds the new call as its own column
+/// of every stats frame and leaves the run's `is_cell` alone, the way the
+/// MatrixMarket mode leaves `raw/` alone and writes the call elsewhere.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_run_mode_solo_cell_filtering_on_a_scverse_store() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use polars::prelude::DataFrame;
+
+    let (_tmpdir, store, _cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ"]);
+    let frame = |m: &str, key: &str| -> DataFrame {
+        let adata = AnnData::<Zarr>::open(Zarr::open(store.join("mod").join(m)).unwrap()).unwrap();
+        adata.obsm().get_item(key).unwrap().unwrap()
+    };
+    let is_cell_before = frame("gex", "stats_Gene")
+        .column("is_cell")
+        .unwrap()
+        .clone();
+
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "is_cell_top1",
+            "--soloCellFilter",
+            "TopCells",
+            "1",
+        ])
+        .assert()
+        .success();
+
+    for (m, key) in [
+        ("gex", "stats_Gene"),
+        ("gex", "stats_GeneFull"),
+        ("sj", "stats_SJ"),
+    ] {
+        let df = frame(m, key);
+        let called: Vec<Option<bool>> = df
+            .column("is_cell_top1")
+            .unwrap_or_else(|_| panic!("mod/{m}/obsm/{key} has no new column"))
+            .bool()
+            .unwrap()
+            .into_iter()
+            .collect();
+        // Only the first whitelist barcode has reads.
+        assert_eq!(called, [Some(true), Some(false), Some(false)], "{m}/{key}");
+    }
+    assert_eq!(
+        frame("gex", "stats_Gene").column("is_cell").unwrap(),
+        &is_cell_before,
+        "the run's own call is untouched"
+    );
+    // The frame is still indexed by obs_names after the rewrite.
+    let (obs, obsm) = obs_and_obsm_index(&store.join("mod").join("gex"), "stats_Gene");
+    assert_eq!(obsm, obs);
+
+    // Count columns are not a valid target.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "n_umis",
+        ])
+        .assert()
+        .failure();
+}
+
 /// `(obs_names, index of obsm/<key>)` of one modality, read back from disk.
 #[cfg(feature = "scverse-out")]
 fn obs_and_obsm_index(modality: &std::path::Path, key: &str) -> (Vec<String>, Vec<String>) {

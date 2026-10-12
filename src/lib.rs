@@ -81,7 +81,13 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
         RunMode::AlignReads => align_reads(params),
         RunMode::InputAlignmentsFromBAM => bam_dedup::run(params),
         RunMode::LiftOver => liftover::run(params),
-        RunMode::SoloCellFiltering => crate::solo::mtx_market::run_cell_filtering(params),
+        RunMode::SoloCellFiltering => {
+            if crate::solo::adata::is_scverse_store(std::path::Path::new(&params.run_mode_in[1])) {
+                crate::solo::adata::run_cell_filtering(params)
+            } else {
+                crate::solo::mtx_market::run_cell_filtering(params)
+            }
+        }
     }
 }
 

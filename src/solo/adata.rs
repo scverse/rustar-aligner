@@ -69,6 +69,37 @@ impl OutputFormat {
 pub use zarr::write_scverse;
 
 #[cfg(feature = "scverse-out")]
+pub use zarr::is_scverse_store;
+
+/// `--runMode soloCellFiltering <matrix.zarr> <column>`: re-call cells in a
+/// scverse store without aligning anything.
+///
+/// The MatrixMarket mode leaves the raw matrix alone and writes the new call
+/// to a path the user names. The store keeps the same contract: counts and the
+/// run's own `is_cell` are untouched, and the new call is added as the boolean
+/// column `<column>` of every `obsm/stats_<Feature>` frame, so the two calls
+/// can be compared side by side. Naming an existing column (e.g. `is_cell`)
+/// overwrites it.
+pub fn run_cell_filtering(params: &crate::params::Parameters) -> anyhow::Result<()> {
+    #[cfg(feature = "scverse-out")]
+    {
+        zarr::recall_cells(
+            std::path::Path::new(&params.run_mode_in[1]),
+            &params.run_mode_in[2],
+            params,
+        )?;
+        Ok(())
+    }
+    #[cfg(not(feature = "scverse-out"))]
+    {
+        anyhow::bail!(
+            "{} is a scverse store, but this binary was built without the `scverse-out` feature",
+            params.run_mode_in[1]
+        )
+    }
+}
+
+#[cfg(feature = "scverse-out")]
 mod zarr {
     use crate::error::Error;
     use crate::solo::SoloContext;
@@ -76,12 +107,14 @@ mod zarr {
         CellCounts, CellStat, FeatureSummary, MultiMethod, cells_to_csr, multi_matrices,
     };
     use crate::solo::whitelist::CbWhitelist;
+    use anndata::ArrayElemOp;
     use anndata::backend::{AttributeOp, Value};
     use anndata::data::{DataFrameIndex, Mapping};
     use anndata::{
         AnnData, AnnDataOp, AxisArraysOp, Backend, ElemCollectionOp, backend::GroupOp, data::Data,
     };
     use anndata_zarr::Zarr;
+    use nalgebra_sparse::CsrMatrix;
     use polars::prelude::{Column, DataFrame};
     use rustc_hash::FxHashMap as HashMap;
     use std::path::Path;
@@ -91,6 +124,26 @@ mod zarr {
     /// anndata-rs does not stamp its anndata stores with this but it is technically required..
     const MUDATA_VERSION: &str = "0.1.0";
     const ANNDATA_VERSION: &str = "0.1.0";
+
+    /// True when `path` is the root of a zarr store (a `--soloOutputFormat scverse`
+    /// output) rather than a MatrixMarket `raw/` directory.
+    pub fn is_scverse_store(path: &std::path::Path) -> bool {
+        let group_res = Zarr::open(path);
+        group_res.is_ok_and(|store| {
+            store.open_group("/").is_ok_and(|g| {
+                g.get_json_attr("encoding-type").is_ok_and(|encoding_type| {
+                    g.get_json_attr("encoding-version")
+                        .is_ok_and(|encoding_version| match (encoding_type, encoding_version) {
+                            (Value::String(t), Value::String(v)) => {
+                                (v == MUDATA_VERSION && t == "mudata")
+                                    || (v == ANNDATA_VERSION && t == "anndata")
+                            }
+                            (_, _) => false,
+                        })
+                })
+            })
+        })
+    }
 
     /// Write the solo count matrices as one mudata store. No-op (with a warning)
     /// when there is no explicit whitelist, matching the MatrixMarket writer.
@@ -335,6 +388,107 @@ mod zarr {
         // axis = 0: the modalities share `obs` (the whitelist) and concatenate `var`.
         root.new_json_attr("axis", &Value::from(0))
             .map_err(zarr_err)?;
+        Ok(())
+    }
+
+    /// Columns of the stats frames that hold counts, not a cell call; the
+    /// re-call must not clobber them.
+    const STATS_COUNT_COLUMNS: [&str; 3] = ["n_reads", "n_umis", "n_features"];
+
+    /// See [`super::run_cell_filtering`]. Each `stats_<Feature>` frame in obsm is
+    /// re-called against its own matrix, one of the `<Feature>` layer or `X` for the
+    /// single-matrix `sj` modality.
+    pub(super) fn recall_cells(
+        store: &Path,
+        column: &str,
+        params: &crate::params::Parameters,
+    ) -> Result<(), Error> {
+        if STATS_COUNT_COLUMNS.contains(&column) {
+            return Err(Error::Parameter(format!(
+                "soloCellFiltering: `{column}` holds counts; choose another column name for the cell call"
+            )));
+        }
+        // MuData keeps one AnnData per modality under `mod/`; plain AnnData is the root.
+        let roots: Vec<std::path::PathBuf> = if store.join("mod").is_dir() {
+            ["gex", "sj"]
+                .iter()
+                .map(|m| store.join("mod").join(m))
+                .filter(|p| p.is_dir())
+                .collect()
+        } else {
+            vec![store.to_path_buf()]
+        };
+
+        let mut n_frames = 0;
+        for root in roots {
+            let adata =
+                AnnData::<Zarr>::open(Zarr::open_rw(&root).map_err(zarr_err)?).map_err(zarr_err)?;
+            let keys: Vec<String> = adata
+                .obsm()
+                .keys()
+                .into_iter()
+                .filter(|k| k.starts_with("stats_"))
+                .collect();
+            for key in keys {
+                let feature = &key["stats_".len()..];
+                let matrix: CsrMatrix<u64> =
+                    if adata.layers().keys().iter().any(|l| l == feature) {
+                        adata.layers().get_item(feature)
+                    } else {
+                        adata.x().get()
+                    }
+                    .map_err(zarr_err)?
+                    .ok_or_else(|| {
+                        Error::Parameter(format!("{}: no matrix for obsm/{key}", root.display()))
+                    })?;
+
+                // Cell calling only reads per-barcode UMI totals.
+                let stats: Vec<CellStat> = matrix
+                    .row_iter()
+                    .enumerate()
+                    .map(|(cb, row)| {
+                        let n_umis = row.values().iter().sum();
+                        CellStat {
+                            cb: cb as u32,
+                            n_reads: n_umis,
+                            n_umis,
+                            n_genes: row.nnz() as u32,
+                        }
+                    })
+                    .filter(|s| s.n_umis > 0)
+                    .collect();
+                let called = call_cells(&stats, &matrix, matrix.ncols(), params)?;
+
+                let mut is_cell = vec![false; matrix.nrows()];
+                for &cb in &called {
+                    is_cell[cb as usize] = true;
+                }
+                let mut frame: DataFrame = adata
+                    .obsm()
+                    .get_item(&key)
+                    .map_err(zarr_err)?
+                    .ok_or_else(|| {
+                        Error::Parameter(format!("{}: obsm/{key} is empty", root.display()))
+                    })?;
+                frame
+                    .with_column(Column::new(column.into(), is_cell))
+                    .map_err(|e| Error::Parameter(format!("updating obsm/{key}: {e}")))?;
+                adata.obsm().add(&key, frame).map_err(zarr_err)?;
+                log::info!(
+                    "soloCellFiltering: {} cells called -> {}/obsm/{key}/{column}",
+                    called.len(),
+                    root.display()
+                );
+                n_frames += 1;
+            }
+            adata.close().map_err(zarr_err)?;
+        }
+        if n_frames == 0 {
+            return Err(Error::Parameter(format!(
+                "{}: no obsm/stats_<Feature> frames to re-call",
+                store.display()
+            )));
+        }
         Ok(())
     }
 
