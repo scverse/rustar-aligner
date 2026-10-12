@@ -12,6 +12,7 @@
 //!       layers/{Gene,GeneFull}     one per --soloFeatures gene feature
 //!       layers/{spliced,unspliced,ambiguous}
 //!       layers/Gene_UniqueAndMult-EM …
+//!       layers/<each of the above>_CSC  the same counts, CSC
 //!       obs (whitelist barcodes),
 //!       var (gene_id + gene_name, feature_types)
 //!       obsm/stats_<Feature>       per-barcode reads/UMIs/genes + is_cell
@@ -19,7 +20,7 @@
 //!       uns/summary/<Feature>/…    the Summary.csv statistics, unformatted
 //!       uns/cellranger_summary     CellRanger.summary.csv (Gene + GeneFull)
 //!       uns/cell_reads_not_in_passlist  CellReads.stats' CBnotInPasslist row
-//!     sj/                          cells × junctions (X only)
+//!     sj/                          cells × junctions, layers/{SJ,SJ_CSC}
 //! ```
 //!
 //! Without `--soloFeatures SJ` there is no second modality to wrap, so the
@@ -31,9 +32,9 @@
 //! no cell-calling decision is baked into the axis. **Cell calling lives in each
 //! output type's `obsm` frame** as an `is_cell` column, rather than one
 //! `is_cell_<Feature>` column per feature sprayed across `obs`; the MTX writer's
-//! `filtered/` directory is that same boolean, materialized. And **`gex` has no
-//! `X`**: no gene feature is privileged as *the* matrix, so every one of them is
-//! a named layer and the caller picks (`sj` has a single matrix, so it keeps `X`).
+//! `filtered/` directory is that same boolean, materialized. And **there is no
+//! `X`**: no feature is privileged as *the* matrix, so every one of them is a
+//! named layer and the caller picks (`sj` too, for symmetry with `stats_SJ`).
 
 /// Container format for the solo count matrices (`--soloOutputFormat`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,14 +114,13 @@ mod zarr {
         CellCounts, CellStat, FeatureSummary, MultiMethod, cells_to_csr, multi_matrices,
     };
     use crate::solo::whitelist::CbWhitelist;
-    use anndata::ArrayElemOp;
     use anndata::backend::{AttributeOp, Value};
     use anndata::data::{DataFrameIndex, Mapping};
     use anndata::{
         AnnData, AnnDataOp, AxisArraysOp, Backend, ElemCollectionOp, backend::GroupOp, data::Data,
     };
     use anndata_zarr::Zarr;
-    use nalgebra_sparse::CsrMatrix;
+    use nalgebra_sparse::{CscMatrix, CsrMatrix};
     use polars::prelude::{Column, DataFrame};
     use rustc_hash::FxHashMap as HashMap;
     use std::path::Path;
@@ -236,9 +236,11 @@ mod zarr {
             let mg = recorder.multi_gene.lock().unwrap();
             for m in multi_matrices(&matrix, &mg, &multi_methods) {
                 let (method, mat) = m?;
-                gex.layers()
-                    .add(&format!("{name}_UniqueAndMult-{}", method.name()), mat)
-                    .map_err(zarr_err)?;
+                add_layer(
+                    &gex,
+                    &format!("{name}_UniqueAndMult-{}", method.name()),
+                    mat,
+                )?;
             }
             drop(mg);
 
@@ -248,7 +250,7 @@ mod zarr {
                 &funnel,
                 crate::solo::count::feature_reads(ctx, *feature),
             );
-            gex.layers().add(&name, matrix).map_err(zarr_err)?;
+            add_layer(&gex, &name, matrix)?;
             let mut frame = stats_frame(&stats, &called, n_obs)?;
             if let Some((cols, _)) = &cell_reads {
                 for (col, values) in CellReadStats::COLUMNS.iter().zip(cols) {
@@ -282,9 +284,7 @@ mod zarr {
                 .take(if keep_ambiguous { 3 } else { 2 })
             {
                 let per_cat: Vec<CellCounts> = cells.iter().map(|c| c[k].clone()).collect();
-                gex.layers()
-                    .add(name, cells_to_csr(&per_cat, n_obs, n_genes)?)
-                    .map_err(zarr_err)?;
+                add_layer(&gex, name, cells_to_csr(&per_cat, n_obs, n_genes)?)?;
             }
         }
 
@@ -368,7 +368,7 @@ mod zarr {
             sj.set_var_names(DataFrameIndex::from(index))
                 .map_err(zarr_err)?;
             sj.set_obs_names(obs_index.clone()).map_err(zarr_err)?;
-            sj.set_x(matrix).map_err(zarr_err)?;
+            add_layer(&sj, "SJ", matrix)?;
             sj.obsm()
                 .add("stats_SJ", stats_frame(&stats, &called, n_obs)?)
                 .map_err(zarr_err)?;
@@ -452,13 +452,27 @@ mod zarr {
                 .obsm()
                 .add("stats_Gene", stats_frame(&stats, &all, n_obs)?)
                 .map_err(zarr_err)?;
-            adata.layers().add("Gene", matrix).map_err(zarr_err)?;
+            add_layer(&adata, "Gene", matrix)?;
             adata.uns().add("run_info", run_info()).map_err(zarr_err)?;
             adata.close().map_err(zarr_err)?;
             let mut root = store.open_group("/").map_err(zarr_err)?;
             set_encoding(&mut root, "anndata", ANNDATA_VERSION)?;
             Ok(path)
         }
+    }
+
+    /// Write `matrix` as layer `name` (CSR) and `{name}_CSC` (the same counts, CSC).
+    fn add_layer<T>(adata: &AnnData<Zarr>, name: &str, matrix: CsrMatrix<T>) -> Result<(), Error>
+    where
+        T: nalgebra_sparse::na::Scalar + Copy,
+        CsrMatrix<T>: Into<anndata::data::ArrayData>,
+        CscMatrix<T>: Into<anndata::data::ArrayData>,
+    {
+        let layers = adata.layers();
+        layers
+            .add(&format!("{name}_CSC"), CscMatrix::from(&matrix))
+            .map_err(zarr_err)?;
+        layers.add(name, matrix).map_err(zarr_err)
     }
 
     /// `Solo.out/<matrix stem>.zarr` under the output prefix, parent created.
@@ -505,8 +519,7 @@ mod zarr {
     const STATS_COUNT_COLUMNS: [&str; 3] = ["n_reads", "n_umis", "n_features"];
 
     /// See [`super::run_cell_filtering`]. Each `stats_<Feature>` frame in obsm is
-    /// re-called against its own matrix, one of the `<Feature>` layer or `X` for the
-    /// single-matrix `sj` modality.
+    /// re-called against its own matrix, the `<Feature>` layer.
     pub(super) fn recall_cells(
         store: &Path,
         column: &str,
@@ -540,12 +553,9 @@ mod zarr {
                 .collect();
             for key in keys {
                 let feature = &key["stats_".len()..];
-                let matrix: CsrMatrix<u64> =
-                    if adata.layers().keys().iter().any(|l| l == feature) {
-                        adata.layers().get_item(feature)
-                    } else {
-                        adata.x().get()
-                    }
+                let matrix: CsrMatrix<u64> = adata
+                    .layers()
+                    .get_item(feature)
                     .map_err(zarr_err)?
                     .ok_or_else(|| {
                         Error::Parameter(format!("{}: no matrix for obsm/{key}", root.display()))

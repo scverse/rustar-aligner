@@ -1403,18 +1403,28 @@ fn test_starsolo_output_format_zarr() {
             );
         }
     }
-    // No gene feature is privileged as X: every one of them is a named layer.
-    // (SJ has a single matrix, so it keeps X.)
-    assert!(
-        !store.join("mod/gex/X").exists(),
-        "gex must not have an X — the features are layers"
-    );
-    assert!(store.join("mod/sj/X").exists(), "sj is missing X");
-    for layer in ["Gene", "GeneFull", "spliced", "unspliced", "ambiguous"] {
+    // No feature is privileged as X: every one of them is a named layer,
+    // each with a CSC twin.
+    for m in ["gex", "sj"] {
         assert!(
-            store.join(format!("mod/gex/layers/{layer}")).exists(),
-            "missing gex layer {layer}"
+            !store.join(format!("mod/{m}/X")).exists(),
+            "{m} must not have an X — the features are layers"
         );
+    }
+    for (m, layer) in [
+        ("gex", "Gene"),
+        ("gex", "GeneFull"),
+        ("gex", "spliced"),
+        ("gex", "unspliced"),
+        ("gex", "ambiguous"),
+        ("sj", "SJ"),
+    ] {
+        for key in [layer.to_string(), format!("{layer}_CSC")] {
+            assert!(
+                store.join(format!("mod/{m}/layers/{key}")).exists(),
+                "missing {m} layer {key}"
+            );
+        }
     }
     for feature in ["Gene", "GeneFull"] {
         assert!(
