@@ -508,45 +508,6 @@ impl SaIndex {
         })
     }
 
-    /// Streaming builder: accepts (sa_idx, packed_value) pairs in SA
-    /// order and updates the per-k-mer first-occurrence entries
-    /// online. Used by the streaming `genomeGenerate` path so the
-    /// 25 GB SA `PackedArray` never has to be materialised in RAM —
-    /// caps-sa emits each entry, the SA file writer takes one copy,
-    /// and this builder takes another (a few bytes per emit).
-    ///
-    /// Holds a shared reference to `genome` for the k-mer extraction
-    /// `genome.sequence[genome_pos..]` reads.
-    pub fn streaming_builder(
-        genome: &Genome,
-        gstrand_bit: u32,
-        gstrand_mask: u64,
-        nbases: u32,
-    ) -> SaIndexBuilder<'_> {
-        let word_length = gstrand_bit + 3;
-        let mut genome_sa_index_start = vec![0u64; (nbases + 1) as usize];
-        for k in 1..=nbases {
-            genome_sa_index_start[k as usize] =
-                genome_sa_index_start[(k - 1) as usize] + 4u64.pow(k);
-        }
-        let num_indices = Self::calculate_num_indices(nbases);
-        let mut data = PackedArray::new(word_length, num_indices as usize);
-        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
-        for i in 0..num_indices as usize {
-            data.write(i, absent_marker);
-        }
-        SaIndexBuilder {
-            nbases,
-            word_length,
-            gstrand_bit,
-            gstrand_mask,
-            genome_sa_index_start,
-            data,
-            genome,
-            sa_idx: 0,
-        }
-    }
-
     /// Build SA index from genome and sorted suffix array.
     ///
     /// # Arguments
@@ -667,89 +628,6 @@ impl SaIndex {
             word_length,
             gstrand_bit,
         })
-    }
-}
-
-/// Online accumulator for [`SaIndex`]'s per-k-mer first-occurrence
-/// entries. See [`SaIndex::streaming_builder`] for the constructor;
-/// feed each emitted SA entry through [`SaIndexBuilder::add`] in SA
-/// order, then call [`SaIndexBuilder::finish`] to obtain the
-/// [`SaIndex`].
-///
-/// The streaming `genomeGenerate` path interleaves this with the
-/// on-disk SA writer: each caps-sa emit goes to both, and the
-/// 25 GB-class SA `PackedArray` is never materialised in RAM.
-pub struct SaIndexBuilder<'a> {
-    nbases: u32,
-    word_length: u32,
-    gstrand_bit: u32,
-    gstrand_mask: u64,
-    genome_sa_index_start: Vec<u64>,
-    data: PackedArray,
-    genome: &'a Genome,
-    /// 0-based index of the next entry to be added. Updated by
-    /// [`add`][Self::add] after each call.
-    sa_idx: usize,
-}
-
-impl SaIndexBuilder<'_> {
-    /// Feed the next SA entry (the strand-bit-encoded packed value,
-    /// exactly what would be at `SuffixArray::get(self.sa_idx())`).
-    /// Updates the first-occurrence entry of every k-mer of length
-    /// 1..=nbases that starts at the SA entry's genome position,
-    /// matching the body of [`SaIndex::build`]'s main loop.
-    pub fn add(&mut self, packed_value: u64) {
-        let pos = packed_value & self.gstrand_mask;
-        let is_reverse = (packed_value >> self.gstrand_bit) != 0;
-        let genome_pos = if is_reverse {
-            pos as usize + self.genome.n_genome as usize
-        } else {
-            pos as usize
-        };
-
-        // Incremental k-mer index: one base read per k, break on N.
-        // See the matching loop in `SaIndex::build` for the
-        // correctness argument.
-        let mut kmer_idx: u64 = 0;
-        for k in 1..=self.nbases {
-            if genome_pos + (k as usize) > self.genome.sequence.len() {
-                break;
-            }
-            let next_base = self.genome.sequence.base(genome_pos + (k - 1) as usize);
-            if next_base >= 4 {
-                break;
-            }
-            kmer_idx = (kmer_idx << 2) | (next_base as u64);
-
-            let sai_pos = self.genome_sa_index_start[(k - 1) as usize] + kmer_idx;
-            let current_entry = self.data.read(sai_pos as usize);
-            let is_absent = (current_entry >> (self.gstrand_bit + 2)) & 1 != 0;
-            if is_absent {
-                self.data.write(sai_pos as usize, self.sa_idx as u64);
-            }
-        }
-        self.sa_idx += 1;
-    }
-
-    /// Number of entries fed so far.
-    pub fn len(&self) -> usize {
-        self.sa_idx
-    }
-
-    /// Whether no entries have been fed yet.
-    pub fn is_empty(&self) -> bool {
-        self.sa_idx == 0
-    }
-
-    /// Finalise the builder into a [`SaIndex`].
-    pub fn finish(self) -> SaIndex {
-        SaIndex {
-            nbases: self.nbases,
-            genome_sa_index_start: self.genome_sa_index_start,
-            data: self.data,
-            word_length: self.word_length,
-            gstrand_bit: self.gstrand_bit,
-        }
     }
 }
 
