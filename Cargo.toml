@@ -2,7 +2,7 @@
 name = "rustar-aligner"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 authors = ["James Ferguson"]
 description = "A Rust reimplementation of STAR (Spliced Transcripts Alignment to a Reference), the RNA-seq aligner"
 license = "MIT"
