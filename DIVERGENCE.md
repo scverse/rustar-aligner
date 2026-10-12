@@ -24,11 +24,11 @@ Divergences are grouped by kind:
 
 **Why.** Determinism and thread-count invariance: the same read produces the same primary regardless of `--runThreadN`. STAR's exact mt19937 stream cannot be reproduced under per-read parallelism, and matching it would forfeit reproducibility.
 
-**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all** — the primary is the deterministic best alignment (max score → smaller genomic length → earliest discovered), which is STAR-faithful. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary — never in the set of reported alignments.
+**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all**. Alignments are written in STAR's `trMult` order (window order) and the primary is STAR's `trBest`: best score, then shorter genomic length, then the earlier window (`ReadAlign_multMapSelect.cpp:58-91`, `ReadAlign_stitchPieces.cpp:328-329`). On the yeast 10k and 100k benchmarks, SE and PE, every SAM record, including the primary flag and `HI` order, is identical to STAR's. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary and in what order the alignments are written — never in the set of reported alignments.
 
-This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast benchmark, 299 SE and 475 PE primary-selection differences are all genuine ties: both tools find the identical alignment set, and differ only in which equal-scoring member is primary (from SA-iteration order or the RNG-seed difference above). Excluding those ties, SE is 99.815% and PE 99.883% exact.
+**Transcriptome BAM primary.** With `--quantMode TranscriptomeSAM`, STAR marks one of a read's transcript alignments primary with a draw from the same per-thread stream, `int(u * nAlignT)`, for every mapped read and whatever `--outMultimapperOrder` says (`ReadAlign_quantTranscriptome.cpp:69`). rustar-aligner draws it from STAR's generator (`mt19937` seeded with `--runRNGseed`, `ReadAlign.cpp:11-12`) in the single writer stage, in STAR's read order: the BySJout held reads come after all the others, as in STAR's second stage. That is the stream of STAR's chunk 0, so `Aligned.toTranscriptome.out.bam` is record for record STAR's `--runThreadN 1` output at any `--runThreadN` here. With more threads STAR's own draws depend on which thread maps which chunk. Under `--outMultimapperOrder Random`, STAR's shuffles take numbers from the same stream first, which rustar-aligner does not, so the transcriptome primaries differ there too.
 
-**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`), `src/params/mod.rs` (`MultimapperOrder`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlignChunk` RNG seeding.
+**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`, `mult_map_order`), `src/params/mod.rs` (`MultimapperOrder`), `src/lib.rs` (`TrRecords::finalize`, `tr_primary_rng`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlign_quantTranscriptome.cpp`, `ReadAlignChunk` RNG seeding.
 
 ### 1.2 `--soloUMIfiltering MultiGeneUMI_All` filters, rather than doing nothing
 
@@ -139,19 +139,33 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
+### 3.3 SAM/BAM header program lines
+
+**What STAR does.** The header names STAR: `@PG ID:STAR PN:STAR VN:2.7.11b CL:<commandLineFull>` (`samHeaders.cpp:64`), where `commandLineFull` is STAR's re-formatted parameter list, and `@CO user command line: <command line>` (`:84`).
+
+**What rustar-aligner does.** The same two lines, in the same place, name rustar-aligner: `@PG ID:rustar-aligner PN:rustar-aligner VN:<version> CL:<command line>` and `@CO user command line: <command line>`. Every other header line follows STAR's layout and text, including `@HD VN:1.4`, a user `@HD`/`@PG`, the comment file and `@RG` (`samHeaders.cpp:29-100`).
+
+**Why.** The program record says which program wrote the file; claiming to be STAR would be wrong, and the command line differs anyway (`argv[0]`, spacing).
+
+**Impact.** On the yeast 10k runs (SE and PE, SAM, unsorted, sorted and both BAMs, user `@HD`/`@PG`, comment file, read groups) the headers are identical to STAR's apart from these two lines. A tool that detects the aligner from `PN:STAR` will not recognise the file as STAR's.
+
+**Source.** `src/io/sam.rs` (header text), `src/io/bam.rs`.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
 
-### 4.1 Transcriptome tables built on the fly
+### 4.1 Transcriptome tables built on the fly (GTF given at mapping time)
 
-For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exon map directly from the input GTF at run time, instead of loading STAR's persisted `transcriptInfo.tab` / `exonInfo.tab` files. The projection logic mirrors STAR's `Transcriptome_quantAlign.cpp`; the output (`Aligned.toTranscriptome.out.bam`) is intended to be equivalent.
+With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<prefix>_STARgenome/` and then reads them back (`Transcriptome.cpp:13`). rustar-aligner writes the same tables but builds its in-memory transcript index and gene model directly from the GTF. Without a GTF at mapping, both read the index's `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`, for `--quantMode TranscriptomeSAM` / `GeneCounts`, STARsolo `Gene` / `GeneFull` / `Velocyto` / SmartSeq and the `GX`/`GN` tags, and exit with STAR's "could not open ... geneInfo.tab" error when neither a GTF nor the tables exist. The output is intended to be the same.
 
-**Source.** `src/quant/transcriptome.rs`.
+**Source.** `src/index/io.rs` (`GenomeIndex::load`), `src/quant/transcriptome.rs`, `src/quant/mod.rs` (`resolve_gene_annotation`).
 
 ### 4.2 In-tree RNG generator
 
-rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` samples with a bit-exact libc++ `mt19937` (`src/solo/libcxx_rng.rs`) so its Monte-Carlo null matches STAR's — a convergence with STAR rather than a divergence from it.
+rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` and the transcriptome BAM primary (§1.1) draw from a bit-exact `mt19937` (`src/solo/libcxx_rng.rs`) so their results match STAR's — a convergence with STAR rather than a divergence from it.
 
 ### 4.3 Coordinate-sort memory budget and spilling
 
@@ -164,6 +178,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 **Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
 
 **Source.** `src/io/bam.rs` (`CoordinateSorter`).
+
+### 4.4 Gzipped GTF files
+
+**What STAR does.** `--sjdbGTFfile` is read as plain text; a gzipped GTF fails to parse.
+
+**What rustar-aligner does.** A GTF whose first two bytes are the gzip magic (`1f 8b`) is decompressed while it is read, at `genomeGenerate`, at mapping and in `--runMode liftOver`; the file name does not matter, and multi-member gzip is read to the end. A plain-text GTF is read as before.
+
+**Why.** Annotations are often shipped compressed (10x references: `genes/genes.gtf.gz`), and decompressing them first adds a step and a large file for no change in the result.
+
+**Impact.** None on output: the same GTF gzipped or not gives identical indexes, `_STARgenome/` tables, alignments, `ReadsPerGene.out.tab` and transcriptome BAM. Only a run STAR would reject is accepted.
+
+**Source.** `src/junction/gtf.rs` (`open_annotation`).
 
 ## 5. Known residual single-read differences
 

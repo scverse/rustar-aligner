@@ -7,11 +7,9 @@ Two-pass alignment improves recovery of reads spanning novel splice junctions â€
 
 ## How it works
 
-1. **Pass 1** aligns all reads (or a subset, see `--twopass1readsN`) against the original index. Splice junctions discovered during this pass are filtered and collected.
-2. The discovered junctions are inserted into a per-run on-the-fly junction database.
-3. **Pass 2** re-aligns all reads against the augmented index. Reads that previously soft-clipped over an unannotated junction now stitch through it.
-
-The pass-1 junctions are filtered the same way as STAR: by motif (canonical GT/AG vs non-canonical), unique-mapping support, distance to other junctions, and intron length vs read count. Defaults are STAR-compatible.
+1. **Pass 1** aligns all reads (or a subset, see `--twopass1readsN`) against the original index, with output, chimeric detection and quantification switched off. Its junctions go through the `SJ.out.tab` filters and are written to `<prefix>_STARpass1/SJ.out.tab`.
+2. Every junction in that file is inserted into the genome, as STAR does: the junction flanks are added to the genome and the suffix array and SAindex are updated, so pass-2 seeds can cross the new junctions.
+3. **Pass 2** re-aligns all reads against the extended genome. In pass 2 the new junctions count as annotated, as in STAR (`sjdbScore`, column 6 of `SJ.out.tab`).
 
 ## Basic command
 
@@ -27,7 +25,7 @@ rustar-aligner \
 
 ## Combining with a GTF
 
-You can use two-pass mode together with `--sjdbGTFfile`. Annotated junctions from the GTF are loaded into the index alongside the pass-1 discoveries; a junction in both gets the higher-confidence treatment.
+You can use two-pass mode together with `--sjdbGTFfile`. The GTF's junctions are inserted before pass 1; the pass-1 junctions are then added to them. When the same junction comes from both, the genome's and the GTF's version is kept, as STAR does.
 
 ```bash
 rustar-aligner \
@@ -76,4 +74,4 @@ Skip it when:
 
 ## Output
 
-Two-pass mode writes the same set of files as a single-pass run. The `SJ.out.tab` reflects the final pass-2 set of junctions used during alignment.
+Two-pass mode writes the same set of files as a single-pass run, plus `<prefix>_STARpass1/` (pass-1 `SJ.out.tab` and `Log.final.out`) and `<prefix>_STARgenome/` (the inserted junctions; see `--sjdbInsertSave`). The main `SJ.out.tab` comes from pass 2.

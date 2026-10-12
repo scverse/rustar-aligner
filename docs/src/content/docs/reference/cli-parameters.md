@@ -40,17 +40,17 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--outFileNamePrefix` | `./` | Prefix (path + filename stem) for all output files. |
-| `--outSAMtype` | `SAM` | `SAM`, `BAM Unsorted`, `BAM SortedByCoordinate`, or `None`. |
+| `--outSAMtype` | `SAM` | `SAM`, `BAM Unsorted`, `BAM SortedByCoordinate`, `BAM Unsorted SortedByCoordinate` (both files), or `None`. |
 | `--outBAMcompression` | `1` | BGZF level. `-1`/`0` = uncompressed; `1`–`8` = flate2 levels; `≥9` = max. |
 | `--limitBAMsortRAM` | `0` | Max RAM for the coordinate sort; accepts a suffix (`8G`, `512M`). Records beyond it spill to sorted runs beside the output and are merged, so output is unaffected by this value. `0` means 512 MiB. Very small values still work but cost wall time (many spill runs plus an extra merge pass). |
-| `--outStd` | `None` | Route primary output to stdout: `None`, `SAM`, `BAM_Unsorted`, `BAM_SortedByCoordinate`. |
+| `--outStd` | `None` | Send one output to stdout instead of its file: `SAM`, `BAM_Unsorted` or `BAM_SortedByCoordinate`, each only when that output is requested by `--outSAMtype`. `None` writes everything to files. |
 
 ## Output: SAM/BAM records
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--outSAMstrandField` | `None` | `None` or `intronMotif` (sets XS tag from junction motifs). |
-| `--outSAMattributes` | `Standard` | Tags to include: `Standard`, `All`, `None`, or an explicit list (e.g. `NH HI AS NM nM MD`). |
+| `--outSAMstrandField` | `None` | `None` or `intronMotif`: adds the XS tag, from the junction strands of the whole alignment (both mates of a pair), and drops spliced alignments whose strand is undefined. Listing `XS` in `--outSAMattributes` turns it on, as in STAR. |
+| `--outSAMattributes` | `Standard` | Tags to include, written in the order given: `Standard` (`NH HI AS nM`), `All` (`NH HI AS nM NM MD jM jI MC ch`), `None`, or a list of `NH HI AS nM NM MD jM jI MC ch XS RG vA vG vW GX GN`. Derived tags follow the list: `RG` (read group), `XS` (`intronMotif`), `vW` (WASP), then `NM` (`--chimOutType WithinBAM`). `ch`, `vA`, `vG`, `vW`, `GX` and `GN` need BAM output, so `All` does too. Unmapped records always carry `NH HI AS nM uT` (then `RG`); the transcriptome BAM carries `NH HI` (then `RG`). |
 | `--outSAMattrRGline` | `-` | Read group line(s). Multiple blocks separated by a literal `,`. |
 | `--outSAMunmapped` | `None` | Unmapped reads in SAM: `None`, `Within`, or `Within KeepPairs`. |
 | `--outSAMmapqUnique` | `255` | MAPQ value for uniquely-mapping reads. |
@@ -60,7 +60,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--outFilterType` | `Normal` | `Normal` or `BySJout` (re-filter by discovered SJ pass). |
+| `--outFilterType` | `Normal` | `Normal` or `BySJout`. With `BySJout`, reads with an unannotated junction are held until every read is mapped, then mapped again with only the novel junctions that passed the `--outSJfilter*` filters, and written after the others (STAR's two stages). |
 | `--outFilterMultimapNmax` | `10` | Max number of multi-mapping loci. Reads exceeding this are unmapped (`MultiMapTooMany`). |
 | `--outFilterMultimapScoreRange` | `1` | Score range for keeping multi-mappers within best score. |
 | `--outFilterMismatchNmax` | `10` | Max mismatches per pair. |
@@ -139,12 +139,13 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--sjdbGTFfile` | — | GTF file with exon annotations. |
+| `--sjdbGTFfile` | — | GTF file with exon annotations; may be gzipped (STAR needs plain text). |
 | `--sjdbGTFchrPrefix` | `""` | Prefix to add to chromosome names from GTF (e.g. `chr`). |
 | `--sjdbGTFfeatureExon` | `exon` | GTF feature type to use as exon. |
 | `--sjdbGTFtagExonParentTranscript` | `transcript_id` | GTF attribute for transcript ID. |
 | `--sjdbGTFtagExonParentGene` | `gene_id` | GTF attribute for gene ID. |
 | `--sjdbOverhang` | `100` | Overhang length around junctions in the index. Set to `read_length - 1`. |
+| `--sjdbInsertSave` | `Basic` | After junctions are inserted at mapping (GTF at mapping or two-pass): `Basic` writes the junction and transcript tables to `<prefix>_STARgenome/`, `All` also writes Genome, SA and SAindex. |
 | `--sjdbScore` | `2` | Extra score for alignments crossing annotated junctions. |
 
 ## Quantification

@@ -42,7 +42,8 @@ pub struct SaIndex {
 
     /// Packed array storing SA index entries
     /// Each entry is (gstrand_bit + 3) bits:
-    /// - Bits 0..gstrand_bit: SA position (or max value if prefix absent)
+    /// - Bits 0..=gstrand_bit: SA index (`gstrand_bit + 1` bits; for an absent
+    ///   prefix, the next present one's, or the SA length)
     /// - Bit gstrand_bit+1: "contains N" flag
     /// - Bit gstrand_bit+2: "prefix absent" flag
     pub data: PackedArray,
@@ -52,6 +53,11 @@ pub struct SaIndex {
 
     /// Strand bit position (from SA)
     pub gstrand_bit: u32,
+
+    /// `genomeSAsparseD` of the suffix array this index fronts: only every
+    /// `sparse_d`-th genome position is a suffix, so the seed search tries
+    /// `sparse_d` shifted starts (STAR's `iDist` loop). 1 for a dense SA.
+    pub sparse_d: u64,
 }
 
 impl SaIndex {
@@ -504,46 +510,8 @@ impl SaIndex {
             data,
             word_length: sai_word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
-    }
-
-    /// Streaming builder: accepts (sa_idx, packed_value) pairs in SA
-    /// order and updates the per-k-mer first-occurrence entries
-    /// online. Used by the streaming `genomeGenerate` path so the
-    /// 25 GB SA `PackedArray` never has to be materialised in RAM —
-    /// caps-sa emits each entry, the SA file writer takes one copy,
-    /// and this builder takes another (a few bytes per emit).
-    ///
-    /// Holds a shared reference to `genome` for the k-mer extraction
-    /// `genome.sequence[genome_pos..]` reads.
-    pub fn streaming_builder(
-        genome: &Genome,
-        gstrand_bit: u32,
-        gstrand_mask: u64,
-        nbases: u32,
-    ) -> SaIndexBuilder<'_> {
-        let word_length = gstrand_bit + 3;
-        let mut genome_sa_index_start = vec![0u64; (nbases + 1) as usize];
-        for k in 1..=nbases {
-            genome_sa_index_start[k as usize] =
-                genome_sa_index_start[(k - 1) as usize] + 4u64.pow(k);
-        }
-        let num_indices = Self::calculate_num_indices(nbases);
-        let mut data = PackedArray::new(word_length, num_indices as usize);
-        let absent_marker = (1u64 << (gstrand_bit + 2)) | ((1u64 << gstrand_bit) - 1);
-        for i in 0..num_indices as usize {
-            data.write(i, absent_marker);
-        }
-        SaIndexBuilder {
-            nbases,
-            word_length,
-            gstrand_bit,
-            gstrand_mask,
-            genome_sa_index_start,
-            data,
-            genome,
-            sa_idx: 0,
-        }
     }
 
     /// Build SA index from genome and sorted suffix array.
@@ -665,94 +633,24 @@ impl SaIndex {
             data,
             word_length,
             gstrand_bit,
+            sparse_d: 1,
         })
     }
 }
 
-/// Online accumulator for [`SaIndex`]'s per-k-mer first-occurrence
-/// entries. See [`SaIndex::streaming_builder`] for the constructor;
-/// feed each emitted SA entry through [`SaIndexBuilder::add`] in SA
-/// order, then call [`SaIndexBuilder::finish`] to obtain the
-/// [`SaIndex`].
-///
-/// The streaming `genomeGenerate` path interleaves this with the
-/// on-disk SA writer: each caps-sa emit goes to both, and the
-/// 25 GB-class SA `PackedArray` is never materialised in RAM.
-pub struct SaIndexBuilder<'a> {
-    nbases: u32,
-    word_length: u32,
-    gstrand_bit: u32,
-    gstrand_mask: u64,
-    genome_sa_index_start: Vec<u64>,
-    data: PackedArray,
-    genome: &'a Genome,
-    /// 0-based index of the next entry to be added. Updated by
-    /// [`add`][Self::add] after each call.
-    sa_idx: usize,
-}
-
-impl SaIndexBuilder<'_> {
-    /// Feed the next SA entry (the strand-bit-encoded packed value,
-    /// exactly what would be at `SuffixArray::get(self.sa_idx())`).
-    /// Updates the first-occurrence entry of every k-mer of length
-    /// 1..=nbases that starts at the SA entry's genome position,
-    /// matching the body of [`SaIndex::build`]'s main loop.
-    pub fn add(&mut self, packed_value: u64) {
-        let pos = packed_value & self.gstrand_mask;
-        let is_reverse = (packed_value >> self.gstrand_bit) != 0;
-        let genome_pos = if is_reverse {
-            pos as usize + self.genome.n_genome as usize
-        } else {
-            pos as usize
-        };
-
-        // Incremental k-mer index: one base read per k, break on N.
-        // See the matching loop in `SaIndex::build` for the
-        // correctness argument.
-        let mut kmer_idx: u64 = 0;
-        for k in 1..=self.nbases {
-            if genome_pos + (k as usize) > self.genome.sequence.len() {
-                break;
-            }
-            let next_base = self.genome.sequence.base(genome_pos + (k - 1) as usize);
-            if next_base >= 4 {
-                break;
-            }
-            kmer_idx = (kmer_idx << 2) | (next_base as u64);
-
-            let sai_pos = self.genome_sa_index_start[(k - 1) as usize] + kmer_idx;
-            let current_entry = self.data.read(sai_pos as usize);
-            let is_absent = (current_entry >> (self.gstrand_bit + 2)) & 1 != 0;
-            if is_absent {
-                self.data.write(sai_pos as usize, self.sa_idx as u64);
-            }
-        }
-        self.sa_idx += 1;
-    }
-
-    /// Number of entries fed so far.
-    pub fn len(&self) -> usize {
-        self.sa_idx
-    }
-
-    /// Whether no entries have been fed yet.
-    pub fn is_empty(&self) -> bool {
-        self.sa_idx == 0
-    }
-
-    /// Finalise the builder into a [`SaIndex`].
-    pub fn finish(self) -> SaIndex {
-        SaIndex {
-            nbases: self.nbases,
-            genome_sa_index_start: self.genome_sa_index_start,
-            data: self.data,
-            word_length: self.word_length,
-            gstrand_bit: self.gstrand_bit,
-        }
-    }
-}
-
 impl SaIndex {
+    /// Mask for the SA index held in an entry, below the N and absent marks.
+    ///
+    /// The SA index needs `GstrandBit + 1` bits, not `GstrandBit`: the SA has
+    /// an entry per base on both strands, so a genome over 2^31 bases (every
+    /// full human index) has more than 2^32 SA entries. STAR puts the marks
+    /// at `GstrandBit + 1` and `GstrandBit + 2` and clears only those bits on
+    /// read (`Genome_genomeLoad.cpp:161-167`,
+    /// `ReadAlign_maxMappableLength2strands.cpp:56,71`).
+    fn sa_value_mask(&self) -> u64 {
+        (1u64 << (self.gstrand_bit + 1)) - 1
+    }
+
     /// Hierarchical SAindex lookup (STAR's maxMappableLength2strands approach).
     ///
     /// Starts with full k-mer at level min(k, nbases), progressively shortens
@@ -762,8 +660,9 @@ impl SaIndex {
     ///   - sa_start: first SA index in range
     ///   - sa_end_exclusive: past-the-end SA index
     ///   - matched_level: how many bases the SAindex resolved
-    ///   - bounds_tight: both bounds came from present SAindex entries
-    ///     (safe to skip first matched_level bases in binary search)
+    ///   - bounds_tight: STAR's `iSA2good && iSA1noN`: the upper bound came from
+    ///     a present SAindex entry and the range holds no N-flagged suffix (safe
+    ///     to skip first matched_level bases in binary search)
     ///
     /// Returns None if no prefix exists in the index (all levels absent).
     pub fn hierarchical_lookup(
@@ -794,18 +693,24 @@ impl SaIndex {
 
             if !is_absent {
                 // Found present entry — extract SA position
-                let sa_pos_mask = (1u64 << self.gstrand_bit) - 1;
+                let sa_pos_mask = self.sa_value_mask();
                 let sa_start = (entry & sa_pos_mask) as usize;
 
                 // Get upper bound from next k-mer at same level
                 let level_end = self.genome_sa_index_start[lind as usize];
                 let next_pos = self.genome_sa_index_start[(lind - 1) as usize] + ind + 1;
 
+                // STAR `iSA1noN`: a prefix flagged `SAiMarkNmaskC` is followed in the
+                // SA by suffixes that hit an N inside the first `lind` bases. They
+                // sit inside [sa_start, sa_end) without sharing the prefix, so the
+                // `lind` bases cannot be assumed matched (maxMappableLength2strands.cpp
+                // :73-98: such a range is searched with maxL=0).
+                let has_n = (entry >> (self.gstrand_bit + 1)) & 1 != 0;
                 let (sa_end, bounds_tight) = if next_pos < level_end {
                     let next_entry = self.data.read(next_pos as usize);
                     let next_absent = (next_entry >> (self.gstrand_bit + 2)) & 1 != 0;
                     if !next_absent {
-                        ((next_entry & sa_pos_mask) as usize, true)
+                        ((next_entry & sa_pos_mask) as usize, !has_n)
                     } else {
                         (n_sa, false)
                     }
@@ -847,7 +752,7 @@ impl SaIndex {
         }
 
         // Extract SA position
-        let sa_pos = entry & ((1u64 << self.gstrand_bit) - 1);
+        let sa_pos = entry & self.sa_value_mask();
         (sa_pos, true)
     }
 }
@@ -995,6 +900,34 @@ mod tests {
     }
 
     #[test]
+    fn hierarchical_lookup_n_flagged_prefix_is_not_tight() {
+        // Suffixes that hit an N inside the first `nbases` bases sort inside the range
+        // of a flagged prefix without sharing it. STAR (iSA1noN) must then search that
+        // range from base 0, so the lookup may not report tight bounds.
+        let (sai, n_sa) = make_test_index_with_sa("ACGTNACGTTACGNACGATTACGGGTNAC", 2, 3);
+        let mut flagged = 0;
+        for lind in 1..=3u32 {
+            for kmer in 0..(1u64 << (2 * lind)) {
+                let pos = sai.genome_sa_index_start[(lind - 1) as usize] + kmer;
+                let entry = sai.data.read(pos as usize);
+                let absent = (entry >> (sai.gstrand_bit + 2)) & 1 != 0;
+                let has_n = (entry >> (sai.gstrand_bit + 1)) & 1 != 0;
+                if absent || !has_n {
+                    continue;
+                }
+                flagged += 1;
+                let (_, _, level, tight) = sai.hierarchical_lookup(kmer, lind, n_sa).unwrap();
+                assert_eq!(level as u32, lind);
+                assert!(
+                    !tight,
+                    "N-flagged prefix {kmer:b} at level {lind} reported tight"
+                );
+            }
+        }
+        assert!(flagged > 0, "test genome must produce an N-flagged prefix");
+    }
+
+    #[test]
     fn hierarchical_lookup_tight_vs_nontight() {
         // Genome "ACGTACGT" with sa_nbases=2: many 2-mers present
         // AC(01), CG(12), GT(23) and their RC: AC(01), CG(12), GT(23)
@@ -1016,6 +949,44 @@ mod tests {
             // sa_end should be a valid SA index (not n_sa)
             assert!(sa_end <= n_sa);
         }
+    }
+
+    #[test]
+    fn sa_index_above_2_pow_32_is_not_truncated() {
+        // A full human genome has GstrandBit 32 and ~6e9 SA entries, so SAi
+        // entries hold SA indices >= 2^32 in bit GstrandBit; only bits
+        // GstrandBit+1 (N) and GstrandBit+2 (absent) are marks.
+        let gstrand_bit = 32;
+        let n_mark = 1u64 << (gstrand_bit + 1);
+        let absent = 1u64 << (gstrand_bit + 2);
+        let n_sa = (1usize << 32) + 20;
+        let c_start = (1u64 << 32) + 5;
+        let g_start = (1u64 << 32) + 9;
+        let word_length = gstrand_bit + 3;
+        let mut data = PackedArray::new(word_length, 4);
+        data.write(0, 0); // A
+        data.write(1, c_start); // C
+        data.write(2, g_start | n_mark); // G, some suffix hits N
+        data.write(3, n_sa as u64 | absent); // T absent
+        let sai = SaIndex {
+            nbases: 1,
+            genome_sa_index_start: vec![0, 4],
+            data,
+            word_length,
+            gstrand_bit,
+            sparse_d: 1,
+        };
+
+        assert_eq!(sai.lookup(1, 1), (c_start, true));
+        assert_eq!(sai.lookup(2, 1), (g_start, true));
+        assert_eq!(
+            sai.hierarchical_lookup(1, 1, n_sa),
+            Some((c_start as usize, g_start as usize, 1, true))
+        );
+        assert_eq!(
+            sai.hierarchical_lookup(2, 1, n_sa),
+            Some((g_start as usize, n_sa, 1, false))
+        );
     }
 
     #[test]
