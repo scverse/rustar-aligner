@@ -42,7 +42,8 @@ pub struct SaIndex {
 
     /// Packed array storing SA index entries
     /// Each entry is (gstrand_bit + 3) bits:
-    /// - Bits 0..gstrand_bit: SA position (or max value if prefix absent)
+    /// - Bits 0..=gstrand_bit: SA index (`gstrand_bit + 1` bits; for an absent
+    ///   prefix, the next present one's, or the SA length)
     /// - Bit gstrand_bit+1: "contains N" flag
     /// - Bit gstrand_bit+2: "prefix absent" flag
     pub data: PackedArray,
@@ -753,6 +754,18 @@ impl SaIndexBuilder<'_> {
 }
 
 impl SaIndex {
+    /// Mask for the SA index held in an entry, below the N and absent marks.
+    ///
+    /// The SA index needs `GstrandBit + 1` bits, not `GstrandBit`: the SA has
+    /// an entry per base on both strands, so a genome over 2^31 bases (every
+    /// full human index) has more than 2^32 SA entries. STAR puts the marks
+    /// at `GstrandBit + 1` and `GstrandBit + 2` and clears only those bits on
+    /// read (`Genome_genomeLoad.cpp:161-167`,
+    /// `ReadAlign_maxMappableLength2strands.cpp:56,71`).
+    fn sa_value_mask(&self) -> u64 {
+        (1u64 << (self.gstrand_bit + 1)) - 1
+    }
+
     /// Hierarchical SAindex lookup (STAR's maxMappableLength2strands approach).
     ///
     /// Starts with full k-mer at level min(k, nbases), progressively shortens
@@ -794,7 +807,7 @@ impl SaIndex {
 
             if !is_absent {
                 // Found present entry — extract SA position
-                let sa_pos_mask = (1u64 << self.gstrand_bit) - 1;
+                let sa_pos_mask = self.sa_value_mask();
                 let sa_start = (entry & sa_pos_mask) as usize;
 
                 // Get upper bound from next k-mer at same level
@@ -847,7 +860,7 @@ impl SaIndex {
         }
 
         // Extract SA position
-        let sa_pos = entry & ((1u64 << self.gstrand_bit) - 1);
+        let sa_pos = entry & self.sa_value_mask();
         (sa_pos, true)
     }
 }
@@ -1016,6 +1029,43 @@ mod tests {
             // sa_end should be a valid SA index (not n_sa)
             assert!(sa_end <= n_sa);
         }
+    }
+
+    #[test]
+    fn sa_index_above_2_pow_32_is_not_truncated() {
+        // A full human genome has GstrandBit 32 and ~6e9 SA entries, so SAi
+        // entries hold SA indices >= 2^32 in bit GstrandBit; only bits
+        // GstrandBit+1 (N) and GstrandBit+2 (absent) are marks.
+        let gstrand_bit = 32;
+        let n_mark = 1u64 << (gstrand_bit + 1);
+        let absent = 1u64 << (gstrand_bit + 2);
+        let n_sa = (1usize << 32) + 20;
+        let c_start = (1u64 << 32) + 5;
+        let g_start = (1u64 << 32) + 9;
+        let word_length = gstrand_bit + 3;
+        let mut data = PackedArray::new(word_length, 4);
+        data.write(0, 0); // A
+        data.write(1, c_start); // C
+        data.write(2, g_start | n_mark); // G, some suffix hits N
+        data.write(3, n_sa as u64 | absent); // T absent
+        let sai = SaIndex {
+            nbases: 1,
+            genome_sa_index_start: vec![0, 4],
+            data,
+            word_length,
+            gstrand_bit,
+        };
+
+        assert_eq!(sai.lookup(1, 1), (c_start, true));
+        assert_eq!(sai.lookup(2, 1), (g_start, true));
+        assert_eq!(
+            sai.hierarchical_lookup(1, 1, n_sa),
+            Some((c_start as usize, g_start as usize, 1, true))
+        );
+        assert_eq!(
+            sai.hierarchical_lookup(2, 1, n_sa),
+            Some((g_start as usize, n_sa, 1, false))
+        );
     }
 
     #[test]

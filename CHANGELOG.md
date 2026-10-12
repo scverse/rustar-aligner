@@ -65,6 +65,16 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **SAindex lookups no longer truncate SA indices at 2^32.** An `SAindex`
+  entry holds an SA index in `GstrandBit + 1` bits, with the N and absent
+  marks above it (STAR `Genome_genomeLoad.cpp:161-167`); the seed lookup
+  masked it to `GstrandBit` bits. A genome over 2^31 bases, i.e. every full
+  human index, has more than 2^32 SA entries (`GstrandBit` stays 32), so
+  k-mers whose SA range starts past 2^32 were searched in the wrong part of
+  the suffix array. Index files were always written correctly and need no
+  rebuild; genomes under 2^31 bases are unaffected (yeast and human chr21
+  output byte-identical). Found by @BenjaminDEMAILLE in #322.
+
 - **`--chimOutType WithinBAM` ported from STAR** (`chimericBAMoutput`,
   `alignBAM`). The chimera now replaces the read's normal alignment, as in
   STAR: one segment as a normal record and the other as a supplementary
