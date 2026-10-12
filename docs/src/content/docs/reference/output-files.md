@@ -23,7 +23,7 @@ Coordinate-sorted BAM. Written when `--outSAMtype BAM SortedByCoordinate`. The s
 
 ### `sample_Aligned.toTranscriptome.out.bam`
 
-Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within.
+Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record (one per mate for a pair) is emitted per transcript that the read aligns within, in STAR's order. MAPQ comes from the number of transcript alignments, and one of them is marked primary at random, as STAR does (see the migration guide's tie-breaking notes).
 
 ## Log files
 

@@ -65,6 +65,61 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`SJ.out.tab` is filtered as STAR's `outputSJ` does** (from
+  @BenjaminDEMAILLE's #316, `outputSJ.cpp:59-120`). The intron-length limit
+  of `--outSJfilterIntronMaxVsReadN` was off by one and still applied above
+  three reads, where STAR has none; a threshold of -1 passed everything, where STAR's
+  unsigned cast lets nothing through; a junction's overhang did not end at an
+  indel; and the distance filter looked at the previous junction's end rather
+  than at the nearest other donor and the nearest other acceptor, with
+  annotated junctions counted as neighbours but never dropped. On the yeast
+  10k reads `SJ.out.tab` is now identical to STAR's, SE and PE, annotated and
+  unannotated index (main kept 1 or 2 junctions STAR drops and missed 2 or 3
+  it keeps). Two-pass mode inserts pass 1's `SJ.out.tab`, so its output now
+  matches STAR's too.
+- **`--outFilterType BySJout` works in STAR's two stages** (from #316). A read
+  with an unannotated junction is held; once every read is mapped, the novel
+  junctions that pass the `SJ.out.tab` filters (distance filter included) are
+  collected from all reads, and the held reads are mapped again with only
+  those junctions allowed (`stitchWindowAligns.cpp:169-177`) and written after
+  the others. The final `SJ.out.tab` skips the distance filter, as STAR's
+  second stage does. Main dropped a held read's alignments when one of its
+  junctions failed, instead of mapping it again, and counted it unmapped. On
+  the yeast 10k reads, SAM, `SJ.out.tab` and `Log.final.out` now match STAR's
+  (SE 9,632/9,632 lines, main 9,523; PE 18,552/18,552, main 18,458). A held
+  read's chimeric alignments are still written: STAR detects chimeras before
+  the hold (`ReadAlign_oneRead.cpp:96,111`), and #316 as submitted lost them (SE
+  `Chimeric.out.junction` 18 of STAR's 20 lines, now 20).
+- **`Aligned.toTranscriptome.out.bam` matches STAR record for record** (from
+  #315, which supersedes #293):
+  - The primary is STAR's draw, `int(u * nAlignT)` from the `mt19937` seeded
+    with `--runRNGseed` (`ReadAlign_quantTranscriptome.cpp:69`), made in
+    STAR's read order. It equals STAR's `--runThreadN 1` output at any thread
+    count (DIVERGENCE.md §1.1).
+  - A pair is filtered as one alignment: the indel ban reads the CIGAR of both
+    mates, and the soft-clip extension mismatches of both mates share the
+    pair's budget (`min(outFilterMismatchNmaxTotal,
+    outFilterMismatchNoverLmax * (Lread - 1))`).
+  - MAPQ comes from the number of transcript alignments; the left segment of
+    a pair is written first; the M blocks either side of a junction merge
+    (`25M125M` becomes `150M`); a deletion no longer has to match a
+    transcript junction; alignments follow STAR's `trMult` order.
+  - With BySJout, the held reads' records come after all the others, from
+    their second-stage alignments.
+
+  On the yeast 10k reads (annotated index, `--quantMode TranscriptomeSAM`,
+  with and without BySJout), every record matches STAR's `--runThreadN 1`
+  output in order, apart from the optional tags: STAR writes only `NH HI`
+  there, which comes with #306. Main matched 7,167 of 8,121 SE records and 4
+  of 13,792 PE records in order.
+- An index whose `genomeParameters.txt` has no `versionGenome`, or one other
+  than `2.7.4a`, is refused with STAR's message; so is an annotated index
+  without `sjdbInsertSave` when junctions are inserted at mapping
+  (`Genome_genomeLoad.cpp:70-101`, from #322).
+- A read with more than `--seedPerReadNmax` stored seeds stops the run with
+  STAR's "too many pieces pere read" error (`ReadAlign_storeAligns.cpp:46-51`,
+  from #322). rustar-aligner silently dropped the extra seeds, which changes
+  that read's alignment where STAR refuses to go on.
 - **Junctions given at mapping, and two-pass junctions, are inserted into the
   genome as STAR does.** With `--sjdbGTFfile` or `--sjdbFileChrStartEnd` at
   mapping, or `--twopassMode Basic`, STAR inserts the junctions into the loaded

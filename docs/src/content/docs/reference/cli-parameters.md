@@ -60,7 +60,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--outFilterType` | `Normal` | `Normal` or `BySJout` (re-filter by discovered SJ pass). |
+| `--outFilterType` | `Normal` | `Normal` or `BySJout`. With `BySJout`, reads with an unannotated junction are held until every read is mapped, then mapped again with only the novel junctions that passed the `--outSJfilter*` filters, and written after the others (STAR's two stages). |
 | `--outFilterMultimapNmax` | `10` | Max number of multi-mapping loci. Reads exceeding this are unmapped (`MultiMapTooMany`). |
 | `--outFilterMultimapScoreRange` | `1` | Score range for keeping multi-mappers within best score. |
 | `--outFilterMismatchNmax` | `10` | Max mismatches per pair. |

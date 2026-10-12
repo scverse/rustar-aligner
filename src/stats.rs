@@ -333,52 +333,6 @@ impl AlignmentStats {
         self.total_reads.load(Ordering::Relaxed)
     }
 
-    /// Undo a mapped read record for BySJout filtering.
-    /// Moves one read from uniquely_mapped (or multi_mapped) to unmapped.
-    /// Since we don't know which category the read was in, we try unique first
-    /// (most reads are uniquely mapped), then multi.
-    pub fn undo_mapped_record_bysj(&self) {
-        // Try to decrement uniquely_mapped first
-        let mut current = self.uniquely_mapped.load(Ordering::Relaxed);
-        loop {
-            if current == 0 {
-                break;
-            }
-            match self.uniquely_mapped.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.unmapped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(x) => current = x,
-            }
-        }
-
-        // If no unique reads, try multi_mapped
-        let mut current = self.multi_mapped.load(Ordering::Relaxed);
-        loop {
-            if current == 0 {
-                break;
-            }
-            match self.multi_mapped.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.unmapped.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-                Err(x) => current = x,
-            }
-        }
-    }
-
     /// Write STAR-compatible Log.final.out file
     pub fn write_log_final(
         &self,
@@ -729,44 +683,6 @@ mod tests {
         assert_eq!(stats.unmapped_percent(), 0.0);
         assert_eq!(stats.mapped_percent(), 0.0);
         assert_eq!(stats.total_mapped(), 0);
-    }
-
-    #[test]
-    fn test_undo_mapped_record_bysj_unique() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(1, 10); // unique
-        stats.record_alignment(1, 10); // unique
-
-        stats.undo_mapped_record_bysj();
-
-        assert_eq!(stats.total_reads.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.uniquely_mapped.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_undo_mapped_record_bysj_multi() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(5, 10); // multi
-
-        stats.undo_mapped_record_bysj();
-
-        // No unique reads, so multi should be decremented
-        assert_eq!(stats.multi_mapped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn test_undo_mapped_record_bysj_noop_when_empty() {
-        let stats = AlignmentStats::new();
-        stats.record_alignment(0, 10); // unmapped
-
-        stats.undo_mapped_record_bysj();
-
-        // Should be a no-op (no mapped reads to undo)
-        assert_eq!(stats.unmapped.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.uniquely_mapped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.multi_mapped.load(Ordering::Relaxed), 0);
     }
 
     #[test]

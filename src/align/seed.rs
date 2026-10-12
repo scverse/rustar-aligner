@@ -28,6 +28,21 @@ pub struct Seed {
     pub mate_id: u8,
 }
 
+/// STAR's `seedPerReadNmax` guard (`ReadAlign_storeAligns.cpp:46-51`): the
+/// stored, deduplicated pieces of one read (both mates) may not exceed the
+/// limit. STAR aborts the run rather than dropping seeds, since a truncated
+/// seed set changes the alignment.
+pub(crate) fn check_seed_per_read(n_seeds: usize, params: &Parameters) -> Result<(), Error> {
+    if n_seeds > params.seed_per_read_nmax {
+        return Err(Error::Alignment(
+            "EXITING because of FATAL error: too many pieces pere read\n\
+             SOLUTION: increase input parameter --seedPerReadNmax"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl Seed {
     /// Find all seeds for a read sequence using MMP (Maximal Mappable Prefix) search.
     ///
@@ -101,11 +116,6 @@ impl Seed {
             &mut seeds,
         );
 
-        // Cap check between directions (STAR: seedPerReadNmax applies across both)
-        if seeds.len() >= params.seed_per_read_nmax {
-            return Ok(seeds);
-        }
-
         // Search R→L (reverse direction on read): sparse chain search on RC read.
         // The RC read carries the same good pieces mirrored end-for-end, which
         // is how STAR's `iDir==1` walks each piece from its right edge
@@ -160,6 +170,7 @@ impl Seed {
                 );
             seeds.retain(|s| seen.insert((s.read_pos, s.length)));
         }
+        check_seed_per_read(seeds.len(), params)?;
         Ok(seeds)
     }
 
@@ -208,6 +219,7 @@ impl Seed {
         // Pool seeds together
         seeds.extend(seeds2);
 
+        check_seed_per_read(seeds.len(), params)?;
         Ok(seeds)
     }
 
@@ -435,10 +447,6 @@ fn search_direction_sparse(
                     }
 
                     seeds.push(seed);
-
-                    if seeds.len() >= params.seed_per_read_nmax {
-                        return;
-                    }
                 }
 
                 // STAR: `iDir==0 && istart==0 && Lmapped==0 && Shift+L == splitR[1][ip]`
@@ -1238,17 +1246,26 @@ mod tests {
 
     #[test]
     fn test_shared_seed_cap() {
-        // Test that combined L→R + R→L respects seedPerReadNmax
+        // STAR aborts (rather than truncates) when the deduplicated pieces of a
+        // read exceed seedPerReadNmax; within the limit the seeds are returned.
         let index = make_test_index("ACGTACGTACGTACGT");
         let read = encode_sequence("ACGTACGT");
-        let params = params(&["--seedPerReadNmax", "3"]);
+        let n = Seed::find_seeds(&read, &index, 2, &params(&[]), "")
+            .unwrap()
+            .len();
+        assert!(n > 1, "fixture must produce several seeds, got {n}");
 
-        let seeds = Seed::find_seeds(&read, &index, 4, &params, "").unwrap();
-        assert!(
-            seeds.len() <= 3,
-            "Total seeds ({}) should respect seedPerReadNmax=3",
-            seeds.len()
+        let at_limit = params(&["--seedPerReadNmax", &n.to_string()]);
+        assert_eq!(
+            Seed::find_seeds(&read, &index, 2, &at_limit, "")
+                .unwrap()
+                .len(),
+            n
         );
+
+        let below = params(&["--seedPerReadNmax", &(n - 1).to_string()]);
+        let err = Seed::find_seeds(&read, &index, 2, &below, "").unwrap_err();
+        assert!(err.to_string().contains("--seedPerReadNmax"), "{err}");
     }
 
     #[test]

@@ -20,6 +20,7 @@ impl GenomeIndex {
     /// Reads Genome, SA, and SAindex files from the specified directory.
     pub fn load(genome_dir: &Path, params: &Parameters) -> Result<Self, Error> {
         log::info!("Loading genome from {}...", genome_dir.display());
+        check_genome_version(genome_dir, params)?;
 
         // Load Genome file
         let genome = load_genome(genome_dir, params)?;
@@ -177,6 +178,65 @@ fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
         }
     }
     Ok(None)
+}
+
+/// The `versionGenome` an index has to carry (STAR 2.7.11b's `versionGenome`
+/// default, `parametersDefault:2`).
+const VERSION_GENOME: &str = "2.7.4a";
+
+/// STAR's genome compatibility checks (`Genome_genomeLoad.cpp:70-101`): the
+/// index's `versionGenome` must be the one this STAR release writes, and an
+/// annotated index written before `sjdbInsertSave` existed cannot take junctions
+/// inserted at mapping time.
+fn check_genome_version(genome_dir: &Path, params: &Parameters) -> Result<(), Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = std::fs::read_to_string(&path).map_err(|_| {
+        Error::Index(format!(
+            "EXITING because of FATAL ERROR: could not open genome file {}\n\
+             SOLUTION: check that the path to genome files, specified in --genomeDir is \
+             correct and the files are present, and have user read permsissions",
+            path.display()
+        ))
+    })?;
+    let value = |key: &str| {
+        contents.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some(key)).then(|| f.next().unwrap_or("").to_string())
+        })
+    };
+    match value("versionGenome").filter(|v| !v.is_empty()) {
+        None => {
+            return Err(Error::Index(
+                "EXITING because of FATAL ERROR: read no value for the versionGenome parameter \
+                 from genomeParameters.txt file\n\
+                 SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                    .to_string(),
+            ));
+        }
+        Some(v) if v != VERSION_GENOME => {
+            return Err(Error::Index(format!(
+                "EXITING because of FATAL ERROR: Genome version: {v} is INCOMPATIBLE with \
+                 running STAR version: 2.7.11b\n\
+                 SOLUTION: please re-generate genome from scratch with running version of STAR, \
+                 or with version: {VERSION_GENOME}"
+            )));
+        }
+        Some(_) => log::info!("Genome version is compatible with current STAR"),
+    }
+    // `sjdbInsert.yes` (`Parameters.cpp:1002-1010`).
+    let sjdb_insert = params.sjdb_gtf_file.is_some()
+        || !params.sjdb_file_chr_start_end.is_empty()
+        || params.twopass_mode == crate::params::TwopassMode::Basic;
+    if sjdb_insert && genome_dir.join("sjdbInfo.txt").exists() && value("sjdbInsertSave").is_none()
+    {
+        return Err(Error::Index(
+            "EXITING because of FATAL ERROR: old Genome is INCOMPATIBLE with on the fly junction \
+             insertion\n\
+             SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The suffix-array stride the index was built with (`genomeSAsparseD` in
@@ -385,6 +445,36 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// STAR refuses an index written for another genome format version, and an
+    /// annotated index without `sjdbInsertSave` when junctions are inserted.
+    #[test]
+    fn rejects_incompatible_genome_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
+        let gp = dir.path().join("genomeParameters.txt");
+        std::fs::write(&gp, "versionGenome\t2.7.1a\n").unwrap();
+        let err = check_genome_version(dir.path(), &params).unwrap_err();
+        assert!(err.to_string().contains("INCOMPATIBLE"), "{err}");
+        std::fs::write(&gp, "genomeType\tFull\n").unwrap();
+        let err = check_genome_version(dir.path(), &params).unwrap_err();
+        assert!(err.to_string().contains("read no value"), "{err}");
+        std::fs::write(&gp, "versionGenome\t2.7.4a\n").unwrap();
+        assert!(check_genome_version(dir.path(), &params).is_ok());
+
+        std::fs::write(dir.path().join("sjdbInfo.txt"), "0\t100\n").unwrap();
+        let two_pass = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--twopassMode",
+            "Basic",
+        ]);
+        let err = check_genome_version(dir.path(), &two_pass).unwrap_err();
+        assert!(err.to_string().contains("on the fly"), "{err}");
+        std::fs::write(&gp, "versionGenome\t2.7.4a\nsjdbInsertSave\tBasic\n").unwrap();
+        assert!(check_genome_version(dir.path(), &two_pass).is_ok());
+    }
 
     #[test]
     fn load_generated_index() {

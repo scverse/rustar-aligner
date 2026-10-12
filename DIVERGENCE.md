@@ -26,7 +26,9 @@ Divergences are grouped by kind:
 
 **Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all**. Alignments are written in STAR's `trMult` order (window order) and the primary is STAR's `trBest`: best score, then shorter genomic length, then the earlier window (`ReadAlign_multMapSelect.cpp:58-91`, `ReadAlign_stitchPieces.cpp:328-329`). On the yeast 10k and 100k benchmarks, SE and PE, every SAM record, including the primary flag and `HI` order, is identical to STAR's. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary and in what order the alignments are written — never in the set of reported alignments.
 
-**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`, `mult_map_order`), `src/params/mod.rs` (`MultimapperOrder`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlignChunk` RNG seeding.
+**Transcriptome BAM primary.** With `--quantMode TranscriptomeSAM`, STAR marks one of a read's transcript alignments primary with a draw from the same per-thread stream, `int(u * nAlignT)`, for every mapped read and whatever `--outMultimapperOrder` says (`ReadAlign_quantTranscriptome.cpp:69`). rustar-aligner draws it from STAR's generator (`mt19937` seeded with `--runRNGseed`, `ReadAlign.cpp:11-12`) in the single writer stage, in STAR's read order: the BySJout held reads come after all the others, as in STAR's second stage. That is the stream of STAR's chunk 0, so `Aligned.toTranscriptome.out.bam` is record for record STAR's `--runThreadN 1` output at any `--runThreadN` here. With more threads STAR's own draws depend on which thread maps which chunk. Under `--outMultimapperOrder Random`, STAR's shuffles take numbers from the same stream first, which rustar-aligner does not, so the transcriptome primaries differ there too.
+
+**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`, `mult_map_order`), `src/params/mod.rs` (`MultimapperOrder`), `src/lib.rs` (`TrRecords::finalize`, `tr_primary_rng`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlign_quantTranscriptome.cpp`, `ReadAlignChunk` RNG seeding.
 
 ### 1.2 `--soloUMIfiltering MultiGeneUMI_All` filters, rather than doing nothing
 
@@ -149,7 +151,7 @@ With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<pr
 
 ### 4.2 In-tree RNG generator
 
-rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` samples with a bit-exact libc++ `mt19937` (`src/solo/libcxx_rng.rs`) so its Monte-Carlo null matches STAR's — a convergence with STAR rather than a divergence from it.
+rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` and the transcriptome BAM primary (§1.1) draw from a bit-exact `mt19937` (`src/solo/libcxx_rng.rs`) so their results match STAR's — a convergence with STAR rather than a divergence from it.
 
 ### 4.3 Coordinate-sort memory budget and spilling
 
