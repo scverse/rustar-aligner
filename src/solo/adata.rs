@@ -13,7 +13,8 @@
 //!       layers/{Gene,GeneFull}     one per --soloFeatures gene feature
 //!       layers/{spliced,unspliced,ambiguous}
 //!       layers/Gene_UniqueAndMult-EM …
-//!       obs (whitelist barcodes), var (gene_id + gene_name, feature_types)
+//!       obs (whitelist barcodes),
+//!       var (gene_id + gene_name, feature_types)
 //!       obsm/stats_<Feature>       per-barcode reads/UMIs/genes + is_cell
 //!                                  (+ the CellReads.stats counters with --soloCellReadStats CB)
 //!     sj/                          cells × junctions (X only)
