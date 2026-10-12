@@ -1372,7 +1372,7 @@ fn test_starsolo_summary_split() {
 #[test]
 #[cfg(feature = "scverse-out")]
 fn test_starsolo_output_format_zarr() {
-    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"]);
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"], &[]);
     let solo = store.parent().unwrap();
     assert!(store.is_dir(), "no MuData store at {}", store.display());
     assert!(!solo.join("Gene").join("raw").join("matrix.mtx").exists());
@@ -1453,8 +1453,9 @@ fn test_starsolo_output_format_zarr() {
 
 /// Run STARsolo with `--soloOutputFormat scverse` on six spliced reads of one
 /// whitelisted barcode; returns the tempdir guard, the store path and the barcode.
+/// `extra` is appended to the command line.
 #[cfg(feature = "scverse-out")]
-fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
+fn run_solo_zarr(features: &[&str], extra: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
     let tmpdir = TempDir::new().unwrap();
     let genome = build_genome();
     let fasta = write_fasta(&tmpdir, &genome);
@@ -1512,6 +1513,7 @@ fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static st
             "--outFileNamePrefix",
             &prefix,
         ])
+        .args(extra)
         .assert()
         .success();
 
@@ -1523,7 +1525,7 @@ fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static st
 #[test]
 #[cfg(feature = "scverse-out")]
 fn test_starsolo_output_format_zarr_no_sj() {
-    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"]);
+    let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"], &[]);
     let root: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
     assert_eq!(root["attributes"]["encoding-type"], "anndata");
@@ -1556,7 +1558,7 @@ fn test_run_mode_solo_cell_filtering_on_a_scverse_store() {
     use anndata_zarr::Zarr;
     use polars::prelude::DataFrame;
 
-    let (_tmpdir, store, _cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ"]);
+    let (_tmpdir, store, _cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ"], &[]);
     let frame = |m: &str, key: &str| -> DataFrame {
         let adata = AnnData::<Zarr>::open(Zarr::open(store.join("mod").join(m)).unwrap()).unwrap();
         adata.obsm().get_item(key).unwrap().unwrap()
@@ -1611,6 +1613,53 @@ fn test_run_mode_solo_cell_filtering_on_a_scverse_store() {
             "soloCellFiltering",
             store.to_str().unwrap(),
             "n_umis",
+        ])
+        .assert()
+        .failure();
+}
+
+/// `--soloCellReadStats CB` with scverse output: the `CellReads.stats` counters
+/// land as columns of every gene feature's stats frame, the passlist-miss row
+/// in `uns`, and `soloCellFiltering` refuses to overwrite them.
+#[test]
+#[cfg(feature = "scverse-out")]
+fn test_starsolo_cell_read_stats_in_scverse_store() {
+    use anndata::{AnnData, AnnDataOp, AxisArraysOp, Backend};
+    use anndata_zarr::Zarr;
+    use polars::prelude::DataFrame;
+
+    let (_tmpdir, store, _cb) =
+        run_solo_zarr(&["Gene", "GeneFull"], &["--soloCellReadStats", "CB"]);
+    let adata = AnnData::<Zarr>::open(Zarr::open(&store).unwrap()).unwrap();
+    for key in ["stats_Gene", "stats_GeneFull"] {
+        let df: DataFrame = adata.obsm().get_item(key).unwrap().unwrap();
+        let col = |name: &str| -> Vec<Option<u64>> {
+            df.column(name)
+                .unwrap_or_else(|_| panic!("obsm/{key} has no {name}"))
+                .u64()
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        // All six reads carry the first barcode, exactly, and map uniquely.
+        for name in ["cb_match", "cb_perfect", "genome_u"] {
+            assert_eq!(col(name), [Some(6), Some(0), Some(0)], "{key}/{name}");
+        }
+        assert_eq!(col("cb_mm_unique"), [Some(0); 3], "{key}/cb_mm_unique");
+    }
+    drop(adata);
+    assert!(
+        store.join("uns/cell_reads_not_in_passlist").exists(),
+        "missing uns/cell_reads_not_in_passlist"
+    );
+
+    // The counters are not a valid target for a re-call.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "soloCellFiltering",
+            store.to_str().unwrap(),
+            "cb_match",
         ])
         .assert()
         .failure();

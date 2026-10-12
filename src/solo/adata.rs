@@ -7,13 +7,15 @@
 //! ```text
 //! Solo.out/matrix.zarr/            encoding-type = mudata
 //!   uns/summary/<Feature>/…        the Summary.csv statistics, unformatted
+//!   uns/cell_reads_not_in_passlist CellReads.stats' CBnotInPasslist dataframe (--soloCellReadStats CB)
 //!   mod/                           mod-order = [gex, sj]
 //!     gex/                         cells × genes, no X
 //!       layers/{Gene,GeneFull}     one per --soloFeatures gene feature
 //!       layers/{spliced,unspliced,ambiguous}
 //!       layers/Gene_UniqueAndMult-EM …
-//!       obs (whitelist barcodes), var (gene_id + gene_name)
+//!       obs (whitelist barcodes), var (gene_id + gene_name, feature_types)
 //!       obsm/stats_<Feature>       per-barcode reads/UMIs/genes + is_cell
+//!                                  (+ the CellReads.stats counters with --soloCellReadStats CB)
 //!     sj/                          cells × junctions (X only)
 //! ```
 //!
@@ -103,6 +105,7 @@ pub fn run_cell_filtering(params: &crate::params::Parameters) -> anyhow::Result<
 mod zarr {
     use crate::error::Error;
     use crate::solo::SoloContext;
+    use crate::solo::cell_reads::CellReadStats;
     use crate::solo::count::{
         CellCounts, CellStat, FeatureSummary, MultiMethod, cells_to_csr, multi_matrices,
     };
@@ -202,6 +205,14 @@ mod zarr {
             .map_err(zarr_err)?;
         gex.set_obs_names(obs_index.clone()).map_err(zarr_err)?;
 
+        // `--soloCellReadStats CB`: the read counters are per barcode, not per
+        // feature, but the MTX writer puts `CellReads.stats` in every feature's
+        // directory, so they join every gene feature's stats frame.
+        let cell_reads = ctx.cell_read_stats.as_ref().map(|s| {
+            let s = s.lock().unwrap();
+            (s.columns(n_obs), *s.not_in_passlist())
+        });
+
         // Each layer is written as soon as it is built and dropped right after,
         // so at most a feature's matrix plus one derived matrix is in memory.
         let mut summaries: Vec<(String, Mapping)> = Vec::new();
@@ -235,11 +246,16 @@ mod zarr {
                 crate::solo::count::feature_reads(ctx, *feature),
             );
             gex.layers().add(&name, matrix).map_err(zarr_err)?;
+            let mut frame = stats_frame(&stats, &called, n_obs)?;
+            if let Some((cols, _)) = &cell_reads {
+                for (col, values) in CellReadStats::COLUMNS.iter().zip(cols) {
+                    frame
+                        .with_column(Column::new((*col).into(), values))
+                        .map_err(|e| Error::Parameter(format!("building solo obsm frame: {e}")))?;
+                }
+            }
             gex.obsm()
-                .add(
-                    &format!("stats_{name}"),
-                    stats_frame(&stats, &called, n_obs)?,
-                )
+                .add(&format!("stats_{name}"), frame)
                 .map_err(zarr_err)?;
             summaries.push((name, summary_map(&summary)));
         }
@@ -285,6 +301,21 @@ mod zarr {
             uns.insert("cellranger_summary".to_string(), cellranger_map(&cr).into());
         }
         uns.insert("run_info".to_string(), run_info().into());
+        // The file's `CBnotInPasslist` row: reads that never reached a barcode,
+        // so they have no `obs` row to live in.
+        if let Some((_, no_cb)) = &cell_reads {
+            uns.insert(
+                "cell_reads_not_in_passlist".to_string(),
+                Mapping::from(
+                    CellReadStats::COLUMNS
+                        .iter()
+                        .zip(no_cb)
+                        .map(|(k, &v)| ((*k).to_string(), Data::from(v)))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+                .into(),
+            );
+        }
 
         if !should_write_mudata {
             for (k, v) in uns.drain() {
@@ -481,7 +512,7 @@ mod zarr {
         column: &str,
         params: &crate::params::Parameters,
     ) -> Result<(), Error> {
-        if STATS_COUNT_COLUMNS.contains(&column) {
+        if STATS_COUNT_COLUMNS.contains(&column) || CellReadStats::COLUMNS.contains(&column) {
             return Err(Error::Parameter(format!(
                 "soloCellFiltering: `{column}` holds counts; choose another column name for the cell call"
             )));
@@ -639,11 +670,18 @@ mod zarr {
         .map_err(|e| Error::Parameter(format!("building solo obsm frame: {e}")))
     }
 
-    /// `var` for the gene modality (the index is set separately from `gene_ids`).
+    /// `var` for the gene modality (the index is set separately from `gene_ids`):
+    /// `features.tsv` columns 2 and 3, named as scanpy's `read_10x_mtx` names them.
     fn gene_frame(gene_names: &[String]) -> Result<DataFrame, Error> {
         DataFrame::new(
             gene_names.len(),
-            vec![Column::new("gene_name".into(), gene_names)],
+            vec![
+                Column::new("gene_name".into(), gene_names),
+                Column::new(
+                    "feature_types".into(),
+                    vec!["Gene Expression"; gene_names.len()],
+                ),
+            ],
         )
         .map_err(|e| Error::Parameter(format!("building solo var frame: {e}")))
     }
