@@ -1,12 +1,11 @@
-//! `--soloOutputFormat Zarr`: the whole solo run as one MuData store (Phase 14.x,
-//! a rustar extension beyond STARsolo, which only writes MatrixMarket).
-//!
-//! On-disk layout (Zarr v3; `mod/<name>` groups are plain AnnData stores, the
-//! MuData scaffolding around them is written here by hand — there is no MuData
+//! `--soloOutputFormat scverse`: the whole solo run as one mudata (if junctions are present) or anndata store (i.e., just gex).
+//
+//! On-disk layout (scverse v3; `mod/<name>` groups are plain AnnData stores, the
+//! mudata scaffolding around them is written here by hand if necessary — there is no mudata
 //! crate):
 //!
 //! ```text
-//! Solo.out/matrix.zarr/            encoding-type = MuData
+//! Solo.out/matrix.zarr/            encoding-type = mudata
 //!   uns/summary/<Feature>/…        the Summary.csv statistics, unformatted
 //!   mod/                           mod-order = [gex, sj]
 //!     gex/                         cells × genes, no X
@@ -20,10 +19,10 @@
 //!
 //! Without `--soloFeatures SJ` there is no second modality to wrap, so the
 //! store is plain AnnData: `gex`'s contents (and the root `uns`) sit at
-//! `matrix.zarr/` itself, with no `mod/` and no MuData attributes.
+//! `matrix.zarr/` itself, with no `mod/` and no mudata attributes.
 //!
 //! Three things are deliberate. **`obs` is the full whitelist**, identical in every
-//! matrix and both modalities — so the modalities can share one MuData `obs` and
+//! matrix and both modalities — so the modalities can share one mudata `obs` and
 //! no cell-calling decision is baked into the axis. **Cell calling lives in each
 //! output type's `obsm` frame** as an `is_cell` column, rather than one
 //! `is_cell_<Feature>` column per feature sprayed across `obs`; the MTX writer's
@@ -36,15 +35,16 @@
 pub enum OutputFormat {
     /// STARsolo's `raw/` + `filtered/` MatrixMarket triplet.
     Mtx,
-    /// One sharded Zarr v3 MuData store.
-    Zarr,
+    /// One sharded scverse v3 {mu,ann}data store.
+    #[allow(non_camel_case_types)]
+    scverse,
 }
 
 impl OutputFormat {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "MTX" => Some(Self::Mtx),
-            "Zarr" => Some(Self::Zarr),
+            "scverse" => Some(Self::scverse),
             _ => None,
         }
     }
@@ -53,22 +53,22 @@ impl OutputFormat {
     pub fn is_available(self) -> bool {
         match self {
             Self::Mtx => true,
-            Self::Zarr => cfg!(feature = "anndata-out"),
+            Self::scverse => cfg!(feature = "scverse-out"),
         }
     }
 
     pub fn cargo_feature(self) -> &'static str {
         match self {
             Self::Mtx => "",
-            Self::Zarr => "anndata-out",
+            Self::scverse => "scverse-out",
         }
     }
 }
 
-#[cfg(feature = "anndata-out")]
-pub use zarr::write_mudata;
+#[cfg(feature = "scverse-out")]
+pub use zarr::write_scverse;
 
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 mod zarr {
     use crate::error::Error;
     use crate::solo::SoloContext;
@@ -88,12 +88,13 @@ mod zarr {
 
     /// mudata's on-disk format versions (`mudata.__mudataversion__` /
     /// `__anndataversion__`), which its reader checks the groups against.
+    /// anndata-rs does not stamp its anndata stores with this but it is technically required..
     const MUDATA_VERSION: &str = "0.1.0";
     const ANNDATA_VERSION: &str = "0.1.0";
 
-    /// Write the solo count matrices as one MuData store. No-op (with a warning)
+    /// Write the solo count matrices as one mudata store. No-op (with a warning)
     /// when there is no explicit whitelist, matching the MatrixMarket writer.
-    pub fn write_mudata(
+    pub fn write_scverse(
         ctx: &SoloContext,
         params: &crate::params::Parameters,
         align_stats: &crate::stats::AlignmentStats,
@@ -132,27 +133,29 @@ mod zarr {
             std::fs::create_dir_all(parent).map_err(|e| Error::io(e, parent))?;
         }
         // Without the sj modality there is nothing to wrap: gex is the store root.
-        let mudata = ctx.sj_enabled && sj_stats.is_some();
+        let should_write_mudata = ctx.sj_enabled && sj_stats.is_some();
         // The store root. `Zarr::new` wipes any previous store at this path.
         let store = Zarr::new(&path).map_err(zarr_err)?;
-        if mudata {
+        if should_write_mudata {
             std::fs::create_dir_all(path.join("mod")).map_err(|e| Error::io(e, &path))?;
         }
 
         // The one `obs` axis every matrix and both modalities are written against.
+        // This matches the use of `write_barcodes` against the full whitelist in the matrix market output.
+        let mut buf = Vec::with_capacity(ctx.whitelist.barcode_len());
         let obs_index = DataFrameIndex::from(
             (0..n_obs)
                 .map(|i| {
-                    let mut buf = Vec::with_capacity(ctx.whitelist.barcode_len());
                     ctx.whitelist.unpack_barcode_into(i as u32, &mut buf);
                     String::from_utf8_lossy(&buf).into_owned()
                 })
                 .collect::<Vec<String>>(),
         );
+        drop(buf);
 
         // -- gex: every gene-indexed output type shares one cells × genes axis --
         // `features` is never empty (it defaults to Gene), so gex always exists.
-        let gex_path = if mudata {
+        let gex_path = if should_write_mudata {
             path.join("mod").join("gex")
         } else {
             path.clone()
@@ -231,7 +234,7 @@ mod zarr {
             }
         }
 
-        // Root `uns`: on the MuData root, or on gex itself when it is the root.
+        // Root `uns`: on the mudata root, or on gex itself when it is the root.
         let mut uns: HashMap<String, Data> = HashMap::default();
         uns.insert(
             "summary".to_string(),
@@ -248,7 +251,7 @@ mod zarr {
         }
         uns.insert("run_info".to_string(), run_info().into());
 
-        if !mudata {
+        if !should_write_mudata {
             for (k, v) in uns.drain() {
                 gex.uns().add(&k, v).map_err(zarr_err)?;
             }
@@ -259,10 +262,10 @@ mod zarr {
             "STARsolo: wrote {} ({n_obs} barcodes × {n_genes} genes)",
             gex_path.display(),
         );
-        if !mudata {
+        if !should_write_mudata {
             // AnnData does not tag its own root; mudata's `mod/*` get this below.
             let mut root = store.open_group("/").map_err(zarr_err)?;
-            return set_attrs(&mut root, "anndata", ANNDATA_VERSION);
+            return set_encoding(&mut root, "anndata", ANNDATA_VERSION);
         }
 
         // -- sj: junction-indexed, so its own modality (it cannot share `var`) --
@@ -308,7 +311,7 @@ mod zarr {
             );
         }
 
-        // -- the MuData scaffolding: root uns, group attributes, mod-order --
+        // -- the mudata scaffolding: root uns, group attributes, mod-order --
         anndata::data::Writable::write(
             &Mapping::from(uns.into_iter().collect::<std::collections::HashMap<_, _>>()),
             &store,
@@ -318,7 +321,7 @@ mod zarr {
 
         for m in &modalities {
             let mut g = store.open_group(&format!("mod/{m}")).map_err(zarr_err)?;
-            set_attrs(&mut g, "anndata", ANNDATA_VERSION)?;
+            set_encoding(&mut g, "anndata", ANNDATA_VERSION)?;
         }
         let mut mod_group = store.new_group("mod").map_err(zarr_err)?;
         mod_group
@@ -328,14 +331,14 @@ mod zarr {
             )
             .map_err(zarr_err)?;
         let mut root = store.new_group("/").map_err(zarr_err)?;
-        set_attrs(&mut root, "MuData", MUDATA_VERSION)?;
+        set_encoding(&mut root, "mudata", MUDATA_VERSION)?;
         // axis = 0: the modalities share `obs` (the whitelist) and concatenate `var`.
         root.new_json_attr("axis", &Value::from(0))
             .map_err(zarr_err)?;
         Ok(())
     }
 
-    fn set_attrs(
+    fn set_encoding(
         group: &mut <Zarr as Backend>::Group,
         encoding: &str,
         version: &str,
@@ -346,12 +349,7 @@ mod zarr {
         group
             .new_json_attr("encoding-version", &Value::from(version))
             .map_err(zarr_err)?;
-        group
-            .new_json_attr("encoder", &Value::from("rustar-aligner"))
-            .map_err(zarr_err)?;
-        group
-            .new_json_attr("encoder-version", &Value::from(env!("CARGO_PKG_VERSION")))
-            .map_err(zarr_err)
+        Ok(())
     }
 
     /// The whitelist indices `--soloCellFilter` calls cells for this matrix —

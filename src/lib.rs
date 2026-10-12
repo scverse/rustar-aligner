@@ -510,9 +510,9 @@ fn write_solo_output(
     // Validated in `Parameters::validate`, so an unknown/unavailable format
     // never reaches here.
     match crate::solo::OutputFormat::parse(&params.solo_output_format) {
-        #[cfg(feature = "anndata-out")]
-        Some(crate::solo::OutputFormat::Zarr) => {
-            crate::solo::adata::write_mudata(
+        #[cfg(feature = "scverse-out")]
+        Some(crate::solo::OutputFormat::scverse) => {
+            crate::solo::adata::write_scverse(
                 sctx,
                 params,
                 stats,

@@ -1362,7 +1362,7 @@ fn test_starsolo_summary_split() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9a2 — STARsolo --soloOutputFormat Zarr (MuData store)
+// Test 9a2 — STARsolo --soloOutputFormat scverse (MuData store)
 //
 // The same spliced reads as test 9b, but with every feature on and the counts
 // written as one MuData store instead of MatrixMarket: a `gex` modality with
@@ -1370,7 +1370,7 @@ fn test_starsolo_summary_split() {
 // junction-indexed `sj` modality, and the MuData scaffolding around them.
 // ---------------------------------------------------------------------------
 #[test]
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 fn test_starsolo_output_format_zarr() {
     let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull", "SJ", "Velocyto"]);
     let solo = store.parent().unwrap();
@@ -1380,7 +1380,7 @@ fn test_starsolo_output_format_zarr() {
     // MuData scaffolding: root + `mod` group metadata written by hand.
     let root: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(store.join("zarr.json")).unwrap()).unwrap();
-    assert_eq!(root["attributes"]["encoding-type"], "MuData");
+    assert_eq!(root["attributes"]["encoding-type"], "mudata");
     assert_eq!(root["node_type"], "group");
     let mods: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(store.join("mod/zarr.json")).unwrap()).unwrap();
@@ -1451,9 +1451,9 @@ fn test_starsolo_output_format_zarr() {
     }
 }
 
-/// Run STARsolo with `--soloOutputFormat Zarr` on six spliced reads of one
+/// Run STARsolo with `--soloOutputFormat scverse` on six spliced reads of one
 /// whitelisted barcode; returns the tempdir guard, the store path and the barcode.
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static str) {
     let tmpdir = TempDir::new().unwrap();
     let genome = build_genome();
@@ -1506,7 +1506,7 @@ fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static st
             "--soloStrand",
             "Forward",
             "--soloOutputFormat",
-            "Zarr",
+            "scverse",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
             "--outFileNamePrefix",
@@ -1521,7 +1521,7 @@ fn run_solo_zarr(features: &[&str]) -> (TempDir, std::path::PathBuf, &'static st
 
 // Without SJ there is one modality, so the store is plain AnnData at the root.
 #[test]
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 fn test_starsolo_output_format_zarr_no_sj() {
     let (_tmpdir, store, cb) = run_solo_zarr(&["Gene", "GeneFull"]);
     let root: serde_json::Value =
@@ -1547,7 +1547,7 @@ fn test_starsolo_output_format_zarr_no_sj() {
 }
 
 /// `(obs_names, index of obsm/<key>)` of one modality, read back from disk.
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 fn obs_and_obsm_index(modality: &std::path::Path, key: &str) -> (Vec<String>, Vec<String>) {
     use anndata::Backend;
     use anndata::backend::{DataContainer, GroupOp};

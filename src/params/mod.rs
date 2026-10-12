@@ -1329,7 +1329,7 @@ pub struct Parameters {
 
     /// Container format for the solo count matrices (rustar extension beyond
     /// STARsolo). `MTX` (default) is STARsolo's `raw/`+`filtered/` MatrixMarket
-    /// triplet. `Zarr` writes one sharded Zarr v3 MuData store,
+    /// triplet. `scverse` writes one sharded scverse v3 MuData store,
     /// `<soloOutFileNames[0]>/<matrix stem>.zarr`, holding every feature as a
     /// layer of a `gex` modality plus a junction-indexed `sj` modality — cells ×
     /// features (AnnData's obs × var orientation, the transpose of `.mtx`).
@@ -2088,7 +2088,7 @@ impl Parameters {
                 None => {
                     return Err(command.error(
                         ErrorKind::InvalidValue,
-                        format!("unsupported --soloOutputFormat '{f}'; expected MTX or Zarr"),
+                        format!("unsupported --soloOutputFormat '{f}'; expected MTX or scverse"),
                     ));
                 }
             }

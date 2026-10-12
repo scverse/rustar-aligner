@@ -12,7 +12,7 @@
 use crate::error::Error;
 use crate::solo::whitelist::CbWhitelist;
 use crate::solo::{SoloContext, SoloCountRecord};
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 use nalgebra_sparse::CsrMatrix;
 // FxHash (non-cryptographic) rather than std's SipHash: every map here is keyed
 // on packed integers (u64 UMIs, u32 gene/cell ids) on the per-cell UMI-dedup hot
@@ -549,7 +549,7 @@ fn build_matrix_body(
 /// Per-cell counts as a cells × features CSR. Rows span the **whole whitelist**
 /// (`n_rows`), so row index == whitelist barcode index and every matrix in the
 /// run shares one `obs` axis; barcodes with no counts are empty rows.
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 pub(crate) fn cells_to_csr(
     cells: &[CellCounts],
     n_rows: usize,
@@ -908,7 +908,7 @@ fn build_multi_matrices(
 /// `--soloMultiMappers` method, in `methods` order. Cells present only in
 /// `multi_records` (no unique gene) still get their molecules distributed here —
 /// unlike the `.mtx` writer, which walks the unique body and so skips them.
-#[cfg(feature = "anndata-out")]
+#[cfg(feature = "scverse-out")]
 pub(crate) fn multi_matrices<'a>(
     unique: &'a CsrMatrix<u64>,
     multi_records: &[crate::solo::MultiGeneRecord],
@@ -1695,7 +1695,7 @@ pub fn write_matrix_market(
             gzip,
         )?;
         let cells = sj_cells(&ctx.sj_records.lock().unwrap(), &row, opts.method, umi_len);
-        let nnz = build_sj_matrix(
+        let nnz = write_as_mtx_sj_matrix(
             &cells,
             &sj_dir.join(&matrix_name),
             order.len(),
@@ -1805,7 +1805,7 @@ pub(crate) fn sj_cells(
 
 /// Write the SJ feature matrix (junctions are rows) in the same MatrixMarket
 /// layout as the gene matrix.
-fn build_sj_matrix(
+fn write_as_mtx_sj_matrix(
     cells: &[CellCounts],
     matrix_path: &Path,
     n_junctions: usize,
@@ -2582,7 +2582,7 @@ mod tests {
         assert!((pu0[&0] - 0.5).abs() < 1e-9 && (pu0[&1] - 0.5).abs() < 1e-9);
     }
 
-    #[cfg(feature = "anndata-out")]
+    #[cfg(feature = "scverse-out")]
     #[test]
     fn cells_to_csr_rows_are_whitelist_barcodes() {
         let cells = vec![
@@ -2604,7 +2604,7 @@ mod tests {
         assert_eq!(t, vec![(1, 0, 2), (1, 2, 1), (3, 1, 1)]);
     }
 
-    #[cfg(feature = "anndata-out")]
+    #[cfg(feature = "scverse-out")]
     #[test]
     fn multi_matrices_csr() {
         // 4 whitelist barcodes × 3 genes. Cell 1: gene 0 = 4 unique. Cell 3: gene 2 = 1.
