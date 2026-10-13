@@ -122,7 +122,13 @@ So when `umiL` is still 0 at construction, the loop body never runs and all four
 
 **What rustar-aligner does.** Rejects all four homopolymers, in every barcode geometry.
 
-**Why.** A UMI of one repeated base carries no information whichever base it is, so rejecting only poly-A is not a threshold choice to be matched but an accident of when a length becomes known. STAR's own `CB_UMI_Simple` path, where `umiL` is set from the parameters before construction, rejects all four; the complex path is the outlier. Matching the accident would mean counting poly-T UMIs as real molecules.
+**Why.** Rejecting only poly-A is an accident of when the UMI length becomes known, not a rule, on three pieces of evidence:
+
+1. **The code builds all four.** The constructor loops over all four bases to build one constant per homopolymer; it only ends up matching poly-A because `umiL` is still 0 (`ParametersSolo.cpp:368`: `umiL = 0; //this will be defined when the first barcode is processed`) and `A` encodes as 0.
+2. **STAR's documentation says all homopolymers.** `--soloUMIfiltering -` is "basic filtering: remove UMIs with N and homopolymers (similar to CellRanger 2.2.0)" (`parametersDefault:888`, `docs/STARsolo.md:436`), with no exception by base or by `--soloType`. CellRanger removes all four.
+3. **The same check rejects all four under `CB_UMI_Simple`**, where `umiL` comes from `--soloUMIlen` before the constructor runs. Nothing in the source or the commit history gives `CB_UMI_Complex` a rule of its own.
+
+Poly-A being special in RNA does not apply here: the UMI comes from the barcode read, not the cDNA. In oligo-dT chemistries the UMI sits next to the dT, so a UMI that runs into it reads as poly-T, the one homopolymer STAR's complex path lets through. Matching the accident would count poly-T UMIs as molecules.
 
 **Impact.** Under `--soloType CB_UMI_Complex`, reads whose UMI is a non-A homopolymer are dropped here and counted by STAR. On real data these are rare and are sequencing artefacts.
 
