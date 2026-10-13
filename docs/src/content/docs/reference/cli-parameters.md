@@ -154,6 +154,14 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 |-----------|---------|-------------|
 | `--quantMode` | — | `GeneCounts` and/or `TranscriptomeSAM`, space-separated. |
 | `--quantTranscriptomeSAMoutput` | `BanSingleEnd_BanIndels_ExtendSoftclip` | Variant for transcriptome BAM: `BanSingleEnd`, `BanSingleEnd_ExtendSoftclip`, or the default RSEM-compatible form. |
+| `--quantTranscriptomeUnspliced` | `None` | rustar-aligner extension. `Intron` / `PreMRNA`: add one unspliced target per gene (`<gene_id>-I`: merged introns plus flanks, or the gene body) to the transcriptome BAM. `None` is STAR's behaviour. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/). |
+| `--quantTranscriptomeUnsplicedFlank` | `-1` | rustar-aligner extension. Flank around each merged intron for `Intron`; `-1` uses the index's `sjdbOverhang`. |
+| `--quantTranscriptomeUnsplicedFasta` | `No` | rustar-aligner extension. `Yes` writes the unspliced target sequences to `Aligned.toTranscriptome.unspliced.fa`. |
+| `--quantGeneSplicing` | `No` | rustar-aligner extension. `Yes` writes bulk spliced / unspliced / ambiguous gene counts (`ReadsPerGeneSplicing.out.tab`), see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/). |
+| `--outSAMsplicingStatus` | `No` | rustar-aligner extension. `Yes` adds an `sp:A` splicing-status tag (S / U / A) to genomic SAM/BAM records. |
+| `--quantGeneCoverage` | `No` | rustar-aligner extension. `Yes` writes per-gene exonic coverage to `GeneCoverage.out.bin` for DegNorm. See [DegNorm](/rustar-aligner/guides/degnorm/). |
+| `--degNormSampleId` | basename of `--outFileNamePrefix` | rustar-aligner extension. Sample name stored in `GeneCoverage.out.bin`. |
+| `--degNormCoverageFiles` | — | rustar-aligner extension. Two or more `GeneCoverage.out.bin` files: runs the DegNorm merge (no reads, no `--runMode`) and writes `DegNorm.out/`. Tuning: `--degNormIter`, `--degNormNmfIter`, `--degNormDownsampleRate`, `--degNormMinimaxCoverage`, `--degNormSkipBaselineSelection`, `--degNormBins`, `--degNormMinHighCoverage` (see the guide). |
 
 ## Two-pass mode
 

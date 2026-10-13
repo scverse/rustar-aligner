@@ -64,6 +64,39 @@ The site that acts on those zeroed counts, however, gates on a different flag (`
 
 **Source.** `src/solo/sgt.rs`, locked by `solo::sgt::tests::too_few_frequencies_leaves_the_unseen_mass_at_zero` (asserting the exact bit pattern, since the point is that nothing was written). STAR: `SoloFeature_emptyDrops_CR.cpp`, `SimpleGoodTuring/sgt.h`.
 
+### 1.4 Bulk total-RNA options: unspliced transcriptome targets, `sp` tag, `--quantGeneSplicing`
+
+All three are rustar-aligner extensions with no STAR equivalent, and all are opt-in. Each has its own flag rather than a new value of a STAR parameter (`--quantMode`, `--outSAMattributes`), so a STAR command line never means something different here. With the defaults (`--quantTranscriptomeUnspliced None`, `--outSAMsplicingStatus No`, `--quantGeneSplicing No`) no output changes, which `tests/bulk_unspliced.rs` (`new_options_leave_existing_outputs_unchanged`) checks.
+
+**What STAR does.** `--quantMode TranscriptomeSAM` projects every alignment onto every annotated transcript whose exons contain it (`Transcriptome_quantAlign.cpp`); there are no unspliced targets, so an unspliced read inside an intron that another isoform retains is projected onto the retaining isoform only, and a read in a constitutive intron is not projected at all. STAR classifies reads as spliced / unspliced / ambiguous only for single-cell runs (STARsolo, `Transcriptome_classifyAlign.cpp` + `SoloFeature_countVelocyto.cpp`), and has no per-alignment splicing tag.
+
+**What rustar-aligner does.**
+
+- `--quantTranscriptomeUnspliced Intron|PreMRNA` appends one `<gene_id>-I` target per gene (merged introns of all isoforms plus `--quantTranscriptomeUnsplicedFlank`, or the gene body) after the annotated transcripts, and projects alignments onto them with the unchanged STAR projection, except that fragments crossing a splice junction are kept off the unspliced targets. It also writes `Aligned.toTranscriptome.targets.tsv` and, on request, the unspliced sequences.
+- `--outSAMsplicingStatus Yes` and `--quantGeneSplicing Yes` run a port of STARsolo's spliced / unspliced classification (`alignToTranscriptMinOverlap` with `minOverlapMinusOne = 6` and the 1 Mb intron cap, then the per-UMI collapse of `countVelocyto`), one read or pair standing for one UMI. Two details differ from `classifyAlign`: the containment test uses the true leftmost / rightmost aligned base of the pair, where STAR uses the first block's start and the last block's end (a `TODO` next to that line in STAR flags the case where mate 2 ends before mate 1); and blocks are sorted by position before the scan, so STAR's early exit at the last exon also holds for overlapping mates. The `sp` tag collapses over all containing transcripts regardless of gene and strand.
+
+**Why.** In ribo-depleted total RNA a large share of reads is pre-mRNA. Without unspliced targets STAR's projection gives the intronic ones to retained-intron isoforms, so isoform proportions follow the library's pre-mRNA content (see the PR for measurements, and COMBINE-lab/salmon#1229 for the same effect with Salmon decoys). Unspliced targets let the downstream EM share such reads, as splici does for single-cell data. Bulk users have no STAR option that reports how much of a library is unspliced.
+
+**Impact.** Only when the options are given. Unspliced targets add `@SQ` lines and records to `Aligned.toTranscriptome.out.bam` and change `NH` / `HI` / `MAPQ` of the reads they receive; `sp` adds one tag per record.
+
+**Source.** `src/quant/transcriptome.rs` (`with_unspliced_targets`, `unspliced_intervals`, `filter_and_project`), `src/quant/splice_status.rs`, `src/quant/mod.rs` (`QuantContext`), `src/params/mod.rs` (the three flags). STAR: `Transcriptome_quantAlign.cpp`, `Transcriptome_classifyAlign.cpp`, `SoloFeature_countVelocyto.cpp`.
+
+### 1.5 DegNorm degradation normalization (`--quantGeneCoverage`, `--degNormCoverageFiles`)
+
+A rustar-aligner extension with no STAR equivalent, opt-in. Like §1.4 it uses its own flags rather than new values of `--quantMode` or `--runMode`.
+
+**What STAR does.** Nothing: STAR has no transcript-degradation model and no per-gene coverage output.
+
+**What rustar-aligner does.** `--quantGeneCoverage Yes` accumulates per-gene, per-exonic-base coverage during alignment and writes `GeneCoverage.out.bin`. A separate run with `--degNormCoverageFiles` (two or more files, no reads) merges the samples and fits the rank-one NMF over-approximation of [DegNorm](https://nustatbioinfo.github.io/DegNorm/) (Xiong et al., *Genome Biology* 2019), writing Degradation Index scores and degradation-adjusted counts to `DegNorm.out/`.
+
+**Why.** Degradation bias is gene- and sample-specific, so a global size factor cannot remove it. DegNorm normally recovers coverage curves by re-reading sorted, indexed BAMs; the aligner already assigns each unique read to a gene for `ReadsPerGene.out.tab`, so the curves cost almost nothing to produce there.
+
+**Impact.** Only when the options are given; alignment output and `ReadsPerGene.out.tab` are unchanged (`tests/degnorm.rs`). A degradation index is defined across samples, so the merge needs at least two coverage files.
+
+**Relation to the Python DegNorm.** The fit is a port of `degnorm/nmf.py` (upstream commit 1023383): gene filter (`__main__.py:226-232`), rank-one NMF over-approximation, baseline selection, DI, scale factors, outer loop and adjusted counts. Given the same coverage matrices, DI agrees within 7e-6 and adjusted counts within 3e-5 relative (human chr21, four samples, default, `--degNormSkipBaselineSelection` and non-default iteration/bin settings). The remaining differences are float-level: upstream takes the leading singular triplet with `svds`, rustar-aligner by power iteration on the `p x p` Gram matrix. With `--degNormDownsampleRate` above 1, upstream draws each gene's sampling offset from a global random stream; rustar-aligner derives it from `--runRNGseed` and the gene index, so a run does not depend on thread count. The coverage is not DegNorm's: its BAM reader drops reads with any base outside the annotated exons, advances the reference on soft clips and insertions, assigns reads in overlapping genes by containment in one gene's exons, and treats a BAM as paired only when read names end in `.1`/`.2` (`reads.py`), so it reads STAR-style BAMs as single-end. rustar-aligner counts the exonic bases of unique reads (fragments) that overlap the exons of exactly one gene, with mate overlap counted once. On the same alignments the two coverage definitions give different matrices for most genes, so DI scores differ from a Python DegNorm run on the BAMs.
+
+**Source.** `src/quant/coverage.rs`, `src/degnorm/` (ported from DegNorm's `degnorm/nmf.py`, MIT), `src/params/mod.rs` (the flags).
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

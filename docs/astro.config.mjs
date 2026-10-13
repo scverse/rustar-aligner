@@ -55,6 +55,8 @@ export default defineConfig({
             { label: 'Two-pass mode', slug: 'guides/two-pass' },
             { label: 'Chimeric detection', slug: 'guides/chimeric' },
             { label: 'Gene quantification', slug: 'guides/quantification' },
+            { label: 'Bulk total RNA-seq', slug: 'guides/bulk-total-rna' },
+            { label: 'Degradation normalization (DegNorm)', slug: 'guides/degnorm' },
             { label: 'Migrating from STAR', slug: 'guides/migrating-from-star' },
           ],
         },

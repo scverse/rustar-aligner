@@ -1140,6 +1140,101 @@ pub struct Parameters {
     )]
     pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
 
+    /// rustar-aligner extension (not in STAR), for `--quantMode
+    /// TranscriptomeSAM` on total RNA-seq: add one unspliced target per gene,
+    /// named `<gene_id>-I`, after the annotated transcripts.
+    ///   * `None` (default): STAR behaviour, annotated transcripts only
+    ///   * `Intron`: the gene's merged annotated introns plus flanks
+    ///   * `PreMRNA`: the whole gene body
+    ///
+    /// Unspliced reads and pairs are projected onto every compatible target,
+    /// spliced and unspliced; fragments crossing a junction only onto
+    /// spliced ones.
+    #[arg(long = "quantTranscriptomeUnspliced", default_value = "None")]
+    pub quant_transcriptome_unspliced: crate::quant::transcriptome::QuantTranscriptomeUnspliced,
+
+    /// Flank (bases) added on each side of every merged intron for
+    /// `--quantTranscriptomeUnspliced Intron`; -1 (default) uses the index's
+    /// sjdbOverhang, i.e. read length - 1 by STAR's convention.
+    #[arg(
+        long = "quantTranscriptomeUnsplicedFlank",
+        default_value_t = -1,
+        allow_hyphen_values = true
+    )]
+    pub quant_transcriptome_unspliced_flank: i64,
+
+    /// rustar-aligner extension: `Yes` also writes the unspliced target
+    /// sequences to `Aligned.toTranscriptome.unspliced.fa` (Salmon's alignment
+    /// mode needs them next to the transcript FASTA). `No` by default, as
+    /// the file is of the order of the genome size.
+    #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
+    pub quant_transcriptome_unspliced_fasta: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` writes per-gene spliced /
+    /// unspliced / ambiguous counts for bulk data
+    /// (`ReadsPerGeneSplicing.out.tab` and `.summary.tsv`), using STARsolo's
+    /// spliced / unspliced rules. Needs a GTF-aware index.
+    #[arg(long = "quantGeneSplicing", default_value = "No")]
+    pub quant_gene_splicing: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` adds an `sp:A` tag to the
+    /// genomic SAM/BAM records with the alignment's splicing status against
+    /// the annotation (S spliced, U unspliced, A ambiguous). Needs a
+    /// GTF-aware index. Kept out of `--outSAMattributes` so that STAR's
+    /// parameter keeps STAR's meaning.
+    #[arg(long = "outSAMsplicingStatus", default_value = "No")]
+    pub out_sam_splicing_status: String,
+
+    // ── DegNorm (rustar-aligner extension, not STAR) ────────────────────
+    /// `Yes` writes per-gene, per-exonic-base coverage to
+    /// `GeneCoverage.out.bin` for the DegNorm merge (`--degNormCoverageFiles`).
+    /// Uses the GeneCounts gene model and its unique-read rule.
+    #[arg(long = "quantGeneCoverage", default_value = "No")]
+    pub quant_gene_coverage: String,
+
+    /// Sample name recorded in `GeneCoverage.out.bin`
+    /// (`--quantGeneCoverage Yes`). Defaults to the basename of
+    /// `--outFileNamePrefix`.
+    #[arg(long = "degNormSampleId", default_value = "")]
+    pub deg_norm_sample_id: String,
+
+    /// `GeneCoverage.out.bin` files, one per sample. Giving them runs the
+    /// DegNorm merge instead of an alignment. At least two are required: a
+    /// degradation index is defined across samples, not within one.
+    #[arg(long = "degNormCoverageFiles", num_args = 0.., value_name = "FILE")]
+    pub deg_norm_coverage_files: Vec<PathBuf>,
+
+    /// Outer DegNorm iterations (DegNorm's `--iter`).
+    #[arg(long = "degNormIter", default_value_t = 5)]
+    pub deg_norm_iter: usize,
+
+    /// NMF-OA iterations per gene per outer iteration (DegNorm's `--nmf-iter`).
+    #[arg(long = "degNormNmfIter", default_value_t = 100)]
+    pub deg_norm_nmf_iter: usize,
+
+    /// Systematic "take every" downsample rate over transcript positions
+    /// (DegNorm's `--downsample-rate`); 1 = no downsampling.
+    #[arg(long = "degNormDownsampleRate", default_value_t = 1)]
+    pub deg_norm_downsample_rate: usize,
+
+    /// A gene enters the DegNorm fit only if its largest coverage over all
+    /// samples reaches this value (DegNorm's `--minimax-coverage`).
+    #[arg(long = "degNormMinimaxCoverage", default_value_t = 0)]
+    pub deg_norm_minimax_coverage: u32,
+
+    /// Skip baseline selection: faster, less accurate DI scores.
+    #[arg(long = "degNormSkipBaselineSelection", default_value_t = false)]
+    pub deg_norm_skip_baseline_selection: bool,
+
+    /// Number of bins used by baseline selection.
+    #[arg(long = "degNormBins", default_value_t = 20)]
+    pub deg_norm_bins: usize,
+
+    /// Minimum number of high-coverage transcript positions required before a
+    /// gene is sent through baseline selection.
+    #[arg(long = "degNormMinHighCoverage", default_value_t = 50)]
+    pub deg_norm_min_high_coverage: usize,
+
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
     #[arg(long = "twopassMode", default_value = "None")]
@@ -1635,6 +1730,7 @@ impl Parameters {
         if params.run_mode() == RunMode::AlignReads
             && params.read_files_in.is_empty()
             && params.solo_type != SoloType::SmartSeq
+            && params.deg_norm_coverage_files.is_empty()
         {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
@@ -1703,6 +1799,26 @@ impl Parameters {
                 return Err(command.error(
                     ErrorKind::MissingRequiredArgument,
                     "--sjdbGTFfile is required when --runMode liftOver",
+                ));
+            }
+        }
+
+        // --degNormCoverageFiles runs the DegNorm merge of per-sample
+        // GeneCoverage files instead of an alignment. A degradation index is
+        // defined across samples, so one file is never enough.
+        if !params.deg_norm_coverage_files.is_empty() {
+            if params.deg_norm_coverage_files.len() < 2 {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--degNormCoverageFiles needs at least 2 files (one per sample); \
+                     a degradation index is defined across samples, not within one",
+                ));
+            }
+            if params.run_mode() != RunMode::AlignReads || !params.read_files_in.is_empty() {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "--degNormCoverageFiles runs the DegNorm merge on its own; \
+                     it cannot be combined with --runMode or --readFilesIn",
                 ));
             }
         }
@@ -1794,9 +1910,10 @@ impl Parameters {
             ));
         }
 
-        // quantMode GeneCounts needs a gene model: --sjdbGTFfile here, or the
-        // annotation tables of a GTF-built index (checked when the index is
-        // loaded, as STAR's Transcriptome constructor does).
+        // quantMode GeneCounts (and --quantGeneCoverage) need a gene model:
+        // --sjdbGTFfile here, or the annotation tables of a GTF-built index
+        // (checked when the index is loaded, as STAR's Transcriptome
+        // constructor does).
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
@@ -1864,6 +1981,39 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
+            ));
+        }
+
+        for (flag, value) in [
+            ("--quantGeneSplicing", &params.quant_gene_splicing),
+            ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
+            ("--quantGeneCoverage", &params.quant_gene_coverage),
+        ] {
+            if !matches!(value.as_str(), "Yes" | "No") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("{flag} must be Yes or No, got '{value}'"),
+                ));
+            }
+        }
+
+        // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
+        if !matches!(
+            params.quant_transcriptome_unspliced_fasta.as_str(),
+            "Yes" | "No"
+        ) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--quantTranscriptomeUnsplicedFasta must be Yes or No",
+            ));
+        }
+        if params.quant_transcriptome_unspliced
+            != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None
+            && !params.quant_transcriptome_sam()
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
             ));
         }
 
@@ -2281,9 +2431,44 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "GeneCounts")
     }
 
+    /// Returns true if `--quantGeneCoverage Yes` (rustar-aligner extension:
+    /// per-gene exonic coverage for the DegNorm merge) was requested.
+    pub fn quant_gene_coverage(&self) -> bool {
+        self.quant_gene_coverage == "Yes"
+    }
+
+    /// Sample id recorded in `GeneCoverage.out.bin`: `--degNormSampleId` when
+    /// set, otherwise the basename of `--outFileNamePrefix`, otherwise
+    /// `sample`.
+    pub fn deg_norm_sample_id_or_default(&self) -> String {
+        if !self.deg_norm_sample_id.is_empty() {
+            return self.deg_norm_sample_id.clone();
+        }
+        let trimmed = self.out_file_name_prefix.trim_end_matches('/');
+        let base = trimmed.rsplit('/').next().unwrap_or("");
+        let base = base.trim_end_matches(['.', '_']);
+        if base.is_empty() {
+            "sample".to_string()
+        } else {
+            base.to_string()
+        }
+    }
+
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
+    /// bulk spliced / unspliced / ambiguous gene counts) was requested.
+    pub fn quant_gene_splicing(&self) -> bool {
+        self.quant_gene_splicing == "Yes"
+    }
+
+    /// Returns true if `--outSAMsplicingStatus Yes` (rustar-aligner extension:
+    /// `sp:A` splicing-status tag on genomic records) was requested.
+    pub fn out_sam_splicing_status(&self) -> bool {
+        self.out_sam_splicing_status == "Yes"
     }
 
     /// True when a single-cell run is requested (`--soloType` != None).
@@ -2390,6 +2575,81 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    #[test]
+    fn gene_coverage_is_its_own_flag() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantGeneCoverage", "Yes"]).unwrap();
+        assert!(p.quant_gene_coverage());
+        assert!(!p.quant_gene_counts());
+        assert!(
+            !try_parse(&["--readFilesIn", "r.fq"])
+                .unwrap()
+                .quant_gene_coverage()
+        );
+        // Not a value of STAR's --quantMode.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneCoverage"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneCoverage", "yes"]).is_err());
+    }
+
+    #[test]
+    fn deg_norm_sample_id_falls_back_to_output_prefix() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "sampleA");
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+            "--degNormSampleId",
+            "explicit",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "explicit");
+    }
+
+    #[test]
+    fn degnorm_merge_parses_and_validates() {
+        let p = try_parse(&["--degNormCoverageFiles", "a.bin", "b.bin"]).unwrap();
+        assert_eq!(p.deg_norm_coverage_files.len(), 2);
+        assert_eq!(p.deg_norm_iter, 5);
+        assert_eq!(p.deg_norm_nmf_iter, 100);
+        assert_eq!(p.deg_norm_bins, 20);
+        assert_eq!(p.deg_norm_min_high_coverage, 50);
+        assert_eq!(p.deg_norm_downsample_rate, 1);
+    }
+
+    #[test]
+    fn degnorm_merge_needs_two_files_and_no_other_run() {
+        assert!(try_parse(&["--degNormCoverageFiles", "a.bin"]).is_err());
+        assert!(
+            try_parse(&[
+                "--degNormCoverageFiles",
+                "a.bin",
+                "b.bin",
+                "--readFilesIn",
+                "r.fq"
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse(&[
+                "--degNormCoverageFiles",
+                "a.bin",
+                "b.bin",
+                "--runMode",
+                "genomeGenerate"
+            ])
+            .is_err()
+        );
+        // Not a value of STAR's --runMode.
+        assert!(try_parse(&["--runMode", "degNorm"]).is_err());
     }
 
     #[test]
@@ -3101,6 +3361,54 @@ mod tests {
         );
         assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
         assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).is_ok());
+    }
+
+    #[test]
+    fn splicing_status_tag_is_opt_in() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--outSAMattributes",
+            "All",
+        ])
+        .unwrap();
+        assert!(!p.out_sam_splicing_status());
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "Yes"]).unwrap();
+        assert!(p.out_sam_splicing_status());
+        assert!(p.out_sam_attributes.contains(SamAttributes::NH));
+        // Not a value of STAR's --outSAMattributes.
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMattributes",
+                "Standard",
+                "sp"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "yes"]).is_err());
+    }
+
+    #[test]
+    fn quant_gene_splicing_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
+        assert!(!p.quant_gene_splicing());
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantGeneSplicing",
+            "Yes",
+        ])
+        .unwrap();
+        assert!(p.quant_gene_splicing());
+        assert!(p.quant_transcriptome_sam());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneSplicing", "1"]).is_err());
     }
 
     #[test]
