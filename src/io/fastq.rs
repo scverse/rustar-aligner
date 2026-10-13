@@ -1,10 +1,9 @@
 /// FASTQ reader with base encoding and decompression support
 use crate::error::Error;
-use flate2::read::MultiGzDecoder;
 use noodles::fastq;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Writer for unmapped reads in FASTQ format (`--outReadsUnmapped Fastx`).
@@ -56,6 +55,9 @@ pub struct EncodedRead {
     /// FASTQ ASCII quality bytes (Phred+33 encoded) - subtract 33 before
     /// writing to BAM binary QUAL.
     pub quality: Vec<u8>,
+    /// Index of the `--readFilesIn` file this read came from (STAR
+    /// `readFilesIndex`); selects the read group.
+    pub file_index: u32,
 }
 
 /// A paired-end read from two FASTQ files
@@ -85,10 +87,29 @@ pub struct FastqReader {
     /// Characters that terminate a read name (`--readNameSeparator`). Empty
     /// means keep the whole name.
     name_separators: Vec<u8>,
+    /// Files still to read after the current one (several files per mate).
+    pending: std::collections::VecDeque<PathBuf>,
+    decompress_cmd: Option<String>,
+    /// Index of the file `inner` is reading.
+    file_index: u32,
 }
 
 impl FastqReader {
-    /// Open a FASTQ file (plain or gzip compressed)
+    /// Open a list of FASTQ files read one after another (STAR's comma-separated
+    /// `--readFilesIn` list for one mate), each through `decompress_cmd` if given.
+    pub fn open_files(paths: &[PathBuf], decompress_cmd: Option<&str>) -> Result<Self, Error> {
+        let (first, rest) = paths.split_first().ok_or_else(|| {
+            Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no read files given",
+            ))
+        })?;
+        let mut reader = Self::open(first, decompress_cmd)?;
+        reader.pending = rest.iter().cloned().collect();
+        Ok(reader)
+    }
+
+    /// Open a FASTQ file, plain or compressed (format detected by magic bytes)
     ///
     /// # Arguments
     /// * `path` - Path to FASTQ file
@@ -101,27 +122,14 @@ impl FastqReader {
             // Use external decompression command
             Self::open_with_command(path, cmd)?
         } else {
-            // Auto-detect compression by file extension
-            let path_str = path.to_string_lossy();
-            let is_gzipped = path_str.ends_with(".gz") || path_str.ends_with(".gzip");
-
+            // Detect compression from the magic bytes, not the file name, and
+            // stack the matching decoder (gzip always; bzip2/zstd/xz when their
+            // Cargo feature is on). See `io::compression`.
             let file = File::open(path).map_err(|e| Error::io(e, path))?;
-
-            // Larger-than-default (8 KiB) buffers cut read syscalls on the decode
-            // hot path. Feed the inflater from a big buffered file, and hand the
-            // decoded stream to noodles through a big BufReader.
-            const DECODE_BUF: usize = 1 << 19; // 512 KiB
-            if is_gzipped {
-                // Gzipped file
-                let buffered = BufReader::with_capacity(DECODE_BUF, file);
-                Box::new(BufReader::with_capacity(
-                    DECODE_BUF,
-                    MultiGzDecoder::new(buffered),
-                ))
-            } else {
-                // Plain text FASTQ
-                Box::new(BufReader::with_capacity(DECODE_BUF, file))
-            }
+            let (reader, format) =
+                crate::io::compression::open_decoded(file).map_err(|e| Error::io(e, path))?;
+            log::debug!("reading {} as {format} input", path.display());
+            reader
         };
 
         let fastq_reader = fastq::io::Reader::new(reader);
@@ -130,6 +138,9 @@ impl FastqReader {
             inner: fastq_reader,
             qual_shift: 0,
             name_separators: vec![b'/'],
+            pending: std::collections::VecDeque::new(),
+            decompress_cmd: decompress_cmd.map(str::to_owned),
+            file_index: 0,
         })
     }
 
@@ -171,6 +182,21 @@ impl FastqReader {
 
     /// Get next read with encoded bases
     pub fn next_encoded(&mut self) -> Result<Option<EncodedRead>, Error> {
+        loop {
+            if let Some(read) = self.next_in_current_file()? {
+                return Ok(Some(read));
+            }
+            // Current file exhausted: continue with the next one, if any.
+            let Some(next) = self.pending.pop_front() else {
+                return Ok(None);
+            };
+            let next_reader = Self::open(&next, self.decompress_cmd.as_deref())?;
+            self.inner = next_reader.inner;
+            self.file_index += 1;
+        }
+    }
+
+    fn next_in_current_file(&mut self) -> Result<Option<EncodedRead>, Error> {
         match self.inner.records().next() {
             Some(Ok(record)) => {
                 let name = std::str::from_utf8(record.name())
@@ -208,6 +234,7 @@ impl FastqReader {
                     name,
                     sequence,
                     quality,
+                    file_index: self.file_index,
                 }))
             }
             Some(Err(e)) => Err(Error::from(e)),
@@ -255,6 +282,18 @@ impl PairedFastqReader {
         let reader2 = FastqReader::open(path2, decompress_cmd)?;
 
         Ok(Self { reader1, reader2 })
+    }
+
+    /// Open the file lists of both mates (several comma-separated files per mate).
+    pub fn open_files(
+        paths1: &[PathBuf],
+        paths2: &[PathBuf],
+        decompress_cmd: Option<&str>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            reader1: FastqReader::open_files(paths1, decompress_cmd)?,
+            reader2: FastqReader::open_files(paths2, decompress_cmd)?,
+        })
     }
 
     /// Apply the read-input knobs to both mates. See
@@ -569,6 +608,75 @@ mod tests {
         assert_eq!(read1.quality.len(), 4);
     }
 
+    /// Write `bytes` to a temp file named `name_suffix`, open it with
+    /// `FastqReader`, and return every read name.
+    fn read_names_from(bytes: &[u8], name_suffix: &str) -> Vec<String> {
+        let mut tmpfile = tempfile::Builder::new()
+            .suffix(name_suffix)
+            .tempfile()
+            .unwrap();
+        tmpfile.write_all(bytes).unwrap();
+        tmpfile.flush().unwrap();
+        let mut reader = FastqReader::open(tmpfile.path(), None).unwrap();
+        let mut names = Vec::new();
+        while let Some(r) = reader.next_encoded().unwrap() {
+            names.push(r.name);
+        }
+        names
+    }
+
+    const TWO_READS: &[u8] = b"@read1\nACGT\n+\nIIII\n@read2\nTGCA\n+\nHHHH\n";
+
+    fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Compression is detected by content: the file name is irrelevant, and a
+    /// `.gz` made of several members (bcl2fastq, `cat a.gz b.gz`) is read whole.
+    #[test]
+    fn test_fastq_reader_detects_by_content_and_reads_all_gzip_members() {
+        let (a, b) = TWO_READS.split_at(19);
+        let mut multi = gzip_bytes(a);
+        multi.extend(gzip_bytes(b));
+        assert_eq!(read_names_from(&multi, ".fastq"), ["read1", "read2"]);
+        assert_eq!(read_names_from(&multi, ".fq.gz"), ["read1", "read2"]);
+        // A plain file with a misleading extension is still plain.
+        assert_eq!(read_names_from(TWO_READS, ".fq.gz"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "bz2")]
+    #[test]
+    fn test_fastq_reader_bzip2() {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(TWO_READS).unwrap();
+        let bytes = e.finish().unwrap();
+        assert_eq!(read_names_from(&bytes, ".fq.bz2"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_fastq_reader_zstd() {
+        let bytes = ruzstd::encoding::compress_to_vec(
+            TWO_READS,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        assert_eq!(read_names_from(&bytes, ".fq.zst"), ["read1", "read2"]);
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn test_fastq_reader_xz() {
+        let mut w =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6)).unwrap();
+        w.write_all(TWO_READS).unwrap();
+        let bytes = w.finish().unwrap();
+        assert_eq!(read_names_from(&bytes, ".fq.xz"), ["read1", "read2"]);
+    }
+
     /// A `.gz` written as several concatenated gzip members — what `bcl2fastq`
     /// emits, what `cat a.fq.gz b.fq.gz` produces, and what every BGZF file is.
     /// `flate2::read::GzDecoder` stops after the first member and reports EOF,
@@ -825,5 +933,24 @@ mod tests {
         // EOF batch
         let batch3 = reader.read_paired_batch(3).unwrap();
         assert_eq!(batch3.len(), 0);
+    }
+
+    #[test]
+    fn test_open_files_chains_files_and_tracks_index() {
+        let mut f1 = NamedTempFile::new().unwrap();
+        writeln!(f1, "@r1\nACGT\n+\nIIII").unwrap();
+        f1.flush().unwrap();
+        let mut f2 = NamedTempFile::new().unwrap();
+        writeln!(f2, "@r2\nTTTT\n+\nIIII\n@r3\nGGGG\n+\nIIII").unwrap();
+        f2.flush().unwrap();
+        let paths = vec![f1.path().to_path_buf(), f2.path().to_path_buf()];
+        let mut reader = FastqReader::open_files(&paths, None).unwrap();
+        let got: Vec<(String, u32)> = std::iter::from_fn(|| reader.next_encoded().unwrap())
+            .map(|r| (r.name, r.file_index))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("r1".into(), 0), ("r2".into(), 1), ("r3".into(), 1)]
+        );
     }
 }

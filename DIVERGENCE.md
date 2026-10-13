@@ -224,6 +224,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **Source.** `src/junction/gtf.rs` (`open_annotation`).
 
+### 4.5 Compressed FASTQ input detected by magic bytes
+
+**What STAR does.** Reads `--readFilesIn` as plain text unless `--readFilesCommand` names a decompressor (`zcat`, `bunzip2 -c`, ...), which STAR runs per file (`Parameters_openReadsFiles.cpp:21-70`). It does no detection of its own.
+
+**What rustar-aligner does.** Without `--readFilesCommand`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
+
+**Why.** Extension-based gzip detection was already a local convenience; content detection makes it independent of file names and covers stdin and pipes.
+
+**Impact.** Input STAR would reject (compressed data without `--readFilesCommand`) is accepted. No alignment output changes for input both accept.
+
+**Source.** `src/io/compression.rs`, called from `FastqReader::open` in `src/io/fastq.rs`.
+
 ## 5. Known residual single-read differences
 
 These are **not** deliberate divergences — they are tracked residual diffs on the 10k yeast benchmark, kept here for completeness. Each is a single read; none is a systematic behaviour difference.

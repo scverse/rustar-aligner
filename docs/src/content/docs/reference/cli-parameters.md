@@ -29,7 +29,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). |
+| `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). Several files per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`) and read in order; each mate must list the same number. Compression is detected from the file contents (gzip; bzip2/zstd/xz with the matching build features) unless `--readFilesCommand` is given. |
 | `--readFilesCommand` | — | Decompression command, e.g. `zcat` for `.gz`. |
 | `--readMapNumber` | `-1` | Number of reads to map (`-1` = all). |
 | `--clip5pNbases` | `0` | Bases to clip from the 5' end of each mate. |
@@ -51,7 +51,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 |-----------|---------|-------------|
 | `--outSAMstrandField` | `None` | `None` or `intronMotif`: adds the XS tag, from the junction strands of the whole alignment (both mates of a pair), and drops spliced alignments whose strand is undefined. Listing `XS` in `--outSAMattributes` turns it on, as in STAR. |
 | `--outSAMattributes` | `Standard` | Tags to include, written in the order given: `Standard` (`NH HI AS nM`), `All` (`NH HI AS nM NM MD jM jI MC ch`), `None`, or a list of `NH HI AS nM NM MD jM jI MC ch XS RG vA vG vW GX GN`. Derived tags follow the list: `RG` (read group), `XS` (`intronMotif`), `vW` (WASP), then `NM` (`--chimOutType WithinBAM`). `ch`, `vA`, `vG`, `vW`, `GX` and `GN` need BAM output, so `All` does too. Unmapped records always carry `NH HI AS nM uT` (then `RG`); the transcriptome BAM carries `NH HI` (then `RG`). |
-| `--outSAMattrRGline` | `-` | Read group line(s). Multiple blocks separated by a literal `,`. |
+| `--outSAMattrRGline` | `-` | Read group line(s). Multiple blocks separated by a literal `,`: one per `--readFilesIn` file, or a single one for all files. |
 | `--outSAMunmapped` | `None` | Unmapped reads in SAM: `None`, `Within`, or `Within KeepPairs`. |
 | `--outSAMmapqUnique` | `255` | MAPQ value for uniquely-mapping reads. |
 | `--outSAMmultNmax` | `-1` | Max alignments per read in SAM (`-1` = all up to `outFilterMultimapNmax`). |
