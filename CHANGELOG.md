@@ -48,6 +48,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **Two more STAR 2.7.11b parameters, with behaviour rather than
+  acceptance**: `--parametersFiles` (STAR-format parameter files, command
+  line wins, unknown name or empty value is fatal) and `--sysShell`,
+  alongside a `--readFilesCommand` fix: it now runs through a shell, for
+  every file of a comma-separated list, so multi-word commands such as
+  `gunzip -c` work instead of failing as a missing program.
 - **`--clipAdapterType CellRanger4` now matches STAR exactly**, both halves of the
   clip (#198). The 5' TSO trim is an overlap alignment against the first 91 bases of the
   read, replicating `ClipCR4`'s Opal call (ACGTN alphabet; match +1, mismatch -2,

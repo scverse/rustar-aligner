@@ -636,7 +636,8 @@ fn run_smartseq(
             counts.add(ci, g);
         }
     };
-    let cmd = params.read_files_command.as_deref();
+    let read_command = params.read_command();
+    let cmd = read_command.as_ref();
 
     for (ci, cell) in cells.iter().enumerate() {
         match &cell.read2 {
@@ -1770,8 +1771,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let read_files = params.mate_files(0);
     info!("Reading single-end from {}", join_paths(read_files));
 
-    let reader = FastqReader::open_files(read_files, params.read_files_command.as_deref())?
-        .with_params(params);
+    let reader =
+        FastqReader::open_files(read_files, params.read_command().as_ref())?.with_params(params);
 
     // Create chimeric output writer if enabled
     let chimeric_writer = if params.chim_segment_min > 0 && params.chim_out_junctions() {
@@ -3152,7 +3153,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let reader = PairedFastqReader::open_files(
         params.mate_files(0),
         params.mate_files(1),
-        params.read_files_command.as_deref(),
+        params.read_command().as_ref(),
     )?
     .with_params(params);
 

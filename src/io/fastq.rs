@@ -89,15 +89,87 @@ pub struct FastqReader {
     name_separators: Vec<u8>,
     /// Files still to read after the current one (several files per mate).
     pending: std::collections::VecDeque<PathBuf>,
-    decompress_cmd: Option<String>,
+    decompress_cmd: Option<ReadCommand>,
     /// Index of the file `inner` is reading.
     file_index: u32,
+}
+
+/// A `--readFilesCommand`, plus the shell it is run through (`--sysShell`).
+///
+/// STAR runs the command as `sysShell -c "<command> <file>"`, so a multi-word
+/// command such as `gunzip -c` works. Spawning the whole string as one program
+/// name does not: it fails with "no such file or directory" on the very
+/// commands STAR's own documentation gives as examples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadCommand {
+    /// The command line as written by the user, without the input file.
+    pub command: String,
+    /// Shell to run it through. `None` means run it directly, splitting the
+    /// command into words: the fallback where no POSIX shell is guaranteed.
+    pub shell: Option<String>,
+}
+
+impl ReadCommand {
+    /// Build from `--readFilesCommand` and `--sysShell`.
+    ///
+    /// `sys_shell` is STAR's `-` sentinel for "the platform default", which is
+    /// `/bin/sh` on Unix and no shell on Windows.
+    pub fn new(command: &str, sys_shell: &str) -> Self {
+        let shell = if sys_shell != "-" && !sys_shell.is_empty() {
+            Some(sys_shell.to_string())
+        } else if cfg!(unix) {
+            Some("/bin/sh".to_string())
+        } else {
+            None
+        };
+        ReadCommand {
+            command: command.to_string(),
+            shell,
+        }
+    }
+
+    /// The `Command` that streams `path` on stdout.
+    fn build(&self, path: &Path) -> Result<Command, Error> {
+        if let Some(shell) = &self.shell {
+            let quoted = shlex::try_quote(&path.to_string_lossy())
+                .map_err(|_| {
+                    Error::Parameter(format!(
+                        "input path contains a NUL byte and cannot be passed to \
+                         --readFilesCommand: {}",
+                        path.display()
+                    ))
+                })?
+                .into_owned();
+            let mut c = Command::new(shell);
+            c.arg("-c").arg(format!("{} {quoted}", self.command));
+            return Ok(c);
+        }
+
+        // No shell: split the command line into words ourselves so that a
+        // multi-word command still runs.
+        let mut words = shlex::split(&self.command).ok_or_else(|| {
+            Error::Parameter(format!(
+                "could not parse --readFilesCommand '{}' into words",
+                self.command
+            ))
+        })?;
+        if words.is_empty() {
+            return Err(Error::Parameter("--readFilesCommand is empty".to_string()));
+        }
+        let program = words.remove(0);
+        let mut c = Command::new(program);
+        c.args(words).arg(path);
+        Ok(c)
+    }
 }
 
 impl FastqReader {
     /// Open a list of FASTQ files read one after another (STAR's comma-separated
     /// `--readFilesIn` list for one mate), each through `decompress_cmd` if given.
-    pub fn open_files(paths: &[PathBuf], decompress_cmd: Option<&str>) -> Result<Self, Error> {
+    pub fn open_files(
+        paths: &[PathBuf],
+        decompress_cmd: Option<&ReadCommand>,
+    ) -> Result<Self, Error> {
         let (first, rest) = paths.split_first().ok_or_else(|| {
             Error::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -117,7 +189,7 @@ impl FastqReader {
     ///
     /// # Returns
     /// A FastqReader that iterates over encoded reads
-    pub fn open(path: &Path, decompress_cmd: Option<&str>) -> Result<Self, Error> {
+    pub fn open(path: &Path, decompress_cmd: Option<&ReadCommand>) -> Result<Self, Error> {
         let reader: Box<dyn BufRead + Send> = if let Some(cmd) = decompress_cmd {
             // Use external decompression command
             Self::open_with_command(path, cmd)?
@@ -139,7 +211,7 @@ impl FastqReader {
             qual_shift: 0,
             name_separators: vec![b'/'],
             pending: std::collections::VecDeque::new(),
-            decompress_cmd: decompress_cmd.map(str::to_owned),
+            decompress_cmd: decompress_cmd.cloned(),
             file_index: 0,
         })
     }
@@ -164,9 +236,9 @@ impl FastqReader {
     }
 
     /// Open FASTQ file using external decompression command
-    fn open_with_command(path: &Path, cmd: &str) -> Result<Box<dyn BufRead + Send>, Error> {
-        let mut child = Command::new(cmd)
-            .arg(path)
+    fn open_with_command(path: &Path, cmd: &ReadCommand) -> Result<Box<dyn BufRead + Send>, Error> {
+        let mut child = cmd
+            .build(path)?
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| Error::io(e, path))?;
@@ -190,7 +262,7 @@ impl FastqReader {
             let Some(next) = self.pending.pop_front() else {
                 return Ok(None);
             };
-            let next_reader = Self::open(&next, self.decompress_cmd.as_deref())?;
+            let next_reader = Self::open(&next, self.decompress_cmd.as_ref())?;
             self.inner = next_reader.inner;
             self.file_index += 1;
         }
@@ -277,7 +349,11 @@ impl PairedFastqReader {
     ///
     /// # Returns
     /// A PairedFastqReader that iterates over paired reads with name validation
-    pub fn open(path1: &Path, path2: &Path, decompress_cmd: Option<&str>) -> Result<Self, Error> {
+    pub fn open(
+        path1: &Path,
+        path2: &Path,
+        decompress_cmd: Option<&ReadCommand>,
+    ) -> Result<Self, Error> {
         let reader1 = FastqReader::open(path1, decompress_cmd)?;
         let reader2 = FastqReader::open(path2, decompress_cmd)?;
 
@@ -288,7 +364,7 @@ impl PairedFastqReader {
     pub fn open_files(
         paths1: &[PathBuf],
         paths2: &[PathBuf],
-        decompress_cmd: Option<&str>,
+        decompress_cmd: Option<&ReadCommand>,
     ) -> Result<Self, Error> {
         Ok(Self {
             reader1: FastqReader::open_files(paths1, decompress_cmd)?,
@@ -935,6 +1011,87 @@ mod tests {
         assert_eq!(batch3.len(), 0);
     }
 
+    // ── --readFilesCommand / --sysShell ──────────────────────────────────
+
+    fn write_gzipped_fastq(dir: &std::path::Path) -> std::path::PathBuf {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let path = dir.join("reads.fq.gz");
+        let f = std::fs::File::create(&path).unwrap();
+        let mut enc = GzEncoder::new(f, Compression::fast());
+        enc.write_all(b"@r1\nACGTACGTAC\n+\nIIIIIIIIII\n").unwrap();
+        enc.finish().unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_files_command_accepts_a_multi_word_command() {
+        // `gunzip -c` is the example STAR's own documentation gives. Spawning
+        // the whole string as one program name fails; running it through a
+        // shell is what STAR does.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_gzipped_fastq(dir.path());
+        let cmd = ReadCommand::new("gunzip -c", "-");
+        let mut reader = FastqReader::open(&path, Some(&cmd)).unwrap();
+        let record = reader.next_encoded().unwrap().expect("one record");
+        assert_eq!(record.name, "r1");
+        assert_eq!(record.sequence.len(), 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_files_command_runs_through_the_shell_sys_shell_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_gzipped_fastq(dir.path());
+        let cmd = ReadCommand::new("gunzip -c", "/bin/sh");
+        assert_eq!(cmd.shell.as_deref(), Some("/bin/sh"));
+        let mut reader = FastqReader::open(&path, Some(&cmd)).unwrap();
+        assert!(reader.next_encoded().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_files_command_handles_a_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("a directory with spaces");
+        std::fs::create_dir(&sub).unwrap();
+        let path = write_gzipped_fastq(&sub);
+        let cmd = ReadCommand::new("gunzip -c", "-");
+        let mut reader = FastqReader::open(&path, Some(&cmd)).unwrap();
+        assert!(
+            reader.next_encoded().unwrap().is_some(),
+            "the file path must be quoted when handed to the shell"
+        );
+    }
+
+    #[test]
+    fn read_files_command_without_a_shell_splits_the_command_itself() {
+        // The Windows path: no POSIX shell is guaranteed, so the command line
+        // is split into program plus arguments rather than handed to a shell.
+        let cmd = ReadCommand {
+            command: "gunzip -c".to_string(),
+            shell: None,
+        };
+        let built = cmd.build(std::path::Path::new("reads.fq.gz")).unwrap();
+        assert_eq!(built.get_program(), "gunzip");
+        let args: Vec<_> = built
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["-c".to_string(), "reads.fq.gz".to_string()]);
+    }
+
+    #[test]
+    fn sys_shell_default_is_platform_dependent() {
+        let cmd = ReadCommand::new("zcat", "-");
+        if cfg!(unix) {
+            assert_eq!(cmd.shell.as_deref(), Some("/bin/sh"));
+        } else {
+            assert_eq!(cmd.shell, None);
+        }
+    }
+
     #[test]
     fn test_open_files_chains_files_and_tracks_index() {
         let mut f1 = NamedTempFile::new().unwrap();
@@ -952,5 +1109,24 @@ mod tests {
             got,
             vec![("r1".into(), 0), ("r2".into(), 1), ("r3".into(), 1)]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_files_command_runs_on_every_file_of_a_list() {
+        // The command must follow the reader onto the second file, not only
+        // the first.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let paths = vec![
+            write_gzipped_fastq(dir1.path()),
+            write_gzipped_fastq(dir2.path()),
+        ];
+        let cmd = ReadCommand::new("gunzip -c", "-");
+        let mut reader = FastqReader::open_files(&paths, Some(&cmd)).unwrap();
+        let got: Vec<u32> = std::iter::from_fn(|| reader.next_encoded().unwrap())
+            .map(|r| r.file_index)
+            .collect();
+        assert_eq!(got, vec![0, 1]);
     }
 }

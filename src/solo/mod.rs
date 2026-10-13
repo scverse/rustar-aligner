@@ -412,7 +412,7 @@ impl SoloReadReader {
         cdna_path: &[PathBuf],
         barcode_path: &[PathBuf],
         layout: SoloBarcodeLayout,
-        decompress_cmd: Option<&str>,
+        decompress_cmd: Option<&crate::io::fastq::ReadCommand>,
     ) -> Result<Self, Error> {
         Ok(Self {
             cdna: FastqReader::open_files(cdna_path, decompress_cmd)?,
@@ -477,7 +477,7 @@ pub fn open_reader(params: &Parameters) -> Result<SoloReadReader, Error> {
         ))
     })?;
     let layout = SoloBarcodeLayout::from_params(params);
-    SoloReadReader::open(cdna, barcode, layout, params.read_files_command.as_deref())
+    SoloReadReader::open(cdna, barcode, layout, params.read_command().as_ref())
 }
 
 /// One paired-end solo read for `--soloBarcodeMate 1` (5' 10x): both mates carry
@@ -502,7 +502,7 @@ impl SoloPairedReader {
         mate1_path: &[PathBuf],
         mate2_path: &[PathBuf],
         layout: SoloBarcodeLayout,
-        decompress_cmd: Option<&str>,
+        decompress_cmd: Option<&crate::io::fastq::ReadCommand>,
     ) -> Result<Self, Error> {
         Ok(Self {
             mate1: FastqReader::open_files(mate1_path, decompress_cmd)?,
@@ -553,7 +553,7 @@ pub fn open_paired_reader(params: &Parameters) -> Result<SoloPairedReader, Error
         ))
     })?;
     let layout = SoloBarcodeLayout::from_params(params);
-    SoloPairedReader::open(mate1, mate2, layout, params.read_files_command.as_deref())
+    SoloPairedReader::open(mate1, mate2, layout, params.read_command().as_ref())
 }
 
 // ---------------------------------------------------------------------------
