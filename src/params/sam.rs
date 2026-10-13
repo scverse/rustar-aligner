@@ -4,56 +4,227 @@
 
 use std::str::FromStr;
 
-bitflags::bitflags! {
-    /// Optional SAM tags requested via `--outSAMattributes`.
-    ///
-    /// Each bit corresponds to one tag the writer may emit. `STANDARD` and
-    /// `ALL` are convenience aliases matching STAR's preset names.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct SamAttributes: u16 {
-        const NH = 1 << 0;
-        const HI = 1 << 1;
-        const AS = 1 << 2;
-        /// `NM:i` — SAM-standard edit distance (mismatches + inserted + deleted
-        /// bases). NOT in STAR's `Standard` preset; opt-in via `NM` / `All`.
-        const NM = 1 << 3;
-        const MD = 1 << 4;
-        const JM = 1 << 5;
-        const JI = 1 << 6;
-        const XS = 1 << 7;
-        const RG = 1 << 8;
-        /// STARsolo gene id of the read's Gene-feature assignment (GX:Z).
-        const GX = 1 << 9;
-        /// STARsolo gene name (symbol) of the Gene-feature assignment (GN:Z).
-        const GN = 1 << 10;
-        /// `nM:i` — STAR's mismatch count (mismatches only, excluding indels). This
-        /// is the tag in STAR's `Standard` preset (distinct from `NM`).
-        const NMM = 1 << 11;
-        /// WASP allele-specific-mapping tags (require --waspOutputMode SAMtag).
-        const VW = 1 << 12;
-        const VA = 1 << 13;
-        const VG = 1 << 14;
+/// One optional SAM tag requested via `--outSAMattributes`.
+///
+/// The discriminant is the bit position in [`SamAttributes`]'s presence mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SamAttr {
+    NH = 0,
+    HI = 1,
+    AS = 2,
+    /// `NM:i`: SAM-standard edit distance (mismatches + inserted + deleted
+    /// bases). NOT in STAR's `Standard` preset; opt-in via `NM` / `All`.
+    NM = 3,
+    MD = 4,
+    JM = 5,
+    JI = 6,
+    XS = 7,
+    RG = 8,
+    /// STARsolo gene id of the read's Gene-feature assignment (GX:Z).
+    GX = 9,
+    /// STARsolo gene name (symbol) of the Gene-feature assignment (GN:Z).
+    GN = 10,
+    /// `nM:i`: STAR's mismatch count (mismatches only, excluding indels). This
+    /// is the tag in STAR's `Standard` preset (distinct from `NM`).
+    NMM = 11,
+    /// WASP allele-specific-mapping tags (require --waspOutputMode SAMtag).
+    VW = 12,
+    VA = 13,
+    VG = 14,
+    /// `MC:Z`: the mate's CIGAR, on paired-end records with both mates aligned.
+    MC = 15,
+    /// `ch:A:1`: marks chimeric alignments in `--chimOutType WithinBAM` output
+    /// (BAM only).
+    CH = 16,
+}
 
-        // STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
-        const STANDARD =
-            Self::NH.bits() | Self::HI.bits() | Self::AS.bits()
-            | Self::NMM.bits();
-        // STAR `All` additionally includes the edit-distance NM, MD, jM, jI (+ XS here).
-        const ALL =
-            Self::STANDARD.bits()
-            | Self::NM.bits()
-            | Self::MD.bits() | Self::JM.bits() | Self::JI.bits() | Self::XS.bits();
+impl SamAttr {
+    /// The two-letter SAM tag.
+    pub const fn tag(self) -> [u8; 2] {
+        match self {
+            Self::NH => *b"NH",
+            Self::HI => *b"HI",
+            Self::AS => *b"AS",
+            Self::NM => *b"NM",
+            Self::MD => *b"MD",
+            Self::JM => *b"jM",
+            Self::JI => *b"jI",
+            Self::XS => *b"XS",
+            Self::RG => *b"RG",
+            Self::GX => *b"GX",
+            Self::GN => *b"GN",
+            Self::NMM => *b"nM",
+            Self::VW => *b"vW",
+            Self::VA => *b"vA",
+            Self::VG => *b"vG",
+            Self::MC => *b"MC",
+            Self::CH => *b"ch",
+        }
+    }
+}
+
+const MAX_ATTRS: usize = 17;
+
+/// Ordered set of optional SAM tags (`--outSAMattributes`).
+///
+/// STAR writes the optional tags in the order given on the command line
+/// (`outSAMattrOrder`, Parameters_samAttributes.cpp), with the derived tags
+/// (RG for `--outSAMattrRGline`, XS for `--outSAMstrandField intronMotif`, vW
+/// for WASP) appended after it. This type keeps both the presence mask (for
+/// `contains` checks) and that order (for the writers). `|` appends the
+/// right-hand attributes that are not yet present, in their order, which is
+/// how STAR's appends behave. `Copy`, so it is passed around like the former
+/// bitflags value; `PartialEq` compares the order too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamAttributes {
+    mask: u32,
+    len: u8,
+    order: [SamAttr; MAX_ATTRS],
+}
+
+impl Default for SamAttributes {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl SamAttributes {
+    pub const NH: Self = Self::of(&[SamAttr::NH]);
+    pub const HI: Self = Self::of(&[SamAttr::HI]);
+    pub const AS: Self = Self::of(&[SamAttr::AS]);
+    pub const NM: Self = Self::of(&[SamAttr::NM]);
+    pub const MD: Self = Self::of(&[SamAttr::MD]);
+    pub const JM: Self = Self::of(&[SamAttr::JM]);
+    pub const JI: Self = Self::of(&[SamAttr::JI]);
+    pub const XS: Self = Self::of(&[SamAttr::XS]);
+    pub const RG: Self = Self::of(&[SamAttr::RG]);
+    pub const GX: Self = Self::of(&[SamAttr::GX]);
+    pub const GN: Self = Self::of(&[SamAttr::GN]);
+    pub const NMM: Self = Self::of(&[SamAttr::NMM]);
+    pub const VW: Self = Self::of(&[SamAttr::VW]);
+    pub const VA: Self = Self::of(&[SamAttr::VA]);
+    pub const VG: Self = Self::of(&[SamAttr::VG]);
+    pub const MC: Self = Self::of(&[SamAttr::MC]);
+    pub const CH: Self = Self::of(&[SamAttr::CH]);
+
+    /// STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
+    pub const STANDARD: Self = Self::of(&[SamAttr::NH, SamAttr::HI, SamAttr::AS, SamAttr::NMM]);
+    /// STAR `All` = NH HI AS nM NM MD jM jI MC ch (ch needs BAM output),
+    /// followed here by XS, which the parameter fold keeps only under
+    /// `--outSAMstrandField intronMotif`.
+    pub const ALL: Self = Self::of(&[
+        SamAttr::NH,
+        SamAttr::HI,
+        SamAttr::AS,
+        SamAttr::NMM,
+        SamAttr::NM,
+        SamAttr::MD,
+        SamAttr::JM,
+        SamAttr::JI,
+        SamAttr::MC,
+        SamAttr::CH,
+        SamAttr::XS,
+    ]);
+
+    /// No attributes.
+    pub const fn empty() -> Self {
+        Self {
+            mask: 0,
+            len: 0,
+            order: [SamAttr::NH; MAX_ATTRS],
+        }
+    }
+
+    /// Build from an ordered list (duplicates dropped, first occurrence wins).
+    #[must_use]
+    pub const fn of(list: &[SamAttr]) -> Self {
+        let mut s = Self::empty();
+        let mut i = 0;
+        while i < list.len() {
+            s = s.with(list[i]);
+            i += 1;
+        }
+        s
+    }
+
+    /// Append one attribute if absent.
+    #[must_use]
+    pub const fn with(mut self, a: SamAttr) -> Self {
+        let bit = 1u32 << (a as u8);
+        if self.mask & bit == 0 {
+            self.mask |= bit;
+            self.order[self.len as usize] = a;
+            self.len += 1;
+        }
+        self
+    }
+
+    /// True when no attribute is present.
+    pub const fn is_empty(&self) -> bool {
+        self.mask == 0
+    }
+
+    /// True when every attribute of `other` is present (order ignored).
+    pub const fn contains(&self, other: Self) -> bool {
+        self.mask & other.mask == other.mask
+    }
+
+    /// True when at least one attribute of `other` is present.
+    pub const fn intersects(&self, other: Self) -> bool {
+        self.mask & other.mask != 0
+    }
+
+    /// The attributes in output order.
+    pub fn iter(&self) -> impl Iterator<Item = SamAttr> + '_ {
+        self.order[..self.len as usize].iter().copied()
+    }
+
+    /// Remove the attributes of `other`, keeping the order of the rest.
+    pub fn remove(&mut self, other: Self) {
+        let mut out = Self::empty();
+        for a in self.iter() {
+            if other.mask & (1u32 << (a as u8)) == 0 {
+                out = out.with(a);
+            }
+        }
+        *self = out;
+    }
+}
+
+impl std::ops::BitOr for SamAttributes {
+    type Output = Self;
+    fn bitor(mut self, rhs: Self) -> Self {
+        for a in rhs.iter() {
+            self = self.with(a);
+        }
+        self
+    }
+}
+
+impl std::ops::BitOrAssign for SamAttributes {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
+    }
+}
+
+impl std::ops::Sub for SamAttributes {
+    type Output = Self;
+    fn sub(mut self, rhs: Self) -> Self {
+        self.remove(rhs);
+        self
     }
 }
 
 impl FromStr for SamAttributes {
     type Err = String;
     /// Parse a single CLI token into a flag. `Standard`/`All`/`None` expand to
-    /// their preset sets; individual tag names map to a single bit.
+    /// their preset sets; individual tag names map to a single attribute.
     fn from_str(s: &str) -> Result<Self, String> {
         Ok(match s {
+            // STAR's `All` has no XS (it is appended later by intronMotif).
+            "All" => Self::ALL - Self::XS,
             "Standard" => Self::STANDARD,
-            "All" => Self::ALL,
             "None" => Self::empty(),
             "NH" => Self::NH,
             "HI" => Self::HI,
@@ -72,6 +243,8 @@ impl FromStr for SamAttributes {
             "vW" => Self::VW,
             "vA" => Self::VA,
             "vG" => Self::VG,
+            "MC" => Self::MC,
+            "ch" => Self::CH,
             other => return Err(format!("unknown --outSAMattributes token '{other}'")),
         })
     }
@@ -117,7 +290,7 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI XS RG vW vA vG.",
+                     NH HI AS NM nM MD jM jI MC ch XS RG vW vA vG.",
                 ),
         )
     }
@@ -140,29 +313,35 @@ pub enum OutSamFormat {
     None,
 }
 
-/// STAR's `--outSAMtype` sort order component (only applies to BAM).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutSamSortOrder {
-    Unsorted,
-    SortedByCoordinate,
-}
-
 /// Combined `--outSAMtype` value.
+///
+/// STAR accepts `BAM Unsorted`, `BAM SortedByCoordinate`, or both in either
+/// order (`outBAMunsorted` / `outBAMcoord` in Parameters.cpp), so the two BAM
+/// outputs are independent flags rather than one sort order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OutSamType {
     pub format: OutSamFormat,
-    pub sort_order: Option<OutSamSortOrder>,
+    /// `Aligned.out.bam` is requested (STAR `outBAMunsorted`).
+    pub bam_unsorted: bool,
+    /// `Aligned.sortedByCoord.out.bam` is requested (STAR `outBAMcoord`).
+    pub bam_sorted: bool,
 }
 
 impl std::fmt::Display for OutSamType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.format, &self.sort_order) {
-            (OutSamFormat::Sam, _) => write!(f, "SAM"),
-            (OutSamFormat::None, _) => write!(f, "None"),
-            (OutSamFormat::Bam, Some(OutSamSortOrder::SortedByCoordinate)) => {
-                write!(f, "BAM SortedByCoordinate")
+        match self.format {
+            OutSamFormat::Sam => write!(f, "SAM"),
+            OutSamFormat::None => write!(f, "None"),
+            OutSamFormat::Bam => {
+                write!(f, "BAM")?;
+                if self.bam_unsorted {
+                    write!(f, " Unsorted")?;
+                }
+                if self.bam_sorted {
+                    write!(f, " SortedByCoordinate")?;
+                }
+                Ok(())
             }
-            (OutSamFormat::Bam, _) => write!(f, "BAM Unsorted"),
         }
     }
 }
@@ -182,24 +361,34 @@ impl clap::FromArgMatches for OutSamType {
         *self = match tokens.as_slice() {
             ["SAM"] => Self {
                 format: OutSamFormat::Sam,
-                sort_order: None,
+                ..Self::default()
             },
             ["None"] => Self {
                 format: OutSamFormat::None,
-                sort_order: None,
+                ..Self::default()
             },
-            ["BAM", "Unsorted"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::Unsorted),
-            },
-            ["BAM", "SortedByCoordinate"] => Self {
-                format: OutSamFormat::Bam,
-                sort_order: Some(OutSamSortOrder::SortedByCoordinate),
-            },
+            ["BAM", rest @ ..]
+                if !rest.is_empty()
+                    && rest
+                        .iter()
+                        .all(|t| matches!(*t, "Unsorted" | "SortedByCoordinate")) =>
+            {
+                Self {
+                    format: OutSamFormat::Bam,
+                    bam_unsorted: rest.contains(&"Unsorted"),
+                    bam_sorted: rest.contains(&"SortedByCoordinate"),
+                }
+            }
             other => {
                 return Err(invalid_multi_arg(
                     other,
-                    &["SAM", "None", "BAM Unsorted", "BAM SortedByCoordinate"],
+                    &[
+                        "SAM",
+                        "None",
+                        "BAM Unsorted",
+                        "BAM SortedByCoordinate",
+                        "BAM Unsorted SortedByCoordinate",
+                    ],
                 ));
             }
         };
@@ -212,10 +401,10 @@ impl clap::Args for OutSamType {
         cmd.arg(
             clap::Arg::new("outSAMtype")
                 .long("outSAMtype")
-                .num_args(1..=2)
+                .num_args(1..=3)
                 .default_values(["SAM"])
                 .help(
-                    "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, None. \
+                    "Output type: SAM, BAM Unsorted, BAM SortedByCoordinate, BAM Unsorted SortedByCoordinate (both files), None. \
                      Provide as space-separated tokens, e.g. `--outSAMtype BAM SortedByCoordinate`.",
                 ),
         )

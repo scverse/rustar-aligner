@@ -24,7 +24,7 @@ fn parse_mem_bytes(s: &str) -> Result<u64, String> {
 
 mod sam;
 
-pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttributes};
+pub use sam::{OutSamFormat, OutSamType, OutSamUnmapped, SamAttr, SamAttributes};
 
 // ---------------------------------------------------------------------------
 // Run mode enum
@@ -526,7 +526,8 @@ pub struct Parameters {
     pub genome_transform_vcf: Option<PathBuf>,
 
     // ── Read files ──────────────────────────────────────────────────────
-    /// Input read file(s); second file is mate 2 for paired-end
+    /// Input read file(s); second file is mate 2 for paired-end. Several files
+    /// per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`).
     #[arg(long = "readFilesIn", num_args = 1..=2)]
     pub read_files_in: Vec<PathBuf>,
 
@@ -541,12 +542,6 @@ pub struct Parameters {
     /// default (`/bin/sh` on Unix). STAR's `sysShell`.
     #[arg(long = "sysShell", default_value = "-")]
     pub sys_shell: String,
-
-    /// Earliest genome index version this run accepts. A genome directory
-    /// written by an older STAR / rustar-aligner is rejected rather than read
-    /// with the wrong layout.
-    #[arg(long = "versionGenome", default_value = "2.7.4a")]
-    pub version_genome: String,
 
     /// Command to decompress input files (e.g. "zcat" for .gz)
     #[arg(long = "readFilesCommand")]
@@ -1131,6 +1126,13 @@ pub struct Parameters {
     #[arg(long = "sjdbOverhang", default_value_t = 100)]
     pub sjdb_overhang: u32,
 
+    /// What to save of the genome after junctions are inserted at mapping:
+    /// `Basic` (junction and annotation tables) or `All` (also Genome, SA,
+    /// SAindex), written to `<prefix>_STARgenome/`. As in STAR, any value other
+    /// than `All` behaves as `Basic` (`sjdbInsertJunctions.cpp:69`).
+    #[arg(long = "sjdbInsertSave", default_value = "Basic")]
+    pub sjdb_insert_save: String,
+
     /// Extra score for alignments crossing annotated junctions
     #[arg(long = "sjdbScore", default_value_t = 2)]
     pub sjdb_score: i32,
@@ -1150,6 +1152,101 @@ pub struct Parameters {
         default_value = "BanSingleEnd_BanIndels_ExtendSoftclip"
     )]
     pub quant_transcriptome_sam_output: crate::quant::transcriptome::QuantTranscriptomeSAMoutput,
+
+    /// rustar-aligner extension (not in STAR), for `--quantMode
+    /// TranscriptomeSAM` on total RNA-seq: add one unspliced target per gene,
+    /// named `<gene_id>-I`, after the annotated transcripts.
+    ///   * `None` (default): STAR behaviour, annotated transcripts only
+    ///   * `Intron`: the gene's merged annotated introns plus flanks
+    ///   * `PreMRNA`: the whole gene body
+    ///
+    /// Unspliced reads and pairs are projected onto every compatible target,
+    /// spliced and unspliced; fragments crossing a junction only onto
+    /// spliced ones.
+    #[arg(long = "quantTranscriptomeUnspliced", default_value = "None")]
+    pub quant_transcriptome_unspliced: crate::quant::transcriptome::QuantTranscriptomeUnspliced,
+
+    /// Flank (bases) added on each side of every merged intron for
+    /// `--quantTranscriptomeUnspliced Intron`; -1 (default) uses the index's
+    /// sjdbOverhang, i.e. read length - 1 by STAR's convention.
+    #[arg(
+        long = "quantTranscriptomeUnsplicedFlank",
+        default_value_t = -1,
+        allow_hyphen_values = true
+    )]
+    pub quant_transcriptome_unspliced_flank: i64,
+
+    /// rustar-aligner extension: `Yes` also writes the unspliced target
+    /// sequences to `Aligned.toTranscriptome.unspliced.fa` (Salmon's alignment
+    /// mode needs them next to the transcript FASTA). `No` by default, as
+    /// the file is of the order of the genome size.
+    #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
+    pub quant_transcriptome_unspliced_fasta: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` writes per-gene spliced /
+    /// unspliced / ambiguous counts for bulk data
+    /// (`ReadsPerGeneSplicing.out.tab` and `.summary.tsv`), using STARsolo's
+    /// spliced / unspliced rules. Needs a GTF-aware index.
+    #[arg(long = "quantGeneSplicing", default_value = "No")]
+    pub quant_gene_splicing: String,
+
+    /// rustar-aligner extension (not in STAR): `Yes` adds an `sp:A` tag to the
+    /// genomic SAM/BAM records with the alignment's splicing status against
+    /// the annotation (S spliced, U unspliced, A ambiguous). Needs a
+    /// GTF-aware index. Kept out of `--outSAMattributes` so that STAR's
+    /// parameter keeps STAR's meaning.
+    #[arg(long = "outSAMsplicingStatus", default_value = "No")]
+    pub out_sam_splicing_status: String,
+
+    // ── DegNorm (rustar-aligner extension, not STAR) ────────────────────
+    /// `Yes` writes per-gene, per-exonic-base coverage to
+    /// `GeneCoverage.out.bin` for the DegNorm merge (`--degNormCoverageFiles`).
+    /// Uses the GeneCounts gene model and its unique-read rule.
+    #[arg(long = "quantGeneCoverage", default_value = "No")]
+    pub quant_gene_coverage: String,
+
+    /// Sample name recorded in `GeneCoverage.out.bin`
+    /// (`--quantGeneCoverage Yes`). Defaults to the basename of
+    /// `--outFileNamePrefix`.
+    #[arg(long = "degNormSampleId", default_value = "")]
+    pub deg_norm_sample_id: String,
+
+    /// `GeneCoverage.out.bin` files, one per sample. Giving them runs the
+    /// DegNorm merge instead of an alignment. At least two are required: a
+    /// degradation index is defined across samples, not within one.
+    #[arg(long = "degNormCoverageFiles", num_args = 0.., value_name = "FILE")]
+    pub deg_norm_coverage_files: Vec<PathBuf>,
+
+    /// Outer DegNorm iterations (DegNorm's `--iter`).
+    #[arg(long = "degNormIter", default_value_t = 5)]
+    pub deg_norm_iter: usize,
+
+    /// NMF-OA iterations per gene per outer iteration (DegNorm's `--nmf-iter`).
+    #[arg(long = "degNormNmfIter", default_value_t = 100)]
+    pub deg_norm_nmf_iter: usize,
+
+    /// Systematic "take every" downsample rate over transcript positions
+    /// (DegNorm's `--downsample-rate`); 1 = no downsampling.
+    #[arg(long = "degNormDownsampleRate", default_value_t = 1)]
+    pub deg_norm_downsample_rate: usize,
+
+    /// A gene enters the DegNorm fit only if its largest coverage over all
+    /// samples reaches this value (DegNorm's `--minimax-coverage`).
+    #[arg(long = "degNormMinimaxCoverage", default_value_t = 0)]
+    pub deg_norm_minimax_coverage: u32,
+
+    /// Skip baseline selection: faster, less accurate DI scores.
+    #[arg(long = "degNormSkipBaselineSelection", default_value_t = false)]
+    pub deg_norm_skip_baseline_selection: bool,
+
+    /// Number of bins used by baseline selection.
+    #[arg(long = "degNormBins", default_value_t = 20)]
+    pub deg_norm_bins: usize,
+
+    /// Minimum number of high-coverage transcript positions required before a
+    /// gene is sent through baseline selection.
+    #[arg(long = "degNormMinHighCoverage", default_value_t = 50)]
+    pub deg_norm_min_high_coverage: usize,
 
     // ── Two-pass ────────────────────────────────────────────────────────
     /// Two-pass mode: None or Basic
@@ -1230,7 +1327,7 @@ pub struct Parameters {
     pub chim_score_junction_non_gtag: i32,
 
     /// Chimeric output type
-    #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
+    #[arg(long = "chimOutType", num_args = 1.., default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
     // ── STARsolo (single-cell) ──────────────────────────────────────────
@@ -1243,6 +1340,11 @@ pub struct Parameters {
     /// Multiple files are allowed for `CB_UMI_Complex` (one per CB segment).
     #[arg(long = "soloCBwhitelist", num_args = 1.., default_values_t = vec!["None".to_string()])]
     pub solo_cb_whitelist: Vec<String>,
+
+    /// How cell barcodes are represented: `Sequence` (2-bit packed ACGT, the
+    /// default).
+    #[arg(long = "soloCBtype", default_value = "Sequence")]
+    pub solo_cb_type: String,
 
     /// 1-based start position of the cell barcode in the barcode read.
     #[arg(long = "soloCBstart", default_value_t = 1)]
@@ -1277,6 +1379,17 @@ pub struct Parameters {
     /// STAR's shared-memory genome-loading modes are a no-op here.
     #[arg(long = "genomeLoad", default_value = "NoSharedMemory")]
     pub genome_load: String,
+
+    /// Adapter sequence that `--soloCBposition` / `--soloUMIposition` anchor
+    /// codes 2 and 3 are measured from. `-` (the default) means no adapter, so
+    /// only the read-start and read-end anchors are usable.
+    #[arg(long = "soloAdapterSequence", default_value = "-")]
+    pub solo_adapter_sequence: String,
+
+    /// Mismatches tolerated when locating `--soloAdapterSequence` in the
+    /// barcode read.
+    #[arg(long = "soloAdapterMismatchesNmax", default_value_t = 1)]
+    pub solo_adapter_mismatches_nmax: usize,
 
     /// `CB_UMI_Complex` cell-barcode segment positions, one per segment, as
     /// `startAnchor_startDist_endAnchor_endDist`. Only read-start anchoring
@@ -1328,6 +1441,14 @@ pub struct Parameters {
     #[arg(long = "soloMultiMappers", num_args = 1.., default_values_t = vec!["Unique".to_string()])]
     pub solo_multi_mappers: Vec<String>,
 
+    /// Third column of `features.tsv`. STAR's default is `Gene Expression`;
+    /// the sentinel `-` suppresses the column entirely.
+    #[arg(
+        long = "soloOutFormatFeaturesGeneField3",
+        default_value = "Gene Expression"
+    )]
+    pub solo_out_format_features_gene_field3: String,
+
     /// Output directory name for solo matrices (relative to `--outFileNamePrefix`).
     #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
     pub solo_out_file_names: Vec<String>,
@@ -1364,6 +1485,18 @@ pub struct Parameters {
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,
+
+    /// The command line as STAR records it (`Parameters.cpp`, `commandLine`):
+    /// the arguments joined by single spaces, a value argument containing
+    /// white space wrapped in double quotes. Written to the `@CO` header line.
+    #[arg(skip)]
+    pub star_command_line: Option<String>,
+
+    /// Per-mate list of read files after splitting each `--readFilesIn` entry on
+    /// commas and prepending `--readFilesPrefix` (STAR `readFilesNames`). Filled
+    /// by `parse_from`; all mates have the same number of files.
+    #[arg(skip)]
+    pub read_files_names: Vec<Vec<PathBuf>>,
 }
 
 impl Parameters {
@@ -1383,11 +1516,11 @@ impl Parameters {
     }
 
     /// Whether the run produces per-read alignment records (SAM/BAM). False only
-    /// for `--outSAMtype None` written to a file (no `--outStd`): the alignment
+    /// for `--outSAMtype None` (STAR writes nothing to `--outStd` then either): the alignment
     /// loops then skip building SAM records entirely, which is a large saving for
     /// solo / quant-only runs that only need the count matrix.
     pub fn emits_alignments(&self) -> bool {
-        !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
+        self.out_sam_type.format != OutSamFormat::None
     }
 
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
@@ -1398,6 +1531,79 @@ impl Parameters {
     /// Whether `--chimOutType` includes `WithinBAM` (write supplementary BAM records).
     pub fn chim_out_within_bam(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "WithinBAM")
+    }
+
+    /// `--chimOutType ... HardClip|SoftClip`: whether the supplementary chimeric
+    /// segment is hard-clipped. STAR reads the values in order, so the last of
+    /// the two wins; hard clipping is the default (`ParametersChimeric_initialize.cpp:10-30`).
+    pub fn chim_out_bam_hard_clip(&self) -> bool {
+        self.chim_out_type
+            .iter()
+            .rev()
+            .find_map(|s| match s.as_str() {
+                "HardClip" => Some(true),
+                "SoftClip" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(true)
+    }
+
+    /// Split each `--readFilesIn` entry on commas and prepend
+    /// `--readFilesPrefix` (`-` means none), as `Parameters_readFilesInit.cpp`:
+    /// a trailing comma is dropped and every mate must list the same number of
+    /// files.
+    pub fn build_read_files_names(&self) -> Result<Vec<Vec<PathBuf>>, String> {
+        let prefix = if self.read_files_prefix == "-" {
+            ""
+        } else {
+            self.read_files_prefix.as_str()
+        };
+        let mut names: Vec<Vec<PathBuf>> = Vec::with_capacity(self.read_files_in.len());
+        for (imate, entry) in self.read_files_in.iter().enumerate() {
+            let entry = entry.to_string_lossy();
+            let mut parts: Vec<&str> = entry.split(',').collect();
+            if parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+                parts.pop();
+            }
+            if let Some(prev) = names.last()
+                && prev.len() != parts.len()
+            {
+                // STAR's text, including its `imate-1` for the previous mate
+                // (`Parameters_readFilesInit.cpp`).
+                return Err(format!(
+                    "EXITING: because of fatal INPUT ERROR: number of input files for mate{}={} \
+                     is not equal to that for mate{}={}\n\
+                     Make sure that the number of files in --readFilesIn is the same for both mates",
+                    imate + 1,
+                    parts.len(),
+                    imate - 1,
+                    prev.len()
+                ));
+            }
+            names.push(
+                parts
+                    .iter()
+                    .map(|f| PathBuf::from(format!("{prefix}{f}")))
+                    .collect(),
+            );
+        }
+        Ok(names)
+    }
+
+    /// Number of read files per mate (STAR `readFilesN`); 0 when none given.
+    pub fn read_files_n(&self) -> usize {
+        self.read_files_names.first().map_or(0, Vec::len)
+    }
+
+    /// Files of mate `imate` (empty slice if absent).
+    pub fn mate_files(&self, imate: usize) -> &[PathBuf] {
+        self.read_files_names.get(imate).map_or(&[], Vec::as_slice)
+    }
+
+    /// Read group ID for each read file index (`outSAMattrRG`); empty without an
+    /// RG line.
+    pub fn rg_id_per_file(&self) -> Vec<String> {
+        self.rg_ids().unwrap_or_default()
     }
 
     /// True if the user provided a non-default `--outSAMattrRGline`.
@@ -1457,12 +1663,15 @@ impl Parameters {
                 first.trim_start_matches("ID:").to_string()
             })
             .collect();
-        let n_files = self.read_files_in.len().max(1);
+        let n_files = self.read_files_n().max(1);
         if ids.len() > 1 && ids.len() != n_files {
             return Err(crate::error::Error::Parameter(format!(
-                "--outSAMattrRGline: {} RG entries does not match --readFilesIn count {} (must be 1 or N)",
-                ids.len(),
-                n_files
+                "EXITING: because of fatal INPUT ERROR: number of input read files: {} does not \
+                 agree with number of read group RG entries: {}\n\
+                 Make sure that the number of RG lines in --outSAMattrRGline is equal to either 1, \
+                 or the number of input read files in --readFilesIn",
+                n_files,
+                ids.len()
             )));
         }
         if ids.len() == 1 {
@@ -1728,6 +1937,20 @@ impl Parameters {
         let matches = command.clone().get_matches_from(expanded.iter());
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
+        params.star_command_line = Some(
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let a = a.to_string_lossy();
+                    if i > 0 && !a.starts_with("--") && a.contains([' ', '\t']) {
+                        format!("\"{a}\"")
+                    } else {
+                        a.into_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         params.command_line = {
             let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
             shlex::try_join(args.iter().map(AsRef::as_ref)).ok()
@@ -1775,6 +1998,7 @@ impl Parameters {
         if params.run_mode() == RunMode::AlignReads
             && params.read_files_in.is_empty()
             && params.solo_type != SoloType::SmartSeq
+            && params.deg_norm_coverage_files.is_empty()
         {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
@@ -1847,6 +2071,26 @@ impl Parameters {
             }
         }
 
+        // --degNormCoverageFiles runs the DegNorm merge of per-sample
+        // GeneCoverage files instead of an alignment. A degradation index is
+        // defined across samples, so one file is never enough.
+        if !params.deg_norm_coverage_files.is_empty() {
+            if params.deg_norm_coverage_files.len() < 2 {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--degNormCoverageFiles needs at least 2 files (one per sample); \
+                     a degradation index is defined across samples, not within one",
+                ));
+            }
+            if params.run_mode() != RunMode::AlignReads || !params.read_files_in.is_empty() {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "--degNormCoverageFiles runs the DegNorm merge on its own; \
+                     it cannot be combined with --runMode or --readFilesIn",
+                ));
+            }
+        }
+
         // --outWigType at alignReads: only `bedGraph` (stranded, full-length) is
         // implemented. `wiggle`, `--outWigStrand Unstranded`, and the 2nd word
         // (`read1_5p`/`read2`) are STAR features of `--runMode
@@ -1882,6 +2126,40 @@ impl Parameters {
             }
         }
 
+        // --chimOutType (`ParametersChimeric_initialize.cpp`): unknown values are
+        // fatal. SeparateSAMold is a STAR value this build does not write, so it
+        // is refused rather than silently ignored.
+        if params.chim_segment_min > 0 {
+            for t in &params.chim_out_type {
+                match t.as_str() {
+                    "Junctions" | "WithinBAM" | "HardClip" | "SoftClip" => {}
+                    "SeparateSAMold" => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--chimOutType SeparateSAMold is not supported; use Junctions and/or WithinBAM",
+                        ));
+                    }
+                    other => {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "unknown --chimOutType value '{other}'; allowed: Junctions, \
+                                 WithinBAM, HardClip, SoftClip"
+                            ),
+                        ));
+                    }
+                }
+            }
+            if params.chim_out_within_bam() && params.out_sam_type.format != OutSamFormat::Bam {
+                // WithinBAM needs BAM output (`:76-81`).
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--chimOutType WithinBAM requires BAM output: use --outSAMtype BAM Unsorted \
+                     or SortedByCoordinate",
+                ));
+            }
+        }
+
         // Unknown --quantMode values are fatal, as in STAR
         // (`Parameters.cpp:898-936`: "unrecognized option in --quantMode"); a
         // leading "-" means none.
@@ -1900,12 +2178,55 @@ impl Parameters {
             ));
         }
 
-        // quantMode GeneCounts requires a GTF file
-        if params.quant_gene_counts() && params.sjdb_gtf_file.is_none() {
+        // quantMode GeneCounts (and --quantGeneCoverage) need a gene model:
+        // --sjdbGTFfile here, or the annotation tables of a GTF-built index
+        // (checked when the index is loaded, as STAR's Transcriptome
+        // constructor does).
+
+        // Split every --readFilesIn entry on commas (STAR `readFilesNames`) and
+        // prepend --readFilesPrefix to each file name (plain string concatenation,
+        // Parameters_readFilesInit.cpp).
+        match params.build_read_files_names() {
+            Ok(names) => params.read_files_names = names,
+            Err(e) => return Err(command.error(ErrorKind::InvalidValue, e)),
+        }
+
+        // --clipAdapterType, as `ParametersClip_initialize.cpp:11-30`.
+        if !matches!(params.clip_adapter_type.as_str(), "Hamming" | "CellRanger4") {
             return Err(command.error(
-                ErrorKind::MissingRequiredArgument,
-                "--quantMode GeneCounts requires --sjdbGTFfile",
+                ErrorKind::InvalidValue,
+                format!(
+                    "EXITING because of fatal PARAMETER error: --clipAdapterType = {} is not a \
+                     valid option\nSOLUTION: use valid --clipAdapterType options: Hamming OR \
+                     CellRanger4",
+                    params.clip_adapter_type
+                ),
             ));
+        }
+        if params.clip_adapter_type == "CellRanger4" {
+            if params.clip3p_adapter_seq != "-" {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "EXITING because of fatal PARAMETER error: --clipAdapterType CellRanger4 uses \
+                     fixed sequences for 3' polyA adapters.\nSOLUTION: Do not use \
+                     --clip5pAdapter* options.",
+                ));
+            }
+            // CellRanger4 sets one 5' adapter (the TSO), so STAR's per-mate count
+            // check fails for two mates (`ParametersClip_initialize.cpp:56-61`).
+            let read_nmates = if params.solo_enabled() {
+                if params.solo_barcode_mate == 1 { 2 } else { 1 }
+            } else {
+                params.read_files_in.len()
+            };
+            if read_nmates == 2 {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "EXITING because of fatal PARAMETER error: --clip5pAdapterSeq has to contain 2 \
+                     values to match the number of mates.\nSOLUTION: specify 2values in \
+                     --clip5pAdapterSeq , for no clipping use -",
+                ));
+            }
         }
 
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
@@ -1926,15 +2247,22 @@ impl Parameters {
         if params.rg_line_set() {
             params.out_sam_attributes |= SamAttributes::RG;
         }
-        // XS is only emitted in intronMotif mode (Parameters_samAttributes.cpp:172-179).
-        // intronMotif forces XS on; anything else strips XS even if explicitly listed.
-        if params.out_sam_strand_field == "intronMotif" {
+        // Parameters_samAttributes.cpp: an explicit XS turns on
+        // --outSAMstrandField intronMotif (which also drops spliced
+        // alignments with an undefined strand); intronMotif appends XS when it
+        // is not listed.
+        if params.out_sam_attributes.contains(SamAttributes::XS) {
+            if params.out_sam_strand_field != "intronMotif" {
+                log::info!(
+                    "--outSAMattributes contains XS, therefore rustar-aligner will use --outSAMstrandField intronMotif"
+                );
+                params.out_sam_strand_field = "intronMotif".into();
+            }
+        } else if params.out_sam_strand_field == "intronMotif" {
             log::info!(
                 "--outSAMstrandField=intronMotif, therefore rustar-aligner will output XS attribute"
             );
             params.out_sam_attributes |= SamAttributes::XS;
-        } else {
-            params.out_sam_attributes.remove(SamAttributes::XS);
         }
 
         // --alignEndsType: reject unknown/unimplemented values up front.
@@ -1970,13 +2298,37 @@ impl Parameters {
             ));
         }
 
-        // --readFilesPrefix is prepended to every input read path, so apply it
-        // here and let every consumer see the final paths.
-        if !params.read_files_prefix.is_empty() {
-            let prefix = std::path::Path::new(&params.read_files_prefix);
-            for rf in &mut params.read_files_in {
-                *rf = prefix.join(&*rf);
+        for (flag, value) in [
+            ("--quantGeneSplicing", &params.quant_gene_splicing),
+            ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
+            ("--quantGeneCoverage", &params.quant_gene_coverage),
+        ] {
+            if !matches!(value.as_str(), "Yes" | "No") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!("{flag} must be Yes or No, got '{value}'"),
+                ));
             }
+        }
+
+        // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
+        if !matches!(
+            params.quant_transcriptome_unspliced_fasta.as_str(),
+            "Yes" | "No"
+        ) {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                "--quantTranscriptomeUnsplicedFasta must be Yes or No",
+            ));
+        }
+        if params.quant_transcriptome_unspliced
+            != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None
+            && !params.quant_transcriptome_sam()
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
+            ));
         }
 
         // Validate --outSAMmode.
@@ -2056,6 +2408,19 @@ impl Parameters {
                     format!("unknown --chimFilter '{f}'; expected banGenomicN or None"),
                 ));
             }
+        }
+
+        // --soloCBtype: only 2-bit packed ACGT barcodes are supported. `String`
+        // needs a different whitelist representation entirely, so refuse rather
+        // than silently pack a non-ACGT barcode into nonsense.
+        if params.solo_cb_type != "Sequence" {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "--soloCBtype {} is not supported; expected Sequence",
+                    params.solo_cb_type
+                ),
+            ));
         }
 
         // ── STARsolo validation ─────────────────────────────────────────
@@ -2165,18 +2530,8 @@ impl Parameters {
                     ));
                 }
             }
-            // Gene-level features need a gene model (SJ does not — junctions come
-            // from the alignments).
-            let needs_gtf = params
-                .solo_features
-                .iter()
-                .any(|f| f == "Gene" || f == "GeneFull" || f == "Velocyto");
-            if needs_gtf && params.sjdb_gtf_file.is_none() {
-                return Err(command.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
-                ));
-            }
+            // Gene-level features need a gene model (SJ does not), from
+            // --sjdbGTFfile or the index tables; checked when the index is loaded.
             // CB length / UMI length sanity.
             if params.solo_type == SoloType::CbUmiSimple
                 && (params.solo_cb_len == 0 || params.solo_umi_len == 0)
@@ -2270,19 +2625,6 @@ impl Parameters {
                      per cluster of cells, since one cell has too few UMIs to resolve isoforms",
                 ));
             }
-            // Validate --clipAdapterType.
-            if !matches!(
-                params.clip_adapter_type.as_str(),
-                "Hamming" | "CellRanger4" | "None"
-            ) {
-                return Err(command.error(
-                    ErrorKind::InvalidValue,
-                    format!(
-                        "unknown --clipAdapterType '{}'; expected Hamming, CellRanger4, or None",
-                        params.clip_adapter_type
-                    ),
-                ));
-            }
             // Validate --soloStrand.
             if params
                 .solo_strand
@@ -2319,7 +2661,71 @@ impl Parameters {
                     "--waspOutputMode SAMtag requires --varVCFfile",
                 ));
             }
+            // `Parameters.cpp:882-887`.
+            if params.out_sam_type.format != OutSamFormat::Bam {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--waspOutputMode requires output to BAM file: re-run with \
+                     --outSAMtype BAM ...",
+                ));
+            }
             params.out_sam_attributes |= SamAttributes::VW;
+        }
+
+        // `Parameters_samAttributes.cpp:187-199`: vA/vG need the VCF, vW the WASP mode.
+        if params.var_vcf_file.is_none()
+            && params
+                .out_sam_attributes
+                .intersects(SamAttributes::VA | SamAttributes::VG)
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--outSAMattributes contains vA and/or vG tag(s), but --varVCFfile is not set",
+            ));
+        }
+        if params.wasp_output_mode != WaspOutputMode::SAMtag
+            && params.out_sam_attributes.contains(SamAttributes::VW)
+        {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--outSAMattributes contains vW tag, but --waspOutputMode is not set",
+            ));
+        }
+
+        // STAR's samAttrRequiresBAM (`Parameters_samAttributes.cpp:225-242,251-259`):
+        // these tags exist only in BAM output, checked in STAR's order.
+        if params.run_mode() == RunMode::AlignReads
+            && params.out_sam_type.format != OutSamFormat::Bam
+        {
+            for (attr, name) in [
+                (SamAttributes::CH, "ch"),
+                (SamAttributes::VG, "vG"),
+                (SamAttributes::VA, "vA"),
+                (SamAttributes::VW, "vW"),
+                (SamAttributes::GX, "GX"),
+                (SamAttributes::GN, "GN"),
+            ] {
+                if params.out_sam_attributes.contains(attr) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--outSAMattributes contains {name} tag, which requires BAM output. \
+                             Re-run with --outSAMtype BAM Unsorted (and/or SortedByCoordinate), \
+                             or without the {name} tag in --outSAMattributes"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // WithinBAM adds the NM attribute that the SA tag reads
+        // (`ParametersChimeric_initialize.cpp:99-102`). STAR does it in
+        // `pCh.initialize` (`STAR.cpp:188`), after RG, XS and vW are appended,
+        // so NM comes after them.
+        // With `--chimSegmentMin 0` the chimeric parameters are not read at all
+        // (`ParametersChimeric_initialize.cpp:13-14`).
+        if params.chim_segment_min > 0 && params.chim_out_within_bam() {
+            params.out_sam_attributes |= SamAttributes::NM;
         }
 
         Ok(params)
@@ -2341,9 +2747,44 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "GeneCounts")
     }
 
+    /// Returns true if `--quantGeneCoverage Yes` (rustar-aligner extension:
+    /// per-gene exonic coverage for the DegNorm merge) was requested.
+    pub fn quant_gene_coverage(&self) -> bool {
+        self.quant_gene_coverage == "Yes"
+    }
+
+    /// Sample id recorded in `GeneCoverage.out.bin`: `--degNormSampleId` when
+    /// set, otherwise the basename of `--outFileNamePrefix`, otherwise
+    /// `sample`.
+    pub fn deg_norm_sample_id_or_default(&self) -> String {
+        if !self.deg_norm_sample_id.is_empty() {
+            return self.deg_norm_sample_id.clone();
+        }
+        let trimmed = self.out_file_name_prefix.trim_end_matches('/');
+        let base = trimmed.rsplit('/').next().unwrap_or("");
+        let base = base.trim_end_matches(['.', '_']);
+        if base.is_empty() {
+            "sample".to_string()
+        } else {
+            base.to_string()
+        }
+    }
+
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
+    /// bulk spliced / unspliced / ambiguous gene counts) was requested.
+    pub fn quant_gene_splicing(&self) -> bool {
+        self.quant_gene_splicing == "Yes"
+    }
+
+    /// Returns true if `--outSAMsplicingStatus Yes` (rustar-aligner extension:
+    /// `sp:A` splicing-status tag on genomic records) was requested.
+    pub fn out_sam_splicing_status(&self) -> bool {
+        self.out_sam_splicing_status == "Yes"
     }
 
     /// True when a single-cell run is requested (`--soloType` != None).
@@ -2354,15 +2795,15 @@ impl Parameters {
     /// Path to the cDNA (transcript) read file. For solo runs this is the
     /// FIRST `--readFilesIn` file (STAR convention: `cDNA_read barcode_read`).
     /// Returns `None` if no read files are configured.
-    pub fn cdna_read_file(&self) -> Option<&PathBuf> {
-        self.read_files_in.first()
+    pub fn cdna_read_file(&self) -> Option<&[PathBuf]> {
+        self.read_files_names.first().map(Vec::as_slice)
     }
 
     /// Path to the barcode (CB+UMI) read file — the SECOND `--readFilesIn`
     /// file when solo is enabled. `None` if absent.
-    pub fn barcode_read_file(&self) -> Option<&PathBuf> {
+    pub fn barcode_read_file(&self) -> Option<&[PathBuf]> {
         if self.solo_enabled() {
-            self.read_files_in.get(1)
+            self.read_files_names.get(1).map(Vec::as_slice)
         } else {
             None
         }
@@ -2375,9 +2816,9 @@ impl Parameters {
     }
 
     /// The two cDNA mate files (mate 1, mate 2) for a `--soloBarcodeMate 1` run.
-    pub fn solo_cdna_mate_files(&self) -> Option<(&PathBuf, &PathBuf)> {
-        match (self.read_files_in.first(), self.read_files_in.get(1)) {
-            (Some(m1), Some(m2)) => Some((m1, m2)),
+    pub fn solo_cdna_mate_files(&self) -> Option<(&[PathBuf], &[PathBuf])> {
+        match (self.read_files_names.first(), self.read_files_names.get(1)) {
+            (Some(m1), Some(m2)) => Some((m1.as_slice(), m2.as_slice())),
             _ => None,
         }
     }
@@ -2559,6 +3000,169 @@ mod tests {
     }
 
     #[test]
+    fn gene_coverage_is_its_own_flag() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantGeneCoverage", "Yes"]).unwrap();
+        assert!(p.quant_gene_coverage());
+        assert!(!p.quant_gene_counts());
+        assert!(
+            !try_parse(&["--readFilesIn", "r.fq"])
+                .unwrap()
+                .quant_gene_coverage()
+        );
+        // Not a value of STAR's --quantMode.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "GeneCoverage"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneCoverage", "yes"]).is_err());
+    }
+
+    #[test]
+    fn deg_norm_sample_id_falls_back_to_output_prefix() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "sampleA");
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outFileNamePrefix",
+            "out/sampleA_",
+            "--degNormSampleId",
+            "explicit",
+        ])
+        .unwrap();
+        assert_eq!(p.deg_norm_sample_id_or_default(), "explicit");
+    }
+
+    /// `--clipAdapterType` as STAR (`ParametersClip_initialize.cpp`): only
+    /// Hamming and CellRanger4, and CellRanger4 neither with a 3' adapter nor
+    /// with two mates.
+    #[test]
+    fn clip_adapter_type_follows_star() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--clipAdapterType", "CellRanger4"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--clipAdapterType", "None"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--clipAdapterType",
+                "CellRanger4",
+                "--clip3pAdapterSeq",
+                "AAAA"
+            ])
+            .is_err()
+        );
+        let e = try_parse(&[
+            "--readFilesIn",
+            "r1.fq",
+            "r2.fq",
+            "--clipAdapterType",
+            "CellRanger4",
+        ])
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("--clip5pAdapterSeq has to contain 2 values")
+        );
+    }
+
+    #[test]
+    fn degnorm_merge_parses_and_validates() {
+        let p = try_parse(&["--degNormCoverageFiles", "a.bin", "b.bin"]).unwrap();
+        assert_eq!(p.deg_norm_coverage_files.len(), 2);
+        assert_eq!(p.deg_norm_iter, 5);
+        assert_eq!(p.deg_norm_nmf_iter, 100);
+        assert_eq!(p.deg_norm_bins, 20);
+        assert_eq!(p.deg_norm_min_high_coverage, 50);
+        assert_eq!(p.deg_norm_downsample_rate, 1);
+    }
+
+    #[test]
+    fn degnorm_merge_needs_two_files_and_no_other_run() {
+        assert!(try_parse(&["--degNormCoverageFiles", "a.bin"]).is_err());
+        assert!(
+            try_parse(&[
+                "--degNormCoverageFiles",
+                "a.bin",
+                "b.bin",
+                "--readFilesIn",
+                "r.fq"
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse(&[
+                "--degNormCoverageFiles",
+                "a.bin",
+                "b.bin",
+                "--runMode",
+                "genomeGenerate"
+            ])
+            .is_err()
+        );
+        // Not a value of STAR's --runMode.
+        assert!(try_parse(&["--runMode", "degNorm"]).is_err());
+    }
+
+    #[test]
+    fn read_files_comma_lists_and_prefix() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "a1.fq,b1.fq",
+            "a2.fq,b2.fq",
+            "--readFilesPrefix",
+            "dir_",
+        ])
+        .unwrap();
+        assert_eq!(p.read_files_n(), 2);
+        assert_eq!(
+            p.read_files_names,
+            vec![
+                vec![PathBuf::from("dir_a1.fq"), PathBuf::from("dir_b1.fq")],
+                vec![PathBuf::from("dir_a2.fq"), PathBuf::from("dir_b2.fq")],
+            ]
+        );
+        // Trailing comma is dropped.
+        let p = try_parse(&["--readFilesIn", "a.fq,b.fq,"]).unwrap();
+        assert_eq!(p.mate_files(0).len(), 2);
+    }
+
+    #[test]
+    fn read_files_mate_count_mismatch_is_error() {
+        let e = try_parse(&["--readFilesIn", "a1.fq,b1.fq", "a2.fq"]).unwrap_err();
+        assert!(e.to_string().contains("number of input files for mate2"));
+    }
+
+    #[test]
+    fn rg_line_count_must_match_file_count() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "a.fq,b.fq",
+            "--outSAMattrRGline",
+            "ID:x",
+            ",",
+            "ID:y",
+        ])
+        .unwrap();
+        assert_eq!(p.rg_ids().unwrap(), vec!["x", "y"]);
+        let p = try_parse(&["--readFilesIn", "a.fq,b.fq", "--outSAMattrRGline", "ID:x"]).unwrap();
+        assert_eq!(p.rg_ids().unwrap(), vec!["x", "x"]);
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "a.fq,b.fq,c.fq",
+                "--outSAMattrRGline",
+                "ID:x",
+                ",",
+                "ID:y",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn defaults() {
         let p = try_parse(&["--readFilesIn", "reads.fq"]).unwrap();
         assert_eq!(p.run_mode(), RunMode::AlignReads);
@@ -2704,10 +3308,7 @@ mod tests {
         assert_eq!(p.read_files_command, Some("zcat".to_string()));
         assert_eq!(p.run_thread_n, NonZeroUsize::new(16).unwrap());
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(
-            p.out_sam_type.sort_order,
-            Some(OutSamSortOrder::SortedByCoordinate)
-        );
+        assert!(p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
         assert_eq!(p.out_file_name_prefix, "/out/sample1_");
         assert_eq!(p.out_filter_multimap_nmax, 20);
         assert_eq!(p.align_intron_max, 1_000_000);
@@ -2879,11 +3480,30 @@ mod tests {
     fn out_sam_type_parsing() {
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Sam);
-        assert_eq!(p.out_sam_type.sort_order, None);
+        assert!(!p.out_sam_type.bam_sorted && !p.out_sam_type.bam_unsorted);
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Unsorted"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
-        assert_eq!(p.out_sam_type.sort_order, Some(OutSamSortOrder::Unsorted));
+        assert!(p.out_sam_type.bam_unsorted && !p.out_sam_type.bam_sorted);
+
+        for order in [
+            ["Unsorted", "SortedByCoordinate"],
+            ["SortedByCoordinate", "Unsorted"],
+        ] {
+            let p = try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMtype",
+                "BAM",
+                order[0],
+                order[1],
+            ])
+            .unwrap();
+            assert_eq!(p.out_sam_type.format, OutSamFormat::Bam);
+            assert!(p.out_sam_type.bam_unsorted && p.out_sam_type.bam_sorted);
+        }
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "BAM", "Bogus"]).is_err());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "SAM", "Unsorted"]).is_err());
 
         let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMtype", "None"]).unwrap();
         assert_eq!(p.out_sam_type.format, OutSamFormat::None);
@@ -2927,6 +3547,116 @@ mod tests {
     }
 
     #[test]
+    fn chim_out_type_follows_star() {
+        let base = ["--readFilesIn", "r.fq", "--chimSegmentMin", "12"];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        // WithinBAM needs BAM output, and adds NM.
+        assert!(with(&["--chimOutType", "WithinBAM"]).is_err());
+        let p = with(&[
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.out_sam_attributes.contains(SamAttributes::NM));
+        assert!(p.chim_out_bam_hard_clip());
+        // Three values, and the last of HardClip / SoftClip wins.
+        let p = with(&[
+            "--chimOutType",
+            "Junctions",
+            "WithinBAM",
+            "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
+        assert!(p.chim_out_junctions() && p.chim_out_within_bam());
+        assert!(!p.chim_out_bam_hard_clip());
+        // Unknown values, and the unimplemented SeparateSAMold, are errors.
+        assert!(with(&["--chimOutType", "Junction"]).is_err());
+        assert!(with(&["--chimOutType", "SeparateSAMold"]).is_err());
+        // Without chimeric detection the value is not checked, as in STAR.
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--chimOutType", "WithinBAM"]).is_ok());
+    }
+
+    #[test]
+    fn bam_only_tags_and_wasp_are_refused_with_sam_output() {
+        // STAR: `Parameters.cpp:882-887` (WASP), `Parameters_samAttributes.cpp:187-199`
+        // (vA/vG need the VCF, vW the WASP mode) and `:225-242` (BAM-only tags).
+        let err = |args: &[&str]| try_parse(args).unwrap_err().to_string();
+        let base = ["--readFilesIn", "r.fq"];
+        let with = |extra: &[&'static str]| -> Vec<&str> {
+            base.iter().copied().chain(extra.iter().copied()).collect()
+        };
+        assert!(
+            err(&with(&[
+                "--waspOutputMode",
+                "SAMtag",
+                "--varVCFfile",
+                "v.vcf"
+            ]))
+            .contains("requires output to BAM")
+        );
+        assert!(err(&with(&["--outSAMattributes", "NH", "vA"])).contains("--varVCFfile"));
+        assert!(err(&with(&["--outSAMattributes", "NH", "vW"])).contains("--waspOutputMode"));
+        assert!(err(&with(&["--outSAMattributes", "NH", "GX"])).contains("GX tag"));
+        assert!(
+            try_parse(&with(&[
+                "--outSAMattributes",
+                "NH",
+                "GX",
+                "--outSAMtype",
+                "BAM",
+                "Unsorted"
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn within_bam_nm_comes_after_rg_xs_and_vw() {
+        // STAR appends RG, XS and vW in samAttributes() and NM later, in
+        // pCh.initialize (`STAR.cpp:188`).
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--chimSegmentMin",
+            "12",
+            "--chimOutType",
+            "WithinBAM",
+            "--outSAMattrRGline",
+            "ID:g1",
+            "--outSAMstrandField",
+            "intronMotif",
+        ])
+        .unwrap();
+        let order: Vec<SamAttr> = p.out_sam_attributes.iter().collect();
+        assert_eq!(
+            order,
+            [
+                SamAttr::NH,
+                SamAttr::HI,
+                SamAttr::AS,
+                SamAttr::NMM,
+                SamAttr::RG,
+                SamAttr::XS,
+                SamAttr::NM
+            ]
+        );
+    }
+
+    #[test]
     fn chimeric_params() {
         let p = try_parse(&[
             "--readFilesIn",
@@ -2938,6 +3668,9 @@ mod tests {
             "--chimOutType",
             "WithinBAM",
             "SoftClip",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ])
         .unwrap();
         assert_eq!(p.chim_segment_min, 20);
@@ -3041,8 +3774,7 @@ mod tests {
     fn rg_line_multi() {
         let p = try_parse(&[
             "--readFilesIn",
-            "r1.fq",
-            "r2.fq",
+            "r1.fq,r2.fq",
             "--outSAMattrRGline",
             "ID:a",
             "SM:a",
@@ -3063,8 +3795,7 @@ mod tests {
     fn rg_line_single_replicates_for_multi_file() {
         let p = try_parse(&[
             "--readFilesIn",
-            "r1.fq",
-            "r2.fq",
+            "r1.fq,r2.fq",
             "--outSAMattrRGline",
             "ID:foo",
         ])
@@ -3094,7 +3825,9 @@ mod tests {
             "ID:b",
         ])
         .unwrap_err();
-        assert!(err.to_string().contains("does not match"));
+        assert!(err.to_string().contains(
+            "number of input read files: 1 does not agree with number of read group RG entries: 2"
+        ));
     }
 
     #[test]
@@ -3138,6 +3871,54 @@ mod tests {
         );
         assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "-"]).is_ok());
         assert!(try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).is_ok());
+    }
+
+    #[test]
+    fn splicing_status_tag_is_opt_in() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--outSAMattributes",
+            "All",
+        ])
+        .unwrap();
+        assert!(!p.out_sam_splicing_status());
+        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "Yes"]).unwrap();
+        assert!(p.out_sam_splicing_status());
+        assert!(p.out_sam_attributes.contains(SamAttributes::NH));
+        // Not a value of STAR's --outSAMattributes.
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--outSAMattributes",
+                "Standard",
+                "sp"
+            ])
+            .is_err()
+        );
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "yes"]).is_err());
+    }
+
+    #[test]
+    fn quant_gene_splicing_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
+        assert!(!p.quant_gene_splicing());
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantGeneSplicing",
+            "Yes",
+        ])
+        .unwrap();
+        assert!(p.quant_gene_splicing());
+        assert!(p.quant_transcriptome_sam());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneSplicing", "1"]).is_err());
     }
 
     #[test]
@@ -3421,9 +4202,8 @@ mod tests {
     }
 
     #[test]
-    fn xs_without_intron_motif_is_stripped() {
-        // Explicit XS in attrs without --outSAMstrandField intronMotif: XS gets stripped.
-        // Users must set both to get XS output.
+    fn xs_without_intron_motif_enables_intron_motif() {
+        // Explicit XS in attrs turns on intronMotif, as STAR.
         let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
@@ -3433,8 +4213,8 @@ mod tests {
             "XS",
         ])
         .unwrap();
-        assert_eq!(p.out_sam_strand_field, "None");
-        assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+        assert_eq!(p.out_sam_strand_field, "intronMotif");
+        assert!(p.out_sam_attributes.contains(SamAttributes::XS));
     }
 
     #[test]
@@ -3447,8 +4227,49 @@ mod tests {
     #[test]
     fn xs_stripped_from_all_preset_without_intron_motif() {
         // "All" includes XS but it is stripped unless intronMotif is also set.
-        let p = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "All"]).unwrap();
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ])
+        .unwrap();
         assert_eq!(p.out_sam_strand_field, "None");
         assert!(!p.out_sam_attributes.contains(SamAttributes::XS));
+    }
+
+    #[test]
+    fn solo_cb_type_string_is_refused_rather_than_mispacked() {
+        let base = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "10",
+        ];
+        let with = |extra: &[&str]| {
+            let mut a = base.to_vec();
+            a.extend_from_slice(extra);
+            try_parse(&a)
+        };
+        assert!(with(&["--soloCBtype", "Sequence"]).is_ok());
+        // `String` needs a whitelist representation this does not have; packing
+        // a non-ACGT barcode into 2 bits per base would produce nonsense.
+        assert!(with(&["--soloCBtype", "String"]).is_err());
     }
 }

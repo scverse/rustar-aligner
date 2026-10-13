@@ -1,3 +1,5 @@
+pub mod coverage;
+pub mod splice_status;
 /// Gene-level read quantification (`--quantMode GeneCounts`).
 ///
 /// Implements HTSeq-style "union" counting: a read counts toward a gene if any
@@ -19,6 +21,7 @@ use crate::align::transcript::Transcript;
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::junction::gtf::GtfRecord;
+use crate::quant::transcriptome::TranscriptomeIndex;
 
 // ---------------------------------------------------------------------------
 // GeneAnnotation — interval index for overlap queries
@@ -125,6 +128,67 @@ impl GeneAnnotation {
             }
         }
 
+        Self::assemble(gene_ids, gene_names, gene_is_reverse, chr_exons, &gene_span)
+    }
+
+    /// Build from the persisted annotation tables of a genome index (STAR's
+    /// `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`, already loaded as a
+    /// [`TranscriptomeIndex`]): the gene model STAR's `Transcriptome` constructor
+    /// reads from `--genomeDir` when no `--sjdbGTFfile` is given at mapping time.
+    /// Gene order is `geneInfo.tab` order, the gene strand is that of its first
+    /// transcript, and every transcript exon is a gene exon.
+    pub fn from_transcriptome(tr: &TranscriptomeIndex, genome: &Genome) -> Self {
+        let n_chrs = genome.n_chr_real;
+        let n_genes = tr.gene_ids.len();
+        let mut gene_is_reverse = vec![false; n_genes];
+        let mut gene_seen = vec![false; n_genes];
+        let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
+        let mut gene_span: Vec<Option<(usize, u64, u64)>> = vec![None; n_genes];
+
+        for t in 0..tr.n_transcripts() {
+            let g = tr.tr_gene_idx[t] as usize;
+            if g >= n_genes {
+                continue;
+            }
+            if !gene_seen[g] {
+                gene_seen[g] = true;
+                gene_is_reverse[g] = tr.tr_strand[t] == 2;
+            }
+            let chr_idx = tr.tr_chr_idx[t];
+            if chr_idx >= n_chrs {
+                continue;
+            }
+            for ex in &tr.tr_exons[t] {
+                chr_exons[chr_idx].push((ex.genome_start, ex.genome_end, g));
+                match &mut gene_span[g] {
+                    Some((_, s, e)) => {
+                        *s = (*s).min(ex.genome_start);
+                        *e = (*e).max(ex.genome_end);
+                    }
+                    slot @ None => *slot = Some((chr_idx, ex.genome_start, ex.genome_end)),
+                }
+            }
+        }
+
+        Self::assemble(
+            tr.gene_ids.clone(),
+            tr.gene_names.clone(),
+            gene_is_reverse,
+            chr_exons,
+            &gene_span,
+        )
+    }
+
+    /// Shared tail of the constructors: sort the per-chromosome exon lists and
+    /// derive the gene-body, merged-exon and max-end segment-tree structures.
+    fn assemble(
+        gene_ids: Vec<String>,
+        gene_names: Vec<String>,
+        gene_is_reverse: Vec<bool>,
+        mut chr_exons: Vec<Vec<(u64, u64, usize)>>,
+        gene_span: &[Option<(usize, u64, u64)>],
+    ) -> Self {
+        let n_chrs = chr_exons.len();
         for exons in &mut chr_exons {
             exons.sort_unstable_by_key(|&(s, e, _)| (s, e));
             exons.dedup();
@@ -541,27 +605,186 @@ impl GeneCounts {
 // QuantContext — top-level bundle (passed as Arc to alignment loops)
 // ---------------------------------------------------------------------------
 
-/// Bundles GeneAnnotation + GeneCounts for cheap Arc sharing across threads.
+/// STAR's `Transcriptome` constructor source choice: a GTF given at mapping time
+/// is always used; otherwise the gene model comes from the annotation tables in
+/// `--genomeDir` (built by `genomeGenerate --sjdbGTFfile`); with neither, STAR
+/// exits with the "could not open geneInfo.tab" error.
+pub fn resolve_gene_annotation(
+    params: &crate::params::Parameters,
+    genome: &Genome,
+    transcriptome: Option<&TranscriptomeIndex>,
+) -> Result<GeneAnnotation, Error> {
+    if let Some(gtf_path) = params.sjdb_gtf_file.as_ref() {
+        log::info!("gene model: building from {}", gtf_path.display());
+        let exons = crate::junction::gtf::parse_gtf_configured(
+            gtf_path,
+            &params.sjdb_gtf_feature_exon,
+            &params.sjdb_gtf_chr_prefix,
+        )?;
+        return Ok(GeneAnnotation::from_gtf_exons_configured(
+            &exons,
+            genome,
+            &params.sjdb_gtf_tag_exon_parent_gene,
+        ));
+    }
+    match transcriptome {
+        Some(tr) => {
+            log::info!(
+                "gene model: loaded from the genome index ({}/geneInfo.tab et al.)",
+                params.genome_dir.display()
+            );
+            Ok(GeneAnnotation::from_transcriptome(tr, genome))
+        }
+        // STAR's `ifstrOpen` message (`streamFuns.cpp:129-131`, `Transcriptome.cpp:18`).
+        None => Err(Error::Index(format!(
+            "exiting because of *INPUT FILE* error: could not open input file {}/geneInfo.tab\n\
+             Solution: check that the file exists and you have read permission for this file\n\
+             SOLUTION: utilize --sjdbGTFfile /path/to/annotations.gtf option at the genome \
+             generation step or mapping step",
+            params.genome_dir.display()
+        ))),
+    }
+}
+
+/// Bundles the per-read quantifications (`--quantMode GeneCounts`,
+/// `--quantGeneCoverage`, `--quantGeneSplicing`, `--outSAMsplicingStatus`) for
+/// cheap Arc sharing across threads.
 pub struct QuantContext {
+    /// `--quantMode GeneCounts` and/or `--quantGeneCoverage`: the gene model
+    /// and its counters.
+    pub gene: Option<GeneQuant>,
+    /// `--quantGeneSplicing Yes`: spliced / unspliced / ambiguous per gene.
+    pub splicing: Option<SplicingQuant>,
+    /// `--outSAMsplicingStatus Yes`: annotated transcripts for the per-alignment
+    /// splicing-status tag.
+    pub splice_tag: Option<std::sync::Arc<transcriptome::TranscriptomeIndex>>,
+}
+
+/// GeneAnnotation + GeneCounts (`ReadsPerGene.out.tab`), and the per-gene
+/// coverage of `--quantGeneCoverage Yes`, which uses the same gene model.
+pub struct GeneQuant {
     pub gene_ann: GeneAnnotation,
-    pub counts: GeneCounts,
+    /// `ReadsPerGene.out.tab` is written only for `--quantMode GeneCounts`.
+    pub counts: Option<GeneCounts>,
+    /// `--quantGeneCoverage Yes` (DegNorm's input; not a STAR feature).
+    pub coverage: Option<CoverageQuant>,
+}
+
+/// Coverage accumulator and the header fields of `GeneCoverage.out.bin`.
+pub struct CoverageQuant {
+    pub coverage: coverage::GeneCoverage,
+    pub sample_id: String,
+    pub paired: bool,
+}
+
+/// Transcript models + counters for `ReadsPerGeneSplicing.out.tab`.
+pub struct SplicingQuant {
+    pub transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>,
+    pub counts: splice_status::SplicingCounts,
+}
+
+impl GeneQuant {
+    /// Build the gene model and the requested counters. Call once before
+    /// alignment.
+    pub fn build(
+        params: &crate::params::Parameters,
+        genome: &Genome,
+        transcriptome: Option<&TranscriptomeIndex>,
+    ) -> Result<Self, Error> {
+        let gene_ann = resolve_gene_annotation(params, genome, transcriptome)?;
+        let n = gene_ann.n_genes();
+        log::info!("gene model: {n} genes loaded");
+        let counts = params.quant_gene_counts().then(|| GeneCounts::new(n));
+        let coverage = params.quant_gene_coverage().then(|| CoverageQuant {
+            coverage: coverage::GeneCoverage::new(&gene_ann),
+            sample_id: params.deg_norm_sample_id_or_default(),
+            paired: params.read_files_in.len() == 2 && !params.solo_enabled(),
+        });
+        Ok(GeneQuant {
+            gene_ann,
+            counts,
+            coverage,
+        })
+    }
+}
+
+impl SplicingQuant {
+    /// Counters over the genes of an already-loaded transcriptome index.
+    pub fn new(transcriptome: std::sync::Arc<transcriptome::TranscriptomeIndex>) -> Self {
+        let counts = splice_status::SplicingCounts::new(transcriptome.gene_ids.len());
+        SplicingQuant {
+            transcriptome,
+            counts,
+        }
+    }
 }
 
 impl QuantContext {
-    /// Build from a GTF file.  Call once before alignment.
-    pub fn build(
-        gtf_path: &Path,
-        genome: &Genome,
-        feature_exon: &str,
-        chr_prefix: &str,
-        gene_tag: &str,
-    ) -> Result<Self, Error> {
-        let exons = crate::junction::gtf::parse_gtf_configured(gtf_path, feature_exon, chr_prefix)?;
-        let gene_ann = GeneAnnotation::from_gtf_exons_configured(&exons, genome, gene_tag);
-        let n = gene_ann.n_genes();
-        log::info!("quantMode GeneCounts: {n} genes loaded from GTF");
-        let counts = GeneCounts::new(n);
-        Ok(QuantContext { gene_ann, counts })
+    /// Count a single-end read in every enabled quantification.
+    pub fn count_se_read(&self, transcripts: &[Transcript], n_for_mapq: usize) {
+        if let Some(g) = &self.gene {
+            if let Some(c) = &g.counts {
+                c.count_se_read(transcripts, n_for_mapq, &g.gene_ann);
+            }
+            if let Some(c) = &g.coverage {
+                c.coverage.count_se_read(transcripts, &g.gene_ann);
+            }
+        }
+        if let Some(v) = &self.splicing {
+            v.counts.count_se_read(transcripts, &v.transcriptome);
+        }
+    }
+
+    /// Count a read pair in every enabled quantification.
+    pub fn count_pe_read(
+        &self,
+        both_mapped: &[&PairedAlignment],
+        unmapped: bool,
+        half_mapped: bool,
+    ) {
+        if let Some(g) = &self.gene {
+            if let Some(c) = &g.counts {
+                c.count_pe_read(both_mapped, unmapped, half_mapped, &g.gene_ann);
+            }
+            if let Some(c) = &g.coverage {
+                c.coverage.count_pe_read(both_mapped, &g.gene_ann);
+            }
+        }
+        if let Some(v) = &self.splicing {
+            v.counts
+                .count_pe_read(both_mapped, unmapped, &v.transcriptome);
+        }
+    }
+
+    /// Write the output files of every enabled quantification; returns the
+    /// paths written.
+    pub fn write_outputs(
+        &self,
+        output_path: impl Fn(&str) -> std::path::PathBuf,
+    ) -> Result<Vec<std::path::PathBuf>, Error> {
+        let mut written = Vec::new();
+        if let Some(g) = &self.gene {
+            if let Some(c) = &g.counts {
+                let path = output_path("ReadsPerGene.out.tab");
+                c.write_output(&path, &g.gene_ann)?;
+                written.push(path);
+            }
+            if let Some(c) = &g.coverage {
+                let path = output_path("GeneCoverage.out.bin");
+                c.coverage
+                    .write_file(&path, &g.gene_ann, &c.sample_id, c.paired)?;
+                written.push(path);
+            }
+        }
+        if let Some(v) = &self.splicing {
+            let path = output_path("ReadsPerGeneSplicing.out.tab");
+            v.counts.write_table(&path, &v.transcriptome)?;
+            written.push(path);
+            let path = output_path("ReadsPerGeneSplicing.summary.tsv");
+            v.counts.write_summary(&path)?;
+            written.push(path);
+        }
+        Ok(written)
     }
 }
 
@@ -611,6 +834,7 @@ mod tests {
 
     fn make_transcript(chr_idx: usize, gs: u64, ge: u64, is_reverse: bool) -> Transcript {
         Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: gs,
             genome_end: ge,
@@ -629,6 +853,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         }
     }
 
@@ -732,6 +957,7 @@ mod tests {
                 continue;
             }
             let t = Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: t_exons[0].genome_start,
                 genome_end: t_exons.last().unwrap().genome_end,
@@ -744,6 +970,7 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             };
             assert_eq!(
                 ann.overlapping_genes(&t),
@@ -911,5 +1138,30 @@ mod tests {
         assert_eq!(counts.n_no_feature[1].load(Ordering::Relaxed), 1);
         // col3 (strand2 = opposite = +): G1 is on + → G1 counts
         assert_eq!(counts.strand2[0].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn from_transcriptome_matches_from_gtf() {
+        // The index-table gene model must count like the GTF-built one.
+        let genome = make_genome();
+        let mut exons = vec![
+            make_gtf_exon("chr1", 101, 200, '+', "G1"),
+            make_gtf_exon("chr1", 301, 400, '+', "G1"),
+            make_gtf_exon("chr1", 351, 450, '-', "G2"),
+            make_gtf_exon("chr2", 51, 150, '-', "G3"),
+        ];
+        for (e, t) in exons.iter_mut().zip(["T1", "T1", "T2", "T3"]) {
+            e.attributes
+                .insert("transcript_id".to_string(), t.to_string());
+        }
+        let from_gtf = GeneAnnotation::from_gtf_exons(&exons, &genome);
+        let tr = TranscriptomeIndex::from_gtf_exons(&exons, &genome).unwrap();
+        let from_tr = GeneAnnotation::from_transcriptome(&tr, &genome);
+
+        assert_eq!(from_tr.gene_ids, from_gtf.gene_ids);
+        assert_eq!(from_tr.gene_is_reverse, from_gtf.gene_is_reverse);
+        assert_eq!(from_tr.chr_exons, from_gtf.chr_exons);
+        assert_eq!(from_tr.chr_gene_body, from_gtf.chr_gene_body);
+        assert_eq!(from_tr.gene_exons, from_gtf.gene_exons);
     }
 }

@@ -20,11 +20,7 @@ impl GenomeIndex {
     /// Reads Genome, SA, and SAindex files from the specified directory.
     pub fn load(genome_dir: &Path, params: &Parameters) -> Result<Self, Error> {
         log::info!("Loading genome from {}...", genome_dir.display());
-
-        // Refuse an index older than --versionGenome before reading a byte of
-        // it: an older layout read with today's reader is silently wrong, not
-        // loudly wrong.
-        check_genome_version(genome_dir, &params.version_genome)?;
+        check_genome_version(genome_dir, params)?;
 
         // Load Genome file
         let genome = load_genome(genome_dir, params)?;
@@ -39,7 +35,8 @@ impl GenomeIndex {
         log::info!("Loaded suffix array: {} entries", suffix_array.len());
 
         // Load SAindex file
-        let sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        let mut sa_index = load_sa_index(genome_dir, suffix_array.gstrand_bit)?;
+        sa_index.sparse_d = read_genome_sa_sparse_d(genome_dir)?;
         log::info!(
             "Loaded SA index: nbases={}, {} indices",
             sa_index.nbases,
@@ -65,72 +62,34 @@ impl GenomeIndex {
             (Vec::new(), 0)
         };
 
-        // Build the annotated-junction database consulted at stitch time.
-        //   - If a GTF is supplied at align time, parse it (STAR's on-the-fly path).
-        //   - Otherwise fall back to the junctions stored in the index
-        //     (sjdbInfo.txt). Without this fallback, the standard workflow —
-        //     build the index once with `--sjdbGTFfile`, then align with only
-        //     `--genomeDir` — would treat every junction as novel (the runtime
-        //     db would be empty), losing all `sjdbScore` bonuses and annotated
-        //     junction recognition. Keyed on the stored (post-sjdbPrepare) donor/
-        //     acceptor coordinates, matching what the stitch scan produces.
-        let junction_db = if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            SpliceJunctionDb::from_gtf_configured(
-                gtf_path,
-                &genome,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-            )?
-        } else if !prepared_junctions.is_empty() {
-            let raw: Vec<(usize, u64, u64, u8)> = prepared_junctions
-                .iter()
-                .map(|j| (j.chr_idx, j.stored_start(), j.stored_end(), j.strand))
-                .collect();
-            log::info!(
-                "No GTF at align time; loaded {} annotated junctions from index sjdbInfo.txt",
-                raw.len()
-            );
-            SpliceJunctionDb::from_raw_junctions(&raw)
-        } else {
-            log::info!("No GTF file provided, all junctions will be novel");
+        // The annotated-junction database consulted at stitch time comes from
+        // the index's own junctions (sjdbInfo.txt). Without it the standard
+        // workflow (annotated index, `--genomeDir` only at mapping) would
+        // treat every junction as novel.
+        let junction_db = if prepared_junctions.is_empty() {
+            log::info!("No junctions in the index");
             SpliceJunctionDb::empty()
+        } else {
+            log::info!(
+                "Loaded {} annotated junctions from index sjdbInfo.txt",
+                prepared_junctions.len()
+            );
+            SpliceJunctionDb::from_prepared(&prepared_junctions)
         };
 
-        log::info!(
-            "Junction database loaded: {} annotated junctions",
-            junction_db.len()
-        );
-
-        // Prefer STAR-compatible transcriptInfo.tab / exonInfo.tab /
-        // geneInfo.tab over re-parsing the GTF at align time. If the files
-        // aren't present (legacy rustar-aligner index), fall back to on-the-fly
-        // construction from the GTF when one is supplied — this matches
-        // STAR's behavior in `sjdbInsertJunctions.cpp` (re-parse and regenerate).
-        let transcriptome = if genome_dir.join("transcriptInfo.tab").exists() {
+        // A GTF given at mapping is always the source of transcript info
+        // (`Transcriptome.cpp:13`), in STAR's transcript order; otherwise the
+        // index's tables are used.
+        let transcriptome = if let Some(ref gtf_path) = params.sjdb_gtf_file {
+            Some(TranscriptomeIndex::from_mapping_gtf(
+                params, gtf_path, &genome,
+            )?)
+        } else if genome_dir.join("transcriptInfo.tab").exists() {
             log::info!(
                 "Loading transcriptome index files from {}",
                 genome_dir.display()
             );
             Some(TranscriptomeIndex::from_index_dir(genome_dir, &genome)?)
-        } else if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            log::warn!(
-                "transcriptInfo.tab not found in {}; re-parsing GTF at align time",
-                genome_dir.display()
-            );
-            let exons = crate::junction::gtf::parse_gtf_configured(
-                gtf_path,
-                &params.sjdb_gtf_feature_exon,
-                &params.sjdb_gtf_chr_prefix,
-            )?;
-            Some(TranscriptomeIndex::from_gtf_exons_configured(
-                &exons,
-                &genome,
-                &params.sjdb_gtf_tag_exon_parent_transcript,
-                &params.sjdb_gtf_tag_exon_parent_gene,
-                &params.sjdb_gtf_tag_exon_parent_gene_name,
-                &params.sjdb_gtf_tag_exon_parent_gene_type,
-            )?)
         } else {
             None
         };
@@ -143,7 +102,7 @@ impl GenomeIndex {
             );
         }
 
-        Ok(GenomeIndex {
+        let mut index = GenomeIndex {
             genome,
             suffix_array,
             sa_index,
@@ -151,76 +110,43 @@ impl GenomeIndex {
             transcriptome,
             prepared_junctions,
             sjdb_overhang,
-        })
-    }
-}
+        };
 
-/// Parse a STAR genome version string (`2.7.4a`) into a comparable tuple:
-/// the numeric components, then the trailing letter suffix (`a` -> 1).
-///
-/// STAR compares these versions as strings, which orders `2.7.10a` before
-/// `2.7.4a`; comparing components avoids that trap.
-fn parse_genome_version(v: &str) -> Option<(Vec<u32>, u32)> {
-    let v = v.trim();
-    if v.is_empty() {
-        return None;
-    }
-    let digits_end = v.rfind(|c: char| c.is_ascii_digit()).map_or(0, |i| i + 1);
-    let (numeric, suffix) = v.split_at(digits_end);
-    let mut parts = Vec::new();
-    for p in numeric.split('.') {
-        parts.push(p.parse::<u32>().ok()?);
-    }
-    let suffix_rank = suffix.bytes().next().map_or(0, |b| {
-        u32::from(b.to_ascii_lowercase().saturating_sub(b'a')) + 1
-    });
-    Some((parts, suffix_rank))
-}
-
-/// Read `versionGenome` from `genomeParameters.txt`.
-fn read_genome_version(genome_dir: &Path) -> Result<Option<String>, Error> {
-    let path = genome_dir.join("genomeParameters.txt");
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::io(e, &path)),
-    };
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("versionGenome")
-            && let Some(value) = rest.split_whitespace().next()
-        {
-            return Ok(Some(value.to_string()));
+        // Annotation given at mapping: STAR inserts its junctions into the
+        // loaded genome (`sjdbInsertJunctions.cpp:38-44`, `sjdbInsert.pass1`),
+        // `--sjdbFileChrStartEnd` first (priority 10, `sjdbLoadFromFiles.cpp:19`),
+        // then the GTF (priority 20, `GTF_transcriptGeneSJ.cpp:173`).
+        if params.sjdb_gtf_file.is_some() || !params.sjdb_file_chr_start_end.is_empty() {
+            let mut prepared = Vec::new();
+            if !params.sjdb_file_chr_start_end.is_empty() {
+                let raw = crate::junction::chr_start_end::parse_sjdb_chr_start_end(
+                    &params.sjdb_file_chr_start_end,
+                    &index.genome,
+                )?;
+                prepared.extend(index.prepare_raw_junctions(&raw, 10));
+            }
+            if let Some(ref gtf_path) = params.sjdb_gtf_file {
+                let exons = crate::junction::gtf::parse_gtf_configured(
+                    gtf_path,
+                    &params.sjdb_gtf_feature_exon,
+                    &params.sjdb_gtf_chr_prefix,
+                )?;
+                let raw = crate::junction::gtf::extract_junctions_configured(
+                    exons,
+                    &index.genome,
+                    &params.sjdb_gtf_tag_exon_parent_transcript,
+                )?;
+                prepared.extend(index.prepare_raw_junctions(&raw, 20));
+            }
+            log::info!(
+                "Inserting {} junctions given at mapping into the genome",
+                prepared.len()
+            );
+            crate::index::sjdb_otf::insert_junctions(&mut index, prepared, params)?;
+            index.write_inserted_genome(params, params.sjdb_gtf_file.is_some())?;
         }
+        Ok(index)
     }
-    Ok(None)
-}
-
-/// Fail when the index on disk is older than `required` (`--versionGenome`).
-///
-/// An index with no recorded version, or a version neither side can parse, is
-/// accepted with a warning: refusing it would break directories that load
-/// correctly today, and the version line is advisory metadata, not a checksum.
-pub(crate) fn check_genome_version(genome_dir: &Path, required: &str) -> Result<(), Error> {
-    let Some(found) = read_genome_version(genome_dir)? else {
-        log::warn!(
-            "{} has no versionGenome line; skipping the version check",
-            genome_dir.join("genomeParameters.txt").display()
-        );
-        return Ok(());
-    };
-    let (Some(found_v), Some(required_v)) =
-        (parse_genome_version(&found), parse_genome_version(required))
-    else {
-        log::warn!("could not compare genome version '{found}' against '{required}'");
-        return Ok(());
-    };
-    if found_v < required_v {
-        return Err(Error::Index(format!(
-            "genome index in {} has versionGenome {found}, older than the required {required}.              Regenerate the index with --runMode genomeGenerate, or lower --versionGenome if              you know the layout is compatible",
-            genome_dir.display()
-        )));
-    }
-    Ok(())
 }
 
 /// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
@@ -243,6 +169,84 @@ fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
         }
     }
     Ok(None)
+}
+
+/// The `versionGenome` an index has to carry (STAR 2.7.11b's `versionGenome`
+/// default, `parametersDefault:2`).
+const VERSION_GENOME: &str = "2.7.4a";
+
+/// STAR's genome compatibility checks (`Genome_genomeLoad.cpp:70-101`): the
+/// index's `versionGenome` must be the one this STAR release writes, and an
+/// annotated index written before `sjdbInsertSave` existed cannot take junctions
+/// inserted at mapping time.
+fn check_genome_version(genome_dir: &Path, params: &Parameters) -> Result<(), Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = std::fs::read_to_string(&path).map_err(|_| {
+        Error::Index(format!(
+            "EXITING because of FATAL ERROR: could not open genome file {}\n\
+             SOLUTION: check that the path to genome files, specified in --genomeDir is \
+             correct and the files are present, and have user read permsissions",
+            path.display()
+        ))
+    })?;
+    let value = |key: &str| {
+        contents.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            (f.next() == Some(key)).then(|| f.next().unwrap_or("").to_string())
+        })
+    };
+    match value("versionGenome").filter(|v| !v.is_empty()) {
+        None => {
+            return Err(Error::Index(
+                "EXITING because of FATAL ERROR: read no value for the versionGenome parameter \
+                 from genomeParameters.txt file\n\
+                 SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                    .to_string(),
+            ));
+        }
+        Some(v) if v != VERSION_GENOME => {
+            return Err(Error::Index(format!(
+                "EXITING because of FATAL ERROR: Genome version: {v} is INCOMPATIBLE with \
+                 running STAR version: 2.7.11b\n\
+                 SOLUTION: please re-generate genome from scratch with running version of STAR, \
+                 or with version: {VERSION_GENOME}"
+            )));
+        }
+        Some(_) => log::info!("Genome version is compatible with current STAR"),
+    }
+    // `sjdbInsert.yes` (`Parameters.cpp:1002-1010`).
+    let sjdb_insert = params.sjdb_gtf_file.is_some()
+        || !params.sjdb_file_chr_start_end.is_empty()
+        || params.twopass_mode == crate::params::TwopassMode::Basic;
+    if sjdb_insert && genome_dir.join("sjdbInfo.txt").exists() && value("sjdbInsertSave").is_none()
+    {
+        return Err(Error::Index(
+            "EXITING because of FATAL ERROR: old Genome is INCOMPATIBLE with on the fly junction \
+             insertion\n\
+             SOLUTION: please re-generate genome from scratch with the latest version of STAR"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The suffix-array stride the index was built with (`genomeSAsparseD` in
+/// genomeParameters.txt), 1 when absent. The seed search needs it: with a
+/// sparse SA only every `D`-th position is a suffix, so STAR searches `D`
+/// shifted starts (`maxMappableLength2strands`, `iDist` loop).
+fn read_genome_sa_sparse_d(genome_dir: &Path) -> Result<u64, Error> {
+    let path = genome_dir.join("genomeParameters.txt");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(1),
+        Err(e) => return Err(Error::io(e, &path)),
+    };
+    Ok(contents
+        .lines()
+        .find_map(|line| line.strip_prefix("genomeSAsparseD\t"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1))
 }
 
 /// Load genome from disk.
@@ -423,6 +427,7 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
         data,
         word_length,
         gstrand_bit,
+        sparse_d: 1,
     })
 }
 
@@ -431,6 +436,36 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// STAR refuses an index written for another genome format version, and an
+    /// annotated index without `sjdbInsertSave` when junctions are inserted.
+    #[test]
+    fn rejects_incompatible_genome_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r.fq"]);
+        let gp = dir.path().join("genomeParameters.txt");
+        std::fs::write(&gp, "versionGenome\t2.7.1a\n").unwrap();
+        let err = check_genome_version(dir.path(), &params).unwrap_err();
+        assert!(err.to_string().contains("INCOMPATIBLE"), "{err}");
+        std::fs::write(&gp, "genomeType\tFull\n").unwrap();
+        let err = check_genome_version(dir.path(), &params).unwrap_err();
+        assert!(err.to_string().contains("read no value"), "{err}");
+        std::fs::write(&gp, "versionGenome\t2.7.4a\n").unwrap();
+        assert!(check_genome_version(dir.path(), &params).is_ok());
+
+        std::fs::write(dir.path().join("sjdbInfo.txt"), "0\t100\n").unwrap();
+        let two_pass = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--twopassMode",
+            "Basic",
+        ]);
+        let err = check_genome_version(dir.path(), &two_pass).unwrap_err();
+        assert!(err.to_string().contains("on the fly"), "{err}");
+        std::fs::write(&gp, "versionGenome\t2.7.4a\nsjdbInsertSave\tBasic\n").unwrap();
+        assert!(check_genome_version(dir.path(), &two_pass).is_ok());
+    }
 
     #[test]
     fn load_generated_index() {
@@ -475,57 +510,5 @@ mod tests {
         for i in 0..loaded_index.suffix_array.len().min(5) {
             assert_eq!(loaded_index.suffix_array.get(i), index.suffix_array.get(i));
         }
-    }
-
-    // ── --versionGenome ──────────────────────────────────────────────────
-
-    fn write_genome_params(dir: &std::path::Path, version_line: &str) {
-        std::fs::write(dir.join("genomeParameters.txt"), version_line).unwrap();
-    }
-
-    #[test]
-    fn version_genome_rejects_an_older_index() {
-        let dir = tempfile::tempdir().unwrap();
-        write_genome_params(dir.path(), "versionGenome\t2.7.1a\n");
-        let err = check_genome_version(dir.path(), "2.7.4a").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("2.7.1a"),
-            "error should quote the found version: {msg}"
-        );
-        assert!(
-            msg.contains("2.7.4a"),
-            "error should quote the required version: {msg}"
-        );
-    }
-
-    #[test]
-    fn version_genome_accepts_equal_and_newer_indices() {
-        let dir = tempfile::tempdir().unwrap();
-        write_genome_params(dir.path(), "versionGenome\t2.7.4a\n");
-        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
-
-        write_genome_params(dir.path(), "versionGenome\t2.7.10b\n");
-        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
-    }
-
-    #[test]
-    fn version_genome_orders_by_component_not_lexically() {
-        // A string comparison puts "2.7.10a" before "2.7.4a"; component
-        // comparison must not.
-        let older = parse_genome_version("2.7.4a").unwrap();
-        let newer = parse_genome_version("2.7.10a").unwrap();
-        assert!(newer > older, "2.7.10a must sort after 2.7.4a");
-        assert!(parse_genome_version("2.7.4b").unwrap() > older);
-    }
-
-    #[test]
-    fn version_genome_missing_line_is_accepted_with_a_warning() {
-        let dir = tempfile::tempdir().unwrap();
-        write_genome_params(dir.path(), "genomeType\tFull\n");
-        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
-        // No genomeParameters.txt at all is also accepted.
-        std::fs::remove_file(dir.path().join("genomeParameters.txt")).unwrap();
-        assert!(check_genome_version(dir.path(), "2.7.4a").is_ok());
     }
 }

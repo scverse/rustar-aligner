@@ -208,7 +208,7 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 
 - Single-end and paired-end alignment with mate rescue
 - Read-end alignment mode (`--alignEndsType Local` (default) / `EndToEnd` / `Extend5pOfRead1` / `Extend5pOfReads12` / `Extend3pOfRead1`)
-- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, or `BAM SortedByCoordinate`). The coordinate sort is external: it buffers up to `--limitBAMsortRAM`, spills sorted runs beside the output, and merges them, so peak memory is independent of output size
+- SAM, unsorted BAM, and coordinate-sorted BAM output (`--outSAMtype SAM`, `BAM Unsorted`, `BAM SortedByCoordinate`, or both BAM files). The coordinate sort is external: it buffers up to `--limitBAMsortRAM`, spills sorted runs beside the output, and merges them, so peak memory is independent of output size
 - Multi-threaded parallel alignment (`--runThreadN`)
 - GTF-based junction annotation with scoring bonus (`--sjdbGTFfile`)
 - Two-pass mode for novel junction discovery (`--twopassMode Basic`)
@@ -216,8 +216,10 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 - Chimeric alignment detection — SE and PE, 4-tier pipeline: transcript-pair search, multi-cluster, soft-clip re-seeding, residual outer re-seeding for multi-junction fusions (`--chimSegmentMin`)
 - Gene-level read counting (`--quantMode GeneCounts` → `ReadsPerGene.out.tab`)
 - Transcriptome-coordinate SAM output (`--quantMode TranscriptomeSAM`)
+- Transcript-degradation normalization, DegNorm-style (`--quantGeneCoverage Yes` during alignment, then `--degNormCoverageFiles` across samples) — per-gene Degradation Index scores and degradation-adjusted counts; not a STAR feature
+- Bulk total RNA-seq: unspliced `<gene_id>-I` targets in the transcriptome BAM (`--quantTranscriptomeUnspliced`), an `sp:A` splicing-status tag (`--outSAMsplicingStatus`) and spliced / unspliced gene counts (`--quantGeneSplicing`); not STAR features
 - **Single-cell quantification (STARsolo)** — `--soloType CB_UMI_Simple`, `CB_UMI_Complex` (multi-segment barcodes), and `SmartSeq` (plate-based, SE + PE); features `Gene`, `GeneFull` (pre-mRNA), `SJ`, and `Velocyto` (spliced/unspliced/ambiguous); barcode correction (`--soloCBmatchWLtype` Exact/1MM/1MM_multi/…), UMI dedup (`--soloUMIdedup` 1MM_All/1MM_CR/1MM_Directional/…), multi-gene UMI filtering, multi-mapper resolution (`--soloMultiMappers` Uniform/PropUnique/EM/Rescue), cell calling (`--soloCellFilter` CellRanger2.2/TopCells/EmptyDrops_CR), gzip output, and `Summary.csv` — writes STARsolo-compatible `Solo.out/<feature>/{raw,filtered}/{matrix.mtx, barcodes.tsv, features.tsv}`
-- WASP allele-specific-mapping filter (`--waspOutputMode SAMtag`, `--varVCFfile`) — vW/vA/vG tags, SE + PE
+- WASP allele-specific-mapping filter (`--waspOutputMode SAMtag`, `--varVCFfile`) — vW/vA/vG tags, SE + PE; BAM output only, as in STAR
 - Paired-end mate-overlap merging (`--peOverlapNbasesMin`, `--peOverlapMMp`)
 - Coverage-track output (`--outWigType bedGraph` → `Signal.{Unique,UniqueMultiple}.str{1,2}.out.bg`)
 - Adapter and fixed clipping (`--clip5pNbases`, `--clip3pNbases`, `--clip3pAdapterSeq`, `--clipAdapterType` including CellRanger4 TSO + poly-A) — clipped bases soft-clipped in SAM, matching STAR's convention

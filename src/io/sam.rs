@@ -7,7 +7,7 @@ use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
 use crate::params::{Parameters, SamAttributes};
-use crate::stats::UnmappedReason;
+use crate::stats::{BestTr, UnmappedReason};
 use bstr::BString;
 use noodles::sam;
 use noodles::sam::alignment::io::Write;
@@ -24,7 +24,7 @@ use noodles::sam::header::record::value::{
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write as _};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -34,48 +34,102 @@ use std::path::Path;
 /// only 1 to a few records (primary plus any secondaries), so it starts empty
 /// and grows on demand. There is no batch-level merge: the writer consumes
 /// each read's buffer in order.
-#[derive(Default)]
 pub struct BufferedSamRecords {
     pub records: Vec<RecordBuf>,
+    attrs: SamAttributes,
 }
 
 impl BufferedSamRecords {
-    /// Create an empty per-read buffer (no up-front allocation).
-    pub fn new() -> Self {
-        Self::default()
+    /// Create an empty per-read buffer (no up-front allocation). `attrs` is the
+    /// `--outSAMattributes` order that the buffered records' tags are put in.
+    pub fn new(attrs: SamAttributes) -> Self {
+        Self {
+            records: Vec::new(),
+            attrs,
+        }
     }
 
-    /// Add a record to the buffer
-    pub fn push(&mut self, record: RecordBuf) {
+    /// Add a finished record to the buffer, putting its optional tags in
+    /// `--outSAMattributes` order (all tag sources have run by this point).
+    pub fn push(&mut self, mut record: RecordBuf) {
+        order_record_tags(&mut record, &self.attrs);
         self.records.push(record);
     }
 }
 
-/// Insert STAR-compatible optional tags on unmapped records.
-///
-/// NH, HI, AS, nM are gated on `outSAMattributes`; `uT:A:` is always emitted
-/// (STAR emits it unconditionally so QC tools can parse unmapping categories).
-fn insert_unmapped_tags(record: &mut RecordBuf, attrs: SamAttributes, reason: UnmappedReason) {
+/// Put the optional tags of a mapped record in `--outSAMattributes` order, as
+/// STAR writes them (`outSAMattrOrder`, ReadAlign_outputTranscriptSAM.cpp and
+/// ReadAlign_alignBAM.cpp:290-480). The tag producers (alignment core, RG, WASP,
+/// STARsolo gene tags) run at different places, so the order is applied once,
+/// here, after all of them. Tags outside `attrs` follow the ordered ones in the
+/// order they were added: STAR appends them after its `outSAMattrOrder` loop
+/// (the WithinBAM `SA` tag, ChimericAlign_chimericBAMoutput.cpp:92-96).
+/// Unmapped records have STAR's fixed order and are skipped.
+pub fn order_record_tags(record: &mut RecordBuf, attrs: &SamAttributes) {
+    if record.flags().is_unmapped() {
+        return;
+    }
     let data = record.data_mut();
-    if attrs.contains(SamAttributes::NH) {
-        data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(0i32));
+    let n = data.len();
+    // `Data::remove` is a swap-remove, which would reorder the remaining tags:
+    // note the unlisted tags' order first, then move every field out.
+    let listed = |tag: &Tag| {
+        attrs
+            .iter()
+            .any(|a| Tag::new(a.tag()[0], a.tag()[1]) == *tag)
+    };
+    let unlisted: Vec<Tag> = data.keys().filter(|t| !listed(t)).collect();
+    let mut fields: Vec<(Tag, Value)> = Vec::with_capacity(n);
+    for attr in attrs.iter() {
+        let [a, b] = attr.tag();
+        fields.extend(data.remove(&Tag::new(a, b)));
     }
-    if attrs.contains(SamAttributes::HI) {
-        data.insert(Tag::HIT_INDEX, Value::from(0i32));
+    for tag in &unlisted {
+        fields.extend(data.remove(tag));
     }
-    if attrs.contains(SamAttributes::AS) {
-        data.insert(Tag::ALIGNMENT_SCORE, Value::from(0i32));
-    }
-    if attrs.contains(SamAttributes::NMM) {
-        data.insert(Tag::new(b'n', b'M'), Value::from(0i32));
-    }
+    data.extend(fields);
+}
+
+/// Insert STAR's optional tags on an unmapped record: always
+/// `NH:i:0 HI:i:0 AS:i nM:i uT:A` and then `RG:Z` when a read group is set, in
+/// that fixed order and regardless of `--outSAMattributes`
+/// (ReadAlign_outputTranscriptSAM.cpp unmapped branch, ReadAlign_alignBAM.cpp).
+/// `AS` and `nM` are the best transcript's (`trOut.maxScore`, `trOut.nMM`).
+fn insert_unmapped_tags(
+    record: &mut RecordBuf,
+    rg_id: Option<&str>,
+    reason: UnmappedReason,
+    best: BestTr,
+) {
+    // STAR writes MAPQ 0 on every unmapped record.
+    *record.mapping_quality_mut() = MappingQuality::new(0);
+    let data = record.data_mut();
+    data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(0i32));
+    data.insert(Tag::HIT_INDEX, Value::from(0i32));
+    data.insert(Tag::ALIGNMENT_SCORE, Value::from(best.score));
+    data.insert(Tag::new(b'n', b'M'), Value::from(best.n_mm as i32));
     let ut = match reason {
         UnmappedReason::Other => b'0',
         UnmappedReason::TooShort => b'1',
         UnmappedReason::TooManyMismatches => b'2',
         UnmappedReason::TooManyLoci => b'3',
+        UnmappedReason::HalfMapped => b'4',
     };
     data.insert(Tag::new(b'u', b'T'), Value::Character(ut));
+    maybe_insert_rg_tag(record, rg_id);
+}
+
+/// `MC:Z` on both records of a pair whose mates are both aligned: each carries
+/// the other's CIGAR, soft clips included (ReadAlign_calcCIGAR.cpp, used when
+/// `nMates>1` in ReadAlign_outputTranscriptSAM.cpp / ReadAlign_alignBAM.cpp).
+pub(crate) fn insert_mate_cigar_tags(rec1: &mut RecordBuf, rec2: &mut RecordBuf) {
+    let c1 = cigar_to_string(rec1.cigar().as_ref());
+    let c2 = cigar_to_string(rec2.cigar().as_ref());
+    let tag = Tag::new(b'M', b'C');
+    rec1.data_mut()
+        .insert(tag, Value::String(BString::from(c2)));
+    rec2.data_mut()
+        .insert(tag, Value::String(BString::from(c1)));
 }
 
 /// SAM file writer
@@ -98,7 +152,9 @@ impl SamWriter {
         let header = build_sam_header(genome, params)?;
         let mut writer = sam::io::Writer::new(buf_writer);
 
-        writer.write_header(&header)?;
+        writer
+            .get_mut()
+            .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
 
         Ok(Self { writer, header })
     }
@@ -144,7 +200,12 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`output_rank`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in output_order(transcripts, |t| t.output_rank)
+            .take(max_output)
+            .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -157,7 +218,9 @@ impl SamWriter {
                 params.out_sam_attr_ih_start,
                 attrs,
             )?;
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
+            order_record_tags(&mut record, &attrs);
             apply_sam_flag_or_and(&mut record, params);
             apply_primary_flag(&mut record, transcript.score, best_score, params);
 
@@ -208,12 +271,14 @@ impl SamWriter {
     /// * `read_qual` - Quality scores
     /// * `params` - Parameters (used for attribute gating and RG tag)
     /// * `unmapped_reason` - Why the read was not mapped (drives `uT:A:` tag)
+    /// * `best` - STAR's `trBest` score and mismatches (`AS`, `nM` tags)
     pub fn build_unmapped_record(
         read_name: &str,
         read_seq: &[u8],
         read_qual: &[u8],
         params: &Parameters,
         unmapped_reason: UnmappedReason,
+        best: BestTr,
     ) -> Result<RecordBuf, Error> {
         let mut record = RecordBuf::default();
 
@@ -231,8 +296,7 @@ impl SamWriter {
         *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
 
         let rg_id_owned = params.primary_rg_id()?;
-        maybe_insert_rg_tag(&mut record, rg_id_owned.as_deref());
-        insert_unmapped_tags(&mut record, params.out_sam_attributes, unmapped_reason);
+        insert_unmapped_tags(&mut record, rg_id_owned.as_deref(), unmapped_reason, best);
 
         Ok(record)
     }
@@ -286,7 +350,12 @@ impl SamWriter {
             .map(|t| t.score)
             .max()
             .unwrap_or(i32::MIN);
-        for (hit_index, transcript) in transcripts.iter().take(max_output).enumerate() {
+        // STAR writes the alignments in its output order (`output_rank`); the primary
+        // (`transcripts[0]`) is not necessarily the first.
+        for (hit_index, (is_primary, transcript)) in output_order(transcripts, |t| t.output_rank)
+            .take(max_output)
+            .enumerate()
+        {
             let mut record = transcript_to_record(
                 transcript,
                 read_name,
@@ -310,6 +379,7 @@ impl SamWriter {
                     transcript.is_reverse,
                 );
             }
+            set_secondary(&mut record, !is_primary);
             maybe_insert_rg_tag(&mut record, rg_id);
             apply_sam_flag_or_and(&mut record, params);
             apply_primary_flag(&mut record, transcript.score, best_score, params);
@@ -359,6 +429,7 @@ impl SamWriter {
                 mate2_qual,
                 params,
                 UnmappedReason::Other,
+                BestTr::default(),
             );
         }
 
@@ -381,7 +452,11 @@ impl SamWriter {
             .max()
             .unwrap_or(i32::MIN);
 
-        for (pair_idx, paired_aln) in paired_alignments.iter().take(max_output).enumerate() {
+        for (pair_idx, (is_primary, paired_aln)) in
+            output_order(paired_alignments, |p| p.output_rank)
+                .take(max_output)
+                .enumerate()
+        {
             let hit_index = pair_idx + 1; // 1-based
             // STAR reports the pre-split combined WT score (with length penalty) as AS.
             // This is stored as combined_wt_score, matching STAR's primaryScore.
@@ -413,10 +488,10 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec1, !is_primary);
             maybe_insert_rg_tag(&mut rec1, rg_id);
             apply_sam_flag_or_and(&mut rec1, params);
             apply_primary_flag(&mut rec1, combined_score, best_score, params);
-            records.push(rec1);
 
             // Create record for mate2 (this=mate2, mate=mate1)
             let mut rec2 = build_paired_mate_record(
@@ -444,9 +519,14 @@ impl SamWriter {
                 combined_score,
                 attrs,
             )?;
+            set_secondary(&mut rec2, !is_primary);
             maybe_insert_rg_tag(&mut rec2, rg_id);
             apply_sam_flag_or_and(&mut rec2, params);
             apply_primary_flag(&mut rec2, combined_score, best_score, params);
+            if attrs.contains(SamAttributes::MC) {
+                insert_mate_cigar_tags(&mut rec1, &mut rec2);
+            }
+            records.push(rec1);
             records.push(rec2);
         }
 
@@ -458,10 +538,10 @@ impl SamWriter {
     /// Returns 2 records: mate1 first, mate2 second (regardless of which is mapped).
     ///
     /// **Mapped mate:** Normal alignment with FLAG 0x8 (mate unmapped).
-    ///   RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate).
+    ///   RNEXT `*`, PNEXT 0, as STAR.
     ///
-    /// **Unmapped mate:** FLAG 0x4, co-located at mapped mate's position.
-    ///   SEQ/QUAL in forward orientation (no RC).
+    /// **Unmapped mate:** FLAG 0x4, uT:A:4, MAPQ 0, RNAME `*`, POS 0, RNEXT/PNEXT
+    ///   at the mapped mate. SEQ/QUAL in forward orientation (no RC).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn build_half_mapped_records(
@@ -535,12 +615,8 @@ impl SamWriter {
         *mapped_rec.mapping_quality_mut() = MappingQuality::new(mapq);
         *mapped_rec.cigar_mut() = mapped_transcript.cigar.iter().copied().collect();
 
-        // RNEXT = own chr, PNEXT = own pos (STAR convention for unmapped mate)
-        *mapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *mapped_rec.mate_alignment_start_mut() =
-            Some(mapped_pos.try_into().map_err(|e| {
-                Error::Alignment(format!("invalid mate position {mapped_pos}: {e}"))
-            })?);
+        // RNEXT `*`, PNEXT 0: STAR passes no mate to the mapped mate of a
+        // one-mate alignment (mateChr = -1, ReadAlign_outputTranscriptSAM.cpp).
         *mapped_rec.template_length_mut() = 0;
 
         // SEQ/QUAL (core from the aligned slice; apply_read_clips restores full read)
@@ -584,9 +660,11 @@ impl SamWriter {
         if attrs.contains(SamAttributes::NM) {
             data.insert(
                 Tag::EDIT_DISTANCE,
-                Value::from(sam_spec_nm(
-                    mapped_transcript.n_mismatch,
-                    &mapped_transcript.cigar,
+                Value::from(star_nm(
+                    mapped_transcript,
+                    aligned_mapped_seq,
+                    genome,
+                    mapped_transcript.is_reverse,
                 )),
             );
         }
@@ -595,15 +673,14 @@ impl SamWriter {
         {
             data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
         }
-        if attrs.contains(SamAttributes::JM)
-            && let Some(jm) = build_jm_tag(mapped_transcript)
-        {
-            data.insert(Tag::new(b'j', b'M'), jm);
+        if attrs.contains(SamAttributes::JM) {
+            data.insert(Tag::new(b'j', b'M'), build_jm_tag(mapped_transcript));
         }
-        if attrs.contains(SamAttributes::JI)
-            && let Some(ji) = build_ji_tag(mapped_transcript, chr_start)
-        {
-            data.insert(Tag::new(b'j', b'I'), ji);
+        if attrs.contains(SamAttributes::JI) {
+            data.insert(
+                Tag::new(b'j', b'I'),
+                build_ji_tag(mapped_transcript, chr_start),
+            );
         }
         if attrs.contains(SamAttributes::MD) {
             let md = build_md_tag(
@@ -649,15 +726,10 @@ impl SamWriter {
         }
         *unmapped_rec.flags_mut() = unmapped_flags;
 
-        // Co-locate unmapped mate at mapped mate's position
-        *unmapped_rec.reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
-        *unmapped_rec.alignment_start_mut() = Some(
-            mapped_pos
-                .try_into()
-                .map_err(|e| Error::Alignment(format!("invalid position {mapped_pos}: {e}")))?,
-        );
-        *unmapped_rec.mapping_quality_mut() = MappingQuality::new(0);
-        // CIGAR = * (default empty cigar)
+        // STAR leaves the unmapped mate without a position (RNAME `*`, POS 0)
+        // and points RNEXT/PNEXT at the mapped mate
+        // (ReadAlign_outputTranscriptSAM.cpp, ReadAlign_alignBAM.cpp).
+        // CIGAR = * (default empty cigar), MAPQ 0 (insert_unmapped_tags)
         // RNEXT = mapped mate's chr
         *unmapped_rec.mate_reference_sequence_id_mut() = Some(mapped_transcript.chr_idx);
         *unmapped_rec.mate_alignment_start_mut() =
@@ -671,8 +743,16 @@ impl SamWriter {
         *unmapped_rec.sequence_mut() = Sequence::from(unmapped_seq_bytes);
         *unmapped_rec.quality_scores_mut() =
             QualityScores::from(fastq_qual_to_phred(unmapped_qual));
-        maybe_insert_rg_tag(&mut unmapped_rec, rg_id);
-        insert_unmapped_tags(&mut unmapped_rec, attrs, UnmappedReason::Other);
+        // uT:4 (one-mate alignment of a paired read), AS/nM of trBest (the mapped mate).
+        insert_unmapped_tags(
+            &mut unmapped_rec,
+            rg_id,
+            UnmappedReason::HalfMapped,
+            BestTr {
+                score: mapped_transcript.score,
+                n_mm: mapped_transcript.n_mismatch,
+            },
+        );
 
         // Order: mate1 first, mate2 second
         if mate1_is_mapped {
@@ -695,8 +775,8 @@ impl SamWriter {
     ///     t-space_pos + 1),
     ///   * splice-aware tags (`jM`, `jI`, `XS`) are not emitted (splices
     ///     collapse in t-space and have no meaning there),
-    ///   * standard tags (`NH`, `HI`, `AS`, `NM`/`nM`, `MD`) are emitted per
-    ///     the `--outSAMattributes` set.
+    ///   * the tags are STAR's quantification set `NH HI` (+ `RG`), whatever
+    ///     `--outSAMattributes` says (outSAMattrOrderQuant).
     ///
     /// `primary_hit_idx` (0-based) is the projected alignment selected as
     /// primary (randomly among ties per STAR's `rngUniformReal0to1`).  All
@@ -714,12 +794,6 @@ impl SamWriter {
         if projected.is_empty() {
             return Ok(Vec::new());
         }
-        // Splice tags are meaningless in t-space; MD would require the
-        // transcript's t-space reference which we do not precompute, and
-        // STAR also does not emit MD for transcriptome SAM.
-        let attrs = params.out_sam_attributes
-            - (SamAttributes::JM | SamAttributes::JI | SamAttributes::XS | SamAttributes::MD);
-
         let n_alignments = projected.len();
         let mut records = Vec::with_capacity(n_alignments);
 
@@ -776,32 +850,18 @@ impl SamWriter {
                 *record.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(read_qual));
             }
 
-            // Optional tags
+            // Optional tags: STAR's quantification order (outSAMattrOrderQuant) is
+            // NH HI, then RG when a read group is set, regardless of
+            // --outSAMattributes (Parameters_samAttributes.cpp). AS, nM, NM and
+            // the splice tags are not written.
             let data = record.data_mut();
-            if attrs.contains(SamAttributes::NH) {
-                data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
-            }
-            if attrs.contains(SamAttributes::HI) {
-                // HI defaults to 1-based (primary = 1, secondaries > 1 in emission order);
-                // `--outSAMattrIHstart` shifts the whole sequence (0 = CellRanger convention).
-                data.insert(
-                    Tag::HIT_INDEX,
-                    Value::from(hit_idx as i32 + params.out_sam_attr_ih_start as i32),
-                );
-            }
-            if attrs.contains(SamAttributes::AS) {
-                data.insert(Tag::ALIGNMENT_SCORE, Value::from(t.score));
-            }
-            if attrs.contains(SamAttributes::NMM) {
-                data.insert(Tag::new(b'n', b'M'), Value::from(t.n_mismatch as i32));
-            }
-            if attrs.contains(SamAttributes::NM) {
-                data.insert(
-                    Tag::EDIT_DISTANCE,
-                    Value::from(sam_spec_nm(t.n_mismatch, &t.cigar)),
-                );
-            }
-
+            data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
+            // HI defaults to 1-based (primary = 1, secondaries > 1 in emission order);
+            // `--outSAMattrIHstart` shifts the whole sequence (0 = CellRanger convention).
+            data.insert(
+                Tag::HIT_INDEX,
+                Value::from(hit_idx as i32 + params.out_sam_attr_ih_start as i32),
+            );
             maybe_insert_rg_tag(&mut record, rg_id);
 
             records.push(record);
@@ -811,6 +871,7 @@ impl SamWriter {
     }
 
     /// Build unmapped paired records (both mates unmapped)
+    #[allow(clippy::too_many_arguments)]
     pub fn build_paired_unmapped_records(
         read_name: &str,
         mate1_seq: &[u8],
@@ -819,11 +880,11 @@ impl SamWriter {
         mate2_qual: &[u8],
         params: &Parameters,
         unmapped_reason: UnmappedReason,
+        best: BestTr,
     ) -> Result<Vec<RecordBuf>, Error> {
         let mut records = Vec::with_capacity(2);
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
-        let attrs = params.out_sam_attributes;
 
         // Mate1 record
         let mut rec1 = RecordBuf::default();
@@ -839,8 +900,7 @@ impl SamWriter {
         let seq1_bytes: Vec<u8> = mate1_seq.iter().map(|&b| decode_base(b)).collect();
         *rec1.sequence_mut() = Sequence::from(seq1_bytes);
         *rec1.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate1_qual));
-        maybe_insert_rg_tag(&mut rec1, rg_id);
-        insert_unmapped_tags(&mut rec1, attrs, unmapped_reason);
+        insert_unmapped_tags(&mut rec1, rg_id, unmapped_reason, best);
         records.push(rec1);
 
         // Mate2 record
@@ -857,8 +917,7 @@ impl SamWriter {
         let seq2_bytes: Vec<u8> = mate2_seq.iter().map(|&b| decode_base(b)).collect();
         *rec2.sequence_mut() = Sequence::from(seq2_bytes);
         *rec2.quality_scores_mut() = QualityScores::from(fastq_qual_to_phred(mate2_qual));
-        maybe_insert_rg_tag(&mut rec2, rg_id);
-        insert_unmapped_tags(&mut rec2, attrs, unmapped_reason);
+        insert_unmapped_tags(&mut rec2, rg_id, unmapped_reason, best);
         records.push(rec2);
 
         Ok(records)
@@ -875,7 +934,9 @@ impl SamStdoutWriter {
     pub fn create(genome: &Genome, params: &Parameters) -> Result<Self, Error> {
         let header = build_sam_header(genome, params)?;
         let mut writer = sam::io::Writer::new(BufWriter::new(std::io::stdout()));
-        writer.write_header(&header)?;
+        writer
+            .get_mut()
+            .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
         Ok(Self { writer, header })
     }
 
@@ -896,53 +957,6 @@ pub fn build_sam_header(genome: &Genome, params: &Parameters) -> Result<sam::Hea
     )
 }
 
-/// Create a SAM writer for BySJout disk-buffering (temp file). Returns (header, writer).
-pub fn create_bysj_writer(
-    file: std::fs::File,
-    genome: &Genome,
-    params: &Parameters,
-) -> Result<(sam::Header, sam::io::Writer<BufWriter<std::fs::File>>), Error> {
-    let header = build_sam_header(genome, params)?;
-    let mut writer = sam::io::Writer::new(BufWriter::new(file));
-    writer.write_header(&header)?;
-    Ok((header, writer))
-}
-
-/// Write a slice of RecordBuf to a SAM writer (for BySJout temp file).
-pub fn bysj_write_records<W: std::io::Write>(
-    writer: &mut sam::io::Writer<W>,
-    header: &sam::Header,
-    records: &[RecordBuf],
-) -> Result<(), Error> {
-    for rec in records {
-        writer.write_alignment_record(header, rec)?;
-    }
-    Ok(())
-}
-
-/// Read exactly `n` records from a SAM reader. If `collect` is true, return them in a Vec;
-/// otherwise just advance the reader position (discard records).
-pub fn bysj_read_n_records<R: std::io::BufRead>(
-    reader: &mut sam::io::Reader<R>,
-    header: &sam::Header,
-    n: u32,
-    collect: bool,
-) -> Result<Vec<RecordBuf>, Error> {
-    let mut out = if collect {
-        Vec::with_capacity(n as usize)
-    } else {
-        Vec::new()
-    };
-    let mut buf = RecordBuf::default();
-    for _ in 0..n {
-        reader.read_record_buf(header, &mut buf)?;
-        if collect {
-            out.push(buf.clone());
-        }
-    }
-    Ok(out)
-}
-
 /// Build a SAM header from an iterator of (name, length) reference pairs.
 ///
 /// Used both for the genome header (chromosomes) and the transcriptome header
@@ -955,10 +969,15 @@ where
 
     // @HD line. `--outSAMheaderHD` replaces it wholesale, given as the
     // tab-separated fields STAR expects (`@HD VN:1.4 SO:coordinate`).
-    if params.out_sam_header_hd.is_empty() {
-        builder = builder.set_header(Map::default());
+    // STAR writes `VN:1.4` (`samHeaders.cpp:94`), not the latest spec version.
+    let star_version = sam::header::record::value::map::header::Version::new(1, 4);
+    // `-` is STAR's default value for --outSAMheaderHD, meaning "no override".
+    if params.out_sam_header_hd.is_empty() || params.out_sam_header_hd == ["-"] {
+        builder = builder.set_header(Map::<sam::header::record::value::map::Header>::new(
+            star_version,
+        ));
     } else {
-        let mut hd = Map::<sam::header::record::value::map::Header>::default();
+        let mut hd = Map::<sam::header::record::value::map::Header>::new(star_version);
         for field in &params.out_sam_header_hd {
             let field = field.trim();
             // STAR takes the leading `@HD` as part of the value list; ignore it.
@@ -974,6 +993,12 @@ where
                 return Err(Error::Parameter(format!(
                     "--outSAMheaderHD tag '{tag}' is not two characters"
                 )));
+            }
+            if tag == "VN" {
+                *hd.version_mut() = value
+                    .parse()
+                    .map_err(|e| Error::Parameter(format!("invalid @HD version '{value}': {e}")))?;
+                continue;
             }
             let tag_bytes: [u8; 2] = tag.as_bytes()[..2].try_into().unwrap();
             let other_tag: HeaderOtherTag<_> = HeaderOtherTag::try_from(tag_bytes)
@@ -1072,25 +1097,107 @@ where
         builder = builder.add_program(id, extra);
     }
 
-    // `--outSAMheaderCommentFile` contributes one @CO line per line of the
-    // named file. `-` (the default) means no comments.
-    if params.out_sam_header_comment_file != "-" {
-        let path = std::path::Path::new(&params.out_sam_header_comment_file);
-        let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
-        for line in contents.lines() {
-            if !line.is_empty() {
-                builder = builder.add_comment(line);
+    Ok(builder.build())
+}
+
+/// Which SAM header text to render.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderKind {
+    /// `Aligned.out.sam` / unsorted BAM.
+    Main,
+    /// Coordinate-sorted BAM: `SO:coordinate` appended to the `@HD` line.
+    MainSorted,
+    /// `Aligned.toTranscriptome.out.bam`: `@SQ` (transcripts) and `@RG` only.
+    Transcriptome,
+}
+
+/// Render the SAM header text in STAR's line order (`samHeaders.cpp`):
+/// `@HD`, `@SQ`, user `@PG` (`--outSAMheaderPG`), the program `@PG`, the
+/// `--outSAMheaderCommentFile` lines verbatim, `@RG`, then
+/// `@CO user command line: ...`. The `@HD` line is the user's
+/// `--outSAMheaderHD` text verbatim (no `VN` is added), else `@HD\tVN:1.4`.
+/// The transcriptome BAM carries only `@SQ` and `@RG` lines.
+pub fn render_header_text(
+    header: &sam::Header,
+    params: &Parameters,
+    kind: HeaderKind,
+) -> Result<Vec<u8>, Error> {
+    let mut buf: Vec<u8> = Vec::new();
+
+    if kind != HeaderKind::Transcriptome {
+        if params.out_sam_header_hd.is_empty() || params.out_sam_header_hd[0] == "-" {
+            buf.extend_from_slice(b"@HD\tVN:1.4");
+        } else {
+            buf.extend_from_slice(params.out_sam_header_hd.join("\t").as_bytes());
+        }
+        if kind == HeaderKind::MainSorted {
+            buf.extend_from_slice(b"\tSO:coordinate");
+        }
+        buf.push(b'\n');
+    }
+
+    // Raw bytes so reference names with characters noodles forbids pass through.
+    for (name, rs) in header.reference_sequences() {
+        buf.extend_from_slice(b"@SQ\tSN:");
+        buf.extend_from_slice(name);
+        buf.extend_from_slice(b"\tLN:");
+        buf.extend_from_slice(usize::from(rs.length()).to_string().as_bytes());
+        buf.push(b'\n');
+    }
+
+    if kind != HeaderKind::Transcriptome {
+        if !params.out_sam_header_pg.is_empty() && params.out_sam_header_pg[0] != "-" {
+            buf.extend_from_slice(params.out_sam_header_pg.join("\t").as_bytes());
+            buf.push(b'\n');
+        }
+        if let Some(pg) = header.programs().as_ref().get(&b"rustar-aligner"[..]) {
+            buf.extend_from_slice(b"@PG\tID:rustar-aligner");
+            for (tag, value) in pg.other_fields() {
+                buf.push(b'\t');
+                buf.extend_from_slice(tag.as_ref());
+                buf.push(b':');
+                buf.extend_from_slice(value);
+            }
+            buf.push(b'\n');
+        }
+        if params.out_sam_header_comment_file != "-" {
+            let path = std::path::Path::new(&params.out_sam_header_comment_file);
+            let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+            for line in contents.lines() {
+                // STAR copies non-blank lines as they are (each should start with @CO).
+                if !line.trim().is_empty() {
+                    buf.extend_from_slice(line.as_bytes());
+                    buf.push(b'\n');
+                }
             }
         }
     }
 
-    Ok(builder.build())
+    for (id, rg) in header.read_groups() {
+        buf.extend_from_slice(b"@RG\tID:");
+        buf.extend_from_slice(id);
+        for (tag, value) in rg.other_fields() {
+            buf.push(b'\t');
+            buf.extend_from_slice(tag.as_ref());
+            buf.push(b':');
+            buf.extend_from_slice(value);
+        }
+        buf.push(b'\n');
+    }
+
+    if kind != HeaderKind::Transcriptome {
+        buf.extend_from_slice(b"@CO\tuser command line: ");
+        buf.extend_from_slice(params.star_command_line.as_deref().unwrap_or("").as_bytes());
+        buf.push(b'\n');
+    }
+
+    Ok(buf)
 }
 
 /// Insert `RG:Z:<id>` on the record when an ID is set. `Parameters::try_parse_from`
 /// auto-ORs `SamAttributes::RG` into `out_sam_attributes` whenever an RG line is
 /// configured, so `rg_id.is_some()` implies the attribute is wanted.
-fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
+pub(crate) fn maybe_insert_rg_tag(record: &mut RecordBuf, rg_id: Option<&str>) {
     if let Some(id) = rg_id {
         record
             .data_mut()
@@ -1118,11 +1225,29 @@ pub fn add_gene_tags(records: &mut [RecordBuf], gx: &str, gn: &str, attrs: SamAt
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
 /// `(FLAG & flagAND) | flagOR`. Matches STAR/STAR-rs, which apply this only to
 /// mapped-mate records; unmapped and transcriptome-BAM records are untouched.
-fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters) {
+pub(crate) fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters) {
     let or_bits = params.out_sam_flag_or as u16;
     let and_bits = params.out_sam_flag_and.min(u16::MAX as u32) as u16;
     let bits = u16::from(record.flags());
     *record.flags_mut() = sam::alignment::record::Flags::from((bits & and_bits) | or_bits);
+}
+
+/// Alignments in STAR's output order (ascending `output_rank`), each with whether it is
+/// the primary (`items[0]`, STAR's `trBest`).
+fn output_order<T>(
+    items: &[T],
+    output_rank: impl Fn(&T) -> u32,
+) -> impl Iterator<Item = (bool, &T)> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&i| (output_rank(&items[i]), i));
+    order.into_iter().map(move |i| (i == 0, &items[i]))
+}
+
+/// Set or clear the SECONDARY flag.
+fn set_secondary(record: &mut RecordBuf, secondary: bool) {
+    let mut flags = record.flags();
+    flags.set(sam::alignment::record::Flags::SECONDARY, secondary);
+    *record.flags_mut() = flags;
 }
 
 /// `--outSAMprimaryFlag AllBestScore`: clear the SECONDARY bit on every alignment tied for the
@@ -1164,7 +1289,7 @@ fn paired_tlen(
 /// the BAM binary QUAL field, per SAM spec §4.2.3.
 ///
 /// `saturating_sub` clamps malformed bytes < 33 to 0 rather than underflowing.
-fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
+pub(crate) fn fastq_qual_to_phred(qual: &[u8]) -> Vec<u8> {
     qual.iter().map(|&b| b.saturating_sub(33)).collect()
 }
 
@@ -1330,7 +1455,7 @@ fn transcript_to_record(
     if attrs.contains(SamAttributes::NM) {
         data.insert(
             Tag::EDIT_DISTANCE,
-            Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
+            Value::from(star_nm(transcript, read_seq, genome, transcript.is_reverse)),
         );
     }
     if attrs.contains(SamAttributes::XS)
@@ -1338,15 +1463,11 @@ fn transcript_to_record(
     {
         data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
     }
-    if attrs.contains(SamAttributes::JM)
-        && let Some(jm) = build_jm_tag(transcript)
-    {
-        data.insert(Tag::new(b'j', b'M'), jm);
+    if attrs.contains(SamAttributes::JM) {
+        data.insert(Tag::new(b'j', b'M'), build_jm_tag(transcript));
     }
-    if attrs.contains(SamAttributes::JI)
-        && let Some(ji) = build_ji_tag(transcript, chr_start)
-    {
-        data.insert(Tag::new(b'j', b'I'), ji);
+    if attrs.contains(SamAttributes::JI) {
+        data.insert(Tag::new(b'j', b'I'), build_ji_tag(transcript, chr_start));
     }
     if attrs.contains(SamAttributes::MD) {
         let md = build_md_tag(transcript, read_seq, genome, transcript.is_reverse);
@@ -1356,31 +1477,33 @@ fn transcript_to_record(
     Ok(record)
 }
 
-/// SAM-spec `NM:i:` edit distance: substitutions + inserted bases + deleted bases.
-/// Intron `N` skips and clips are excluded per SAM v1 §1.4.
-fn sam_spec_nm(n_mismatch: u32, cigar: &[cigar::Op]) -> i32 {
-    use cigar::op::Kind;
-    let indel_bases: usize = cigar
-        .iter()
-        .filter_map(|op| match op.kind() {
-            Kind::Insertion | Kind::Deletion => Some(op.len()),
-            _ => None,
-        })
-        .sum();
-    (n_mismatch + indel_bases as u32) as i32
-}
-
 /// Derive XS strand tag from transcript junction motifs.
 /// Returns Some('+') or Some('-') if all junctions agree on strand.
 /// Returns None if no junctions, all non-canonical, or conflicting strands.
 fn derive_xs_strand(transcript: &Transcript) -> Option<char> {
+    derive_xs_strand_of(&[transcript])
+}
+
+/// STAR's `sjMotifStrand` is a property of the whole (pair) transcript, so a
+/// mate without junctions carries the strand of the other mate's junctions.
+fn derive_xs_strand_of(transcripts: &[&Transcript]) -> Option<char> {
     let mut strand: Option<char> = None;
-    for motif in &transcript.junction_motifs {
-        if let Some(s) = motif.implied_strand() {
-            match strand {
-                None => strand = Some(s),
-                Some(prev) if prev != s => return None,
-                _ => {}
+    for t in transcripts {
+        for (i, motif) in t.junction_motifs.iter().enumerate() {
+            // STAR's `sjStr` (annotated strand for an sjdb junction); fall back
+            // to the motif when the transcript carries no strand.
+            let s = match t.junction_strand.get(i) {
+                Some(1) => Some('+'),
+                Some(2) => Some('-'),
+                Some(_) => None,
+                None => motif.implied_strand(),
+            };
+            if let Some(s) = s {
+                match strand {
+                    None => strand = Some(s),
+                    Some(prev) if prev != s => return None,
+                    _ => {}
+                }
             }
         }
     }
@@ -1391,9 +1514,10 @@ fn derive_xs_strand(transcript: &Transcript) -> Option<char> {
 ///
 /// Encoding: 0=non-canonical, 1=GT/AG, 2=CT/AC, 3=GC/AG, 4=CT/GC, 5=AT/AC, 6=GT/AT.
 /// Add +20 if junction is annotated in GTF.
-fn build_jm_tag(transcript: &Transcript) -> Option<Value> {
+fn build_jm_tag(transcript: &Transcript) -> Value {
     if transcript.junction_motifs.is_empty() {
-        return None;
+        // STAR writes `jM:B:c,-1` for a (mate) alignment without junctions.
+        return Value::Array(Array::Int8(vec![-1]));
     }
     let motifs: Vec<i8> = transcript
         .junction_motifs
@@ -1409,17 +1533,18 @@ fn build_jm_tag(transcript: &Transcript) -> Option<Value> {
             if annotated { code + 20 } else { code }
         })
         .collect();
-    Some(Value::Array(Array::Int8(motifs)))
+    Value::Array(Array::Int8(motifs))
 }
 
 /// Build jI tag: array of intron start/end coordinates (1-based, per-chromosome).
 ///
 /// Format: [start1, end1, start2, end2, ...] where start is first intronic base
 /// and end is last intronic base (both 1-based, inclusive).
-fn build_ji_tag(transcript: &Transcript, chr_start: u64) -> Option<Value> {
+fn build_ji_tag(transcript: &Transcript, chr_start: u64) -> Value {
     use cigar::op::Kind;
     if transcript.n_junction == 0 {
-        return None;
+        // STAR writes `jI:B:i,-1` for a (mate) alignment without junctions.
+        return Value::Array(Array::Int32(vec![-1]));
     }
     let mut coords: Vec<i32> = Vec::new();
     let mut genome_pos = transcript.genome_start;
@@ -1438,7 +1563,7 @@ fn build_ji_tag(transcript: &Transcript, chr_start: u64) -> Option<Value> {
             _ => {} // Ins, SoftClip, HardClip don't consume reference
         }
     }
-    Some(Value::Array(Array::Int32(coords)))
+    Value::Array(Array::Int32(coords))
 }
 
 /// Build MD tag string: matches/mismatches/deletions relative to reference.
@@ -1451,6 +1576,26 @@ fn build_md_tag(
     genome: &Genome,
     is_reverse: bool,
 ) -> String {
+    md_and_nm(transcript, read_seq, genome, is_reverse).0
+}
+
+/// STAR's `NM:i` (`ReadAlign::samAttrNM_MD`, `ReadAlign_alignBAM.cpp:9-46`): the
+/// mismatching aligned bases, counting a base where the read or the genome is N
+/// as a mismatch, plus the inserted and deleted bases (junctions excluded).
+/// `nM` (and `n_mismatch`) leave the N positions out, so NM is not built from it.
+fn star_nm(transcript: &Transcript, read_seq: &[u8], genome: &Genome, is_reverse: bool) -> i32 {
+    md_and_nm(transcript, read_seq, genome, is_reverse).1 as i32
+}
+
+/// MD string and NM of one alignment, in one walk over the CIGAR, as STAR's
+/// `samAttrNM_MD`: a base is a mismatch when read and genome differ or either
+/// is N (so N against N is a mismatch too).
+fn md_and_nm(
+    transcript: &Transcript,
+    read_seq: &[u8],
+    genome: &Genome,
+    is_reverse: bool,
+) -> (String, u32) {
     use cigar::op::Kind;
 
     // Build the SAM-order sequence (RC for reverse strand)
@@ -1461,6 +1606,7 @@ fn build_md_tag(
     };
 
     let mut md = String::new();
+    let mut nm: u32 = 0;
     let mut match_count: u32 = 0;
     let mut genome_pos = transcript.genome_start;
     let mut read_pos: usize = 0;
@@ -1475,9 +1621,10 @@ fn build_md_tag(
                     } else {
                         4
                     };
-                    if ref_base == read_base {
+                    if ref_base == read_base && ref_base < 4 {
                         match_count += 1;
                     } else {
+                        nm += 1;
                         write!(md, "{match_count}").unwrap();
                         match_count = 0;
                         md.push(decode_base(ref_base) as char);
@@ -1487,6 +1634,7 @@ fn build_md_tag(
                 }
             }
             Kind::Deletion => {
+                nm += op.len() as u32;
                 write!(md, "{match_count}").unwrap();
                 match_count = 0;
                 md.push('^');
@@ -1496,7 +1644,11 @@ fn build_md_tag(
                     genome_pos += 1;
                 }
             }
-            Kind::Insertion | Kind::SoftClip => {
+            Kind::Insertion => {
+                nm += op.len() as u32;
+                read_pos += op.len();
+            }
+            Kind::SoftClip => {
                 read_pos += op.len();
             }
             Kind::Skip => {
@@ -1507,7 +1659,7 @@ fn build_md_tag(
     }
     // Emit trailing match count
     write!(md, "{match_count}").unwrap();
-    md
+    (md, nm)
 }
 
 /// Stamp paired-end mate-bookkeeping (PROPERLY_SEGMENTED, MATE_REVERSE_COMPLEMENTED,
@@ -1687,32 +1839,35 @@ fn build_paired_mate_record(
         data.insert(Tag::ALIGNMENT_SCORE, Value::from(combined_score));
     }
     // nM (mismatch count) before NM (edit distance), matching STAR's tag order.
+    // nM is the whole pair's `trOut.nMM`, written on both mates (as AS is); NM
+    // below is per mate (`samAttrNM_MD` over this mate's exons).
     if attrs.contains(SamAttributes::NMM) {
         data.insert(
             Tag::new(b'n', b'M'),
-            Value::from(transcript.n_mismatch as i32),
+            Value::from((transcript.n_mismatch + mate_transcript.n_mismatch) as i32),
         );
     }
     if attrs.contains(SamAttributes::NM) {
         data.insert(
             Tag::EDIT_DISTANCE,
-            Value::from(sam_spec_nm(transcript.n_mismatch, &transcript.cigar)),
+            Value::from(star_nm(
+                transcript,
+                aligned_seq,
+                genome,
+                transcript.is_reverse,
+            )),
         );
     }
     if attrs.contains(SamAttributes::XS)
-        && let Some(xs_strand) = derive_xs_strand(transcript)
+        && let Some(xs_strand) = derive_xs_strand_of(&[transcript, mate_transcript])
     {
         data.insert(Tag::new(b'X', b'S'), Value::Character(xs_strand as u8));
     }
-    if attrs.contains(SamAttributes::JM)
-        && let Some(jm) = build_jm_tag(transcript)
-    {
-        data.insert(Tag::new(b'j', b'M'), jm);
+    if attrs.contains(SamAttributes::JM) {
+        data.insert(Tag::new(b'j', b'M'), build_jm_tag(transcript));
     }
-    if attrs.contains(SamAttributes::JI)
-        && let Some(ji) = build_ji_tag(transcript, chr_start)
-    {
-        data.insert(Tag::new(b'j', b'I'), ji);
+    if attrs.contains(SamAttributes::JI) {
+        data.insert(Tag::new(b'j', b'I'), build_ji_tag(transcript, chr_start));
     }
     if attrs.contains(SamAttributes::MD) {
         let md = build_md_tag(transcript, aligned_seq, genome, transcript.is_reverse);
@@ -1739,6 +1894,7 @@ mod tests {
     use super::*;
     use crate::align::score::SpliceMotif;
     use crate::genome::Genome;
+    use crate::params::SamAttr;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
 
@@ -1767,6 +1923,48 @@ mod tests {
 
         // Check that we have a program line (just check header is valid)
         assert_eq!(header.reference_sequences().len(), 1);
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_version_matches_star() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "test.fq"]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        // STAR's default @HD line is `@HD VN:1.4` (samHeaders.cpp:94).
+        assert_eq!(header.header().unwrap().version(), Version::new(1, 4));
+
+        // A VN given in --outSAMheaderHD is the version, not an extra field.
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "@HD",
+            "VN:1.6",
+            "SO:unsorted",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 6));
+        assert_eq!(hd.other_fields().len(), 1, "only SO besides VN");
+    }
+
+    #[test]
+    fn test_build_sam_header_hd_dash_is_the_default() {
+        use sam::header::record::value::map::header::Version;
+        let genome = make_test_genome();
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "test.fq",
+            "--outSAMheaderHD",
+            "-",
+        ]);
+        let header = build_sam_header(&genome, &params).unwrap();
+        let hd = header.header().unwrap();
+        assert_eq!(hd.version(), Version::new(1, 4));
+        assert_eq!(hd.other_fields().len(), 0);
     }
 
     #[test]
@@ -1885,6 +2083,7 @@ mod tests {
         let mut writer = SamWriter::create(tmpfile.path(), &genome, &params).unwrap();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -1903,6 +2102,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         writer
@@ -1958,6 +2158,7 @@ mod tests {
             read_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -1979,6 +2180,7 @@ mod tests {
             read_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -1997,11 +2199,24 @@ mod tests {
             (UnmappedReason::TooShort, b'1'),
             (UnmappedReason::TooManyMismatches, b'2'),
             (UnmappedReason::TooManyLoci, b'3'),
+            (UnmappedReason::HalfMapped, b'4'),
         ] {
+            let best = BestTr { score: 29, n_mm: 2 };
             let record =
-                SamWriter::build_unmapped_record("r", &read_seq, read_qual, &params, reason)
+                SamWriter::build_unmapped_record("r", &read_seq, read_qual, &params, reason, best)
                     .unwrap();
+            // STAR writes MAPQ 0 on unmapped records.
+            assert_eq!(
+                record.mapping_quality().map(u8::from),
+                Some(0),
+                "MAPQ 0 for {reason:?}"
+            );
             let data = record.data();
+            assert_eq!(
+                data.get(&Tag::new(b'n', b'M')),
+                Some(&Value::from(2i32)),
+                "nM of trBest for {reason:?}"
+            );
             // NH/HI/AS present (Standard attrs enabled by default)
             assert_eq!(
                 data.get(&Tag::ALIGNMENT_HIT_COUNT),
@@ -2015,8 +2230,8 @@ mod tests {
             );
             assert_eq!(
                 data.get(&Tag::ALIGNMENT_SCORE),
-                Some(&Value::from(0i32)),
-                "AS:i:0 missing for {reason:?}"
+                Some(&Value::from(29i32)),
+                "AS of trBest for {reason:?}"
             );
             // uT:A: always emitted with correct value
             assert_eq!(
@@ -2033,6 +2248,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 10,
             genome_end: 60,
@@ -2045,6 +2261,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3]; // ACGT
@@ -2088,6 +2305,7 @@ mod tests {
 
         let projected = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 4,
@@ -2100,8 +2318,10 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 6,
@@ -2114,6 +2334,7 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
         ];
 
@@ -2150,6 +2371,7 @@ mod tests {
         let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "test.fq"]);
 
         let projected = vec![Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2162,6 +2384,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         }];
 
         let records = SamWriter::build_transcriptome_records(
@@ -2198,6 +2421,7 @@ mod tests {
             &mate2_qual,
             &params,
             UnmappedReason::Other,
+            BestTr::default(),
         )
         .unwrap();
 
@@ -2234,6 +2458,7 @@ mod tests {
         let genome = make_test_genome();
 
         let mate1_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2252,9 +2477,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate2_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -2273,6 +2500,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate_seq = vec![0, 1, 2, 3];
@@ -2350,6 +2578,7 @@ mod tests {
 
         // Mate1 at position 0 (chr_start=0, so per-chr pos = 1)
         let this_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -2368,10 +2597,12 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Mate2 at position 4 (chr_start=0, so per-chr pos = 5)
         let mate_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -2390,6 +2621,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate_seq = vec![0; 4];
@@ -2425,7 +2657,7 @@ mod tests {
         // Check TLEN
         assert_eq!(rec.template_length(), 250);
 
-        // AS is the combined score (STAR behavior); nM is per-mate mismatches
+        // AS and nM are both the whole pair's (STAR's trOut.maxScore / trOut.nMM)
         let data = rec.data();
         assert_eq!(
             data.get(&Tag::ALIGNMENT_SCORE),
@@ -2434,8 +2666,8 @@ mod tests {
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "nM should be 0 (no mismatches in this mate)"
+            Some(&Value::from(1_i32)),
+            "nM should be the pair's mismatches (0 + 1), on both mates"
         );
     }
 
@@ -2448,6 +2680,7 @@ mod tests {
         let chr_idx = 7;
 
         let t1 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 100,
             genome_end: 130,
@@ -2466,9 +2699,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 200,
             genome_end: 230,
@@ -2487,6 +2722,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mut rec1 = RecordBuf::default();
@@ -2526,6 +2762,7 @@ mod tests {
         let chr_idx = 3;
 
         let t1 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 200,
             genome_end: 230,
@@ -2544,9 +2781,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let t2 = Transcript {
+            output_rank: 0,
             chr_idx,
             genome_start: 100,
             genome_end: 130,
@@ -2565,6 +2804,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mut rec1 = RecordBuf::default();
@@ -2586,15 +2826,17 @@ mod tests {
 
         // Transcript with 2 mismatches and a 3bp deletion → NM = 2 + 3 = 5
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
-            genome_end: 60,
+            genome_end: 8,
             is_reverse: false,
             exons: vec![],
+            // Over genome ACGTACGT: AC (read AA), delete GTA, CGT (read CGA).
             cigar: vec![
-                Op::new(Kind::Match, 20),
+                Op::new(Kind::Match, 2),
                 Op::new(Kind::Deletion, 3),
-                Op::new(Kind::Match, 30),
+                Op::new(Kind::Match, 3),
             ],
             score: 100,
             n_mismatch: 2,
@@ -2602,10 +2844,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
-        let read_seq = vec![0, 1, 2, 3];
-        let read_qual = vec![30, 30, 30, 30];
+        let read_seq = vec![0, 0, 1, 2, 0];
+        let read_qual = vec![30; 5];
 
         let record = transcript_to_record(
             &transcript,
@@ -2654,51 +2897,51 @@ mod tests {
     }
 
     #[test]
-    fn test_edit_distance_computation() {
+    fn test_edit_distance_counts_n_bases_and_indels() {
         use cigar::op::{Kind, Op};
-        // Pure match: NM = n_mismatch only
-        assert_eq!(sam_spec_nm(3, &[Op::new(Kind::Match, 50)]), 3);
-
-        // Match + Ins + Del: NM = n_mismatch + ins_len + del_len
-        assert_eq!(
-            sam_spec_nm(
-                1,
-                &[
-                    Op::new(Kind::Match, 20),
-                    Op::new(Kind::Insertion, 5),
-                    Op::new(Kind::Match, 10),
-                    Op::new(Kind::Deletion, 7),
-                    Op::new(Kind::Match, 20),
-                ],
-            ),
-            13
-        );
-
-        // RefSkip (splice junction) should NOT count toward NM
-        assert_eq!(
-            sam_spec_nm(
-                0,
-                &[
-                    Op::new(Kind::Match, 25),
-                    Op::new(Kind::Skip, 1000),
-                    Op::new(Kind::Match, 25),
-                ],
-            ),
-            0
-        );
-
-        // Soft clips should NOT count toward NM
-        assert_eq!(
-            sam_spec_nm(
-                2,
-                &[
-                    Op::new(Kind::SoftClip, 10),
-                    Op::new(Kind::Match, 40),
-                    Op::new(Kind::SoftClip, 10),
-                ],
-            ),
-            2
-        );
+        // Genome ACGTACGT. STAR's NM (samAttrNM_MD) counts a read N as a mismatch
+        // (nM does not), adds inserted and deleted bases, and skips junctions and
+        // soft clips.
+        let genome = make_test_genome();
+        let tr = |cigar: Vec<Op>| Transcript {
+            output_rank: 0,
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 8,
+            is_reverse: false,
+            exons: vec![],
+            cigar,
+            score: 0,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            junction_strand: vec![],
+        };
+        // ACNTA vs ACGTA: one N.
+        let t = tr(vec![Op::new(Kind::Match, 5)]);
+        assert_eq!(star_nm(&t, &[0, 1, 4, 3, 0], &genome, false), 1);
+        assert_eq!(md_and_nm(&t, &[0, 1, 4, 3, 0], &genome, false).0, "2G2");
+        // From genome 1: 1S 2M 1I 1M 2D 1M over C G | T | (A C) | G, read T CG T T G:
+        // no mismatches; NM = 1 inserted + 2 deleted bases (soft clip not counted).
+        let mut t = tr(vec![
+            Op::new(Kind::SoftClip, 1),
+            Op::new(Kind::Match, 2),
+            Op::new(Kind::Insertion, 1),
+            Op::new(Kind::Match, 1),
+            Op::new(Kind::Deletion, 2),
+            Op::new(Kind::Match, 1),
+        ]);
+        t.genome_start = 1;
+        assert_eq!(star_nm(&t, &[3, 1, 2, 3, 3, 2], &genome, false), 3);
+        // 2M 2N 2M over AC | (GT) | AC: a junction is not an edit.
+        let t = tr(vec![
+            Op::new(Kind::Match, 2),
+            Op::new(Kind::Skip, 2),
+            Op::new(Kind::Match, 2),
+        ]);
+        assert_eq!(star_nm(&t, &[0, 1, 0, 1], &genome, false), 0);
     }
 
     #[test]
@@ -2708,6 +2951,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 10,
             genome_end: 60,
@@ -2720,6 +2964,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -2761,6 +3006,7 @@ mod tests {
 
         let transcripts = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 50,
@@ -2773,8 +3019,10 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 52,
@@ -2787,8 +3035,10 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 4,
                 genome_end: 54,
@@ -2801,6 +3051,7 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
         ];
 
@@ -2847,6 +3098,7 @@ mod tests {
         ]);
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -2859,6 +3111,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -2897,6 +3150,7 @@ mod tests {
         ]);
 
         let mk = |genome_start: u64, score: i32| Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start,
             genome_end: genome_start + 50,
@@ -2909,6 +3163,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
         // Two alignments tied for the best score (100), one strictly worse (98).
         let transcripts = vec![mk(0, 100), mk(2, 98), mk(4, 100)];
@@ -2955,6 +3210,7 @@ mod tests {
 
         let transcripts = vec![
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 0,
                 genome_end: 50,
@@ -2967,8 +3223,10 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
             Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: 2,
                 genome_end: 52,
@@ -2981,6 +3239,7 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             },
         ];
 
@@ -3022,6 +3281,7 @@ mod tests {
         // Mode 1 (default) just returns whatever the caller already computed (opaque here).
         // Mode 2 uses the per-mate max/min span (100) and signs by genomic leftmost (mate1).
         let mate1 = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 200,
@@ -3034,6 +3294,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
         let mate2 = Transcript {
             genome_start: 120,
@@ -3073,6 +3334,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3089,6 +3351,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3122,6 +3385,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3134,6 +3398,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3167,6 +3432,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3183,6 +3449,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::CtAc],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3216,6 +3483,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 300,
@@ -3234,6 +3502,7 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc], // +strand and -strand
             junction_annotated: vec![false, false],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3267,6 +3536,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3283,6 +3553,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3324,6 +3595,7 @@ mod tests {
 
         let transcripts: Vec<Transcript> = (0..5)
             .map(|i| Transcript {
+                output_rank: 0,
                 chr_idx: 0,
                 genome_start: i as u64,
                 genome_end: (i + 50) as u64,
@@ -3336,6 +3608,7 @@ mod tests {
                 n_junction: 0,
                 junction_motifs: vec![],
                 junction_annotated: vec![],
+                junction_strand: vec![],
             })
             .collect();
 
@@ -3392,6 +3665,7 @@ mod tests {
     fn test_build_jm_tag_basic() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3408,18 +3682,19 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         };
 
         let jm = build_jm_tag(&transcript);
-        assert!(jm.is_some());
         // GT/AG = motif code 1, not annotated → 1
-        assert_eq!(jm.unwrap(), Value::Array(Array::Int8(vec![1])));
+        assert_eq!(jm, Value::Array(Array::Int8(vec![1])));
     }
 
     #[test]
     fn test_build_jm_tag_annotated() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -3436,18 +3711,19 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![true],
+            junction_strand: vec![],
         };
 
         let jm = build_jm_tag(&transcript);
-        assert!(jm.is_some());
         // GT/AG = motif code 1, annotated → 1 + 20 = 21
-        assert_eq!(jm.unwrap(), Value::Array(Array::Int8(vec![21])));
+        assert_eq!(jm, Value::Array(Array::Int8(vec![21])));
     }
 
     #[test]
     fn test_build_jm_tag_empty() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3460,15 +3736,21 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
-        assert!(build_jm_tag(&transcript).is_none());
+        // STAR writes `jM:B:c,-1` for an alignment without junctions.
+        assert_eq!(
+            build_jm_tag(&transcript),
+            Value::Array(Array::Int8(vec![-1]))
+        );
     }
 
     #[test]
     fn test_build_jm_tag_multiple_junctions() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 400,
@@ -3487,18 +3769,19 @@ mod tests {
             n_junction: 2,
             junction_motifs: vec![SpliceMotif::GtAg, SpliceMotif::CtAc],
             junction_annotated: vec![true, false],
+            junction_strand: vec![],
         };
 
         let jm = build_jm_tag(&transcript);
-        assert!(jm.is_some());
         // GT/AG annotated=21, CT/AC not annotated=2
-        assert_eq!(jm.unwrap(), Value::Array(Array::Int8(vec![21, 2])));
+        assert_eq!(jm, Value::Array(Array::Int8(vec![21, 2])));
     }
 
     #[test]
     fn test_build_ji_tag_basic() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 100,
             genome_end: 325,
@@ -3515,19 +3798,20 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         };
 
         // chr_start=0, genome_start=100, intron starts at 125, ends at 324
         let ji = build_ji_tag(&transcript, 0);
-        assert!(ji.is_some());
         // Intron start: 100+25 - 0 + 1 = 126, Intron end: 100+25+200 - 0 = 325
-        assert_eq!(ji.unwrap(), Value::Array(Array::Int32(vec![126, 325])));
+        assert_eq!(ji, Value::Array(Array::Int32(vec![126, 325])));
     }
 
     #[test]
     fn test_build_ji_tag_empty() {
         use cigar::op::{Kind, Op};
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 50,
@@ -3540,9 +3824,14 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
-        assert!(build_ji_tag(&transcript, 0).is_none());
+        // STAR writes `jI:B:i,-1` for an alignment without junctions.
+        assert_eq!(
+            build_ji_tag(&transcript, 0),
+            Value::Array(Array::Int32(vec![-1]))
+        );
     }
 
     #[test]
@@ -3551,6 +3840,7 @@ mod tests {
         // Genome: ACGTACGT (A=0,C=1,G=2,T=3)
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3563,6 +3853,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Read exactly matches genome[0..4] = ACGT
@@ -3577,6 +3868,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3589,6 +3881,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Position 1: read=A, ref=C → mismatch (C in MD)
@@ -3604,6 +3897,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 6,
@@ -3620,6 +3914,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Read: A,C,[del G,T],A,C
@@ -3634,6 +3929,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3650,6 +3946,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Insertions are invisible in MD — just match counts
@@ -3664,6 +3961,7 @@ mod tests {
         // Genome: ACGTACGT
         let genome = make_test_genome();
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 2, // Starts at G
             genome_end: 6,
@@ -3680,6 +3978,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Soft clips don't appear in MD
@@ -3695,6 +3994,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3707,6 +4007,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -3727,9 +4028,15 @@ mod tests {
         .unwrap();
 
         let data = record.data();
-        // No junctions → no jM/jI tags
-        assert!(data.get(&Tag::new(b'j', b'M')).is_none());
-        assert!(data.get(&Tag::new(b'j', b'I')).is_none());
+        // No junctions → jM/jI are the STAR -1 placeholders
+        assert_eq!(
+            data.get(&Tag::new(b'j', b'M')),
+            Some(&Value::Array(Array::Int8(vec![-1])))
+        );
+        assert_eq!(
+            data.get(&Tag::new(b'j', b'I')),
+            Some(&Value::Array(Array::Int32(vec![-1])))
+        );
         // MD should be present when in attrs
         assert_eq!(
             data.get(&Tag::new(b'M', b'D')),
@@ -3746,6 +4053,7 @@ mod tests {
 
         // Mate1: forward, chr 0, pos 0
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3764,10 +4072,12 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Mate2: reverse, chr 0, pos 4
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -3786,6 +4096,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let seq = vec![0, 1, 2, 3];
@@ -3853,6 +4164,7 @@ mod tests {
 
         // Mate1: score=100, 0 mismatches, no junctions
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3871,10 +4183,12 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         // Mate2: score=80, 2 mismatches, 1 deletion
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -3897,6 +4211,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let seq1 = vec![0, 1, 2, 3];
@@ -3930,11 +4245,11 @@ mod tests {
             Some(&Value::from(180_i32)),
             "Mate1 AS should be combined score (100+80=180)"
         );
-        // NM attribute maps to nM tag (mismatches only)
+        // nM is the pair's mismatch count (STAR's trOut.nMM), on both mates
         assert_eq!(
             rec1.data().get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(0_i32)),
-            "Mate1 nM should be 0"
+            Some(&Value::from(2_i32)),
+            "Mate1 nM should be the pair's 0 + 2"
         );
 
         // Mate2 also gets combined AS
@@ -3967,7 +4282,7 @@ mod tests {
         assert_eq!(
             rec2.data().get(&Tag::new(b'n', b'M')),
             Some(&Value::from(2_i32)),
-            "Mate2 nM should be 2 (mismatches only, not edit distance)"
+            "Mate2 nM should be the pair's 0 + 2 (mismatches only, not edit distance)"
         );
     }
 
@@ -3980,6 +4295,7 @@ mod tests {
 
         // Both mates forward
         let mate1_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -3998,9 +4314,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate2_trans = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 4,
             genome_end: 7,
@@ -4019,6 +4337,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let seq = vec![0, 1, 2, 3];
@@ -4079,6 +4398,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4091,6 +4411,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -4157,6 +4478,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4169,6 +4491,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -4232,6 +4555,7 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4244,6 +4568,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let read_seq = vec![0, 1, 2, 3];
@@ -4303,6 +4628,67 @@ mod tests {
     }
 
     #[test]
+    fn test_all_preset_order_has_mc_and_ch() {
+        let tags: Vec<[u8; 2]> = SamAttributes::ALL.iter().map(SamAttr::tag).collect();
+        let want: Vec<[u8; 2]> = [
+            "NH", "HI", "AS", "nM", "NM", "MD", "jM", "jI", "MC", "ch", "XS",
+        ]
+        .iter()
+        .map(|t| [t.as_bytes()[0], t.as_bytes()[1]])
+        .collect();
+        assert_eq!(tags, want);
+    }
+
+    #[test]
+    fn test_ch_requires_bam_output() {
+        use crate::params::Parameters;
+        let args = [
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+        ];
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["All"])).is_err());
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["NH", "ch"])).is_err());
+        assert!(
+            Parameters::try_parse_from(args.iter().copied().chain([
+                "NH",
+                "ch",
+                "--outSAMtype",
+                "BAM",
+                "Unsorted"
+            ]))
+            .is_ok()
+        );
+        assert!(Parameters::try_parse_from(args.iter().copied().chain(["NH", "MC"])).is_ok());
+    }
+
+    #[test]
+    fn test_mate_cigar_tags_swap_cigars() {
+        let mut r1 = RecordBuf::default();
+        let mut r2 = RecordBuf::default();
+        *r1.cigar_mut() = [cigar::Op::new(cigar::op::Kind::Match, 50)]
+            .into_iter()
+            .collect();
+        *r2.cigar_mut() = [
+            cigar::Op::new(cigar::op::Kind::SoftClip, 3),
+            cigar::Op::new(cigar::op::Kind::Match, 47),
+        ]
+        .into_iter()
+        .collect();
+        insert_mate_cigar_tags(&mut r1, &mut r2);
+        let mc = Tag::new(b'M', b'C');
+        assert_eq!(
+            r1.data().get(&mc),
+            Some(&Value::String(BString::from("3S47M")))
+        );
+        assert_eq!(
+            r2.data().get(&mc),
+            Some(&Value::String(BString::from("50M")))
+        );
+    }
+
+    #[test]
     fn test_sam_attribute_set_expansion() {
         use crate::params::Parameters;
 
@@ -4318,6 +4704,9 @@ mod tests {
             "r.fq",
             "--outSAMattributes",
             "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ]);
         assert_eq!(p.out_sam_attributes, SamAttributes::ALL - SamAttributes::XS);
 
@@ -4328,6 +4717,9 @@ mod tests {
             "r.fq",
             "--outSAMattributes",
             "All",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
             "--outSAMstrandField",
             "intronMotif",
         ]);
@@ -4366,28 +4758,31 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
-            genome_end: 60,
+            genome_end: 7,
             is_reverse: false,
             exons: vec![],
+            // Over genome ACGTACGT: AC, insert T, GT, delete A, CG (read A for G).
             cigar: vec![
-                Op::new(Kind::Match, 20),
-                Op::new(Kind::Insertion, 5),
-                Op::new(Kind::Match, 10),
-                Op::new(Kind::Deletion, 3),
-                Op::new(Kind::Match, 20),
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Insertion, 1),
+                Op::new(Kind::Match, 2),
+                Op::new(Kind::Deletion, 1),
+                Op::new(Kind::Match, 2),
             ],
             score: 80,
-            n_mismatch: 2,
+            n_mismatch: 1,
             n_gap: 2,
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
-        let read_seq = vec![0, 1, 2, 3];
-        let read_qual = vec![30, 30, 30, 30];
+        let read_seq = vec![0, 1, 3, 2, 3, 1, 0];
+        let read_qual = vec![30; 7];
 
         let record = transcript_to_record(
             &transcript,
@@ -4406,13 +4801,13 @@ mod tests {
         let data = record.data();
         assert_eq!(
             data.get(&Tag::EDIT_DISTANCE),
-            Some(&Value::from(10_i32)),
-            "NM should be edit distance: 2 mismatches + 5 ins + 3 del = 10"
+            Some(&Value::from(3_i32)),
+            "NM should be edit distance: 1 mismatch + 1 ins + 1 del = 3"
         );
         assert_eq!(
             data.get(&Tag::new(b'n', b'M')),
-            Some(&Value::from(2_i32)),
-            "nM should be 2 (mismatches only)"
+            Some(&Value::from(1_i32)),
+            "nM should be 1 (mismatches only)"
         );
     }
 
@@ -4422,15 +4817,17 @@ mod tests {
         let genome = make_test_genome();
 
         let transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
-            genome_end: 103,
+            genome_end: 8,
             is_reverse: false,
             exons: vec![],
+            // Over genome ACGTACGT: ACG, delete TA, CGT (read A for the last T).
             cigar: vec![
-                Op::new(Kind::Match, 80),
+                Op::new(Kind::Match, 3),
                 Op::new(Kind::Deletion, 2),
-                Op::new(Kind::Match, 21),
+                Op::new(Kind::Match, 3),
             ],
             score: 100,
             n_mismatch: 1,
@@ -4438,10 +4835,11 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
-        let read_seq = vec![0, 1, 2, 3];
-        let read_qual = vec![30, 30, 30, 30];
+        let read_seq = vec![0, 1, 2, 1, 2, 0];
+        let read_qual = vec![30; 6];
 
         // NM (edit distance) and NMM (nM, mismatch count) are distinct flags now;
         // request both to emit both tags.
@@ -4506,6 +4904,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4524,6 +4923,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate1_seq = vec![0, 1, 2, 3]; // ACGT
@@ -4578,6 +4978,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 2,
             genome_end: 6,
@@ -4596,6 +4997,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate1_seq = vec![0, 1, 2, 3];
@@ -4631,24 +5033,27 @@ mod tests {
             mapped.alignment_start().map(usize::from),
             Some(expected_pos)
         );
-        // RNEXT and PNEXT should point to own position (STAR convention)
-        assert_eq!(mapped.mate_reference_sequence_id(), Some(0));
-        assert_eq!(
-            mapped.mate_alignment_start().map(usize::from),
-            Some(expected_pos)
-        );
+        // STAR gives the mapped mate of a one-mate alignment no RNEXT/PNEXT (`*`, 0)
+        assert_eq!(mapped.mate_reference_sequence_id(), None);
+        assert_eq!(mapped.mate_alignment_start(), None);
 
-        // Unmapped mate: co-located at mapped mate's position
+        // Unmapped mate: RNAME `*`, POS 0; RNEXT/PNEXT at the mapped mate
         let unmapped = &records[1];
-        assert_eq!(unmapped.reference_sequence_id(), Some(0));
-        assert_eq!(
-            unmapped.alignment_start().map(usize::from),
-            Some(expected_pos)
-        );
+        assert_eq!(unmapped.reference_sequence_id(), None);
+        assert_eq!(unmapped.alignment_start(), None);
         assert_eq!(unmapped.mate_reference_sequence_id(), Some(0));
         assert_eq!(
             unmapped.mate_alignment_start().map(usize::from),
             Some(expected_pos)
+        );
+        // uT:A:4 with the mapped mate's AS and nM (trBest)
+        assert_eq!(
+            unmapped.data().get(&Tag::new(b'u', b'T')),
+            Some(&Value::Character(b'4'))
+        );
+        assert_eq!(
+            unmapped.data().get(&Tag::ALIGNMENT_SCORE),
+            Some(&Value::from(100i32))
         );
         // MAPQ = 0 for unmapped
         assert_eq!(unmapped.mapping_quality().map(u8::from), Some(0));
@@ -4663,6 +5068,7 @@ mod tests {
         let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 4,
@@ -4681,6 +5087,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![],
             junction_annotated: vec![],
+            junction_strand: vec![],
         };
 
         let mate1_seq = vec![0, 1, 2, 3];
@@ -4733,9 +5140,19 @@ mod tests {
         assert!(!records_m2[1].flags().is_unmapped()); // mate2 is mapped
     }
 
+    #[test]
+    fn xs_strand_of_pair_uses_both_mates_junctions() {
+        let spliced = spliced_gtag_transcript();
+        let mut plain = spliced_gtag_transcript();
+        plain.junction_motifs.clear();
+        assert_eq!(derive_xs_strand(&plain), None);
+        assert_eq!(derive_xs_strand_of(&[&plain, &spliced]), Some('+'));
+    }
+
     fn spliced_gtag_transcript() -> Transcript {
         use cigar::op::{Kind, Op};
         Transcript {
+            output_rank: 0,
             chr_idx: 0,
             genome_start: 0,
             genome_end: 200,
@@ -4752,6 +5169,7 @@ mod tests {
             n_junction: 1,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         }
     }
 
@@ -4793,9 +5211,9 @@ mod tests {
     }
 
     #[test]
-    fn xs_tag_absent_when_xs_in_attrs_but_no_intron_motif() {
-        // XS listed in --outSAMattributes without --outSAMstrandField intronMotif:
-        // the bit is stripped at parse time, so no XS tag is emitted.
+    fn xs_tag_present_when_xs_in_attrs_but_no_intron_motif() {
+        // XS listed in --outSAMattributes turns on intronMotif (STAR), so the
+        // tag is emitted, in the requested position.
         let genome = make_test_genome();
         let params = Parameters::parse_from(vec![
             "rustar-aligner",
@@ -4826,9 +5244,9 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         let data = records[0].data();
-        assert!(
-            data.get(&Tag::new(b'X', b'S')).is_none(),
-            "XS:A: should be absent when --outSAMstrandField is not intronMotif"
+        assert_eq!(
+            data.get(&Tag::new(b'X', b'S')),
+            Some(&Value::Character(b'+')),
         );
     }
 
@@ -4861,5 +5279,191 @@ mod tests {
             None,
             "XS should not be emitted under default attributes and strand field"
         );
+    }
+
+    fn tag_names(record: &RecordBuf) -> Vec<String> {
+        record
+            .data()
+            .iter()
+            .map(|(t, _)| String::from_utf8_lossy(t.as_ref()).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tag_order_follows_out_sam_attributes() {
+        // `nM AS NH MD` (STAR writes the user's order, not NH AS nM MD).
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "nM",
+            "AS",
+            "NH",
+            "MD",
+        ]);
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            0,
+            0,
+            &[spliced_gtag_transcript()],
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+        let mut buf = BufferedSamRecords::new(params.out_sam_attributes);
+        for r in records {
+            buf.push(r);
+        }
+        assert_eq!(tag_names(&buf.records[0]), ["nM", "AS", "NH", "MD"]);
+    }
+
+    #[test]
+    fn tag_order_appends_rg_then_xs_after_user_list() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "MD",
+            "NH",
+            "--outSAMattrRGline",
+            "ID:g1",
+            "--outSAMstrandField",
+            "intronMotif",
+        ]);
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            0,
+            0,
+            &[spliced_gtag_transcript()],
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+        let mut buf = BufferedSamRecords::new(params.out_sam_attributes);
+        for r in records {
+            buf.push(r);
+        }
+        assert_eq!(tag_names(&buf.records[0]), ["MD", "NH", "RG", "XS"]);
+    }
+
+    #[test]
+    fn default_tag_order_is_standard() {
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(vec!["rustar-aligner", "--readFilesIn", "r.fq"]);
+        let records = SamWriter::build_alignment_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            0,
+            0,
+            &[spliced_gtag_transcript()],
+            &genome,
+            &params,
+            1,
+        )
+        .unwrap();
+        let mut buf = BufferedSamRecords::new(params.out_sam_attributes);
+        for r in records {
+            buf.push(r);
+        }
+        assert_eq!(tag_names(&buf.records[0]), ["NH", "HI", "AS", "nM"]);
+    }
+
+    #[test]
+    fn unmapped_tags_have_fixed_order_regardless_of_attributes() {
+        // STAR: NH HI AS nM uT then RG, even with --outSAMattributes None.
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "None",
+            "--outSAMattrRGline",
+            "ID:g1",
+        ]);
+        let rec = SamWriter::build_unmapped_record(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &params,
+            UnmappedReason::TooShort,
+            BestTr::default(),
+        )
+        .unwrap();
+        assert_eq!(tag_names(&rec), ["NH", "HI", "AS", "nM", "uT", "RG"]);
+        let mut buf = BufferedSamRecords::new(params.out_sam_attributes);
+        buf.push(rec);
+        assert_eq!(
+            tag_names(&buf.records[0]),
+            ["NH", "HI", "AS", "nM", "uT", "RG"]
+        );
+    }
+
+    #[test]
+    fn transcriptome_tags_are_nh_hi_rg_only() {
+        // STAR's outSAMattrOrderQuant: NH HI (+ RG), never AS/nM/NM.
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMattributes",
+            "nM",
+            "AS",
+            "NH",
+            "--outSAMattrRGline",
+            "ID:g1",
+        ]);
+        let recs = SamWriter::build_transcriptome_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &[spliced_gtag_transcript()],
+            255,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert_eq!(tag_names(&recs[0]), ["NH", "HI", "RG"]);
+    }
+
+    #[test]
+    fn unlisted_tags_follow_the_ordered_ones_in_their_own_order() {
+        // STAR appends tags outside `outSAMattrOrder` (the WithinBAM `SA`) after
+        // the ordered loop. `Data::remove` swaps, so the unlisted tags' own order
+        // has to survive the reordering too.
+        let attrs = SamAttributes::NH | SamAttributes::HI | SamAttributes::AS;
+        let mut rec = RecordBuf::default();
+        *rec.flags_mut() = sam::alignment::record::Flags::empty(); // the default is unmapped
+        {
+            let data = rec.data_mut();
+            data.insert(Tag::new(b'S', b'A'), Value::from("chr1,100,+,50M,255,0;"));
+            data.insert(Tag::ALIGNMENT_SCORE, Value::from(98i32));
+            data.insert(Tag::new(b'x', b'1'), Value::from(1i32));
+            data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(1i32));
+            data.insert(Tag::new(b'x', b'2'), Value::from(2i32));
+            data.insert(Tag::HIT_INDEX, Value::from(1i32));
+        }
+        order_record_tags(&mut rec, &attrs);
+        assert_eq!(tag_names(&rec), ["NH", "HI", "AS", "SA", "x1", "x2"]);
+    }
+
+    #[test]
+    fn sam_attributes_keep_order_and_dedupe() {
+        let a = SamAttributes::NMM | SamAttributes::AS | SamAttributes::NH | SamAttributes::AS;
+        let v: Vec<SamAttr> = a.iter().collect();
+        assert_eq!(v, [SamAttr::NMM, SamAttr::AS, SamAttr::NH]);
+        let b = a - SamAttributes::AS;
+        assert_eq!(b.iter().collect::<Vec<_>>(), [SamAttr::NMM, SamAttr::NH]);
+        assert!(b.contains(SamAttributes::NH) && !b.contains(SamAttributes::AS));
     }
 }

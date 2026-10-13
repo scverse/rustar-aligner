@@ -45,9 +45,11 @@ For deterministic alignments the records match STAR exactly: same position, same
 
 ### Tie-breaking
 
-When two alignments have the same score, the choice of "primary" depends on tie-breaking. STAR uses a Mersenne Twister (MT19937) RNG; rustar-aligner uses Rust's `StdRng` (ChaCha-based). The seed parameter `--runRNGseed` (default `777`) is honoured by both, but the produced sequences differ — so for ~3% of multi-mapped reads, rustar-aligner picks a different copy as primary than STAR does.
+With the default `--outMultimapperOrder Old_2.4` no random numbers are involved: the alignments are written in STAR's order and the primary is the one STAR picks, so the records match STAR's.
 
-This **doesn't affect the alignment set**: both tools find the same alignments. It only affects which one is flagged primary vs. secondary. NH counts, AS scores, and CIGAR strings are unchanged.
+The transcriptome BAM (`--quantMode TranscriptomeSAM`) picks its primary at random among a read's transcript alignments. rustar-aligner draws it from STAR's generator (Mersenne Twister, seeded with `--runRNGseed`) in STAR's read order, so it matches a STAR run with `--runThreadN 1`, whatever `--runThreadN` you give rustar-aligner. A multi-threaded STAR run seeds one generator per thread, and its picks depend on which thread maps which reads.
+
+Under `--outMultimapperOrder Random`, rustar-aligner shuffles each read's equal-scoring alignments with its own per-read generator (seeded from `--runRNGseed` and the read name), so its order and primary differ from STAR's, and so do the transcriptome BAM primaries. The alignment set is the same: NH counts, AS scores and CIGAR strings are unchanged.
 
 ### CIGAR placement in homopolymers
 

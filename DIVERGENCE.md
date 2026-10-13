@@ -24,11 +24,11 @@ Divergences are grouped by kind:
 
 **Why.** Determinism and thread-count invariance: the same read produces the same primary regardless of `--runThreadN`. STAR's exact mt19937 stream cannot be reproduced under per-read parallelism, and matching it would forfeit reproducibility.
 
-**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all** — the primary is the deterministic best alignment (max score → smaller genomic length → earliest discovered), which is STAR-faithful. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary — never in the set of reported alignments.
+**Impact.** With the default `--outMultimapperOrder Old_2.4`, **no RNG is consulted at all**. Alignments are written in STAR's `trMult` order (window order) and the primary is STAR's `trBest`: best score, then shorter genomic length, then the earlier window (`ReadAlign_multMapSelect.cpp:58-91`, `ReadAlign_stitchPieces.cpp:328-329`). On the yeast 10k and 100k benchmarks, SE and PE, every SAM record, including the primary flag and `HI` order, is identical to STAR's. The divergence is observable only under `--outMultimapperOrder Random`, and only in *which* equal-scoring locus is marked primary and in what order the alignments are written — never in the set of reported alignments.
 
-This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast benchmark, 299 SE and 475 PE primary-selection differences are all genuine ties: both tools find the identical alignment set, and differ only in which equal-scoring member is primary (from SA-iteration order or the RNG-seed difference above). Excluding those ties, SE is 99.815% and PE 99.883% exact.
+**Transcriptome BAM primary.** With `--quantMode TranscriptomeSAM`, STAR marks one of a read's transcript alignments primary with a draw from the same per-thread stream, `int(u * nAlignT)`, for every mapped read and whatever `--outMultimapperOrder` says (`ReadAlign_quantTranscriptome.cpp:69`). rustar-aligner draws it from STAR's generator (`mt19937` seeded with `--runRNGseed`, `ReadAlign.cpp:11-12`) in the single writer stage, in STAR's read order: the BySJout held reads come after all the others, as in STAR's second stage. That is the stream of STAR's chunk 0, so `Aligned.toTranscriptome.out.bam` is record for record STAR's `--runThreadN 1` output at any `--runThreadN` here. With more threads STAR's own draws depend on which thread maps which chunk. Under `--outMultimapperOrder Random`, STAR's shuffles take numbers from the same stream first, which rustar-aligner does not, so the transcriptome primaries differ there too.
 
-**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`), `src/params/mod.rs` (`MultimapperOrder`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlignChunk` RNG seeding.
+**Source.** `src/rng.rs`, `src/align/read_align.rs` (`per_read_seed`, `shuffle_tied_prefix`, `mult_map_order`), `src/params/mod.rs` (`MultimapperOrder`), `src/lib.rs` (`TrRecords::finalize`, `tr_primary_rng`). STAR: `ReadAlign_multMapSelect.cpp`, `ReadAlign_quantTranscriptome.cpp`, `ReadAlignChunk` RNG seeding.
 
 ### 1.2 `--soloUMIfiltering MultiGeneUMI_All` filters, rather than doing nothing
 
@@ -63,6 +63,101 @@ The site that acts on those zeroed counts, however, gates on a different flag (`
 **Impact.** Degenerate inputs only — any dataset large enough to reach the significance test has far more than five distinct frequencies. On those inputs an uninitialised read can place arbitrary mass on unseen genes, which makes the multinomial log-probabilities meaningless; zero keeps them defined.
 
 **Source.** `src/solo/sgt.rs`, locked by `solo::sgt::tests::too_few_frequencies_leaves_the_unseen_mass_at_zero` (asserting the exact bit pattern, since the point is that nothing was written). STAR: `SoloFeature_emptyDrops_CR.cpp`, `SimpleGoodTuring/sgt.h`.
+
+### 1.4 Bulk total-RNA options: unspliced transcriptome targets, `sp` tag, `--quantGeneSplicing`
+
+All three are rustar-aligner extensions with no STAR equivalent, and all are opt-in. Each has its own flag rather than a new value of a STAR parameter (`--quantMode`, `--outSAMattributes`), so a STAR command line never means something different here. With the defaults (`--quantTranscriptomeUnspliced None`, `--outSAMsplicingStatus No`, `--quantGeneSplicing No`) no output changes, which `tests/bulk_unspliced.rs` (`new_options_leave_existing_outputs_unchanged`) checks.
+
+**What STAR does.** `--quantMode TranscriptomeSAM` projects every alignment onto every annotated transcript whose exons contain it (`Transcriptome_quantAlign.cpp`); there are no unspliced targets, so an unspliced read inside an intron that another isoform retains is projected onto the retaining isoform only, and a read in a constitutive intron is not projected at all. STAR classifies reads as spliced / unspliced / ambiguous only for single-cell runs (STARsolo, `Transcriptome_classifyAlign.cpp` + `SoloFeature_countVelocyto.cpp`), and has no per-alignment splicing tag.
+
+**What rustar-aligner does.**
+
+- `--quantTranscriptomeUnspliced Intron|PreMRNA` appends one `<gene_id>-I` target per gene (merged introns of all isoforms plus `--quantTranscriptomeUnsplicedFlank`, or the gene body) after the annotated transcripts, and projects alignments onto them with the unchanged STAR projection, except that fragments crossing a splice junction are kept off the unspliced targets. It also writes `Aligned.toTranscriptome.targets.tsv` and, on request, the unspliced sequences.
+- `--outSAMsplicingStatus Yes` and `--quantGeneSplicing Yes` run a port of STARsolo's spliced / unspliced classification (`alignToTranscriptMinOverlap` with `minOverlapMinusOne = 6` and the 1 Mb intron cap, then the per-UMI collapse of `countVelocyto`), one read or pair standing for one UMI. Two details differ from `classifyAlign`: the containment test uses the true leftmost / rightmost aligned base of the pair, where STAR uses the first block's start and the last block's end (a `TODO` next to that line in STAR flags the case where mate 2 ends before mate 1); and blocks are sorted by position before the scan, so STAR's early exit at the last exon also holds for overlapping mates. The `sp` tag collapses over all containing transcripts regardless of gene and strand.
+
+**Why.** In ribo-depleted total RNA a large share of reads is pre-mRNA. Without unspliced targets STAR's projection gives the intronic ones to retained-intron isoforms, so isoform proportions follow the library's pre-mRNA content (see the PR for measurements, and COMBINE-lab/salmon#1229 for the same effect with Salmon decoys). Unspliced targets let the downstream EM share such reads, as splici does for single-cell data. Bulk users have no STAR option that reports how much of a library is unspliced.
+
+**Impact.** Only when the options are given. Unspliced targets add `@SQ` lines and records to `Aligned.toTranscriptome.out.bam` and change `NH` / `HI` / `MAPQ` of the reads they receive; `sp` adds one tag per record.
+
+**Source.** `src/quant/transcriptome.rs` (`with_unspliced_targets`, `unspliced_intervals`, `filter_and_project`), `src/quant/splice_status.rs`, `src/quant/mod.rs` (`QuantContext`), `src/params/mod.rs` (the three flags). STAR: `Transcriptome_quantAlign.cpp`, `Transcriptome_classifyAlign.cpp`, `SoloFeature_countVelocyto.cpp`.
+
+### 1.5 DegNorm degradation normalization (`--quantGeneCoverage`, `--degNormCoverageFiles`)
+
+A rustar-aligner extension with no STAR equivalent, opt-in. Like §1.4 it uses its own flags rather than new values of `--quantMode` or `--runMode`.
+
+**What STAR does.** Nothing: STAR has no transcript-degradation model and no per-gene coverage output.
+
+**What rustar-aligner does.** `--quantGeneCoverage Yes` accumulates per-gene, per-exonic-base coverage during alignment and writes `GeneCoverage.out.bin`. A separate run with `--degNormCoverageFiles` (two or more files, no reads) merges the samples and fits the rank-one NMF over-approximation of [DegNorm](https://nustatbioinfo.github.io/DegNorm/) (Xiong et al., *Genome Biology* 2019), writing Degradation Index scores and degradation-adjusted counts to `DegNorm.out/`.
+
+**Why.** Degradation bias is gene- and sample-specific, so a global size factor cannot remove it. DegNorm normally recovers coverage curves by re-reading sorted, indexed BAMs; the aligner already assigns each unique read to a gene for `ReadsPerGene.out.tab`, so the curves cost almost nothing to produce there.
+
+**Impact.** Only when the options are given; alignment output and `ReadsPerGene.out.tab` are unchanged (`tests/degnorm.rs`). A degradation index is defined across samples, so the merge needs at least two coverage files.
+
+**Relation to the Python DegNorm.** The fit is a port of `degnorm/nmf.py` (upstream commit 1023383): gene filter (`__main__.py:226-232`), rank-one NMF over-approximation, baseline selection, DI, scale factors, outer loop and adjusted counts. Given the same coverage matrices, DI agrees within 7e-6 and adjusted counts within 3e-5 relative (human chr21, four samples, default, `--degNormSkipBaselineSelection` and non-default iteration/bin settings). The remaining differences are float-level: upstream takes the leading singular triplet with `svds`, rustar-aligner by power iteration on the `p x p` Gram matrix. With `--degNormDownsampleRate` above 1, upstream draws each gene's sampling offset from a global random stream; rustar-aligner derives it from `--runRNGseed` and the gene index, so a run does not depend on thread count. The coverage is not DegNorm's: its BAM reader drops reads with any base outside the annotated exons, advances the reference on soft clips and insertions, assigns reads in overlapping genes by containment in one gene's exons, and treats a BAM as paired only when read names end in `.1`/`.2` (`reads.py`), so it reads STAR-style BAMs as single-end. rustar-aligner counts the exonic bases of unique reads (fragments) that overlap the exons of exactly one gene, with mate overlap counted once. On the same alignments the two coverage definitions give different matrices for most genes, so DI scores differ from a Python DegNorm run on the BAMs.
+
+**Source.** `src/quant/coverage.rs`, `src/degnorm/` (ported from DegNorm's `degnorm/nmf.py`, MIT), `src/params/mod.rs` (the flags).
+
+### 1.6 Homopolymer UMIs are rejected whichever base repeats
+
+**What STAR does.** STAR means to reject a UMI made of one repeated base, and under `CB_UMI_Simple` it does. Under `CB_UMI_Complex` it rejects only poly-A, letting poly-C, poly-G and poly-T through.
+
+The mechanism is an initialisation-order defect, not a rule. The four packed constants are built in the `SoloReadBarcode` constructor, after `ParametersSolo.cpp:368` has set `umiL = 0` for this type (`SoloReadBarcode.cpp:16-21`):
+
+```cpp
+for (uint32 jj=0;jj<4;jj++) {
+    homoPolymer[jj]=0;
+    for (uint32 ii=0; ii<pSolo.umiL;ii++)
+        homoPolymer[jj]=(homoPolymer[jj]<<2)+jj;
+};
+```
+
+but `CB_UMI_Complex` does not know its UMI length until it has extracted one, and sets it at read-processing time (`SoloReadBarcode_getCBandUMI.cpp:353-354`):
+
+```cpp
+if ( pSolo.umiL == 0 )
+    pSolo.umiL = umiSeq.size();
+```
+
+So when `umiL` is still 0 at construction, the loop body never runs and all four constants stay `0`. The check (`SoloReadBarcode_getCBandUMI.cpp:139`) then compares the packed UMI against `0` four times. Poly-A packs to `0`, because `A` is nucleotide 0, so poly-A is still caught; poly-C, poly-G and poly-T pack to non-zero values and match nothing.
+
+**What rustar-aligner does.** Rejects all four homopolymers, in every barcode geometry.
+
+**Why.** Rejecting only poly-A is an accident of when the UMI length becomes known, not a rule, on three pieces of evidence:
+
+1. **The code builds all four.** The constructor loops over all four bases to build one constant per homopolymer; it only ends up matching poly-A because `umiL` is still 0 (`ParametersSolo.cpp:368`: `umiL = 0; //this will be defined when the first barcode is processed`) and `A` encodes as 0.
+2. **STAR's documentation says all homopolymers.** `--soloUMIfiltering -` is "basic filtering: remove UMIs with N and homopolymers (similar to CellRanger 2.2.0)" (`parametersDefault:888`, `docs/STARsolo.md:436`), with no exception by base or by `--soloType`. CellRanger removes all four.
+3. **The same check rejects all four under `CB_UMI_Simple`**, where `umiL` comes from `--soloUMIlen` before the constructor runs. Nothing in the source or the commit history gives `CB_UMI_Complex` a rule of its own.
+
+Poly-A being special in RNA does not apply here: the UMI comes from the barcode read, not the cDNA. In oligo-dT chemistries the UMI sits next to the dT, so a UMI that runs into it reads as poly-T, the one homopolymer STAR's complex path lets through. Matching the accident would count poly-T UMIs as molecules.
+
+**Impact.** Under `--soloType CB_UMI_Complex`, reads whose UMI is a non-A homopolymer are dropped here and counted by STAR. On real data these are rare and are sequencing artefacts.
+
+**Source.** `src/solo/whitelist.rs` (`check_umi`, `umi_valid_rejects_every_homopolymer`). STAR: `SoloReadBarcode.cpp:16-21`, `SoloReadBarcode_getCBandUMI.cpp:139` and `:353-354`.
+
+### 1.7 `--clipAdapterType CellRanger4` with `--clip5pNbases`: records that describe the aligned bases
+
+**What STAR does.** With `CellRanger4`, the 5' clip of mate 1 is `ClipMate` type 10. `ClipMate::clip` (`ClipMate_clip.cpp`) runs in three steps:
+
+- **Fixed bases (`:14-24`).** `Lread -= N` and `clippedN += N` always run, but the `memmove` that drops the N bases from the start of the sequence runs only `if (type==0)`. Type 0 is the 5' clip of `--clipAdapterType Hamming`; the guard was not extended to type 10, so the bases are counted as clipped but stay in the buffer.
+- **TSO (`:50-54`).** Type 10 then moves the sequence by the TSO length alone, counted from the original start of the read.
+- **Bases after the adapter (`:64-70`).** `--clip5pAfterAdapterNbases` has the same `type==0` guard.
+
+`readLoad.cpp:60-61` aligns what is left. So STAR aligns read bases `[TSO, len−N)` (before the 3' clip) where it means to align `[N+TSO, len)`: N bases it was told to discard are aligned, and N real bases at the 3' end are lost. The record is then written with a 5' soft clip of `clippedN` = N+TSO (`ReadAlign_alignBAM.cpp:224-230`, `ReadAlign_calcCIGAR.cpp:16-22`), which places SEQ N bases away from the bases that were aligned at POS. The 3' poly-A search (`:55-57`) also runs on the shifted buffer.
+
+**What rustar-aligner does.** Removes the fixed bases, then the TSO, then the bases after it, and at the 3' end the fixed bases, then the poly-A tail (STAR's amounts and order, `clip::clip_mate_cr4`), and aligns the bases that remain. Each record describes the alignment that was made.
+
+**Why.** STAR's records are not internally consistent, and its own `nM` tag shows it. On the 10x v2 mouse chr19 fixture with `--clipAdapterType CellRanger4 --clip5pNbases 5 --clip3pNbases 3`, recomputing mismatches against the genome from each primary record's POS, CIGAR and SEQ:
+
+| | primary records | recomputed = `nM` as written | recomputed = `nM` with SEQ shifted 5 bases | 0 mismatches as written |
+|---|---|---|---|---|
+| STAR | 16,880 | 2 | 16,880 | 0 |
+| rustar-aligner | 16,936 | 16,936 | 13 | 7,501 |
+
+Every STAR record matches the alignment STAR computed only once SEQ is moved by the N bases that were never removed. rustar-aligner's records match their `nM` as written. Nothing in STAR's documentation describes the shift, and no report of it was found in STAR's issue tracker (searched October 2026).
+
+**Impact.** Only `CellRanger4` with a non-zero `--clip5pNbases` (and, by the same code, `--clip5pAfterAdapterNbases`, which has not been run). Without them the two agree (fixture: all 21,732 records identical). With them, every read differs: of the 16,177 reads both map, 9,353 differ only in POS (−N on forward reads, +N on reverse, relative to rustar-aligner), and 6,824 also differ in CIGAR, locus or strand, because STAR aligned a different stretch of the read. The gene matrix differs too (fixture: 21 raw entries, 448 against 443 UMIs).
+
+**Source.** `src/clip/mod.rs` (`clip_mate_cr4`). STAR: `ClipMate_clip.cpp:14-24, 50-57, 64-70`, `readLoad.cpp:60-61`, `ReadAlign_alignBAM.cpp:224-230`, `ReadAlign_calcCIGAR.cpp:16-22`.
 
 ---
 
@@ -139,19 +234,33 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
+### 3.3 SAM/BAM header program lines
+
+**What STAR does.** The header names STAR: `@PG ID:STAR PN:STAR VN:2.7.11b CL:<commandLineFull>` (`samHeaders.cpp:64`), where `commandLineFull` is STAR's re-formatted parameter list, and `@CO user command line: <command line>` (`:84`).
+
+**What rustar-aligner does.** The same two lines, in the same place, name rustar-aligner: `@PG ID:rustar-aligner PN:rustar-aligner VN:<version> CL:<command line>` and `@CO user command line: <command line>`. Every other header line follows STAR's layout and text, including `@HD VN:1.4`, a user `@HD`/`@PG`, the comment file and `@RG` (`samHeaders.cpp:29-100`).
+
+**Why.** The program record says which program wrote the file; claiming to be STAR would be wrong, and the command line differs anyway (`argv[0]`, spacing).
+
+**Impact.** On the yeast 10k runs (SE and PE, SAM, unsorted, sorted and both BAMs, user `@HD`/`@PG`, comment file, read groups) the headers are identical to STAR's apart from these two lines. A tool that detects the aligner from `PN:STAR` will not recognise the file as STAR's.
+
+**Source.** `src/io/sam.rs` (header text), `src/io/bam.rs`.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
 
-### 4.1 Transcriptome tables built on the fly
+### 4.1 Transcriptome tables built on the fly (GTF given at mapping time)
 
-For `--quantMode TranscriptomeSAM`, rustar-aligner builds the per-transcript exon map directly from the input GTF at run time, instead of loading STAR's persisted `transcriptInfo.tab` / `exonInfo.tab` files. The projection logic mirrors STAR's `Transcriptome_quantAlign.cpp`; the output (`Aligned.toTranscriptome.out.bam`) is intended to be equivalent.
+With `--sjdbGTFfile` at mapping, STAR writes the GTF's transcript tables to `<prefix>_STARgenome/` and then reads them back (`Transcriptome.cpp:13`). rustar-aligner writes the same tables but builds its in-memory transcript index and gene model directly from the GTF. Without a GTF at mapping, both read the index's `transcriptInfo.tab` / `exonInfo.tab` / `geneInfo.tab`, for `--quantMode TranscriptomeSAM` / `GeneCounts`, STARsolo `Gene` / `GeneFull` / `Velocyto` / SmartSeq and the `GX`/`GN` tags, and exit with STAR's "could not open ... geneInfo.tab" error when neither a GTF nor the tables exist. The output is intended to be the same.
 
-**Source.** `src/quant/transcriptome.rs`.
+**Source.** `src/index/io.rs` (`GenomeIndex::load`), `src/quant/transcriptome.rs`, `src/quant/mod.rs` (`resolve_gene_annotation`).
 
 ### 4.2 In-tree RNG generator
 
-rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` samples with a bit-exact libc++ `mt19937` (`src/solo/libcxx_rng.rs`) so its Monte-Carlo null matches STAR's — a convergence with STAR rather than a divergence from it.
+rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` crate, avoiding the `getrandom`/`zerocopy`/`ppv-lite86` dependency chain. This is the generator underlying §1.1; it is called out separately because it is a dependency/implementation choice independent of the tie-break policy. It is not the only in-tree generator: `--soloCellFilter EmptyDrops_CR` and the transcriptome BAM primary (§1.1) draw from a bit-exact `mt19937` (`src/solo/libcxx_rng.rs`) so their results match STAR's — a convergence with STAR rather than a divergence from it.
 
 ### 4.3 Coordinate-sort memory budget and spilling
 
@@ -164,6 +273,30 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 **Impact.** None on output: records are byte-identical to an unbounded in-memory sort, ties keep input order (as STAR's do), and this holds through multi-pass merges. Only memory use, temporary files and the absence of the out-of-memory error differ.
 
 **Source.** `src/io/bam.rs` (`CoordinateSorter`).
+
+### 4.4 Gzipped GTF files
+
+**What STAR does.** `--sjdbGTFfile` is read as plain text; a gzipped GTF fails to parse.
+
+**What rustar-aligner does.** A GTF whose first two bytes are the gzip magic (`1f 8b`) is decompressed while it is read, at `genomeGenerate`, at mapping and in `--runMode liftOver`; the file name does not matter, and multi-member gzip is read to the end. A plain-text GTF is read as before.
+
+**Why.** Annotations are often shipped compressed (10x references: `genes/genes.gtf.gz`), and decompressing them first adds a step and a large file for no change in the result.
+
+**Impact.** None on output: the same GTF gzipped or not gives identical indexes, `_STARgenome/` tables, alignments, `ReadsPerGene.out.tab` and transcriptome BAM. Only a run STAR would reject is accepted.
+
+**Source.** `src/junction/gtf.rs` (`open_annotation`).
+
+### 4.5 Compressed FASTQ input detected by magic bytes
+
+**What STAR does.** Reads `--readFilesIn` as plain text unless `--readFilesCommand` names a decompressor (`zcat`, `bunzip2 -c`, ...), which STAR runs per file (`Parameters_openReadsFiles.cpp:21-70`). It does no detection of its own.
+
+**What rustar-aligner does.** Without `--readFilesCommand`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
+
+**Why.** Extension-based gzip detection was already a local convenience; content detection makes it independent of file names and covers stdin and pipes.
+
+**Impact.** Input STAR would reject (compressed data without `--readFilesCommand`) is accepted. No alignment output changes for input both accept.
+
+**Source.** `src/io/compression.rs`, called from `FastqReader::open` in `src/io/fastq.rs`.
 
 ## 5. Known residual single-read differences
 

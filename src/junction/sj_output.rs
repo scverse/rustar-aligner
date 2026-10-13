@@ -54,6 +54,11 @@ pub struct SpliceJunctionStats {
     /// unless `outSJfilterReads=="All" || nTrO==1`), so a multimapper
     /// contributes nothing at all — not its counts, and not its overhang.
     unique_reads_only: bool,
+    /// Apply `outSJfilterDistToOtherSJmin` when writing. STAR skips it in the
+    /// last stage of `--outFilterType BySJout` (`outputSJ.cpp`,
+    /// `outFilterBySJoutStage==2`): the novel junctions it lets through were
+    /// already filtered by distance in the first stage.
+    dist_filter: bool,
 }
 
 impl Clone for SpliceJunctionStats {
@@ -75,6 +80,7 @@ impl Clone for SpliceJunctionStats {
         Self {
             junctions: new_map,
             unique_reads_only: self.unique_reads_only,
+            dist_filter: self.dist_filter,
         }
     }
 }
@@ -85,6 +91,7 @@ impl SpliceJunctionStats {
         Self {
             junctions: DashMap::new(),
             unique_reads_only: false,
+            dist_filter: true,
         }
     }
 
@@ -93,6 +100,16 @@ impl SpliceJunctionStats {
         Self {
             junctions: DashMap::new(),
             unique_reads_only: params.out_sj_filter_reads == "Unique",
+            dist_filter: params.out_filter_type != crate::params::OutFilterType::BySJout,
+        }
+    }
+
+    /// The statistics of every read as the first BySJout stage sees them
+    /// (STAR `chunkOutSJ1`), which are filtered with the distance filter.
+    pub fn first_stage(params: &Parameters) -> Self {
+        Self {
+            dist_filter: true,
+            ..Self::with_params(params)
         }
     }
 
@@ -144,32 +161,82 @@ impl SpliceJunctionStats {
             .record(is_unique, overhang);
     }
 
-    /// Compute the set of junctions that pass all outSJfilter* thresholds.
-    /// Used by outFilterType BySJout to filter read alignments.
+    /// The junctions STAR's `outputSJ` keeps (`outputSJ.cpp`), as a set.
+    ///
+    /// First the per-junction filter, on the collapsed counts: an annotated
+    /// junction always passes; any other needs (unique >= outSJfilterCountUniqueMin
+    /// OR unique + multi >= outSJfilterCountTotalMin) AND an overhang of at least
+    /// outSJfilterOverhangMin on both sides AND, when it has no more reads than
+    /// outSJfilterIntronMaxVsReadN has entries, an intron no longer than the
+    /// entry for its read count. A threshold of -1 is STAR's `(uint) -1`: nothing
+    /// satisfies it.
+    ///
+    /// Then, unless this is the last stage of BySJout (`dist_filter` false), the
+    /// distance filter on what is left: the nearest other donor (junction start)
+    /// and the nearest other acceptor must both be at least
+    /// outSJfilterDistToOtherSJmin away. Annotated junctions are neighbours
+    /// like any other but are never dropped.
     pub(crate) fn compute_surviving_junctions(&self, params: &Parameters) -> HashSet<SjKey> {
-        // Collect all junctions
-        let mut junctions: Vec<_> = self
+        self.surviving_junctions(params, self.dist_filter)
+    }
+
+    /// The unannotated junctions STAR's first BySJout stage lets a held read use
+    /// (`P.sjNovelStart/End`: always with the distance filter), as (first, last)
+    /// absolute intron bases.
+    pub(crate) fn bysjout_novel_junctions(&self, params: &Parameters) -> HashSet<(u64, u64)> {
+        let counts: std::collections::HashMap<SjKey, bool> = self
             .junctions
             .iter()
-            .map(|entry| {
-                let key = entry.key().clone();
-                let counts = entry.value();
-                let multi = counts.multi_count.load(Ordering::Relaxed);
-                (
-                    key,
-                    counts.annotated,
-                    counts.unique_count.load(Ordering::Relaxed),
-                    multi,
-                    counts.max_overhang.load(Ordering::Relaxed),
-                )
+            .map(|e| (e.key().clone(), e.value().annotated))
+            .collect();
+        self.surviving_junctions(params, true)
+            .into_iter()
+            .filter(|k| !counts.get(k).copied().unwrap_or(false))
+            .map(|k| (k.intron_start, k.intron_end))
+            .collect()
+    }
+
+    fn surviving_junctions(&self, params: &Parameters, dist_filter: bool) -> HashSet<SjKey> {
+        // STAR casts the (signed) parameter to uint: -1 is out of reach.
+        let thr = |v: i64| v as u64;
+        let overhang_min = &params.out_sj_filter_overhang_min;
+        let unique_min = &params.out_sj_filter_count_unique_min;
+        let total_min = &params.out_sj_filter_count_total_min;
+        let dist_min = &params.out_sj_filter_dist_to_other_sjmin;
+        let intron_max = &params.out_sj_filter_intron_max_vs_read_n;
+
+        // (key, annotated, unique, multi, overhang) of the junctions that pass the
+        // count filter, in STAR's order (start, then gap; starts are absolute so
+        // the chromosome order is implied).
+        let mut passing: Vec<(SjKey, bool, u32, u32, u32)> = self
+            .junctions
+            .iter()
+            .filter_map(|entry| {
+                let key = entry.key();
+                let c = entry.value();
+                let unique = c.unique_count.load(Ordering::Relaxed);
+                let multi = c.multi_count.load(Ordering::Relaxed);
+                let overhang = c.max_overhang.load(Ordering::Relaxed);
+                if !c.annotated {
+                    let cat = SpliceMotif::filter_category_from_encoded(key.motif);
+                    let total = u64::from(unique) + u64::from(multi);
+                    let gap = key.intron_end - key.intron_start + 1;
+                    let reads_ok = u64::from(unique) >= thr(i64::from(unique_min[cat]))
+                        || total >= thr(i64::from(total_min[cat]));
+                    let overhang_ok = u64::from(overhang) >= thr(i64::from(overhang_min[cat]));
+                    let intron_ok = total as usize > intron_max.len()
+                        || total == 0
+                        || gap <= thr(intron_max[total as usize - 1]);
+                    if !(reads_ok && overhang_ok && intron_ok) {
+                        return None;
+                    }
+                }
+                Some((key.clone(), c.annotated, unique, multi, overhang))
             })
             .collect();
-
-        // Sort by chromosome, start, end (for distance calculation). Strand and
-        // motif join the key because the source is a `DashMap`, whose iteration
-        // order is not stable across runs or thread counts: a tie left to that
-        // order would carry it forward (#210).
-        junctions.sort_by(|a, b| {
+        // Total order: the source is a `DashMap`, whose iteration order is not
+        // stable across runs or thread counts (#210).
+        passing.sort_by(|a, b| {
             a.0.chr_idx
                 .cmp(&b.0.chr_idx)
                 .then(a.0.intron_start.cmp(&b.0.intron_start))
@@ -178,78 +245,51 @@ impl SpliceJunctionStats {
                 .then(a.0.motif.cmp(&b.0.motif))
         });
 
-        let overhang_min = &params.out_sj_filter_overhang_min;
-        let unique_min = &params.out_sj_filter_count_unique_min;
-        let total_min = &params.out_sj_filter_count_total_min;
-        let dist_min = &params.out_sj_filter_dist_to_other_sjmin;
-
-        // Build distance-to-nearest-neighbor map
-        let min_dist_to_neighbor: Vec<u64> = {
-            let n = junctions.len();
-            let mut dists = vec![u64::MAX; n];
-            for i in 0..n {
-                if i > 0 && junctions[i].0.chr_idx == junctions[i - 1].0.chr_idx {
-                    let d = junctions[i]
-                        .0
-                        .intron_start
-                        .saturating_sub(junctions[i - 1].0.intron_end);
-                    dists[i] = dists[i].min(d);
-                    dists[i - 1] = dists[i - 1].min(d);
-                }
-                if i + 1 < n && junctions[i].0.chr_idx == junctions[i + 1].0.chr_idx {
-                    let d = junctions[i + 1]
-                        .0
-                        .intron_start
-                        .saturating_sub(junctions[i].0.intron_end);
-                    dists[i] = dists[i].min(d);
-                }
-            }
-            dists
-        };
-
-        let mut surviving = HashSet::new();
-
-        for (idx, (key, annotated, unique, multi, max_overhang)) in junctions.iter().enumerate() {
-            // Annotated junctions bypass all outSJfilter* checks
-            if !annotated {
-                let cat = SpliceMotif::filter_category_from_encoded(key.motif);
-
-                if (*max_overhang as i32) < overhang_min[cat] {
-                    continue;
-                }
-                // STAR keeps a junction if EITHER the unique count OR the total
-                // (unique+multi) count meets its threshold — an OR, not an AND
-                // (STAR manual; confirmed against STAR source and STAR-rs
-                // `star_sj.rs`). Testing them as two independent drop-guards was
-                // an AND, which discarded every junction supported only by
-                // multi-mapping reads (unique==0) — the cause of rustar-aligner
-                // reporting far fewer novel junctions than STAR. Drop only when
-                // BOTH thresholds fail.
-                let total = unique + multi;
-                if (*unique as i32) < unique_min[cat] && (total as i32) < total_min[cat] {
-                    continue;
-                }
-                if dist_min[cat] > 0 && min_dist_to_neighbor[idx] < dist_min[cat] as u64 {
-                    continue;
-                }
-                let intron_len = key.intron_end.saturating_sub(key.intron_start);
-                let intron_max_thresholds = &params.out_sj_filter_intron_max_vs_read_n;
-                let max_intron_for_reads = if total >= 3 {
-                    intron_max_thresholds.get(2).copied().unwrap_or(200_000)
-                } else if total >= 2 {
-                    intron_max_thresholds.get(1).copied().unwrap_or(100_000)
+        let n = passing.len();
+        let mut keep = vec![true; n];
+        if dist_filter {
+            // Nearest other donor / acceptor, unsigned as in STAR (the first
+            // junction's previous start is 0, the last one's next is -1).
+            let near = |sorted: &[u64], i: usize| -> u64 {
+                let prev = if i > 0 { sorted[i - 1] } else { 0 };
+                let next = if i + 1 < sorted.len() {
+                    sorted[i + 1]
                 } else {
-                    intron_max_thresholds.first().copied().unwrap_or(50_000)
+                    u64::MAX
                 };
-                if intron_len as i64 > max_intron_for_reads {
+                sorted[i]
+                    .wrapping_sub(prev)
+                    .min(next.wrapping_sub(sorted[i]))
+            };
+            let donors: Vec<u64> = passing.iter().map(|p| p.0.intron_start).collect();
+            let mut acceptors: Vec<(u64, usize)> = passing
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.0.intron_end + 1, i))
+                .collect();
+            acceptors.sort_unstable();
+            let acc_sorted: Vec<u64> = acceptors.iter().map(|a| a.0).collect();
+            for (i, p) in passing.iter().enumerate() {
+                if p.1 {
+                    continue; // annotated: no filtering
+                }
+                let cat = SpliceMotif::filter_category_from_encoded(p.0.motif);
+                keep[i] = near(&donors, i) >= thr(i64::from(dist_min[cat]));
+            }
+            for (pos, &(_, i)) in acceptors.iter().enumerate() {
+                if passing[i].1 {
                     continue;
                 }
+                let cat = SpliceMotif::filter_category_from_encoded(passing[i].0.motif);
+                keep[i] = keep[i] && near(&acc_sorted, pos) >= thr(i64::from(dist_min[cat]));
             }
-
-            surviving.insert(key.clone());
         }
 
-        surviving
+        passing
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(p, k)| k.then_some(p.0))
+            .collect()
     }
 
     /// Write SJ.out.tab file with motif-specific filtering
@@ -369,13 +409,6 @@ impl SpliceJunctionStats {
     /// Check if any junctions have been recorded
     pub fn is_empty(&self) -> bool {
         self.junctions.is_empty()
-    }
-
-    /// Iterate over all junctions (for two-pass mode filtering)
-    pub(crate) fn iter(
-        &self,
-    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, SjKey, SjCounts>> {
-        self.junctions.iter()
     }
 }
 
@@ -706,6 +739,70 @@ mod tests {
 
         // Annotated junction should pass despite low overhang and count
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn test_surviving_intron_max_vs_read_n_uses_intron_length() {
+        // outSJfilterIntronMaxVsReadN 50000 100000 200000: one read allows an intron of
+        // 50000 bases (gap = end - start + 1), two reads 100000, more than three: any.
+        let mut params = default_params();
+        params.out_sj_filter_count_unique_min = vec![1, 1, 1, 1];
+        let stats = SpliceJunctionStats::new();
+        stats.record_junction(0, 0, 49_999, 1, SpliceMotif::GtAg, true, 50, false); // 50000
+        stats.record_junction(0, 100_000, 150_000, 1, SpliceMotif::GtAg, true, 50, false); // 50001
+        for _ in 0..4 {
+            stats.record_junction(0, 400_000, 900_000, 1, SpliceMotif::GtAg, true, 50, false);
+        }
+        let surviving = stats.compute_surviving_junctions(&params);
+        let starts: std::collections::BTreeSet<u64> =
+            surviving.iter().map(|k| k.intron_start).collect();
+        assert_eq!(starts, [0, 400_000].into_iter().collect());
+    }
+
+    #[test]
+    fn test_surviving_negative_threshold_never_passes() {
+        // STAR casts the thresholds to uint: -1 is out of reach, not "no limit".
+        let mut params = default_params();
+        params.out_sj_filter_count_unique_min = vec![-1, 1, 1, 1];
+        params.out_sj_filter_count_total_min = vec![-1, 1, 1, 1];
+        let stats = SpliceJunctionStats::new();
+        for _ in 0..10 {
+            stats.record_junction(0, 100, 200, 0, SpliceMotif::NonCanonical, true, 60, false);
+        }
+        assert!(stats.compute_surviving_junctions(&params).is_empty());
+    }
+
+    #[test]
+    fn test_surviving_distance_filter_counts_annotated_neighbours() {
+        // Non-canonical junction needs a donor and an acceptor 10 or more away from
+        // the others, annotated junctions included; the annotated one is kept anyway.
+        let params = default_params();
+        let stats = SpliceJunctionStats::new();
+        stats.record_junction(0, 1000, 1999, 1, SpliceMotif::GtAg, true, 50, true);
+        for _ in 0..3 {
+            stats.record_junction(0, 1005, 3000, 0, SpliceMotif::NonCanonical, true, 50, false);
+            stats.record_junction(0, 5000, 5999, 0, SpliceMotif::NonCanonical, true, 50, false);
+        }
+        let surviving = stats.compute_surviving_junctions(&params);
+        let starts: std::collections::BTreeSet<u64> =
+            surviving.iter().map(|k| k.intron_start).collect();
+        assert_eq!(starts, [1000, 5000].into_iter().collect());
+        // The last stage of BySJout does not filter by distance again.
+        let mut p2 = default_params();
+        p2.out_filter_type = crate::params::OutFilterType::BySJout;
+        let last = SpliceJunctionStats::with_params(&p2);
+        last.record_junction(0, 1000, 1999, 1, SpliceMotif::GtAg, true, 50, true);
+        for _ in 0..3 {
+            last.record_junction(0, 1005, 3000, 0, SpliceMotif::NonCanonical, true, 50, false);
+        }
+        assert_eq!(last.compute_surviving_junctions(&p2).len(), 2);
+        // ... whereas the first stage's novel list does.
+        let first = SpliceJunctionStats::first_stage(&p2);
+        first.record_junction(0, 1000, 1999, 1, SpliceMotif::GtAg, true, 50, true);
+        for _ in 0..3 {
+            first.record_junction(0, 1005, 3000, 0, SpliceMotif::NonCanonical, true, 50, false);
+        }
+        assert!(first.bysjout_novel_junctions(&p2).is_empty());
     }
 
     #[test]

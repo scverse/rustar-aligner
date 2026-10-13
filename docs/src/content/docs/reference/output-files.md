@@ -13,9 +13,11 @@ For the examples below, assume `--outFileNamePrefix sample_`. Replace `sample_` 
 
 Default output. SAM-format alignment file with header and records. Written when `--outSAMtype SAM` (the default).
 
+The header follows STAR's layout: `@HD VN:1.4` (or the `--outSAMheaderHD` line as given), the `@SQ` lines, the `--outSAMheaderPG` line if any, the program's own `@PG`, the lines of `--outSAMheaderCommentFile` (blank lines skipped), the `@RG` lines, and `@CO user command line: ...`. A coordinate-sorted BAM appends `SO:coordinate` to the `@HD` line. The transcriptome BAM's header has only `@SQ` and `@RG` lines.
+
 ### `sample_Aligned.out.bam`
 
-Unsorted BAM equivalent of `Aligned.out.sam`. Written when `--outSAMtype BAM Unsorted`.
+Unsorted BAM equivalent of `Aligned.out.sam`. Written when `--outSAMtype BAM Unsorted` (also together with the sorted BAM: `--outSAMtype BAM Unsorted SortedByCoordinate`).
 
 ### `sample_Aligned.sortedByCoord.out.bam`
 
@@ -23,7 +25,7 @@ Coordinate-sorted BAM. Written when `--outSAMtype BAM SortedByCoordinate`. The s
 
 ### `sample_Aligned.toTranscriptome.out.bam`
 
-Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record is emitted per transcript that the read aligns within.
+Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record (one per mate for a pair) is emitted per transcript that the read aligns within, in STAR's order. MAPQ comes from the number of transcript alignments, and one of them is marked primary at random, as STAR does (see the migration guide's tie-breaking notes). With `--quantTranscriptomeUnspliced Intron|PreMRNA` (rustar-aligner extension) the references also include one `<gene_id>-I` unspliced target per gene, and `sample_Aligned.toTranscriptome.targets.tsv` (target, gene, `spliced`/`unspliced` status, length) is written next to it, plus `sample_Aligned.toTranscriptome.unspliced.fa` with `--quantTranscriptomeUnsplicedFasta Yes`. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
 ## Log files
 
@@ -71,7 +73,7 @@ Written when `--chimSegmentMin > 0`. Format depends on `--chimOutType`.
 
 ### Chimeric records in the primary BAM
 
-When `--chimOutType` includes `WithinBAM`, the chimeric segments are embedded as supplementary alignment records (FLAG `0x800`) in the main BAM output, with `SA` tags linking the donor and acceptor halves. Tools like Arriba and STAR-Fusion know how to read either format.
+When `--chimOutType` includes `WithinBAM`, a chimeric read is written into the main BAM in place of its normal alignment, as STAR does: one segment as a normal record and the other as a supplementary record (FLAG `0x800`, hard-clipped unless `SoftClip`), with `SA` tags linking the two. Paired reads whose mates lie on either side of the junction are written as two normal records. See the [chimeric guide](/rustar-aligner/guides/chimeric/).
 
 ## Quantification
 
@@ -85,6 +87,10 @@ gene_id    unstranded    forward_stranded    reverse_stranded
 
 The first four rows are summary categories: `N_unmapped`, `N_multimapping`, `N_noFeature`, `N_ambiguous`. Subsequent rows are per-gene counts. Pick the column matching your library's strandedness — see the [quantification guide](/rustar-aligner/guides/quantification/).
 
+### `sample_ReadsPerGeneSplicing.out.tab` / `sample_ReadsPerGeneSplicing.summary.tsv`
+
+Written when `--quantGeneSplicing Yes` is set (rustar-aligner extension, not in STAR). The table has a header line and one line per gene with spliced, unspliced and ambiguous counts for the unstranded, forward and reverse strand conventions (nine count columns). The summary gives read accounting and the spliced / unspliced / ambiguous fractions per strand convention. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
+
 ## Unmapped reads
 
 ### `sample_Unmapped.out.mate1` / `sample_Unmapped.out.mate2`
@@ -93,7 +99,9 @@ Written when `--outReadsUnmapped Fastx` is set. FASTQ output of every read that 
 
 ## Two-pass mode
 
-In two-pass mode (`--twopassMode Basic`), pass 1 produces an internal `_STARpass1/SJ.out.tab` that's used to seed pass 2. The final `sample_SJ.out.tab` reflects pass 2's discoveries; pass 1's intermediate file is not retained by default.
+In two-pass mode (`--twopassMode Basic`), pass 1 writes `sample__STARpass1/SJ.out.tab` and `sample__STARpass1/Log.final.out`; the junctions in that `SJ.out.tab` are inserted into the genome for pass 2. The final `sample_SJ.out.tab` comes from pass 2.
+
+Whenever junctions are inserted at mapping (two-pass, or `--sjdbGTFfile` / `--sjdbFileChrStartEnd` at mapping), `sample__STARgenome/` gets `sjdbInfo.txt` and `sjdbList.out.tab`, the transcript tables when a GTF was given, and with `--sjdbInsertSave All` the extended Genome, SA and SAindex.
 
 ## Standard output
 

@@ -241,3 +241,81 @@ fn transcriptome_sam_end_to_end_smoke_test() {
     assert!(keys.iter().any(|k| k == "T1"), "T1 missing from @SQ");
     assert!(keys.iter().any(|k| k == "T2"), "T2 missing from @SQ");
 }
+
+/// `--quantMode GeneCounts` without `--sjdbGTFfile` loads the gene model from
+/// the index tables (STAR's Transcriptome constructor) and equals the run that
+/// passes the GTF; an index without annotation tables gives STAR's error.
+#[test]
+fn gene_counts_from_index_tables_without_gtf() {
+    let tmpdir = TempDir::new().unwrap();
+    let (fasta_path, chr1_seq) = create_fasta(&tmpdir);
+    let gtf_path = create_gtf(&tmpdir);
+    let fastq_path = create_fastq(&tmpdir, 20, &chr1_seq);
+
+    let build = |name: &str, gtf: bool| {
+        let dir = tmpdir.path().join(name);
+        let mut args = vec![
+            "--runMode".to_string(),
+            "genomeGenerate".into(),
+            "--genomeDir".into(),
+            dir.display().to_string(),
+            "--genomeFastaFiles".into(),
+            fasta_path.display().to_string(),
+            "--genomeSAindexNbases".into(),
+            "5".into(),
+            "--outFileNamePrefix".into(),
+            dir.join("run_").display().to_string(),
+        ];
+        if gtf {
+            args.extend(["--sjdbGTFfile".into(), gtf_path.display().to_string()]);
+        }
+        cargo_bin_cmd!("rustar-aligner")
+            .args(args)
+            .assert()
+            .success();
+        dir
+    };
+    let map = |genome: &std::path::Path, out: &str, gtf: bool| {
+        let od = tmpdir.path().join(out);
+        fs::create_dir_all(&od).unwrap();
+        let mut args = vec![
+            "--genomeDir".to_string(),
+            genome.display().to_string(),
+            "--readFilesIn".into(),
+            fastq_path.display().to_string(),
+            "--outFileNamePrefix".into(),
+            format!("{}/", od.display()),
+            "--quantMode".into(),
+            "GeneCounts".into(),
+            "--outFilterMismatchNmax".into(),
+            "20".into(),
+            "--outFilterScoreMinOverLread".into(),
+            "0.3".into(),
+            "--outFilterMatchNminOverLread".into(),
+            "0.3".into(),
+        ];
+        if gtf {
+            args.extend(["--sjdbGTFfile".into(), gtf_path.display().to_string()]);
+        }
+        (od, cargo_bin_cmd!("rustar-aligner").args(args).assert())
+    };
+
+    let with_gtf_idx = build("idx_gtf", true);
+    let (od_a, a) = map(&with_gtf_idx, "out_from_index", false);
+    a.success();
+    let (od_b, b) = map(&with_gtf_idx, "out_with_gtf", true);
+    b.success();
+    let counts_a = fs::read_to_string(od_a.join("ReadsPerGene.out.tab")).unwrap();
+    let counts_b = fs::read_to_string(od_b.join("ReadsPerGene.out.tab")).unwrap();
+    assert_eq!(counts_a, counts_b);
+    assert!(
+        counts_a
+            .lines()
+            .any(|l| l.starts_with("G1\t") && !l.ends_with("\t0\t0\t0"))
+    );
+
+    let plain_idx = build("idx_plain", false);
+    let (_, c) = map(&plain_idx, "out_none", false);
+    c.failure()
+        .stderr(predicates::str::contains("geneInfo.tab"));
+}

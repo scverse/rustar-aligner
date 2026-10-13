@@ -9,12 +9,14 @@
 // `chimericDetectionMult` under `--chimMultimapNmax`, both over the read's
 // window transcripts — combined two-mate transcripts for a pair.
 
+mod bam;
 mod detect;
 mod output;
 mod segment;
 
-pub use detect::{ChimRead, WinTr, chimeric_detection};
-pub use output::{ChimericJunctionWriter, build_within_bam_records};
+pub use bam::{ChimReadInput, build_chimeric_bam_records};
+pub use detect::{ChimBam, ChimRead, WinTr, chimeric_detection};
+pub use output::ChimericJunctionWriter;
 pub use segment::{ChimericAlignment, ChimericSegment, ExonSpan, JunctionLine, MultimapInfo};
 
 #[cfg(test)]

@@ -83,6 +83,9 @@ const ACCEPTED_BUT_INERT: &[(&str, &str)] = &[
 /// Adding a name here must always be a deliberate act. Removing one is what
 /// progress looks like.
 const NOT_YET_ACCEPTED: &[&str] = &[
+    // STAR checks the index against its built-in 2.7.4a (see
+    // `check_genome_version`); the override flag is not accepted.
+    "versionGenome",
     // Aligner core; implemented by the aligner-core PR, not here.
     "alignEndsProtrude",
     "alignInsertionFlush",
@@ -100,12 +103,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
     "genomeType",
-    "sjdbInsertSave",
-    // STARsolo barcode chemistry.
-    "soloAdapterMismatchesNmax",
-    "soloAdapterSequence",
-    "soloCBtype",
-    "soloOutFormatFeaturesGeneField3",
 ];
 
 fn star_parameter_names() -> Vec<String> {

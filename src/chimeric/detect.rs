@@ -217,7 +217,7 @@ impl WinTr {
         }
         let r_length = exons.iter().map(|e| e.l).sum();
         let r_start = exons[0].r;
-        // `stitchWindowAligns.cpp:299`.
+        // `stitchWindowAligns.cpp:229`.
         let ro_start = if str_ == 0 {
             r_start
         } else {
@@ -304,50 +304,16 @@ pub struct Windows {
 }
 
 impl Windows {
-    /// Build each window the way `stitchWindowAligns` records into `wTr`
-    /// (`stitchWindowAligns.cpp:337-381`), taking transcripts in discovery
-    /// order: a transcript whose blocks another already covers is dropped if it
-    /// scores lower, one that covers an earlier transcript evicts it, and the
-    /// rest are inserted by score, shorter genomic span first on ties.
-    ///
-    /// With chimeric detection on STAR records every transcript regardless of
-    /// score (`|| P.pCh.segmentMin>0`), so there is no score gate here.
+    /// The windows as the stitcher recorded them. The stitcher already applies
+    /// STAR's window dedup in discovery order (`stitchWindowAligns.cpp:260-302`)
+    /// and records every transcript when chimeric detection is on, so they are
+    /// taken as given: the dedup is order-dependent and would go wrong if run
+    /// again on the score-sorted windows.
     pub fn new(tr: Vec<Vec<WinTr>>, max_per_window: usize) -> Self {
         let tr = tr
             .into_iter()
-            .map(|win| {
-                let mut w: Vec<WinTr> = Vec::new();
-                for t in win {
-                    let mapped = t.r_length;
-                    let mut i = 0;
-                    let mut dropped = false;
-                    while i < w.len() {
-                        let n = blocks_overlap(&t, &w[i]);
-                        let (u_new, u_old) = (mapped - n, w[i].r_length - n);
-                        if u_new == 0 && t.max_score < w[i].max_score {
-                            dropped = true;
-                            break;
-                        } else if u_old == 0 {
-                            w.remove(i);
-                        } else {
-                            // `uOld>0 && (uNew>0 || Score>=old)` always holds here.
-                            i += 1;
-                        }
-                    }
-                    if dropped {
-                        continue;
-                    }
-                    let at = w
-                        .iter()
-                        .position(|o| {
-                            t.max_score > o.max_score
-                                || (t.max_score == o.max_score && t.g_length() < o.g_length())
-                        })
-                        .unwrap_or(w.len());
-                    w.insert(at, t);
-                    // STAR overwrites the slot past the cap rather than growing.
-                    w.truncate(max_per_window.max(1));
-                }
+            .map(|mut w| {
+                w.truncate(max_per_window.max(1));
                 w
             })
             .filter(|w| !w.is_empty())
@@ -355,7 +321,7 @@ impl Windows {
         Self { tr }
     }
 
-    /// `trBest` (`ReadAlign_stitchPieces.cpp:358`): the best window's top
+    /// `trBest` (`ReadAlign_stitchPieces.cpp:328-329`): the best window's top
     /// transcript, a later window winning only on a higher score or an equal
     /// score with a shorter span.
     fn best(&self) -> Option<usize> {
@@ -412,8 +378,20 @@ fn comp(b: u8) -> u8 {
 /// `Transcript::alignScore` (`Transcript_alignScore.cpp`): re-score a
 /// transcript from its exons.
 fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentScorer) -> i32 {
+    align_score_mm(tr, read, genome, scorer).0
+}
+
+/// `alignScore` with the mismatch count it recomputes alongside (`nMM`), which
+/// is what a chimeric BAM record reports as `nM`.
+fn align_score_mm(
+    tr: &WinTr,
+    read: &ChimRead,
+    genome: &Genome,
+    scorer: &AlignmentScorer,
+) -> (i32, u32) {
     let r: &[u8] = if tr.str_ == 0 { read.fwd } else { &read.rev };
     let mut score = 0i32;
+    let mut n_mm = 0u32;
     for e in &tr.exons {
         for ii in 0..e.l {
             let r1 = r.get(e.r + ii).copied().unwrap_or(5);
@@ -423,6 +401,7 @@ fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentS
                 score += 1;
             } else {
                 score -= 1;
+                n_mm += 1;
             }
         }
     }
@@ -451,7 +430,7 @@ fn align_score(tr: &WinTr, read: &ChimRead, genome: &Genome, scorer: &AlignmentS
         let span = tr.g_length().max(1) as f64;
         score += (span.log2() * scorer.score_genomic_length_log2_scale - 0.5).ceil() as i32;
     }
-    score
+    (score, n_mm)
 }
 
 /// `Transcript::generateCigarP` / `ReadAlign::outputTranscriptCIGARp`: the
@@ -1153,12 +1132,16 @@ fn mate_segment(tr: &WinTr, junction_exon: usize, read: &ChimRead, score: i32) -
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn to_alignment(
     p: &Placed,
     score: i32,
     read: &ChimRead,
     genome: &Genome,
     scorer: &AlignmentScorer,
+    i_tr: usize,
+    chim_n: usize,
+    is_best: bool,
 ) -> ChimericAlignment {
     let e0 = if p.t0.str_ == 1 {
         0
@@ -1195,7 +1178,39 @@ fn to_alignment(
         acceptor_start: p.t1.exons[0].g,
         acceptor_cigar: cigar_p(&p.t1, read),
     });
+    // What `chimericBAMoutput` needs. Both detectors re-score the placed
+    // transcripts with `alignScore` before writing BAM, which is where `AS` and
+    // `nM` come from (`chimericDetectionOldOutput.cpp:12-13`,
+    // `ChimericAlign_chimericStitching.cpp:180`).
+    let (s0, mm0) = align_score_mm(&p.t0, read, genome, scorer);
+    let (s1, mm1) = align_score_mm(&p.t1, read, genome, scorer);
+    chim.bam = Some(Box::new(ChimBam {
+        tr: [p.t0.clone(), p.t1.clone()],
+        max_score: [s0, s1],
+        n_mm: [mm0, mm1],
+        i_tr,
+        chim_n,
+        is_best,
+        read_length: read.read_length,
+        paired: read.paired,
+    }));
     chim
+}
+
+/// A chimera as STAR's `chimericBAMoutput` receives it: the two placed
+/// transcripts in read order, their re-scored `maxScore` / `nMM`, and the
+/// run-level `iTr` / `chimN` / `isBestChimAlign`.
+#[derive(Debug, Clone)]
+pub struct ChimBam {
+    pub tr: [WinTr; 2],
+    pub max_score: [i32; 2],
+    pub n_mm: [u32; 2],
+    pub i_tr: usize,
+    pub chim_n: usize,
+    pub is_best: bool,
+    /// `readLength[0..2]` of the (clipped) mates the exons index.
+    pub read_length: [usize; 2],
+    pub paired: bool,
 }
 
 /// `ReadAlign::chimericDetection`: run whichever STAR detector the parameters
@@ -1219,7 +1234,8 @@ pub fn chimeric_detection(
         // single-best bookkeeping use the re-scored segments.
         let score =
             align_score(&p.t0, read, genome, scorer) + align_score(&p.t1, read, genome, scorer);
-        return vec![to_alignment(&p, score, read, genome, scorer)];
+        // `chimericBAMoutput(&trChim[0], &trChim[1], this, 0, 1, true, P)`.
+        return vec![to_alignment(&p, score, read, genome, scorer, 0, 1, true)];
     }
     let Some(ib) = w.best() else {
         return Vec::new();
@@ -1233,21 +1249,32 @@ pub fn chimeric_detection(
     if best == 0 {
         return Vec::new();
     }
-    let kept: Vec<&MultChim> = chims.iter().filter(|c| c.score >= min_score).collect();
+    let kept: Vec<(usize, &MultChim)> = chims
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.score >= min_score)
+        .collect();
     if kept.len() > params.chim_multimap_nmax {
         return Vec::new();
     }
     let chim_n = kept.len();
+    // `bestChimAlign`: the chimera that last raised `chimScoreBest`, i.e. the
+    // first one to reach the final best score.
+    let best_idx = chims.iter().position(|c| c.score == best);
     kept.into_iter()
-        .map(|c| {
-            to_alignment(&c.p, c.score, read, genome, scorer).with_multimap(MultimapInfo {
-                chim_n,
-                max_possible_score: frag_len,
-                max_non_chim_score: max_non_chim,
-                chim_score: c.score,
-                best_chim_score: best,
-                pe_merged: false,
-            })
+        .enumerate()
+        .map(|(i_tr, (idx, c))| {
+            let is_best = best_idx == Some(idx);
+            to_alignment(&c.p, c.score, read, genome, scorer, i_tr, chim_n, is_best).with_multimap(
+                MultimapInfo {
+                    chim_n,
+                    max_possible_score: frag_len,
+                    max_non_chim_score: max_non_chim,
+                    chim_score: c.score,
+                    best_chim_score: best,
+                    pe_merged: false,
+                },
+            )
         })
         .collect()
 }
@@ -1315,6 +1342,7 @@ mod tests {
             .map(|&(_, l)| l)
             .sum();
         Transcript {
+            output_rank: 0,
             chr_idx: chr,
             genome_start: g_start,
             genome_end: g_start + g_len as u64,
@@ -1333,6 +1361,7 @@ mod tests {
             n_junction: 0,
             junction_motifs: vec![SpliceMotif::GtAg],
             junction_annotated: vec![false],
+            junction_strand: vec![],
         }
     }
 
@@ -1420,33 +1449,27 @@ mod tests {
         assert_eq!(align_score(&t, &read, &gn, &scorer), expected);
     }
 
+    /// The windows are the stitcher's, already deduplicated in STAR's
+    /// discovery order. Re-running the dedup on the score-sorted window would
+    /// let a lower-scoring transcript evict a higher one it covers, which STAR
+    /// kept because it was recorded later (ERR12389696.21252621: `35M39I76M`,
+    /// score 29, covers `35M`, score 34, the chimeric partner).
     #[test]
-    fn window_dedup_follows_stitch_window_aligns() {
-        let w = |e: Vec<ChimExon>, s: i32| wintr(e, vec![], s);
-        let a = w(vec![exon(100, 0, 50, 0)], 50);
-        // Covered by `a` and scoring lower: never recorded.
-        let sub = w(vec![exon(110, 10, 30, 0)], 30);
-        // Unrelated diagonal: kept and ordered by score.
-        let other = w(vec![exon(500, 0, 40, 0)], 40);
-        let win = Windows::new(vec![vec![a.clone(), sub, other]], 100);
+    fn windows_are_taken_as_the_stitcher_recorded_them() {
+        let best = wintr(vec![exon(100, 20, 130, 0)], vec![], 120);
+        let partner = wintr(vec![exon(119, 0, 35, 0)], vec![], 34);
+        let cover = wintr(
+            vec![exon(119, 0, 35, 0), exon(154, 74, 76, 0)],
+            vec![-2],
+            29,
+        );
+        let win = Windows::new(vec![vec![best, partner, cover], vec![]], 100);
         let scores: Vec<i32> = win.tr[0].iter().map(|t| t.max_score).collect();
-        assert_eq!(scores, vec![50, 40]);
-
-        // A later transcript that covers an earlier one evicts it, even when
-        // the earlier one scored higher (`uOld==0` has no score test).
-        let cover = w(vec![exon(100, 0, 60, 0)], 45);
-        let win = Windows::new(vec![vec![a, cover]], 100);
-        assert_eq!(win.tr[0].len(), 1);
-        assert_eq!(win.tr[0][0].max_score, 45);
-
-        // Equal scores: the shorter genomic span goes first.
-        let long = w(vec![exon(100, 0, 20, 0), exon(300, 20, 20, 0)], 40);
-        let short = w(vec![exon(600, 0, 40, 0)], 40);
-        let mut long = long;
-        long.canon_sj = vec![1];
-        long.sj_annot = vec![false];
-        let win = Windows::new(vec![vec![long, short.clone()]], 100);
-        assert_eq!(win.tr[0][0].exons, short.exons);
+        assert_eq!(scores, vec![120, 34, 29]);
+        // Empty windows are dropped; `--alignTranscriptsPerWindowNmax` still caps.
+        assert_eq!(win.tr.len(), 1);
+        let capped = Windows::new(win.tr, 2);
+        assert_eq!(capped.tr[0].len(), 2);
     }
 
     /// A single-end read, half chr0 and half chr1: the old detector pins the

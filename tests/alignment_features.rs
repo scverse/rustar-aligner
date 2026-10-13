@@ -290,6 +290,95 @@ fn test_bam_sorted_output() {
 }
 
 // ---------------------------------------------------------------------------
+// `--outSAMtype BAM Unsorted SortedByCoordinate` writes both BAMs from the same
+// records (STAR: outBAMunsorted and outBAMcoord both set).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bam_unsorted_and_sorted_together() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "4", None);
+
+    let fastq_path = tmpdir.path().join("reads.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        // Reads written out of genomic order so the two outputs differ in order.
+        for (n, i) in (0..30usize).rev().enumerate() {
+            let start = 100 + i * 100;
+            let seq = &genome[start..start + 50];
+            writeln!(f, "@read{}", n + 1).unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f).unwrap();
+            writeln!(f, "+").unwrap();
+            writeln!(f, "{}", "I".repeat(50)).unwrap();
+        }
+    }
+
+    let run = |name: &str, words: &[&str]| -> PathBuf {
+        let dir = tmpdir.path().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let prefix = format!("{}/", dir.display());
+        let mut args = vec![
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outSAMtype",
+            "BAM",
+        ];
+        args.extend_from_slice(words);
+        args.extend_from_slice(&["--outFileNamePrefix", &prefix]);
+        cargo_bin_cmd!("rustar-aligner")
+            .args(args)
+            .assert()
+            .success();
+        dir
+    };
+    let names = |path: &Path| -> Vec<String> {
+        let mut reader = bam::io::Reader::new(fs::File::open(path).unwrap());
+        reader.read_header().unwrap();
+        reader
+            .records()
+            .map(|r| {
+                let r = r.unwrap();
+                format!(
+                    "{}:{:?}",
+                    r.name().map(|n| n.to_string()).unwrap_or_default(),
+                    r.alignment_start().map(|p| p.unwrap().get())
+                )
+            })
+            .collect()
+    };
+
+    let both = run("both", &["Unsorted", "SortedByCoordinate"]);
+    let swapped = run("swapped", &["SortedByCoordinate", "Unsorted"]);
+    let only_u = run("only_u", &["Unsorted"]);
+    let only_s = run("only_s", &["SortedByCoordinate"]);
+
+    for dir in [&both, &swapped] {
+        assert_eq!(
+            names(&dir.join("Aligned.out.bam")),
+            names(&only_u.join("Aligned.out.bam"))
+        );
+        assert_eq!(
+            names(&dir.join("Aligned.sortedByCoord.out.bam")),
+            names(&only_s.join("Aligned.sortedByCoord.out.bam"))
+        );
+    }
+    assert!(!names(&both.join("Aligned.out.bam")).is_empty());
+    // The two files really are in different orders.
+    assert_ne!(
+        names(&both.join("Aligned.out.bam")),
+        names(&both.join("Aligned.sortedByCoord.out.bam"))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 3 — Paired-end alignment
 // ---------------------------------------------------------------------------
 
@@ -465,6 +554,158 @@ fn test_spliced_alignment() {
     }
 }
 
+/// Annotated junctions with a 3-4 base terminal overhang must still be
+/// found (STAR's `alignSJDBoverhangMin` defaults to 3): STAR aligns these reads
+/// spliced; rustar-aligner used to soft-clip or misalign the short end.
+#[test]
+fn test_annotated_junction_short_overhang() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // 47 bp of Exon1's end + 3 bp of Exon2's start, and 4 bp of Exon1's end
+    // + 46 bp of Exon2's start.
+    let mut right_short = genome[10003..10050].to_vec();
+    right_short.extend_from_slice(&genome[10250..10253]);
+    let mut left_short = genome[10046..10050].to_vec();
+    left_short.extend_from_slice(&genome[10250..10296]);
+
+    let fastq_path = tmpdir.path().join("short_overhang.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for (name, seq) in [("right3", &right_short), ("left4", &left_short)] {
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_short_overhang");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    let alignments: Vec<(String, String, String)> = content
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            (
+                cols[0].to_string(),
+                cols[3].to_string(),
+                cols[5].to_string(),
+            )
+        })
+        .collect();
+    let expect = |name: &str, pos: &str, cigar: &str| {
+        assert!(
+            alignments
+                .iter()
+                .any(|(n, p, c)| n == name && p == pos && c == cigar),
+            "{name}: expected {pos} {cigar}, got {alignments:?}"
+        );
+    };
+    expect("right3", "10004", "47M200N3M");
+    expect("left4", "10047", "4M200N46M");
+}
+
+/// An annotated AT-AC junction whose donor exon ends with the intron's last
+/// base ("C"): the junction fits at the annotated position or one base to the
+/// left (non-canonical), and the junction scan scores both -8 and keeps the
+/// left one. STAR stitches the two halves of a seed that crosses the inserted
+/// junction sequence (Gsj) through the annotated junction directly, without the
+/// scan. Expected alignments are STAR 2.7.11b's on this genome: `r25` has no
+/// Gsj seed (25 bp exceeds the 24 bp flank), so STAR scans too.
+#[test]
+fn test_annotated_atac_junction_with_boundary_repeat() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut genome = build_genome();
+    // Exon1 ends with C; the intron becomes AT...AC (last intron base C).
+    genome[10049] = b'C';
+    genome[10050] = b'A';
+    genome[10051] = b'T';
+    genome[10248] = b'A';
+    genome[10249] = b'C';
+    // Keep exon2's first base different from C so only the left shift ties.
+    if genome[10250] == b'C' {
+        genome[10250] = b'G';
+    }
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    // (name, bases on exon1, bases on exon2)
+    let reads = [("r25", 25, 25), ("r14", 14, 36), ("r4", 4, 46)];
+    let fastq_path = tmpdir.path().join("atac.fq");
+    {
+        let mut f = fs::File::create(&fastq_path).unwrap();
+        for (name, n1, n2) in reads {
+            let mut seq = genome[10050 - n1..10050].to_vec();
+            seq.extend_from_slice(&genome[10250..10250 + n2]);
+            writeln!(f, "@{name}").unwrap();
+            f.write_all(&seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_atac");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            fastq_path.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let content = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    let got: Vec<(String, String, String)> = content
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            (c[0].to_string(), c[3].to_string(), c[5].to_string())
+        })
+        .collect();
+    for (name, pos, cigar) in [
+        ("r25", "10026", "24M200N26M"),
+        ("r14", "10037", "14M200N36M"),
+        ("r4", "10047", "4M200N46M"),
+    ] {
+        assert!(
+            got.iter()
+                .any(|(n, p, c)| n == name && p == pos && c == cigar),
+            "{name}: expected {pos} {cigar} (STAR 2.7.11b), got {got:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 5 — BySJout filtering
 // ---------------------------------------------------------------------------
@@ -546,13 +787,11 @@ fn test_bysj_filtering() {
     let log_path = output_dir.join("Log.final.out");
     assert!(log_path.exists(), "Log.final.out not found");
 
-    // Verify the BySJout disk-buffering message was logged
+    // Verify the second stage of BySJout ran (held reads mapped again)
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains(
-            "outFilterType=BySJout: disk-buffering reads for post-alignment junction filtering"
-        ),
-        "expected BySJout disk-buffering log message in stderr; got:\n{stderr}"
+        stderr.contains("held reads again"),
+        "expected the BySJout second-stage log message in stderr; got:\n{stderr}"
     );
 }
 
@@ -1941,7 +2180,8 @@ fn test_starsolo_cellranger_style_matrix() {
 /// A uniquely-mapped read overlapping a heterozygous SNV should be re-mapped with
 /// the allele swapped; since the region is unique it remaps to the same locus and
 /// gets `vW:i:1` (passed WASP). Verifies the end-to-end WASP path + that the vW tag
-/// (auto-added when `--waspOutputMode SAMtag`) reaches the SAM.
+/// (auto-added when `--waspOutputMode SAMtag`) reaches the BAM. STAR refuses WASP
+/// with SAM output (`Parameters.cpp:882-887`).
 #[test]
 fn test_wasp_samtag() {
     let tmpdir = TempDir::new().unwrap();
@@ -2011,18 +2251,31 @@ fn test_wasp_samtag() {
             "--varVCFfile",
             vcf_path.to_str().unwrap(),
             "--outSAMtype",
-            "SAM",
+            "BAM",
+            "Unsorted",
             "--outFileNamePrefix",
             &prefix,
         ])
         .assert()
         .success();
 
-    let sam = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
-    let vw1 = sam
-        .lines()
-        .filter(|l| !l.starts_with('@'))
-        .filter(|l| l.split('\t').any(|f| f == "vW:i:1"))
+    let mut reader =
+        bam::io::Reader::new(fs::File::open(output_dir.join("Aligned.out.bam")).unwrap());
+    let header = reader.read_header().unwrap();
+    let vw1 = reader
+        .records()
+        .map(|r| {
+            noodles::sam::alignment::RecordBuf::try_from_alignment_record(&header, &r.unwrap())
+                .unwrap()
+        })
+        .filter(|r| {
+            r.data()
+                .get(&noodles::sam::alignment::record::data::field::Tag::new(
+                    b'v', b'W',
+                ))
+                .and_then(|v| v.as_int())
+                == Some(1)
+        })
         .count();
     assert_eq!(
         vw1, 10,
@@ -2132,6 +2385,137 @@ fn test_sorted_bam_spills_to_disk_and_matches_unbounded_sort() {
         .filter(|name| name.starts_with("rustar-bamsort-"))
         .collect();
     assert!(leftover.is_empty(), "spill files left behind: {leftover:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Test — CellRanger4 TSO clip is applied per read within a batch
+//
+// The 5' TSO clip is resolved for a whole read batch in one hyalite
+// `Database::scan_all` pass (`solo::tso_clip_lens_cr4_batch`), then indexed back
+// out per read in the parallel align loop. This test interleaves TSO-bearing and
+// TSO-free reads so that any off-by-one or reordering between the batched scan
+// and the per-read loop lands a clip on the wrong read and fails here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_starsolo_cr4_tso_clip_is_per_read_within_batch() {
+    const TSO: &str = "AAGCAGTGGTATCAACGCAGAGTACATGGG";
+
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+
+    let cb = "AAAACCCCGGGGTTTT";
+    // Exon2 (chr1:10251-10300) — the 50 bp the cDNA part of every read carries.
+    let exon2 = String::from_utf8(genome[10250..10300].to_vec()).unwrap();
+    assert!(
+        !exon2.ends_with("AAAAAAAA"),
+        "exon2 must not end in a polyA run, or the 3' CR4 trim would confound this test"
+    );
+
+    // 12 reads, alternating TSO-prefixed and bare, each with a distinct UMI so
+    // none are deduplicated away.
+    let n_pairs = 6;
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..n_pairs {
+            for tso in [true, false] {
+                let name = if tso { "tso" } else { "bare" };
+                let seq = if tso {
+                    format!("{TSO}{exon2}")
+                } else {
+                    exon2.clone()
+                };
+                writeln!(cf, "@{name}{i}\n{seq}\n+\n{}", "I".repeat(seq.len())).unwrap();
+                // Distinct 10 bp UMI per record: "UMI" + 7 digits.
+                let umi = format!("ACG{:07}", i * 2 + usize::from(!tso))
+                    .replace('0', "T")
+                    .replace(['1', '2', '3', '4', '5', '6', '7', '8', '9'], "C");
+                let umi: String = umi.chars().take(10).collect();
+                writeln!(
+                    bf,
+                    "@{name}{i}\n{cb}{umi}\n+\n{}",
+                    "I".repeat(cb.len() + umi.len())
+                )
+                .unwrap();
+            }
+        }
+    }
+    fs::write(&wl_path, format!("{cb}\n")).unwrap();
+
+    let output_dir = tmpdir.path().join("out_cr4_tso");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "10",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--clipAdapterType",
+            "CellRanger4",
+            "--outSAMtype",
+            "SAM",
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let sam = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+
+    let mut n_tso = 0;
+    let mut n_bare = 0;
+    for line in sam.lines().filter(|l| !l.starts_with('@')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (qname, pos, cigar) = (f[0], f[3], f[5]);
+        assert_eq!(pos, "10251", "{qname}: cDNA should map to Exon2");
+
+        if qname.starts_with("tso") {
+            // The 30 nt TSO is clipped from the 5' and retained as a soft clip.
+            assert_eq!(
+                cigar, "30S50M",
+                "{qname}: TSO-bearing read should carry a 30 base 5' soft clip"
+            );
+            n_tso += 1;
+        } else {
+            assert_eq!(
+                cigar, "50M",
+                "{qname}: TSO-free read must not be clipped (a clip here means the \
+                 batched TSO scan was indexed onto the wrong read)"
+            );
+            n_bare += 1;
+        }
+    }
+    assert_eq!(n_tso, n_pairs, "every TSO read should be reported");
+    assert_eq!(n_bare, n_pairs, "every TSO-free read should be reported");
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,5 +2878,161 @@ fn test_seed_split_min_bans_seeds_that_span_genomic_n() {
         flag_of("clean", &flags_high) & 0x4,
         0x4,
         "--seedSplitMin 61 leaves no qualifying run in a 60-base read"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Window formation and window dedup (long splices, alignIntronMax = 0)
+// ---------------------------------------------------------------------------
+
+/// xorshift64 base generator (the LCG above repeats every 2^18 bases, too short
+/// for a megabase genome).
+fn xorshift_seq(seed: u64, length: usize) -> Vec<u8> {
+    let mut x = seed;
+    (0..length)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"ACGT"[((x >> 33) & 3) as usize]
+        })
+        .collect()
+}
+
+fn revcomp_bytes(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            other => other,
+        })
+        .collect()
+}
+
+/// Align one pair against `genome` with default parameters and return the SAM
+/// records as (flag, pos, cigar, NH, HI) in file order.
+fn align_pair(
+    tmpdir: &TempDir,
+    genome: &[u8],
+    mate1: &[u8],
+    mate2: &[u8],
+) -> Vec<(u32, u64, String, String, String)> {
+    let fasta = write_fasta(tmpdir, genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "8", None);
+    let mut paths = Vec::new();
+    for (i, seq) in [mate1, mate2].iter().enumerate() {
+        let path = tmpdir.path().join(format!("r{}.fq", i + 1));
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "@p1").unwrap();
+        f.write_all(seq).unwrap();
+        writeln!(f, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+        paths.push(path);
+    }
+    let output_dir = tmpdir.path().join("out");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            paths[0].to_str().unwrap(),
+            paths[1].to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+    let content = fs::read_to_string(output_dir.join("Aligned.out.sam")).unwrap();
+    content
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            (
+                c[1].parse().unwrap(),
+                c[3].parse().unwrap(),
+                c[5].to_string(),
+                c[11].to_string(),
+                c[12].to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A pair whose mates are both spliced across 420 kb introns spans 840 kb,
+/// more than winBinNbits*winAnchorDistNbins (589,824). With alignIntronMax and
+/// alignMatesGapMax at 0, STAR puts the whole pair in one window and reports it;
+/// rustar-aligner used to reject any pair spanning more than that distance.
+/// Expected alignments are STAR 2.7.11b's on this genome.
+#[test]
+fn test_pair_spanning_more_than_window_distance() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut g = xorshift_seq(0x9E37_79B9_7F4A_7C15, 1_200_000);
+    let (a, intron) = (50_000usize, 420_000usize);
+    let b = a + 75 + intron;
+    let q = b + 75 + 100;
+    let d = q + 75 + intron;
+    // GT..AG introns.
+    for (pos, bases) in [
+        (a + 75, b"GT"),
+        (b - 2, b"AG"),
+        (q + 75, b"GT"),
+        (d - 2, b"AG"),
+    ] {
+        g[pos..pos + 2].copy_from_slice(bases);
+    }
+    let mate1 = [&g[a..a + 75], &g[b..b + 75]].concat();
+    let mate2 = revcomp_bytes(&[&g[q..q + 75], &g[d..d + 75]].concat());
+
+    let sam = align_pair(&tmpdir, &g, &mate1, &mate2);
+    let got: Vec<(u32, u64, &str)> = sam.iter().map(|r| (r.0, r.1, r.2.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![
+            (99, 50_001, "75M420000N75M"),
+            (147, 470_251, "75M420000N75M")
+        ],
+        "{sam:?}"
+    );
+    assert_eq!(sam[0].3, "NH:i:1");
+}
+
+/// Window dedup follows STAR: a transcript that contains an older one replaces it
+/// whatever their scores. Here mate 2 is 140 bases plus 10 bases found 80 kb away
+/// behind a non-canonical junction. The unspliced 140M10S transcript scores
+/// higher, but the spliced one contains it, so STAR keeps both alignments with the
+/// unspliced one as primary (shorter genomic span); the order of the window's
+/// transcripts decides which is primary. Expected alignments are STAR 2.7.11b's.
+#[test]
+fn test_window_dedup_keeps_star_transcript_order() {
+    let tmpdir = TempDir::new().unwrap();
+    let mut g = xorshift_seq(0x2545_F491_4F6C_DD1D ^ (34 * 7919 + 1), 300_000);
+    let (x, y, ov, intron) = (100_000usize, 100_030usize, 10usize, 80_000usize);
+    let e1 = y + 150 - ov;
+    let acc = e1 + intron;
+    g[e1..e1 + 2].copy_from_slice(b"AA");
+    g[acc - 2..acc].copy_from_slice(b"CC");
+    let mate1 = g[x..x + 150].to_vec();
+    let mate2 = revcomp_bytes(&[&g[y..e1], &g[acc..acc + ov]].concat());
+
+    let sam = align_pair(&tmpdir, &g, &mate1, &mate2);
+    let got: Vec<(u32, u64, &str, &str)> = sam
+        .iter()
+        .map(|r| (r.0, r.1, r.2.as_str(), r.4.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (99, 100_001, "150M", "HI:i:1"),
+            (147, 100_031, "140M10S", "HI:i:1"),
+            (355, 100_001, "150M", "HI:i:2"),
+            (403, 100_031, "140M80000N10M", "HI:i:2"),
+        ],
+        "{sam:?}"
     );
 }

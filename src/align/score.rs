@@ -54,10 +54,15 @@ pub struct AlignmentScorer {
     pub align_ends_type: crate::params::AlignEndsType,
     /// STAR's stitch-time intron filters; see [`IntronFilter`].
     pub intron_filter: IntronFilter,
+    /// `--outFilterMultimapScoreRange`, used by the window's score gate.
+    pub multimap_score_range: i32,
+    /// `--chimSegmentMin > 0`: STAR then records every finalized transcript in
+    /// its window, skipping the score gate (`stitchWindowAligns.cpp:247`).
+    pub record_all_window_transcripts: bool,
 }
 
 /// The three intron checks STAR applies when a transcript is finalized
-/// (`stitchWindowAligns.cpp:146-180`), before the window's dedup: a rejected
+/// (`stitchWindowAligns.cpp:130-152`), before the window's dedup: a rejected
 /// transcript never enters the window, so it cannot evict another, set the
 /// score range, become `trBest`, or be a chimeric segment.
 #[derive(Debug, Clone)]
@@ -83,17 +88,17 @@ impl IntronFilter {
     /// Whether a transcript with these junctions (motif, annotated) survives.
     pub fn passes<'a>(
         &self,
-        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool)> + Clone,
+        junctions: impl Iterator<Item = (&'a SpliceMotif, &'a bool, &'a u8)> + Clone,
     ) -> bool {
         use crate::params::{IntronMotifFilter, IntronStrandFilter};
-        // `intronMotifs[sjStr]` counts: STAR's sjStr is 0 for a non-canonical
-        // junction, else the motif's strand.
+        // `intronMotifs[sjStr]` counts: STAR's sjStr is the annotated strand of
+        // an sjdb junction, else the motif's strand (0 for non-canonical).
         let (mut n_junctions, mut plus, mut minus) = (0u32, 0u32, 0u32);
-        for (m, _) in junctions.clone() {
+        for (_, _, s) in junctions.clone() {
             n_junctions += 1;
-            match m.implied_strand() {
-                Some('+') => plus += 1,
-                Some('-') => minus += 1,
+            match s {
+                1 => plus += 1,
+                2 => minus += 1,
                 _ => {}
             }
         }
@@ -109,10 +114,10 @@ impl IntronFilter {
             IntronMotifFilter::None => true,
             IntronMotifFilter::RemoveNoncanonical => !junctions
                 .into_iter()
-                .any(|(m, _)| *m == SpliceMotif::NonCanonical),
+                .any(|(m, _, _)| *m == SpliceMotif::NonCanonical),
             IntronMotifFilter::RemoveNoncanonicalUnannotated => !junctions
                 .into_iter()
-                .any(|(m, annotated)| *m == SpliceMotif::NonCanonical && !annotated),
+                .any(|(m, annotated, _)| *m == SpliceMotif::NonCanonical && !annotated),
         }
     }
 }
@@ -144,6 +149,8 @@ impl AlignmentScorer {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         }
     }
 
@@ -189,6 +196,8 @@ impl AlignmentScorer {
                 strands: params.out_filter_intron_strands.clone(),
                 strand_field_intron_motif: params.out_sam_strand_field == "intronMotif",
             },
+            multimap_score_range: params.out_filter_multimap_score_range,
+            record_all_window_transcripts: params.chim_segment_min > 0,
         }
     }
 
@@ -616,9 +625,9 @@ impl AlignmentScorer {
                 jj_r += jj_l;
                 jj_l = 0;
             }
-            // STAR: if (int(EX_L)+jR<1) return -1000005;
-            // Clamp: don't let exon A become zero-length (STAR rejects, we clamp)
-            best_jr = best_jr.max(1 - prev_exon_len as i32);
+            // STAR: `if (int(EX_L)+jR<1) return -1000005;` The caller rejects the
+            // stitch when the flush leaves no base in the exon that shrinks
+            // (clamping here would build a junction STAR never considers).
             // Re-check motif at flushed position
             if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
                 let donor_sa = (g_a_end_inc as i64 + best_jr as i64 + 1) as u64;
@@ -980,6 +989,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -1026,6 +1037,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1071,6 +1084,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1114,6 +1129,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1150,6 +1167,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -1184,6 +1203,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -1226,6 +1247,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -1266,6 +1289,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1307,6 +1332,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1416,6 +1443,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1497,6 +1526,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1550,6 +1581,8 @@ mod tests {
             out_filter_score_min_over_lread: 0.66,
             align_ends_type: crate::params::AlignEndsType::default(),
             intron_filter: IntronFilter::default(),
+            multimap_score_range: 1,
+            record_all_window_transcripts: false,
         }
     }
 
