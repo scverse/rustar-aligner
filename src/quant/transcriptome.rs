@@ -1770,7 +1770,7 @@ fn find_containing_exon(tr_exons: &[TrExon], pos: u64) -> Option<usize> {
 /// What separates `align.exons[i]` from `align.exons[i + 1]`, read off the
 /// CIGAR (STAR's `canonSJ`: `>= 0` junction, `-1` deletion, `-2` insertion).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockGap {
+pub(crate) enum BlockGap {
     Junction,
     Deletion,
     Insertion,
@@ -1781,7 +1781,7 @@ enum BlockGap {
 /// kind: an `N` makes a junction, else a `D` a deletion, else an `I` an
 /// insertion. Falls back to a geometric guess if the CIGAR does not match the
 /// exon list (an alignment built without a CIGAR).
-fn block_gaps(align: &Transcript) -> Vec<BlockGap> {
+pub(crate) fn block_gaps(align: &Transcript) -> Vec<BlockGap> {
     use cigar::op::Kind;
     let n_gaps = align.exons.len().saturating_sub(1);
     let mut gaps: Vec<BlockGap> = Vec::with_capacity(n_gaps);

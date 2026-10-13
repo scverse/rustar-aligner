@@ -108,11 +108,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "genomeSuffixLengthMax",
     "genomeTransformOutput",
     "genomeType",
-    // STARsolo barcode chemistry.
-    "soloAdapterMismatchesNmax",
-    "soloAdapterSequence",
-    "soloCBtype",
-    "soloOutFormatFeaturesGeneField3",
 ];
 
 fn star_parameter_names() -> Vec<String> {

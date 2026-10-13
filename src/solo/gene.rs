@@ -10,6 +10,7 @@
 
 use crate::align::transcript::Transcript;
 use crate::quant::GeneAnnotation;
+use crate::quant::transcriptome::{BlockGap, TranscriptomeIndex, block_gaps};
 use std::cell::RefCell;
 use std::str::FromStr;
 
@@ -93,6 +94,211 @@ fn strand_keeps(strand: SoloStrand, gene_is_reverse: bool, read_is_reverse: bool
         SoloStrand::Forward => gene_is_reverse == read_is_reverse,
         SoloStrand::Reverse => gene_is_reverse != read_is_reverse,
     }
+}
+
+/// The transcript models of STARsolo's `Gene` feature, each transcript's gene
+/// given as an index into the solo gene list (`GeneAnnotation`, the order of
+/// `features.tsv`).
+pub struct GeneModel {
+    pub transcripts: TranscriptomeIndex,
+    /// Solo gene index per transcript; `u32::MAX` if the gene is not listed.
+    tr_gene: Vec<u32>,
+}
+
+impl GeneModel {
+    pub fn new(transcripts: TranscriptomeIndex, gene_ann: &GeneAnnotation) -> Self {
+        let pos: std::collections::HashMap<&str, u32> = gene_ann
+            .gene_ids
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (g.as_str(), i as u32))
+            .collect();
+        let tr_gene = transcripts
+            .tr_gene_idx
+            .iter()
+            .map(|&g| {
+                transcripts
+                    .gene_ids
+                    .get(g as usize)
+                    .and_then(|id| pos.get(id.as_str()).copied())
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        GeneModel {
+            transcripts,
+            tr_gene,
+        }
+    }
+}
+
+/// STAR's `Gene` annotation of a read (`ReadAnnotFeature`): the genes of all
+/// its alignments (`fSet`) and of each alignment (`fAlign`), both sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneSets {
+    pub genes: Vec<u32>,
+    pub per_align: Vec<Vec<u32>>,
+}
+
+/// STAR's `binarySearch_leLeft` (`serviceFuns.cpp:212-235`) over the
+/// transcript-relative exon starts and inclusive ends `[s0, e0, s1, e1, ...]`:
+/// `None` if `x` is outside `[X[0], X[N-1]]`, else the index of the element
+/// `<= x`, the leftmost one if several are equal. Like STAR's loop it never
+/// returns `N-1`.
+fn exon_bound_le_left(x: u64, bound: impl Fn(usize) -> u64, n: usize) -> Option<usize> {
+    if x > bound(n - 1) || x < bound(0) {
+        return None;
+    }
+    let (mut i1, mut i2) = (0usize, n - 1);
+    while i2 > i1 + 1 {
+        let i3 = usize::midpoint(i1, i2);
+        if bound(i3) > x {
+            i2 = i3;
+        } else {
+            i1 = i3;
+        }
+    }
+    while i1 > 0 && x == bound(i1 - 1) {
+        i1 -= 1;
+    }
+    Some(i1)
+}
+
+/// STAR's `alignToTranscript` (`Transcriptome_classifyAlign.cpp:8-90`), only
+/// as far as the `Gene` feature needs it: is the alignment `Concordant` with
+/// transcript `tr`, i.e. every block inside one of its exons and every splice
+/// junction exactly one of its introns.
+fn concordant_with_transcript(
+    aln: &Transcript,
+    gaps: &[BlockGap],
+    idx: &TranscriptomeIndex,
+    tr: usize,
+) -> bool {
+    let tr_s = idx.tr_start[tr];
+    let exons = &idx.tr_exons[tr];
+    let n_bounds = 2 * exons.len();
+    // exSE1: exon starts and inclusive ends, relative to the transcript start.
+    let bound = |k: usize| {
+        let e = &exons[k / 2];
+        if k.is_multiple_of(2) {
+            e.genome_start - tr_s
+        } else {
+            e.genome_end - 1 - tr_s
+        }
+    };
+    let (mut align_intronic, mut align_spans_exon_intr, mut sj_concordant) = (false, false, true);
+    let (mut ex1, mut b_e, mut e_e, mut en_s) = (0usize, 0u64, 0u64, 0u64);
+    for (iab, block) in aln.exons.iter().enumerate() {
+        let b_e_prev = b_e;
+        if block.genome_start < tr_s {
+            return false; // a 2nd mate protruding to the left of the 1st
+        }
+        let b_s = block.genome_start - tr_s;
+        b_e = block.genome_end - 1 - tr_s;
+        let mate_start = iab == 0 || block.i_frag != aln.exons[iab - 1].i_frag; // canonSJ -3
+        if mate_start {
+            match exon_bound_le_left(b_s, bound, n_bounds) {
+                Some(i) => ex1 = i / 2,
+                None => return false,
+            }
+        } else if gaps.get(iab - 1) == Some(&BlockGap::Junction) {
+            if b_e_prev == e_e && b_s == en_s {
+                ex1 += 1; // the junction is this transcript's intron
+            } else {
+                sj_concordant = false;
+                match exon_bound_le_left(b_s, bound, n_bounds) {
+                    Some(i) => ex1 = i / 2,
+                    None => return false,
+                }
+            }
+        }
+        e_e = bound(2 * ex1 + 1);
+        en_s = if ex1 + 1 < exons.len() {
+            bound(2 * (ex1 + 1))
+        } else {
+            0
+        };
+        if b_s <= e_e {
+            if b_e > e_e {
+                align_spans_exon_intr = true;
+            }
+        } else {
+            if b_e >= en_s {
+                align_spans_exon_intr = true;
+            }
+            align_intronic = true;
+        }
+    }
+    sj_concordant && !align_spans_exon_intr && !align_intronic
+}
+
+/// STAR's `Transcriptome::classifyAlign` for the `Gene` feature
+/// (`Transcriptome_classifyAlign.cpp:173-275`): for each alignment, walk back
+/// from the last transcript starting at or before it while the running
+/// maximum of transcript ends still reaches the alignment's end, and collect
+/// the genes of the transcripts on the `--soloStrand` strand that contain it
+/// and are concordant with it.
+pub fn classify_align(
+    transcripts: &[Transcript],
+    model: &GeneModel,
+    strand: SoloStrand,
+) -> GeneSets {
+    let idx = &model.transcripts;
+    let mut sets = GeneSets {
+        genes: Vec::new(),
+        per_align: vec![Vec::new(); transcripts.len()],
+    };
+    if idx.tr_starts_sorted.is_empty() {
+        return sets;
+    }
+    for (iag, aln) in transcripts.iter().enumerate() {
+        let (Some(first), Some(last)) = (aln.exons.first(), aln.exons.last()) else {
+            continue;
+        };
+        // binarySearch1a: the last transcript whose start is <= the align start.
+        let pp = idx
+            .tr_starts_sorted
+            .partition_point(|&s| s <= first.genome_start);
+        if pp == 0 {
+            continue; // before every transcript
+        }
+        let a_g_end = last.genome_end - 1;
+        let gaps = block_gaps(aln);
+        let mut k = pp - 1;
+        loop {
+            let tr = idx.tr_order[k];
+            // `trStr==1 ? aG.Str : 1-aG.Str` against `pSolo.strand`.
+            let read_str = u32::from(aln.is_reverse);
+            let rel_str = if idx.tr_strand[tr] == 1 {
+                read_str
+            } else {
+                1 - read_str
+            };
+            let strand_ok = match strand {
+                SoloStrand::Unstranded => true,
+                SoloStrand::Forward => rel_str == 0,
+                SoloStrand::Reverse => rel_str == 1,
+            };
+            if a_g_end < idx.tr_end[tr]
+                && strand_ok
+                && concordant_with_transcript(aln, &gaps, idx, tr)
+                && model.tr_gene[tr] != u32::MAX
+            {
+                let g = model.tr_gene[tr];
+                sets.genes.push(g);
+                sets.per_align[iag].push(g);
+            }
+            // `while (trEmax[tr1]>=aGend && tr1>0)`
+            if !(idx.tr_end_max_sorted[k] > a_g_end && k > 0) {
+                break;
+            }
+            k -= 1;
+        }
+        sets.per_align[iag].sort_unstable();
+        sets.per_align[iag].dedup();
+    }
+    sets.genes.sort_unstable();
+    sets.genes.dedup();
+    sets
 }
 
 /// RNA-velocity read category (Sullivan et al. 2025 mature/nascent/ambiguous,
@@ -183,6 +389,7 @@ fn assignment_of(sense_genes: &[usize]) -> GeneAssignment {
 pub fn classify_read(
     transcripts: &[Transcript],
     gene_ann: &GeneAnnotation,
+    model: &GeneModel,
     strand: SoloStrand,
     want_exon: bool,
     want_body: bool,
@@ -217,29 +424,20 @@ pub fn classify_read(
                 // `body_anti_any` tracks an antisense-only body hit.
                 let (mut exon_any, mut body_any, mut body_anti_any) = (false, false, false);
 
+                // The `Gene` feature's genes: those whose transcripts the
+                // alignments are concordant with (STAR's `classifyAlign`).
+                if want_exon {
+                    exon_s.extend(
+                        classify_align(transcripts, model, strand)
+                            .genes
+                            .iter()
+                            .map(|&g| g as usize),
+                    );
+                }
                 for tr in transcripts {
                     if want_exon {
                         gene_ann.overlapping_genes_into(tr, &mut raw);
-                        for &g in raw.iter() {
-                            exon_any = true;
-                            // STAR's Gene feature requires the alignment to be
-                            // *concordant* with the gene, not merely to overlap an
-                            // exon: every aligned block must lie wholly within the
-                            // gene's exons. A read whose block extends past an exon
-                            // boundary into an intron (no matching splice) is NOT a
-                            // Gene read (it may still be GeneFull/intronic). Pure
-                            // exon-overlap over-assigns such boundary reads — the
-                            // measured rustar-vs-STAR divergence.
-                            let concordant = tr
-                                .exons
-                                .iter()
-                                .all(|b| gene_ann.block_is_exonic(g, b.genome_start, b.genome_end));
-                            if concordant
-                                && strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse)
-                            {
-                                exon_s.push(g);
-                            }
-                        }
+                        exon_any |= !raw.is_empty();
                     }
                     if want_body {
                         gene_ann.overlapping_genes_full_into(tr, &mut raw);
@@ -310,11 +508,20 @@ pub fn classify_read(
 pub fn assign_gene_se(
     transcripts: &[Transcript],
     gene_ann: &GeneAnnotation,
+    model: &GeneModel,
     strand: SoloStrand,
     feature: SoloFeature,
 ) -> GeneAssignment {
     let want_exon = feature == SoloFeature::Gene;
-    let class = classify_read(transcripts, gene_ann, strand, want_exon, !want_exon, false);
+    let class = classify_read(
+        transcripts,
+        gene_ann,
+        model,
+        strand,
+        want_exon,
+        !want_exon,
+        false,
+    );
     match feature {
         SoloFeature::Gene => class.gene,
         SoloFeature::GeneFull => class.gene_full,
@@ -357,9 +564,20 @@ mod tests {
     }
 
     /// G1 (+) at 100-200, G2 (-) at 300-400.
+    fn annotation_exons() -> Vec<GtfRecord> {
+        vec![gtf_exon(100, 200, '+', "G1"), gtf_exon(300, 400, '-', "G2")]
+    }
+
     fn annotation() -> GeneAnnotation {
-        let exons = vec![gtf_exon(100, 200, '+', "G1"), gtf_exon(300, 400, '-', "G2")];
-        GeneAnnotation::from_gtf_exons(&exons, &genome())
+        GeneAnnotation::from_gtf_exons(&annotation_exons(), &genome())
+    }
+
+    /// Transcript models built from the same GTF records as the annotation.
+    fn model_of(exons: &[GtfRecord], ann: &GeneAnnotation) -> GeneModel {
+        GeneModel::new(
+            TranscriptomeIndex::from_gtf_exons(exons, &genome()).unwrap(),
+            ann,
+        )
     }
 
     fn read_at(start: u64, end: u64, is_reverse: bool) -> Transcript {
@@ -390,8 +608,9 @@ mod tests {
     #[test]
     fn unmapped_when_no_transcripts() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         assert_eq!(
-            assign_gene_se(&[], &ann, SoloStrand::Forward, SoloFeature::Gene),
+            assign_gene_se(&[], &ann, &model, SoloStrand::Forward, SoloFeature::Gene),
             GeneAssignment::Unmapped
         );
     }
@@ -399,9 +618,10 @@ mod tests {
     #[test]
     fn forward_sense_assigns_g1() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         // Read on + strand overlapping G1 (a + gene).
         let tr = read_at(120, 180, false);
-        match assign_gene_se(&[tr], &ann, SoloStrand::Forward, SoloFeature::Gene) {
+        match assign_gene_se(&[tr], &ann, &model, SoloStrand::Forward, SoloFeature::Gene) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1, got {other:?}"),
         }
@@ -410,10 +630,11 @@ mod tests {
     #[test]
     fn forward_antisense_is_no_feature() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         // Read on - strand overlapping G1 (+): wrong strand under Forward.
         let tr = read_at(120, 180, true);
         assert_eq!(
-            assign_gene_se(&[tr], &ann, SoloStrand::Forward, SoloFeature::Gene),
+            assign_gene_se(&[tr], &ann, &model, SoloStrand::Forward, SoloFeature::Gene),
             GeneAssignment::NoFeature
         );
     }
@@ -421,9 +642,10 @@ mod tests {
     #[test]
     fn reverse_strand_picks_antisense() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         // Read on - strand overlapping G1 (+): kept under Reverse.
         let tr = read_at(120, 180, true);
-        match assign_gene_se(&[tr], &ann, SoloStrand::Reverse, SoloFeature::Gene) {
+        match assign_gene_se(&[tr], &ann, &model, SoloStrand::Reverse, SoloFeature::Gene) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1 under Reverse, got {other:?}"),
         }
@@ -432,9 +654,16 @@ mod tests {
     #[test]
     fn no_overlap_is_no_feature() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         let tr = read_at(500, 600, false);
         assert_eq!(
-            assign_gene_se(&[tr], &ann, SoloStrand::Unstranded, SoloFeature::Gene),
+            assign_gene_se(
+                &[tr],
+                &ann,
+                &model,
+                SoloStrand::Unstranded,
+                SoloFeature::Gene
+            ),
             GeneAssignment::NoFeature
         );
     }
@@ -442,10 +671,17 @@ mod tests {
     #[test]
     fn multilocus_same_gene_is_unique() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         // Two loci both inside G1 → still gene-unique.
         let a = read_at(110, 150, false);
         let b = read_at(150, 190, false);
-        match assign_gene_se(&[a, b], &ann, SoloStrand::Forward, SoloFeature::Gene) {
+        match assign_gene_se(
+            &[a, b],
+            &ann,
+            &model,
+            SoloStrand::Forward,
+            SoloFeature::Gene,
+        ) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1, got {other:?}"),
         }
@@ -454,13 +690,91 @@ mod tests {
     #[test]
     fn two_genes_unstranded_is_ambiguous() {
         let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
         // One locus in G1 (+), one in G2 (-); unstranded sees both.
         let a = read_at(120, 180, false);
         let b = read_at(320, 380, true);
         assert_eq!(
-            assign_gene_se(&[a, b], &ann, SoloStrand::Unstranded, SoloFeature::Gene),
+            assign_gene_se(
+                &[a, b],
+                &ann,
+                &model,
+                SoloStrand::Unstranded,
+                SoloFeature::Gene
+            ),
             GeneAssignment::Ambiguous
         );
+    }
+
+    /// A spliced read: two blocks joined by an `N` (no CIGAR attached, so the
+    /// genome gap is read as a junction).
+    fn spliced_read(a: (u64, u64), b: (u64, u64)) -> Transcript {
+        let mut t = read_at(a.0, b.1, false);
+        let la = (a.1 - a.0) as usize;
+        t.exons = vec![
+            Exon {
+                genome_start: a.0,
+                genome_end: a.1,
+                read_start: 0,
+                read_end: la,
+                i_frag: 0,
+            },
+            Exon {
+                genome_start: b.0,
+                genome_end: b.1,
+                read_start: la,
+                read_end: la + (b.1 - b.0) as usize,
+                i_frag: 0,
+            },
+        ];
+        t.n_junction = 1;
+        t
+    }
+
+    /// STAR's `Gene` feature counts an alignment only if it is concordant with
+    /// one of the gene's transcripts (`alignToTranscript`): a junction must be
+    /// one of its introns, and no block may run into an intron. Being inside
+    /// the gene's exons is not enough.
+    #[test]
+    fn gene_needs_a_concordant_transcript() {
+        // G3 (+): exons [500,600) and [800,900).
+        let g = genome();
+        let exons = vec![gtf_exon(501, 600, '+', "G3"), gtf_exon(801, 900, '+', "G3")];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let model = model_of(&exons, &ann);
+        let gene = |t: Transcript| {
+            assign_gene_se(&[t], &ann, &model, SoloStrand::Forward, SoloFeature::Gene)
+        };
+        // The annotated junction 600 -> 800.
+        assert_eq!(
+            gene(spliced_read((550, 600), (800, 850))),
+            GeneAssignment::Gene(0)
+        );
+        // A junction 580 -> 820: both blocks are exonic, but it is not the
+        // transcript's intron.
+        assert_eq!(
+            gene(spliced_read((550, 580), (820, 850))),
+            GeneAssignment::NoFeature
+        );
+        // An unspliced block running from the exon into the intron.
+        assert_eq!(gene(read_at(590, 610, false)), GeneAssignment::NoFeature);
+        // Wholly in one exon.
+        assert_eq!(gene(read_at(820, 880, false)), GeneAssignment::Gene(0));
+    }
+
+    /// `fSet` collects the genes of all alignments, `fAlign` each alignment's,
+    /// which is what GX/GN are written from.
+    #[test]
+    fn classify_align_keeps_per_alignment_genes() {
+        let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
+        let sets = classify_align(
+            &[read_at(120, 180, false), read_at(600, 650, false)],
+            &model,
+            SoloStrand::Forward,
+        );
+        assert_eq!(sets.genes, vec![0]);
+        assert_eq!(sets.per_align, vec![vec![0], vec![]]);
     }
 
     #[test]
@@ -470,11 +784,13 @@ mod tests {
         let g = genome();
         let exons = vec![gtf_exon(501, 600, '+', "G3"), gtf_exon(801, 900, '+', "G3")];
         let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let model = model_of(&exons, &ann);
         // A read entirely inside the intron overlaps no exon...
         assert_eq!(
             assign_gene_se(
                 &[read_at(650, 700, false)],
                 &ann,
+                &model,
                 SoloStrand::Forward,
                 SoloFeature::Gene
             ),
@@ -484,6 +800,7 @@ mod tests {
         match assign_gene_se(
             &[read_at(650, 700, false)],
             &ann,
+            &model,
             SoloStrand::Forward,
             SoloFeature::GeneFull,
         ) {
@@ -498,10 +815,12 @@ mod tests {
         let g = genome();
         let exons = vec![gtf_exon(101, 200, '+', "Ga"), gtf_exon(401, 500, '+', "Ga")];
         let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let model = model_of(&exons, &ann);
         let cls = |start, end, rev| {
             classify_read(
                 &[read_at(start, end, rev)],
                 &ann,
+                &model,
                 SoloStrand::Forward,
                 true,
                 true,
@@ -533,6 +852,7 @@ mod tests {
             classify_read(
                 &[read_at(120, 180, false)],
                 &ann,
+                &model,
                 SoloStrand::Forward,
                 true,
                 false,

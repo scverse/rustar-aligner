@@ -20,8 +20,8 @@ pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
 pub use gene::{
-    GeneAssignment, Region, SoloFeature, SoloStrand, VelocytoCategory, assign_gene_se,
-    classify_read, velocyto_category,
+    GeneAssignment, GeneModel, GeneSets, Region, SoloFeature, SoloStrand, VelocytoCategory,
+    assign_gene_se, classify_align, classify_read, velocyto_category,
 };
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
@@ -53,11 +53,93 @@ pub enum SoloBarcodeLayout {
         cb_segments: Vec<(usize, usize)>,
         umi: (usize, usize),
     },
+    /// Multi-segment CB whose positions are measured from an adapter rather
+    /// than from the read ends.
+    ///
+    /// The adapter moves from read to read, so unlike every other layout the
+    /// offsets cannot be resolved once at startup; each read is searched. A
+    /// read where the adapter is not found within the mismatch budget yields no
+    /// barcode at all, which is what STAR does — a barcode read at an unknown
+    /// offset is not salvageable.
+    Anchored {
+        cb_segments: Vec<(Anchored, Anchored)>,
+        umi: (Anchored, Anchored),
+        adapter: Vec<u8>,
+        max_mismatches: usize,
+    },
 }
 
 /// Parse a `--soloCBposition`/`--soloUMIposition` spec
 /// (`startAnchor_startDist_endAnchor_endDist`) into a 0-based `(start, len)`.
 /// Only read-start anchoring (`anchor = 0`) is supported.
+/// One end of a `--soloCBposition` / `--soloUMIposition` field: which anchor
+/// it is measured from, and how far.
+///
+/// STAR's anchor codes: 0 = read start, 1 = read end, 2 = adapter start,
+/// 3 = adapter end. Codes 2 and 3 make the position depend on where the
+/// adapter turns out to be in each read, which is why resolution happens per
+/// read rather than once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchored {
+    pub anchor: u8,
+    pub dist: i64,
+}
+
+impl Anchored {
+    /// Position of this anchor plus its distance, as STAR's `extractBarcode`
+    /// computes it (`SoloBarcode_extractBarcode.cpp:7-23`), for a read of
+    /// length `read_len` whose adapter starts at `adapter_start` and is
+    /// `adapter_len` long. Bounds are checked by the caller, as in STAR.
+    fn position(self, read_len: usize, adapter_start: usize, adapter_len: usize) -> i64 {
+        let base = match self.anchor {
+            0 => 0i64,
+            1 => read_len as i64 - 1,
+            2 => adapter_start as i64,
+            _ => adapter_start as i64 + adapter_len as i64 - 1,
+        };
+        base + self.dist
+    }
+}
+
+/// STAR's `extractBarcode` bounds check and `substr`
+/// (`SoloBarcode_extractBarcode.cpp:25-32`): refused when the start is
+/// negative, the end is past the read length or the start is after the end.
+/// An end equal to the read length is allowed and `substr` clamps it.
+fn barcode_span(start: i64, end: i64, read_len: usize) -> Option<(usize, usize)> {
+    if start < 0 || end > read_len as i64 || start > end {
+        return None;
+    }
+    let s0 = start as usize;
+    Some((s0, (end as usize + 1).min(read_len) - s0))
+}
+
+/// STAR's `localAlignHammingDist` (`SequenceFuns.cpp:341-360`): the
+/// fewest-mismatch offset of `adapter` in `seq` and its mismatch count. An `N`
+/// in the adapter never counts as a mismatch; ties go to the leftmost offset
+/// (the incumbent is replaced only on a strictly smaller distance). The
+/// distance starts at the adapter length with the offset at 0, so when no
+/// offset does better the result is `(adapter length, 0)`; a read shorter than
+/// the adapter gives `(read length + 1, 0)`.
+fn local_align_hamming_dist(seq: &[u8], adapter: &[u8]) -> (usize, usize) {
+    const N_CODE: u8 = 4;
+    if seq.len() < adapter.len() {
+        return (seq.len() + 1, 0);
+    }
+    let (mut dist_best, mut pos) = (adapter.len(), 0usize);
+    for start in 0..=(seq.len() - adapter.len()) {
+        let dist = seq[start..start + adapter.len()]
+            .iter()
+            .zip(adapter)
+            .filter(|&(a, b)| *b != N_CODE && a != b)
+            .count();
+        if dist < dist_best {
+            dist_best = dist;
+            pos = start;
+        }
+    }
+    (dist_best, pos)
+}
+
 fn parse_position(spec: &str) -> Result<(usize, usize), Error> {
     let f: Vec<&str> = spec.split('_').collect();
     if f.len() != 4 {
@@ -91,6 +173,36 @@ fn invalid_pos(spec: &str, why: &str) -> Error {
     ))
 }
 
+/// Parse a full `startAnchor_startDist_endAnchor_endDist` field, keeping the
+/// anchors rather than collapsing them to read-start offsets.
+fn parse_position_anchored(spec: &str) -> Result<(Anchored, Anchored), Error> {
+    let f: Vec<&str> = spec.split('_').collect();
+    if f.len() != 4 {
+        return Err(invalid_pos(
+            spec,
+            "expected startAnchor_startDist_endAnchor_endDist",
+        ));
+    }
+    let num = |x: &str| x.parse::<i64>().ok();
+    match (num(f[0]), num(f[1]), num(f[2]), num(f[3])) {
+        (Some(sa), Some(sd), Some(ea), Some(ed))
+            if (0..=3).contains(&sa) && (0..=3).contains(&ea) =>
+        {
+            Ok((
+                Anchored {
+                    anchor: sa as u8,
+                    dist: sd,
+                },
+                Anchored {
+                    anchor: ea as u8,
+                    dist: ed,
+                },
+            ))
+        }
+        _ => Err(invalid_pos(spec, "anchor must be 0, 1, 2 or 3")),
+    }
+}
+
 impl SoloBarcodeLayout {
     /// Build the layout from CLI parameters. `CB_UMI_Complex` parses
     /// `--soloCBposition`/`--soloUMIposition`; otherwise fixed Simple geometry.
@@ -102,6 +214,29 @@ impl SoloBarcodeLayout {
                 .filter_map(|s| parse_position(s).ok())
                 .collect();
             let umi = parse_position(&params.solo_umi_position).unwrap_or((0, 0));
+
+            // An adapter turns the position specs into per-read offsets, so it
+            // selects a different layout rather than being a tweak to this one.
+            if params.solo_adapter_sequence != "-" {
+                let adapter: Vec<u8> = params
+                    .solo_adapter_sequence
+                    .bytes()
+                    .map(crate::io::fastq::encode_base)
+                    .collect();
+                let anchored_cb: Vec<_> = params
+                    .solo_cb_position
+                    .iter()
+                    .filter_map(|s| parse_position_anchored(s).ok())
+                    .collect();
+                if let Ok(anchored_umi) = parse_position_anchored(&params.solo_umi_position) {
+                    return Self::Anchored {
+                        cb_segments: anchored_cb,
+                        umi: anchored_umi,
+                        adapter,
+                        max_mismatches: params.solo_adapter_mismatches_nmax,
+                    };
+                }
+            }
             return Self::Complex { cb_segments, umi };
         }
         Self::Simple {
@@ -121,6 +256,9 @@ impl SoloBarcodeLayout {
                 umi_start,
                 umi_len,
             } => (cb_start + cb_len).max(umi_start + umi_len),
+            // Not knowable without the read: the adapter's position decides.
+            // `extract` does its own bounds checking instead.
+            Self::Anchored { .. } => 0,
             Self::Complex { cb_segments, umi } => cb_segments
                 .iter()
                 .map(|&(s, l)| s + l)
@@ -150,6 +288,41 @@ impl SoloBarcodeLayout {
                 umi_seq: seq[*umi_start..umi_start + umi_len].to_vec(),
                 umi_qual: slice_or_empty(qual, *umi_start, *umi_len),
             }),
+            Self::Anchored {
+                cb_segments,
+                umi,
+                adapter,
+                max_mismatches,
+            } => {
+                // `SoloReadBarcode_getCBandUMI.cpp:336-374`: no barcode when
+                // the adapter is not found within the budget (`noNoAdapter`),
+                // whatever the anchors; then the UMI, then each CB segment.
+                let (dist, adapter_start) = local_align_hamming_dist(seq, adapter);
+                if dist > *max_mismatches {
+                    return None;
+                }
+                let span = |(a, b): &(Anchored, Anchored)| {
+                    barcode_span(
+                        a.position(seq.len(), adapter_start, adapter.len()),
+                        b.position(seq.len(), adapter_start, adapter.len()),
+                        seq.len(),
+                    )
+                };
+                let (us, ul) = span(umi)?;
+                let mut cb_seq = Vec::new();
+                let mut cb_qual = Vec::new();
+                for segment in cb_segments {
+                    let (s0, l) = span(segment)?;
+                    cb_seq.extend_from_slice(&seq[s0..s0 + l]);
+                    cb_qual.extend_from_slice(&slice_or_empty(qual, s0, l));
+                }
+                Some(CellBarcode {
+                    cb_seq,
+                    cb_qual,
+                    umi_seq: seq[us..us + ul].to_vec(),
+                    umi_qual: slice_or_empty(qual, us, ul),
+                })
+            }
             Self::Complex { cb_segments, umi } => {
                 let mut cb_seq = Vec::new();
                 let mut cb_qual = Vec::new();
@@ -391,44 +564,227 @@ pub fn open_paired_reader(params: &Parameters) -> Result<SoloPairedReader, Error
 /// under `--clipAdapterType CellRanger4`. Encoded 0=A,1=C,2=G,3=T.
 const TSO_SEQ: &[u8] = b"AAGCAGTGGTATCAACGCAGAGTACATGGG";
 
+/// STAR aligns the TSO against the first 91 bases of the read (`ClipCR4::readLen`).
+const CR4_READ_LEN: usize = 91;
+
+/// CR4 overlap-alignment scoring, matching `ClipCR4()`: match +1, mismatch -2,
+/// any-vs-N -2, N-vs-N 0; gap open = gap extend = 2. Alphabet A,C,G,T,N = 0..4.
+fn cr4_scoring() -> &'static hyalite::Scoring {
+    static SCORING: std::sync::OnceLock<hyalite::Scoring> = std::sync::OnceLock::new();
+    SCORING.get_or_init(|| {
+        #[rustfmt::skip]
+        let matrix = vec![
+             1, -2, -2, -2, -2,
+            -2,  1, -2, -2, -2,
+            -2, -2,  1, -2, -2,
+            -2, -2, -2,  1, -2,
+            -2, -2, -2, -2,  0,
+        ];
+        hyalite::Scoring::new(5, matrix, 2, 2).expect("valid CR4 scoring matrix")
+    })
+}
+
+/// The TSO query, encoded once (0=A..3=T).
+fn tso_query() -> &'static [u8] {
+    static Q: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| {
+        TSO_SEQ
+            .iter()
+            .map(|&b| crate::io::fastq::encode_base(b))
+            .collect()
+    })
+}
+
+/// STAR-faithful 5' TSO clip length via a hyalite overlap alignment, replacing
+/// STAR's Opal call (`ClipCR4::opalAlign` + `ClipMate_clipChunk.cpp:41-49`).
+///
+/// `read` is encoded (0=A..4=N). The target is the first `min(len, 91)` bases,
+/// N-padded to 91 (exactly `ClipCR4::opalFillOneSeq`); query is the TSO; overlap
+/// mode with end tracking. The clip is `L = target_end + 1`, rejected to 0 by
+/// STAR's score gate: `S < 20 || (S == 20 && L > 26) || (S == 21 && L > 30)`.
+fn tso_clip_len_cr4(read: &[u8]) -> usize {
+    if read.is_empty() {
+        return 0;
+    }
+    let target = cr4_target(read);
+
+    let Ok(hit) = hyalite::align_pair(
+        tso_query(),
+        &target,
+        cr4_scoring(),
+        hyalite::Mode::Ov,
+        hyalite::SearchType::ScoreEnd,
+    ) else {
+        return 0;
+    };
+
+    cr4_gate(&hit, read.len())
+}
+
+/// Apply STAR's clip gate to one hyalite hit, yielding the 5' clip length.
+///
+/// `S < 20 || (S == 20 && L > 26) || (S == 21 && L > 30)` rejects to 0
+/// (`ClipMate_clipChunk.cpp:44-47`), then STAR takes `min(clip, Lread)`
+/// (`ClipMate_clip.cpp:53`).
+fn cr4_gate(hit: &hyalite::BestHit, read_len: usize) -> usize {
+    let s = hit.score;
+    let l = hit.target_end.map_or(0, |e| e + 1) as i32; // ScoreEnd ⇒ Some
+    let reject = s < 20 || (s == 20 && l > 26) || (s == 21 && l > 30);
+    if reject {
+        0
+    } else {
+        (l as usize).min(read_len)
+    }
+}
+
+/// Build the N-padded 91-base target for one read, exactly `ClipCR4::opalFillOneSeq`.
+fn cr4_target(read: &[u8]) -> Vec<u8> {
+    let take = read.len().min(CR4_READ_LEN);
+    let mut target = Vec::with_capacity(CR4_READ_LEN);
+    target.extend_from_slice(&read[..take]);
+    target.resize(CR4_READ_LEN, 4); // pad with N
+    target
+}
+
+/// How many reads share one hyalite `Database` in the batched TSO scan. STAR uses
+/// 64 (`ClipCR4::dbN`); throughput here is flat from 128 to 10k, so this is sized
+/// to give rayon enough chunks to spread across cores rather than to tune SIMD.
+const CR4_SCAN_CHUNK: usize = 512;
+
+/// Batched 5' TSO clip lengths for a whole read batch — the SIMD counterpart to
+/// [`tso_clip_len_cr4`], via hyalite's per-target `Database::scan_all`.
+///
+/// STAR does the same thing: `ClipMate::clipChunk` fills an Opal "database" with
+/// a chunk of reads and aligns the adapter against all of them in one call. The
+/// results are bit-identical to the per-read path on every backend (see the
+/// `cr4_tso_scan_all_batch_matches_scalar_and_is_backend_stable` test), and ~7x
+/// faster than per-read `align_pair` on AVX2 including the per-chunk build.
+///
+/// Falls back to the per-read scalar path for any chunk whose `Database` fails to
+/// build, so this can never change results — only how fast they are computed.
+pub fn tso_clip_lens_cr4_batch(reads: &[&[u8]]) -> Vec<usize> {
+    use rayon::prelude::*;
+
+    reads
+        .par_chunks(CR4_SCAN_CHUNK)
+        .flat_map_iter(|chunk| {
+            let targets: Vec<Vec<u8>> = chunk.iter().map(|r| cr4_target(r)).collect();
+            let db = hyalite::Database::builder()
+                .sequences(&targets)
+                .scoring(cr4_scoring().clone())
+                .mode(hyalite::Mode::Ov)
+                .search_type(hyalite::SearchType::ScoreEnd)
+                .max_query_len(TSO_SEQ.len())
+                .build();
+
+            let Ok(db) = db else {
+                // Should not happen for this fixed shape; degrade to scalar rather
+                // than change results.
+                return chunk
+                    .iter()
+                    .map(|r| tso_clip_len_cr4(r))
+                    .collect::<Vec<_>>();
+            };
+
+            let mut scratch = hyalite::Scratch::new(&db);
+            let mut hits = Vec::with_capacity(chunk.len());
+            db.scan_all(&mut scratch, tso_query(), &mut hits);
+
+            chunk
+                .iter()
+                .zip(&hits)
+                .map(|(read, hit)| {
+                    if read.is_empty() {
+                        0
+                    } else {
+                        cr4_gate(hit, read.len())
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Number of 3' bases to trim as a CellRanger4 polyA tail — STAR
+/// `ClipCR4::polyTail3p`.
+///
+/// Walks in from the 3' end scoring +1 per `A` (encoded 0) and -2 per non-`A`,
+/// remembering the longest prefix of that walk whose running score still clears
+/// a 70% density threshold (`score * 10 >= ib * 7`). It gives up once the score
+/// has fallen more than 27 behind the position, and returns nothing unless the
+/// remembered score reached 20. Reads shorter than 20 bases are never trimmed.
+///
+/// Note the scan does **not** stop at the tail boundary, so A-rich sequence
+/// upstream of a clean run legitimately extends the trim. That reads like an
+/// off-by-one but is STAR's behaviour; the oracle pins it.
+///
+/// Ported from STAR; the Rust transcription is [Benjamin Demaille's in PR
+/// #148](https://github.com/Psy-Fer/rustar-aligner/pull/148), moved here onto
+/// the solo path (the only place `--clipAdapterType CellRanger4` is reached)
+/// and validated against STAR's own compiled `polyTail3p` — see
+/// `cr4_tso_matches_star_opal_oracle`.
+fn poly_tail_3p(seq: &[u8]) -> usize {
+    let seq_len = seq.len();
+    if seq_len < 20 {
+        return 0;
+    }
+    let mut best_len: i64 = seq_len as i64 - 1;
+    let mut score: i64 = 0;
+    let mut best_score: i64 = 0;
+    for ib in 1..=seq_len as i64 {
+        if seq[seq_len - ib as usize] == 0 {
+            score += 1;
+            if score * 10 >= ib * 7 {
+                best_len = ib;
+                best_score = score;
+            }
+        } else {
+            score -= 2;
+            if ib - score > 27 {
+                break;
+            }
+        }
+    }
+    if best_score < 20 {
+        0
+    } else {
+        best_len as usize
+    }
+}
+
 /// Clip the 10x TSO from the 5' end and trim a 3' polyA tail of the cDNA read,
 /// matching `--clipAdapterType CellRanger4`. Operates on encoded bases
 /// (0=A..3=T,4=N) with parallel quality bytes. Returns the clipped read.
 ///
-/// Conservative thresholds (full-length TSO match ≤ 3 mismatches at the 5'
-/// anchor; trailing polyA run ≥ 8) keep this a no-op on adapter-free reads.
+/// The 5' TSO clip is a STAR-faithful overlap alignment (see [`tso_clip_len_cr4`]);
+/// the 3' polyA trim is STAR's scored scan (see [`poly_tail_3p`]).
 /// Returns `(clipped_seq, clipped_qual, clip5p, clip3p)` — the CR4-clipped read plus
 /// the bases trimmed from the 5' (TSO) and 3' (polyA) ends, so the caller can soft-clip
 /// them (STARsolo keeps them in SEQ as soft-clips, e.g. `60M30S`, not dropped).
 pub fn clip_adapter_cr4(seq: &[u8], qual: &[u8]) -> (Vec<u8>, Vec<u8>, usize, usize) {
-    let mut start = 0usize;
-    let mut end = seq.len();
+    // 5' TSO: STAR-faithful overlap alignment (ClipCR4's Opal call → hyalite).
+    clip_adapter_cr4_with_tso(seq, qual, tso_clip_len_cr4(seq))
+}
 
-    // 5' TSO: compare the read prefix against the full TSO; clip on a match.
-    if seq.len() >= TSO_SEQ.len() {
-        let tso: Vec<u8> = TSO_SEQ
-            .iter()
-            .map(|&b| crate::io::fastq::encode_base(b))
-            .collect();
-        let mismatches = seq[..tso.len()]
-            .iter()
-            .zip(&tso)
-            .filter(|(a, b)| a != b)
-            .count();
-        if mismatches <= 3 {
-            start = tso.len();
-        }
-    }
+/// [`clip_adapter_cr4`] with the 5' TSO clip length already computed — the entry
+/// point for the batched scan, which resolves every read's clip up front via
+/// [`tso_clip_lens_cr4_batch`].
+pub fn clip_adapter_cr4_with_tso(
+    seq: &[u8],
+    qual: &[u8],
+    start: usize,
+) -> (Vec<u8>, Vec<u8>, usize, usize) {
+    let start = start.min(seq.len());
 
-    // 3' polyA: trim a trailing run of A (encoded 0) of length >= 8.
-    let mut run = 0usize;
-    while end > start && seq[end - 1] == 0 {
-        run += 1;
-        end -= 1;
-    }
-    if run < 8 {
-        end += run; // not a real polyA tail; keep those bases
-    }
+    // 3' polyA, on the read as it stands after the 5' clip — STAR clips type 10
+    // (which shifts the sequence and shrinks Lread) before type 11.
+    //
+    // NB: with a non-zero --clip5pNbases/--clip3pNbases alongside CellRanger4,
+    // STAR's window differs (it applies those fixed trims first). Narrowing the
+    // window to match made agreement *worse*, because that pairing has a larger
+    // pre-existing +/-clip5pNbases position bug that swamps it — see TODO.md.
+    // Left matching the default (fixed clips = 0) case, which is validated.
+    let end = seq.len() - poly_tail_3p(&seq[start..]);
 
     if start == 0 && end == seq.len() {
         return (seq.to_vec(), qual.to_vec(), 0, 0);
@@ -544,6 +900,8 @@ pub struct SoloContext {
     pub match_type: CbMatchType,
     pub strand: SoloStrand,
     pub gene_ann: GeneAnnotation,
+    /// Transcript models for the `Gene` feature and GX/GN (`classifyAlign`).
+    pub gene_model: GeneModel,
     pub stats: CbMatchStats,
     /// Quantified features (`Gene`, `GeneFull`, …), each with its own recorder
     /// and `Solo.out/<feature>/raw/` output. Parallel to `recorders`.
@@ -657,6 +1015,19 @@ impl SoloContext {
         // Gene model: --sjdbGTFfile if given, else the index's annotation tables.
         let gene_ann = crate::quant::resolve_gene_annotation(params, genome, transcriptome)?;
         log::info!("STARsolo: {} genes loaded", gene_ann.n_genes());
+        // The Gene feature tests alignments against transcript models
+        // (`Transcriptome::classifyAlign`). The index's transcriptome is the
+        // mapping-time GTF's when one is given, else the index tables.
+        let gene_model = GeneModel::new(
+            transcriptome.cloned().ok_or_else(|| {
+                Error::Index(
+                    "STARsolo needs transcript models: the index's transcriptInfo.tab \
+                     or --sjdbGTFfile"
+                        .into(),
+                )
+            })?,
+            &gene_ann,
+        );
 
         let strand: SoloStrand = params.solo_strand.parse().map_err(|e: String| {
             Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
@@ -687,6 +1058,7 @@ impl SoloContext {
             match_type: params.solo_cb_match_type(),
             strand,
             gene_ann,
+            gene_model,
             stats: CbMatchStats::new(),
             features,
             recorders,
@@ -731,17 +1103,22 @@ impl SoloContext {
     /// Process one solo read: match the cell barcode, validate the UMI, assign
     /// a gene, and (on success) produce a count record. Stats are recorded
     /// here; the returned records are appended to the recorder by the caller.
-    /// GX/GN SAM tag strings for a read's `Gene`-feature assignment:
-    /// `(gene_id, gene_name)` when uniquely assigned, else `("-", "-")`
-    /// (STARsolo convention). Drives `--outSAMattributes GX GN`.
-    pub fn gene_tags<'a>(&'a self, transcripts: &[Transcript]) -> (&'a str, &'a str) {
-        match assign_gene_se(transcripts, &self.gene_ann, self.strand, SoloFeature::Gene) {
-            GeneAssignment::Gene(g) => (
-                self.gene_ann.gene_ids[g as usize].as_str(),
-                self.gene_ann.gene_names[g as usize].as_str(),
-            ),
-            _ => ("-", "-"),
-        }
+    /// GX/GN SAM tag strings per alignment, in `transcripts` order
+    /// (`ReadAlign_alignBAM.cpp:99-106`): the alignment's own gene when the
+    /// read's `Gene` set and the alignment's each hold exactly one gene, else
+    /// `("-", "-")`. Drives `--outSAMattributes GX GN`.
+    pub fn gene_tags<'a>(&'a self, transcripts: &[Transcript]) -> Vec<(&'a str, &'a str)> {
+        let sets = classify_align(transcripts, &self.gene_model, self.strand);
+        sets.per_align
+            .iter()
+            .map(|genes| match (sets.genes.len(), genes.as_slice()) {
+                (1, &[g]) => (
+                    self.gene_ann.gene_ids[g as usize].as_str(),
+                    self.gene_ann.gene_names[g as usize].as_str(),
+                ),
+                _ => ("-", "-"),
+            })
+            .collect()
     }
 
     pub fn process_read(
@@ -762,6 +1139,7 @@ impl SoloContext {
         let class = classify_read(
             cdna_transcripts,
             &self.gene_ann,
+            &self.gene_model,
             self.strand,
             want_exon,
             want_body,
@@ -1022,6 +1400,353 @@ mod tests {
         }
     }
 
+    fn enc(s: &str) -> Vec<u8> {
+        s.bytes().map(encode_base).collect()
+    }
+
+    #[test]
+    fn cr4_tso_clip_removes_exact_tso_prefix() {
+        // Read = exact TSO (30 nt) + 61 nt of cDNA (all C, so the 3' polyA trim
+        // is a no-op). Overlap of the 30-nt TSO against target[0..30] scores 30,
+        // ends at target index 29 ⇒ L = 30, well above STAR's gate.
+        let cdna: String = std::iter::repeat_n('C', 61).collect();
+        let read = format!("AAGCAGTGGTATCAACGCAGAGTACATGGG{cdna}");
+        let seq = enc(&read);
+        assert_eq!(seq.len(), 91);
+        assert_eq!(tso_clip_len_cr4(&seq), 30);
+
+        let qual = vec![b'I'; seq.len()];
+        let (clipped, _q, c5, c3) = clip_adapter_cr4(&seq, &qual);
+        assert_eq!(c5, 30, "5' TSO clipped");
+        assert_eq!(c3, 0, "no polyA tail");
+        assert_eq!(clipped, enc(&cdna));
+    }
+
+    /// `clip_adapter_cr4` must run [`poly_tail_3p`] on the read *after* the 5'
+    /// TSO clip (STAR clips type 10 before type 11), and must use STAR's scored
+    /// scan rather than the old "trailing run of A >= 8" rule.
+    #[test]
+    fn cr4_polya_trim_follows_star_not_a_run_length_rule() {
+        let qual = |n: usize| vec![b'I'; n];
+
+        // 10 clean A's: the old >=8 run rule trimmed these; STAR does not,
+        // because polyTail3p's best score (10) never reaches the 20 floor.
+        let seq = enc(&format!("{}{}", "CGT".repeat(20), "A".repeat(10)));
+        let (_, _, c5, c3) = clip_adapter_cr4(&seq, &qual(seq.len()));
+        assert_eq!(
+            (c5, c3),
+            (0, 0),
+            "a 10 base tail is below STAR's score floor"
+        );
+
+        // 25 clean A's clears the floor and is trimmed whole.
+        let seq = enc(&format!("{}{}", "CGT".repeat(20), "A".repeat(25)));
+        let (_, _, c5, c3) = clip_adapter_cr4(&seq, &qual(seq.len()));
+        assert_eq!((c5, c3), (0, 25));
+
+        // An interrupted tail survives at 70% density — the run-length rule
+        // would have stopped at the first non-A and trimmed only 15.
+        let seq = enc(&format!(
+            "{}{}C{}",
+            "CGT".repeat(20),
+            "A".repeat(15),
+            "A".repeat(15)
+        ));
+        let (_, _, _, c3) = clip_adapter_cr4(&seq, &qual(seq.len()));
+        assert_eq!(c3, 31, "scored scan spans the interruption");
+
+        // Both halves together: the polyA scan sees the post-TSO-clip read, so
+        // the 5' and 3' clips are independent and both apply.
+        let cdna = "CGT".repeat(15); // 45 nt, A-free
+        let seq = enc(&format!(
+            "AAGCAGTGGTATCAACGCAGAGTACATGGG{cdna}{}",
+            "A".repeat(30)
+        ));
+        let (clipped, _, c5, c3) = clip_adapter_cr4(&seq, &qual(seq.len()));
+        assert_eq!((c5, c3), (30, 30), "TSO off the 5', polyA off the 3'");
+        assert_eq!(clipped, enc(&cdna));
+    }
+
+    #[test]
+    fn cr4_tso_clip_is_noop_without_adapter() {
+        // Homopolymer read with no TSO similarity ⇒ score below STAR's gate ⇒ 0.
+        assert_eq!(tso_clip_len_cr4(&[3u8; 91]), 0);
+    }
+
+    #[test]
+    fn cr4_tso_clip_handles_short_and_empty_reads() {
+        assert_eq!(tso_clip_len_cr4(&[]), 0);
+        // Shorter than the TSO: target is N-padded to 91; no qualifying match.
+        assert_eq!(tso_clip_len_cr4(&enc("ACGTACGT")), 0);
+    }
+
+    /// Backend-forcing twin of [`tso_clip_lens_cr4_batch`], so the determinism
+    /// test can pin a specific backend (the production function uses runtime
+    /// dispatch and offers no such knob).
+    fn tso_clip_lens_batch(reads: &[Vec<u8>], backend: hyalite::BackendChoice) -> Vec<usize> {
+        use hyalite::{Database, Mode, Scratch, SearchType};
+        let targets: Vec<Vec<u8>> = reads
+            .iter()
+            .map(|r| {
+                let take = r.len().min(CR4_READ_LEN);
+                let mut t = r[..take].to_vec();
+                t.resize(CR4_READ_LEN, 4);
+                t
+            })
+            .collect();
+        let db = Database::builder()
+            .sequences(&targets)
+            .scoring(cr4_scoring().clone())
+            .mode(Mode::Ov)
+            .search_type(SearchType::ScoreEnd)
+            .max_query_len(TSO_SEQ.len())
+            .backend(backend)
+            .build()
+            .expect("build cr4 database");
+        let mut scratch = Scratch::new(&db);
+        let mut out = Vec::new();
+        db.scan_all(&mut scratch, tso_query(), &mut out);
+        reads
+            .iter()
+            .zip(&out)
+            .map(|(r, hit)| {
+                let s = hit.score;
+                let l = hit.target_end.map_or(0, |e| e + 1) as i32;
+                let reject = s < 20 || (s == 20 && l > 26) || (s == 21 && l > 30);
+                if reject { 0 } else { (l as usize).min(r.len()) }
+            })
+            .collect()
+    }
+
+    /// A deterministic, diverse CR4 read set (TSO with mutations/shifts + random),
+    /// all length 91, for exercising the batched path in-tree without fixtures.
+    fn synthetic_cr4_reads() -> Vec<Vec<u8>> {
+        let mut st = 0x51ED_2701_u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            st >> 33
+        };
+        let tso = tso_query().to_vec();
+        let mut reads = Vec::new();
+        for _ in 0..400 {
+            let mut r = tso.clone();
+            let k = (lcg() % 13) as usize; // 0..12 mismatches
+            for _ in 0..k {
+                let p = (lcg() as usize) % r.len();
+                r[p] = ((r[p] as u64 + 1 + lcg() % 3) % 4) as u8;
+            }
+            let shift = (lcg() % 6) as usize;
+            let mut read: Vec<u8> = (0..shift).map(|_| (lcg() % 4) as u8).collect();
+            read.extend(r);
+            while read.len() < CR4_READ_LEN {
+                read.push((lcg() % 4) as u8);
+            }
+            read.truncate(CR4_READ_LEN);
+            reads.push(read);
+        }
+        for _ in 0..100 {
+            reads.push((0..CR4_READ_LEN).map(|_| (lcg() % 4) as u8).collect());
+        }
+        reads
+    }
+
+    /// Confirms the patched per-target `scan_all` (SIMD) path serves CR4: it
+    /// agrees with the scalar `align_pair` clip we ship, is identical across
+    /// backends, and (when the oracle fixture is provided) matches STAR's Opal.
+    #[test]
+    fn cr4_tso_scan_all_batch_matches_scalar_and_is_backend_stable() {
+        let reads = synthetic_cr4_reads();
+        let scalar_ref: Vec<usize> = reads.iter().map(|r| tso_clip_len_cr4(r)).collect();
+
+        // Batched scan_all on Scalar must equal the per-read scalar path.
+        let batch_scalar = tso_clip_lens_batch(
+            &reads,
+            hyalite::BackendChoice::Force(hyalite::Backend::Scalar),
+        );
+        assert_eq!(batch_scalar, scalar_ref, "scan_all(Scalar) vs align_pair");
+
+        // And every available SIMD backend must match it bit-for-bit.
+        for b in [hyalite::Backend::Sse41, hyalite::Backend::Avx2] {
+            if b.is_available() {
+                let batch = tso_clip_lens_batch(&reads, hyalite::BackendChoice::Force(b));
+                assert_eq!(batch, scalar_ref, "scan_all({b:?}) diverged");
+            }
+        }
+
+        // The production batch entry point (runtime-dispatched backend, rayon
+        // chunking) must land on the same clips as the per-read scalar path.
+        let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            tso_clip_lens_cr4_batch(&refs),
+            scalar_ref,
+            "tso_clip_lens_cr4_batch vs align_pair"
+        );
+    }
+
+    /// Faithfulness gate: our CR4 clip — both halves — vs STAR's own C++.
+    ///
+    /// `tests/data/cr4_opal_oracle.tsv` (columns: read, clip, score, L, polyA)
+    /// is generated by `tests/data/cr4_opal_oracle.cpp`, which links STAR's own
+    /// `opal.cpp` and reproduces `ClipCR4` + `ClipMate::clipChunk` verbatim.
+    /// 900 reads straddle the 5' gate `S<20 / S==20&&L>26 / S==21&&L>30` (TSO
+    /// with 0-14 mismatches, 5' shifts, truncations, indels, embedded Ns, polyA,
+    /// random, short reads); a further 38 straddle `polyTail3p`'s own boundaries
+    /// (the score>=20 floor, the 70% density rule, the `ib-score>27` give-up,
+    /// the `seqLen<20` early return, and A-rich sequence upstream of the tail).
+    ///
+    /// The polyA column is computed on the read *after* the 5' clip, matching
+    /// `ClipMate::clip`'s ordering. Committing the expected output lets this run
+    /// in CI with no Opal build; regenerate with the recipe at the top of the
+    /// `.cpp` and override the path via `RUSTAR_CR4_ORACLE`.
+    #[test]
+    fn cr4_tso_matches_star_opal_oracle() {
+        let path = std::env::var("RUSTAR_CR4_ORACLE").unwrap_or_else(|_| {
+            format!(
+                "{}/tests/data/cr4_opal_oracle.tsv",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        });
+        let data = std::fs::read_to_string(&path).expect("read oracle tsv");
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        let mut expected: Vec<usize> = Vec::new();
+        let mut expected_polya: Vec<usize> = Vec::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 5 {
+                continue;
+            }
+            reads.push(f[0].bytes().map(encode_base).collect());
+            expected.push(f[1].parse().expect("clip int"));
+            expected_polya.push(f[4].parse().expect("polyA int"));
+        }
+        assert!(!reads.is_empty(), "oracle file was empty");
+
+        // 3' polyA half: STAR's polyTail3p on the post-5'-clip read.
+        let mut polya_mism = 0usize;
+        for (i, read) in reads.iter().enumerate() {
+            let got = poly_tail_3p(&read[expected[i].min(read.len())..]);
+            if got != expected_polya[i] {
+                eprintln!("POLYA MISMATCH star={} ours={got}", expected_polya[i]);
+                polya_mism += 1;
+            }
+        }
+        assert_eq!(
+            polya_mism,
+            0,
+            "{polya_mism}/{} reads disagreed with STAR's polyTail3p",
+            reads.len()
+        );
+
+        // Scalar per-read path (what we ship).
+        let scalar: Vec<usize> = reads.iter().map(|r| tso_clip_len_cr4(r)).collect();
+        // Batched SIMD per-target path (scan_all), on the best available backend.
+        let backend = if hyalite::Backend::Avx2.is_available() {
+            hyalite::Backend::Avx2
+        } else if hyalite::Backend::Sse41.is_available() {
+            hyalite::Backend::Sse41
+        } else {
+            hyalite::Backend::Scalar
+        };
+        let batch = tso_clip_lens_batch(&reads, hyalite::BackendChoice::Force(backend));
+        // The production entry point, exactly as the solo read loop calls it.
+        let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        let prod = tso_clip_lens_cr4_batch(&refs);
+
+        let mut mism = 0usize;
+        for i in 0..reads.len() {
+            if scalar[i] != expected[i] || batch[i] != expected[i] || prod[i] != expected[i] {
+                eprintln!(
+                    "MISMATCH star={} scalar={} simd={} prod={}",
+                    expected[i], scalar[i], batch[i], prod[i]
+                );
+                mism += 1;
+            }
+        }
+        assert_eq!(
+            mism,
+            0,
+            "{mism}/{} reads disagreed with STAR's Opal (scalar, {backend:?}, or production batch)",
+            reads.len()
+        );
+    }
+
+    /// Kicks hyalite's headline "bit-identical across backends" guarantee on the
+    /// CR4 workload shape, and cross-checks the SIMD `Database` path against the
+    /// scalar `align_pair` path we actually ship in `tso_clip_len_cr4`.
+    ///
+    /// NB: `Database::scan` returns the single best hit over the DB (with
+    /// `db_index`), not a per-sequence result, so this validates the best-hit
+    /// only. STAR's CR4 needs a per-read result, which is what
+    /// [`tso_clip_lens_cr4_batch`] gets from `scan_all` (0.2.0); this test keeps
+    /// the single-best `scan` path covered alongside it.
+    #[test]
+    fn cr4_tso_database_is_deterministic_across_backends_and_matches_scalar() {
+        use hyalite::{Backend, BackendChoice, Database, Mode, Scratch, SearchType};
+
+        // Reads-as-targets, TSO-as-query (STAR's orientation → target_end is the
+        // read coordinate). Read 0 is TSO-led, so it is the unambiguous winner.
+        let mut reads: Vec<Vec<u8>> = Vec::new();
+        let mut tso_led = tso_query().to_vec();
+        tso_led.extend(std::iter::repeat_n(1u8, CR4_READ_LEN - tso_led.len())); // + C's → 91
+        reads.push(tso_led);
+        reads.push(enc(
+            "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACG",
+        )); // 91
+        reads.push(vec![3u8; CR4_READ_LEN]); // homopolymer T
+
+        let mut backends = vec![Backend::Scalar];
+        for b in [Backend::Sse41, Backend::Avx2, Backend::Neon] {
+            if b.is_available() {
+                backends.push(b);
+            }
+        }
+
+        let mut per_backend: Vec<(i32, usize, usize)> = Vec::new(); // (score, db_index, target_end)
+        for backend in &backends {
+            let Ok(db) = Database::builder()
+                .sequences(&reads)
+                .scoring(cr4_scoring().clone())
+                .mode(Mode::Ov)
+                .search_type(SearchType::ScoreEnd)
+                .max_query_len(TSO_SEQ.len())
+                .backend(BackendChoice::Force(*backend))
+                .build()
+            else {
+                continue; // backend not applicable to this DB; skip
+            };
+            let mut scratch = Scratch::new(&db);
+            let hit = db.scan(&mut scratch, tso_query());
+            per_backend.push((hit.score, hit.db_index, hit.target_end.unwrap()));
+        }
+
+        // Every available backend agrees, bit for bit.
+        assert_ne!(per_backend.len(), 0);
+        let first = per_backend[0];
+        for (i, r) in per_backend.iter().enumerate() {
+            assert_eq!(*r, first, "backend {:?} diverged", backends[i]);
+        }
+
+        // The SIMD/Database best hit matches the scalar align_pair path on the
+        // winning read — same score, same end coordinate.
+        let (score, db_index, target_end) = first;
+        let scalar = hyalite::align_pair(
+            tso_query(),
+            &reads[db_index],
+            cr4_scoring(),
+            Mode::Ov,
+            SearchType::ScoreEnd,
+        )
+        .unwrap();
+        assert_eq!(scalar.score, score);
+        assert_eq!(scalar.target_end.unwrap(), target_end);
+
+        // And that winner is the TSO-led read, clipped at the full TSO.
+        assert_eq!(db_index, 0);
+        assert_eq!(target_end + 1, TSO_SEQ.len());
+    }
+
     fn v2_layout() -> SoloBarcodeLayout {
         // 10x v2: CB at 1..16 (16 bp), UMI at 17..26 (10 bp).
         SoloBarcodeLayout::Simple {
@@ -1215,5 +1940,179 @@ mod tests {
         )
         .unwrap();
         assert!(reader.read_batch(10).is_err());
+    }
+
+    #[test]
+    fn adapter_anchoring_finds_the_adapter_and_positions_around_it() {
+        // Adapter ACGT sits at offset 4. CB is the 4 bases before it
+        // (anchor 2, the adapter start), UMI the 4 after (anchor 3, adapter
+        // end). Both move with the adapter, which is the whole point.
+        let adapter = vec![0u8, 1, 2, 3];
+        let layout = SoloBarcodeLayout::Anchored {
+            cb_segments: vec![(
+                Anchored {
+                    anchor: 2,
+                    dist: -4,
+                },
+                Anchored {
+                    anchor: 2,
+                    dist: -1,
+                },
+            )],
+            umi: (
+                Anchored { anchor: 3, dist: 1 },
+                Anchored { anchor: 3, dist: 4 },
+            ),
+            adapter: adapter.clone(),
+            max_mismatches: 1,
+        };
+
+        // GGGG ACGT TTTT  →  CB = GGGG, UMI = TTTT
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
+            quality: vec![b'I'; 12],
+            file_index: 0,
+        };
+        let bc = layout.extract(&read).expect("adapter present");
+        assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
+        assert_eq!(bc.umi_seq, vec![3, 3, 3, 3]);
+
+        // Shift the adapter two bases right; both fields follow it.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![1, 1, 2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
+            quality: vec![b'I'; 14],
+            file_index: 0,
+        };
+        let bc = layout.extract(&read).expect("adapter present, shifted");
+        assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
+        assert_eq!(bc.umi_seq, vec![3, 3, 3, 3]);
+
+        // One mismatch inside the adapter is within budget.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2, 2, 2, 2, 0, 1, 2, 0, 3, 3, 3, 3],
+            quality: vec![b'I'; 12],
+            file_index: 0,
+        };
+        assert!(layout.extract(&read).is_some());
+
+        // No adapter at all: no barcode. A barcode read at an unknown offset
+        // is not salvageable, so guessing would be worse than declining.
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2; 12],
+            quality: vec![b'I'; 12],
+            file_index: 0,
+        };
+        assert!(layout.extract(&read).is_none());
+    }
+
+    /// The discriminating case: an early offset that fits the budget against a
+    /// later one that fits it better. STAR scores every offset and keeps the
+    /// best, so the later exact match wins. Taking the first acceptable one
+    /// instead would anchor the barcode four bases off.
+    #[test]
+    fn adapter_search_takes_the_best_scoring_offset_not_the_leftmost() {
+        // ACGT at 0 with one mismatch, ACGT exactly at 5.
+        let seq = [0u8, 1, 2, 0, 9, 0, 1, 2, 3];
+        assert_eq!(local_align_hamming_dist(&seq, &[0, 1, 2, 3]), (0, 5));
+    }
+
+    /// Among equally good offsets STAR keeps the first, because it replaces its
+    /// best only on a strictly smaller distance.
+    #[test]
+    fn adapter_search_breaks_ties_leftmost() {
+        let seq = [0u8, 1, 2, 3, 9, 0, 1, 2, 3];
+        assert_eq!(local_align_hamming_dist(&seq, &[0, 1, 2, 3]), (0, 0));
+    }
+
+    /// An `N` in the adapter is a wildcard in STAR's query, not a base that
+    /// fails to match, so it costs nothing against any read base.
+    #[test]
+    fn an_n_in_the_adapter_is_not_a_mismatch() {
+        assert_eq!(
+            local_align_hamming_dist(&[0u8, 1, 2, 3], &[0, 4, 2, 3]),
+            (0, 0)
+        );
+    }
+
+    /// STAR's starting values: the distance is the adapter length at offset 0
+    /// until an offset does better, and a read shorter than the adapter gives
+    /// its length + 1. So with a budget of at least the adapter length an
+    /// adapter matching nowhere is still "found" at offset 0, as in STAR.
+    #[test]
+    fn adapter_search_keeps_stars_starting_values() {
+        assert_eq!(local_align_hamming_dist(&[2u8; 8], &[0, 1, 2, 3]), (3, 0));
+        assert_eq!(local_align_hamming_dist(&[2u8; 8], &[0, 0, 0, 0]), (4, 0));
+        assert_eq!(local_align_hamming_dist(&[0u8, 1], &[0, 1, 2, 3]), (3, 0));
+    }
+
+    /// STAR's `extractBarcode` bounds: the end may equal the read length (its
+    /// `substr` clamps), but not exceed it; a negative start or a start after
+    /// the end is refused.
+    #[test]
+    fn barcode_span_follows_extract_barcode() {
+        assert_eq!(barcode_span(2, 5, 10), Some((2, 4)));
+        assert_eq!(barcode_span(8, 10, 10), Some((8, 2)));
+        assert_eq!(barcode_span(8, 11, 10), None);
+        assert_eq!(barcode_span(-1, 3, 10), None);
+        assert_eq!(barcode_span(4, 3, 10), None);
+    }
+
+    /// STAR drops a read whose adapter is not found within the budget
+    /// (`noNoAdapter`), even when no position is measured from the adapter.
+    #[test]
+    fn no_adapter_means_no_barcode_whatever_the_anchors() {
+        let layout = SoloBarcodeLayout::Anchored {
+            cb_segments: vec![(
+                Anchored { anchor: 0, dist: 0 },
+                Anchored { anchor: 0, dist: 3 },
+            )],
+            umi: (
+                Anchored { anchor: 0, dist: 4 },
+                Anchored { anchor: 0, dist: 7 },
+            ),
+            adapter: vec![0, 1, 2, 3],
+            max_mismatches: 0,
+        };
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![2; 12],
+            quality: vec![b'I'; 12],
+            file_index: 0,
+        };
+        assert!(layout.extract(&read).is_none());
+    }
+
+    #[test]
+    fn anchors_outside_the_read_yield_no_barcode() {
+        // Anchor 2 with a distance that runs off the front.
+        let layout = SoloBarcodeLayout::Anchored {
+            cb_segments: vec![(
+                Anchored {
+                    anchor: 2,
+                    dist: -99,
+                },
+                Anchored {
+                    anchor: 2,
+                    dist: -1,
+                },
+            )],
+            umi: (
+                Anchored { anchor: 3, dist: 1 },
+                Anchored { anchor: 3, dist: 2 },
+            ),
+            adapter: vec![0, 1, 2, 3],
+            max_mismatches: 0,
+        };
+        let read = EncodedRead {
+            name: "r".into(),
+            sequence: vec![0, 1, 2, 3, 3, 3, 3],
+            quality: vec![b'I'; 7],
+            file_index: 0,
+        };
+        assert!(layout.extract(&read).is_none());
     }
 }

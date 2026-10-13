@@ -44,6 +44,42 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- **`--clipAdapterType CellRanger4` now matches STAR exactly**, both halves of the
+  clip (#198). The 5' TSO trim is an overlap alignment against the first 91 bases of the
+  read, replicating `ClipCR4`'s Opal call (ACGTN alphabet; match +1, mismatch -2,
+  any-vs-N -2, N-vs-N 0; gap open = gap extend = 2; overlap mode with end
+  tracking), followed by STAR's acceptance gate
+  `S<20 || (S==20 && L>26) || (S==21 && L>30)`. The 3' trim is STAR's scored
+  `polyTail3p` scan, replacing a "trailing run of A >= 8" approximation that was
+  wrong in both directions (a read ending in 10 A's was trimmed by 10 where STAR
+  trims 0; `A*15 + C + A*15` was trimmed by 15 where STAR trims 31). The poly-A
+  transcription is taken from Benjamin Demaille's #148 and moved onto the solo
+  path, which is where `CellRanger4` is actually reached; #148's `clip_mate`
+  wiring is not used and that PR is superseded.
+
+  The overlap alignment comes from [`hyalite`](https://crates.io/crates/hyalite)
+  0.2 — a new dependency, pure Rust with no dependencies of its own. Reads are
+  scanned a batch at a time via `Database::scan_all`, mirroring STAR's
+  `ClipMate::clipChunk`, which aligns the adapter against a chunk of reads in one
+  Opal call.
+
+  Both halves are gated against STAR's own C++: `tests/data/cr4_opal_oracle.cpp`
+  links STAR's `opal.cpp` and reproduces `ClipCR4` + `ClipMate::clipChunk`
+  verbatim, and the committed `cr4_opal_oracle.tsv` is its output over 938 reads
+  chosen to straddle both decision boundaries. `cr4_tso_matches_star_opal_oracle`
+  checks every one against the scalar path, a forced-SIMD path, and the
+  production batch path.
+
+  Measured on 10x mouse chr19 with both tools under `--clipAdapterType
+  CellRanger4`: clip-amount differences against STARsolo drop from 154 to **0**,
+  and the soft-clipped share moves from 39% (STAR 41%) to 34.9% (STAR 35.0%).
+  Default SE/PE alignment is untouched, as `CellRanger4` is opt-in: SE 8788/8926
+  and PE 8390 both-mapped / 0 half-mapped, both unchanged.
+
+  Known limitation: `CellRanger4` combined with a non-zero `--clip5pNbases` /
+  `--clip3pNbases` misplaces most reads by `clip5pNbases`. That is a pre-existing
+  bug, not introduced here, and is tracked separately; `CellRanger4` on its own
+  and the fixed clips on their own are both unaffected.
 - **Bulk total RNA-seq: unspliced targets, splicing-status tag and
   spliced / unspliced gene counts** (rustar-aligner extensions, opt-in, see
   DIVERGENCE.md §1.4 and the "Bulk total RNA-seq" guide; from
@@ -431,6 +467,35 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- **STARsolo barcode options** (from @BenjaminDEMAILLE's #165): `--soloCBtype`
+  (`Sequence`; `String` is refused), `--soloAdapterSequence` /
+  `--soloAdapterMismatchesNmax` for adapter-anchored `CB_UMI_Complex`
+  geometry, and `--soloOutFormatFeaturesGeneField3`. As in STAR
+  (`SoloReadBarcode_getCBandUMI.cpp`, `SoloBarcode_extractBarcode.cpp`), a
+  read whose adapter is not found within the budget gets no barcode whatever
+  its anchors, and a barcode may end at the read length.
+
+- **STARsolo `Gene` feature and GX/GN as STAR's `classifyAlign`.** A read
+  counted for a gene only if each aligned block lay inside the union of the
+  gene's exons; STAR requires the alignment to be concordant with one of the
+  gene's transcripts, every junction one of its introns
+  (`Transcriptome_classifyAlign.cpp`). A spliced read with an unannotated
+  junction between two exons was counted here and not by STAR. GX/GN now come
+  from each alignment's own genes (`fAlign`), written only when the read and
+  the alignment each have exactly one gene (`ReadAlign_alignBAM.cpp:99-106`);
+  the read's gene was written on every alignment. 10x v2 mouse chr19 fixture:
+  Gene matrix (raw and filtered) and all 19,955 BAM records now identical to
+  STARsolo (were 2 matrix entries, one filtered cell and 520 GX/GN records).
+- **STARsolo `UniqueAndMult-*.mtx` include cells with multi-gene reads only.**
+  Cells with no unique-gene read were skipped; STAR distributes their
+  multi-gene molecules too.
+- STARsolo cell-barcode correction (from @BenjaminDEMAILLE's #274) now applies
+  STAR's `cbMinP` posterior threshold (0.975, single precision), caps the mismatch quality at `QSmax`
+  (33), and enforces `oneExact`: under every `--soloCBmatchWLtype` except the
+  pseudocount ones, a barcode corrected to a single whitelist entry counts
+  only if some read matched that entry exactly. Without these,
+  `1MM_multi_Nbase_pseudocounts` produced the same matrix as the default
+  `1MM_multi` (#172).
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
@@ -588,6 +653,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
   2.7.11b the variant is a no-op. It now removes a UMI seen in two or
   more genes from **all** of them, the behaviour the option name
   describes. Recorded in `DIVERGENCE.md` (closes #144).
+- The STARsolo adapter search took the leftmost match inside the
+  mismatch budget; STAR's `localAlignHammingDist` takes the
+  best-scoring one. Since `CB_UMI_Complex` measures barcode positions
+  from the adapter, the wrong offset shifted the whole barcode. Ties now
+  go to the leftmost of the best, and an `N` in the adapter is a
+  wildcard rather than a mismatch.
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block
