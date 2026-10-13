@@ -66,9 +66,11 @@ libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.51", features = ["libdeflate"] }
 # Deterministic SIMD overlap aligner for the CellRanger4 5' TSO clip (STAR
 # links Opal for this). Pure Rust, zero dependencies, bit-identical across
-# backends. 0.2 is the first release with `Database::scan_all`, the per-target
-# scan the batched clip path needs.
-hyalite = "0.2"
+# backends. Pinned exactly: this crate is published, so downstream builds
+# resolve their own version without our Cargo.lock, and an unvetted release
+# must not move alignment output. Bump deliberately, rerunning the Opal oracle
+# test (`cr4_tso_matches_star_opal_oracle`).
+hyalite = "=0.4.0"
 # Optional FASTQ input decoders beyond gzip (#218). The format is detected by
 # magic bytes in `src/io/fastq.rs`. Every backend below is pure Rust, so turning
 # them on adds no C toolchain requirement. `niffler` was evaluated and not used:

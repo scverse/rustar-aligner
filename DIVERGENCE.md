@@ -134,6 +134,31 @@ Poly-A being special in RNA does not apply here: the UMI comes from the barcode 
 
 **Source.** `src/solo/whitelist.rs` (`check_umi`, `umi_valid_rejects_every_homopolymer`). STAR: `SoloReadBarcode.cpp:16-21`, `SoloReadBarcode_getCBandUMI.cpp:139` and `:353-354`.
 
+### 1.7 `--clipAdapterType CellRanger4` with `--clip5pNbases`: records that describe the aligned bases
+
+**What STAR does.** With `CellRanger4`, the 5' clip of mate 1 is `ClipMate` type 10. `ClipMate::clip` (`ClipMate_clip.cpp`) runs in three steps:
+
+- **Fixed bases (`:14-24`).** `Lread -= N` and `clippedN += N` always run, but the `memmove` that drops the N bases from the start of the sequence runs only `if (type==0)`. Type 0 is the 5' clip of `--clipAdapterType Hamming`; the guard was not extended to type 10, so the bases are counted as clipped but stay in the buffer.
+- **TSO (`:50-54`).** Type 10 then moves the sequence by the TSO length alone, counted from the original start of the read.
+- **Bases after the adapter (`:64-70`).** `--clip5pAfterAdapterNbases` has the same `type==0` guard.
+
+`readLoad.cpp:60-61` aligns what is left. So STAR aligns read bases `[TSO, len−N)` (before the 3' clip) where it means to align `[N+TSO, len)`: N bases it was told to discard are aligned, and N real bases at the 3' end are lost. The record is then written with a 5' soft clip of `clippedN` = N+TSO (`ReadAlign_alignBAM.cpp:224-230`, `ReadAlign_calcCIGAR.cpp:16-22`), which places SEQ N bases away from the bases that were aligned at POS. The 3' poly-A search (`:55-57`) also runs on the shifted buffer.
+
+**What rustar-aligner does.** Removes the fixed bases, then the TSO, then the bases after it, and at the 3' end the fixed bases, then the poly-A tail (STAR's amounts and order, `clip::clip_mate_cr4`), and aligns the bases that remain. Each record describes the alignment that was made.
+
+**Why.** STAR's records are not internally consistent, and its own `nM` tag shows it. On the 10x v2 mouse chr19 fixture with `--clipAdapterType CellRanger4 --clip5pNbases 5 --clip3pNbases 3`, recomputing mismatches against the genome from each primary record's POS, CIGAR and SEQ:
+
+| | primary records | recomputed = `nM` as written | recomputed = `nM` with SEQ shifted 5 bases | 0 mismatches as written |
+|---|---|---|---|---|
+| STAR | 16,880 | 2 | 16,880 | 0 |
+| rustar-aligner | 16,936 | 16,936 | 13 | 7,501 |
+
+Every STAR record matches the alignment STAR computed only once SEQ is moved by the N bases that were never removed. rustar-aligner's records match their `nM` as written. Nothing in STAR's documentation describes the shift, and no report of it was found in STAR's issue tracker (searched October 2026).
+
+**Impact.** Only `CellRanger4` with a non-zero `--clip5pNbases` (and, by the same code, `--clip5pAfterAdapterNbases`, which has not been run). Without them the two agree (fixture: all 21,732 records identical). With them, every read differs: of the 16,177 reads both map, 9,353 differ only in POS (−N on forward reads, +N on reverse, relative to rustar-aligner), and 6,824 also differ in CIGAR, locus or strand, because STAR aligned a different stretch of the read. The gene matrix differs too (fixture: 21 raw entries, 448 against 443 UMIs).
+
+**Source.** `src/clip/mod.rs` (`clip_mate_cr4`). STAR: `ClipMate_clip.cpp:14-24, 50-57, 64-70`, `readLoad.cpp:60-61`, `ReadAlign_alignBAM.cpp:224-230`, `ReadAlign_calcCIGAR.cpp:16-22`.
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

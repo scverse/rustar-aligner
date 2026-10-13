@@ -58,7 +58,8 @@ Sections commonly used: Features, Bug fixes, Other changes.
   wiring is not used and that PR is superseded.
 
   The overlap alignment comes from [`hyalite`](https://crates.io/crates/hyalite)
-  0.2 — a new dependency, pure Rust with no dependencies of its own. Reads are
+  0.4.0 (pinned exactly) — a new dependency, pure Rust with no dependencies of
+  its own. Reads are
   scanned a batch at a time via `Database::scan_all`, mirroring STAR's
   `ClipMate::clipChunk`, which aligns the adapter against a chunk of reads in one
   Opal call.
@@ -76,10 +77,20 @@ Sections commonly used: Features, Bug fixes, Other changes.
   Default SE/PE alignment is untouched, as `CellRanger4` is opt-in: SE 8788/8926
   and PE 8390 both-mapped / 0 half-mapped, both unchanged.
 
-  Known limitation: `CellRanger4` combined with a non-zero `--clip5pNbases` /
-  `--clip3pNbases` misplaces most reads by `clip5pNbases`. That is a pre-existing
-  bug, not introduced here, and is tracked separately; `CellRanger4` on its own
-  and the fixed clips on their own are both unaffected.
+  The clips run in STAR's `ClipMate::clip` order (`clip::clip_mate_cr4`): fixed
+  5' bases, then the TSO (found on the original read, capped at what is left),
+  then on the 3' end the fixed bases and then `polyTail3p`. `CellRanger4` now
+  also applies outside STARsolo, as in STAR; it was ignored there. As STAR, it
+  is refused with two mates and with `--clip3pAdapterSeq`, and
+  `--clipAdapterType` takes only `Hamming` or `CellRanger4` (`None` was
+  accepted). Plain single-end alignment of the fixture's cDNA reads with
+  `CellRanger4`: 21,732/21,732 records identical to STAR.
+
+  With a non-zero `--clip5pNbases`, STAR counts the fixed 5' bases as
+  clipped without removing them, so its records place SEQ `clip5pNbases`
+  away from the bases it aligned (its own `nM` matches the record only
+  after that shift). rustar-aligner removes them and its records describe
+  the alignment made; see DIVERGENCE.md §1.7.
 - **Bulk total RNA-seq: unspliced targets, splicing-status tag and
   spliced / unspliced gene counts** (rustar-aligner extensions, opt-in, see
   DIVERGENCE.md §1.4 and the "Bulk total RNA-seq" guide; from

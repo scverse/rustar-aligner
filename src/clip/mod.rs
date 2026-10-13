@@ -111,6 +111,27 @@ fn local_search(x: &[u8], y: &[u8], p_mm: f64) -> usize {
     best_ix
 }
 
+/// [`clip_mate`] under `--clipAdapterType CellRanger4` (STAR `ClipMate::clip`
+/// with clip types 10 and 11, `ClipMate_clip.cpp`). 5': `clip5pNbases`, then the
+/// TSO clip `tso_len`, which `ClipMate::clipChunk` found on the original read,
+/// capped at what is left (`min(clippedInfo, Lread)`), then
+/// `clip5pAfterAdapterNbases`. 3', on what remains: `clip3pNbases`, then
+/// `polyTail3p`, then `clip3pAfterAdapterNbases`. Each step that would use up
+/// the read clips all of it, as STAR's `Lread=0; clippedN=LreadOld`.
+pub fn clip_mate_cr4(read: &[u8], p: &ClipParams, tso_len: usize) -> (usize, usize) {
+    let len = read.len();
+    let mut c5 = p.five.n.min(len);
+    c5 += tso_len.min(len - c5);
+    c5 += p.five.n_after.min(len - c5);
+
+    let s = &read[c5..];
+    let sl = s.len();
+    let mut c3 = p.three.n.min(sl);
+    c3 += crate::solo::poly_tail_3p(&s[..sl - c3]);
+    c3 += p.three.n_after.min(sl - c3);
+    (c5, c3)
+}
+
 /// Clip one mate (STAR's two `ClipMate::clip` passes: 5' then 3'). Returns
 /// `(clip5p_total, clip3p_total)`; the clipped region is
 /// `read[clip5p_total .. len-clip3p_total]`.
@@ -263,5 +284,36 @@ mod tests {
         assert!(read.iter().all(|&b| b <= 3), "test read must be numeric");
         let (_, c3) = clip_mate(&read, &p);
         assert_eq!(c3, 13, "adapter tail must be clipped on a numeric read");
+    }
+
+    /// CellRanger4 in STAR's `ClipMate::clip` order: the fixed 5' bases come
+    /// off before the TSO clip, which is capped at what is left; the poly-A
+    /// scan runs on the read after the fixed 3' bases are gone.
+    #[test]
+    fn clip_mate_cr4_follows_star_order() {
+        let fixed = |n5, n3| ClipParams {
+            five: ClipEnd {
+                n: n5,
+                ..Default::default()
+            },
+            three: ClipEnd {
+                n: n3,
+                ..Default::default()
+            },
+        };
+        // 40 bases then 25 A's.
+        let mut read = enc(&b"CGTC".repeat(10));
+        read.extend(enc(&[b'A'; 25]));
+        // No fixed clips: TSO 10 at the 5' end, the 25 A's at the 3' end.
+        assert_eq!(clip_mate_cr4(&read, &fixed(0, 0), 10), (10, 25));
+        // 5 fixed bases then the TSO: 15 in all.
+        assert_eq!(clip_mate_cr4(&read, &fixed(5, 0), 10), (15, 25));
+        // 3 fixed 3' bases come out of the A's, and poly-A takes the other 22.
+        assert_eq!(clip_mate_cr4(&read, &fixed(0, 3), 10), (10, 25));
+        // With 7 fixed 3' bases only 18 A's are left, under polyTail3p's
+        // score of 20, so poly-A clips nothing.
+        assert_eq!(clip_mate_cr4(&read, &fixed(0, 7), 10), (10, 7));
+        // A TSO clip longer than what is left after the fixed bases is capped.
+        assert_eq!(clip_mate_cr4(&read[..12], &fixed(5, 0), 30), (12, 0));
     }
 }

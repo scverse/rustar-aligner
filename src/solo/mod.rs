@@ -689,6 +689,8 @@ pub fn tso_clip_lens_cr4_batch(reads: &[&[u8]]) -> Vec<usize> {
             let mut scratch = hyalite::Scratch::new(&db);
             let mut hits = Vec::with_capacity(chunk.len());
             db.scan_all(&mut scratch, tso_query(), &mut hits);
+            // `scan_all` returns one hit per sequence, in order; the zip relies on it.
+            debug_assert_eq!(hits.len(), chunk.len());
 
             chunk
                 .iter()
@@ -719,11 +721,9 @@ pub fn tso_clip_lens_cr4_batch(reads: &[&[u8]]) -> Vec<usize> {
 /// off-by-one but is STAR's behaviour; the oracle pins it.
 ///
 /// Ported from STAR; the Rust transcription is [Benjamin Demaille's in PR
-/// #148](https://github.com/Psy-Fer/rustar-aligner/pull/148), moved here onto
-/// the solo path (the only place `--clipAdapterType CellRanger4` is reached)
-/// and validated against STAR's own compiled `polyTail3p` — see
+/// #148](https://github.com/Psy-Fer/rustar-aligner/pull/148), validated against STAR's own compiled `polyTail3p` — see
 /// `cr4_tso_matches_star_opal_oracle`.
-fn poly_tail_3p(seq: &[u8]) -> usize {
+pub(crate) fn poly_tail_3p(seq: &[u8]) -> usize {
     let seq_len = seq.len();
     if seq_len < 20 {
         return 0;
@@ -761,41 +761,21 @@ fn poly_tail_3p(seq: &[u8]) -> usize {
 /// Returns `(clipped_seq, clipped_qual, clip5p, clip3p)` — the CR4-clipped read plus
 /// the bases trimmed from the 5' (TSO) and 3' (polyA) ends, so the caller can soft-clip
 /// them (STARsolo keeps them in SEQ as soft-clips, e.g. `60M30S`, not dropped).
+/// No fixed clips; runs go through [`crate::clip::clip_mate_cr4`].
 pub fn clip_adapter_cr4(seq: &[u8], qual: &[u8]) -> (Vec<u8>, Vec<u8>, usize, usize) {
-    // 5' TSO: STAR-faithful overlap alignment (ClipCR4's Opal call → hyalite).
-    clip_adapter_cr4_with_tso(seq, qual, tso_clip_len_cr4(seq))
-}
-
-/// [`clip_adapter_cr4`] with the 5' TSO clip length already computed — the entry
-/// point for the batched scan, which resolves every read's clip up front via
-/// [`tso_clip_lens_cr4_batch`].
-pub fn clip_adapter_cr4_with_tso(
-    seq: &[u8],
-    qual: &[u8],
-    start: usize,
-) -> (Vec<u8>, Vec<u8>, usize, usize) {
-    let start = start.min(seq.len());
-
-    // 3' polyA, on the read as it stands after the 5' clip — STAR clips type 10
-    // (which shifts the sequence and shrinks Lread) before type 11.
-    //
-    // NB: with a non-zero --clip5pNbases/--clip3pNbases alongside CellRanger4,
-    // STAR's window differs (it applies those fixed trims first). Narrowing the
-    // window to match made agreement *worse*, because that pairing has a larger
-    // pre-existing +/-clip5pNbases position bug that swamps it — see TODO.md.
-    // Left matching the default (fixed clips = 0) case, which is validated.
-    let end = seq.len() - poly_tail_3p(&seq[start..]);
-
-    if start == 0 && end == seq.len() {
-        return (seq.to_vec(), qual.to_vec(), 0, 0);
-    }
+    let (c5, c3) = crate::clip::clip_mate_cr4(
+        seq,
+        &crate::clip::ClipParams::default(),
+        tso_clip_len_cr4(seq),
+    );
+    let end = seq.len() - c3;
     (
-        seq[start..end].to_vec(),
-        qual.get(start..end.min(qual.len()))
+        seq[c5..end].to_vec(),
+        qual.get(c5..end.min(qual.len()))
             .map(<[u8]>::to_vec)
             .unwrap_or_default(),
-        start,
-        seq.len() - end,
+        c5,
+        c3,
     )
 }
 
@@ -1530,7 +1510,9 @@ mod tests {
         };
         let tso = tso_query().to_vec();
         let mut reads = Vec::new();
-        for _ in 0..400 {
+        // 700 reads in all, more than one CR4_SCAN_CHUNK, so the batch tests
+        // cross a chunk boundary.
+        for _ in 0..550 {
             let mut r = tso.clone();
             let k = (lcg() % 13) as usize; // 0..12 mismatches
             for _ in 0..k {
@@ -1546,9 +1528,10 @@ mod tests {
             read.truncate(CR4_READ_LEN);
             reads.push(read);
         }
-        for _ in 0..100 {
+        for _ in 0..150 {
             reads.push((0..CR4_READ_LEN).map(|_| (lcg() % 4) as u8).collect());
         }
+        assert!(reads.len() > CR4_SCAN_CHUNK);
         reads
     }
 

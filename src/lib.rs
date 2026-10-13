@@ -1866,6 +1866,14 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             // Adapter-aware clip params (fixed 5'/3' Nbases + 3' adapter Hamming
             // scan); built once per batch, applied per read via clip_mate.
             let clip_params = crate::clip::clip_params_from(params, 0);
+            // --clipAdapterType CellRanger4: the 5' TSO clip of every read in
+            // one pass, as STAR's `ClipMate::clipChunk` does per read chunk.
+            let cr4_tso: Vec<usize> = if params.clip_adapter_type == "CellRanger4" {
+                let seqs: Vec<&[u8]> = batch.iter().map(|r| r.sequence.as_slice()).collect();
+                crate::solo::tso_clip_lens_cr4_batch(&seqs)
+            } else {
+                Vec::new()
+            };
             let mut out: BatchOut<AlignmentBatchResults> = batch
                 .par_iter()
                 .enumerate()
@@ -1889,8 +1897,12 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     let sj_stats = Arc::clone(&sj_stats);
                     let quant = quant.as_ref().map(Arc::clone);
 
-                    // Apply clipping: fixed Nbases + 3' adapter (clip_mate), then trim.
-                    let (clip5p, clip3p) = crate::clip::clip_mate(&read.sequence, &clip_params);
+                    // Apply clipping: fixed Nbases + 3' adapter (clip_mate), or
+                    // CellRanger4's TSO and poly-A (clip_mate_cr4), then trim.
+                    let (clip5p, clip3p) = match cr4_tso.get(read_idx) {
+                        Some(&tso) => crate::clip::clip_mate_cr4(&read.sequence, &clip_params, tso),
+                        None => crate::clip::clip_mate(&read.sequence, &clip_params),
+                    };
                     let (clipped_seq, clipped_qual) =
                         clip_read(&read.sequence, &read.quality, clip5p, clip3p);
 
@@ -2404,6 +2416,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     let clip5p = params.clip5p(0);
     let clip3p = params.clip3p(0);
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
+    let cr4_params = crate::clip::clip_params_from(params, 0);
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // With `--outSAMtype None` (count-only) we skip building SAM records entirely
     // — a large saving for solo runs that only need the count matrix.
@@ -2546,23 +2559,25 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 } else {
                                     read.name.clone()
                                 };
-                            // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
-                            // the fixed clip5p/clip3p Nbases trimming.
-                            let (cr_seq, cr_qual, cr4_5p, cr4_3p) = if cr4_clip {
-                                crate::solo::clip_adapter_cr4_with_tso(
+                            // Clip amounts against the original read; the clipped bases
+                            // are soft-clipped in the output (STARsolo convention).
+                            // CellRanger4 follows STAR's `ClipMate::clip` order: fixed
+                            // 5' bases, TSO, then fixed 3' bases and the poly-A tail.
+                            let (total_clip5p, total_clip3p) = if cr4_clip {
+                                crate::clip::clip_mate_cr4(
                                     &read.sequence,
-                                    &read.quality,
+                                    &cr4_params,
                                     cr4_tso[read_idx],
                                 )
                             } else {
-                                (read.sequence.clone(), read.quality.clone(), 0, 0)
+                                (clip5p, clip3p)
                             };
-                            let (clipped_seq, clipped_qual) =
-                                clip_read(&cr_seq, &cr_qual, clip5p, clip3p);
-                            // Total clip against the ORIGINAL read = CR4 (TSO/polyA) + fixed
-                            // Nbases; used to soft-clip all trimmed bases (STARsolo convention).
-                            let total_clip5p = cr4_5p + clip5p;
-                            let total_clip3p = cr4_3p + clip3p;
+                            let (clipped_seq, clipped_qual) = clip_read(
+                                &read.sequence,
+                                &read.quality,
+                                total_clip5p,
+                                total_clip3p,
+                            );
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
 

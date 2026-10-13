@@ -2015,6 +2015,44 @@ impl Parameters {
             Err(e) => return Err(command.error(ErrorKind::InvalidValue, e)),
         }
 
+        // --clipAdapterType, as `ParametersClip_initialize.cpp:11-30`.
+        if !matches!(params.clip_adapter_type.as_str(), "Hamming" | "CellRanger4") {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "EXITING because of fatal PARAMETER error: --clipAdapterType = {} is not a \
+                     valid option\nSOLUTION: use valid --clipAdapterType options: Hamming OR \
+                     CellRanger4",
+                    params.clip_adapter_type
+                ),
+            ));
+        }
+        if params.clip_adapter_type == "CellRanger4" {
+            if params.clip3p_adapter_seq != "-" {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "EXITING because of fatal PARAMETER error: --clipAdapterType CellRanger4 uses \
+                     fixed sequences for 3' polyA adapters.\nSOLUTION: Do not use \
+                     --clip5pAdapter* options.",
+                ));
+            }
+            // CellRanger4 sets one 5' adapter (the TSO), so STAR's per-mate count
+            // check fails for two mates (`ParametersClip_initialize.cpp:56-61`).
+            let read_nmates = if params.solo_enabled() {
+                if params.solo_barcode_mate == 1 { 2 } else { 1 }
+            } else {
+                params.read_files_in.len()
+            };
+            if read_nmates == 2 {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    "EXITING because of fatal PARAMETER error: --clip5pAdapterSeq has to contain 2 \
+                     values to match the number of mates.\nSOLUTION: specify 2values in \
+                     --clip5pAdapterSeq , for no clipping use -",
+                ));
+            }
+        }
+
         // Read group: `RG` in outSAMattributes without an RG line is a fatal
         // error (STAR: Parameters_samAttributes.cpp:206). STAR's "All" preset
         // does NOT include RG, so only match a literal user-supplied RG flag.
@@ -2411,19 +2449,6 @@ impl Parameters {
                      per cluster of cells, since one cell has too few UMIs to resolve isoforms",
                 ));
             }
-            // Validate --clipAdapterType.
-            if !matches!(
-                params.clip_adapter_type.as_str(),
-                "Hamming" | "CellRanger4" | "None"
-            ) {
-                return Err(command.error(
-                    ErrorKind::InvalidValue,
-                    format!(
-                        "unknown --clipAdapterType '{}'; expected Hamming, CellRanger4, or None",
-                        params.clip_adapter_type
-                    ),
-                ));
-            }
             // Validate --soloStrand.
             if params
                 .solo_strand
@@ -2716,6 +2741,38 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(p.deg_norm_sample_id_or_default(), "explicit");
+    }
+
+    /// `--clipAdapterType` as STAR (`ParametersClip_initialize.cpp`): only
+    /// Hamming and CellRanger4, and CellRanger4 neither with a 3' adapter nor
+    /// with two mates.
+    #[test]
+    fn clip_adapter_type_follows_star() {
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--clipAdapterType", "CellRanger4"]).is_ok());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--clipAdapterType", "None"]).is_err());
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--clipAdapterType",
+                "CellRanger4",
+                "--clip3pAdapterSeq",
+                "AAAA"
+            ])
+            .is_err()
+        );
+        let e = try_parse(&[
+            "--readFilesIn",
+            "r1.fq",
+            "r2.fq",
+            "--clipAdapterType",
+            "CellRanger4",
+        ])
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("--clip5pAdapterSeq has to contain 2 values")
+        );
     }
 
     #[test]
