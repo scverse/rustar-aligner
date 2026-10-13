@@ -79,7 +79,7 @@ hyalite = "=0.4.0"
 # `bzip2` 0.6 defaults to `libbz2-rs-sys` (pure Rust), not the C `bzip2-sys`.
 bzip2 = { version = "0.6", optional = true }
 # Decode-only pure-Rust Zstandard.
-ruzstd = { version = "0.9", optional = true }
+ruzstd = { version = "0.9.1", optional = true }
 # Pure-Rust XZ decoder; encoder and lzip support left out.
 lzma-rust2 = { version = "0.21", optional = true, default-features = false, features = ["std", "xz", "optimization"] }
 

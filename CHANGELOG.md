@@ -13,6 +13,10 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- ruzstd 0.9.0 → 0.9.1 for RUSTSEC-2026-0344 (a small zstd input could
+  exhaust memory). Only builds with the optional `zstd` or
+  `compressed-input` feature contain ruzstd; the default build does not.
+
 - noodles 0.113 → 0.116 and noodles-bgzf 0.49 → 0.51, bumped together. The
   direct `noodles-bgzf` dependency exists only to enable its `libdeflate`
   feature; bumping one without the other puts two copies in the tree, and
