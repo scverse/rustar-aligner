@@ -168,6 +168,17 @@ pub struct PairedAlignment {
 }
 
 impl PairedAlignment {
+    /// STAR's `gLength` of the pair, which breaks score ties for the primary
+    /// (`trBest`): first exon start to last exon end in transcript order
+    /// (`stitchWindowAligns.cpp:94`), mate 1 then mate 2 on the forward strand
+    /// and mate 2 then mate 1 on the reverse. Not the pair's extent, which is
+    /// longer when the mates overlap or protrude.
+    pub fn star_g_length(&self) -> u64 {
+        let (m1, m2) = (&self.mate1_transcript, &self.mate2_transcript);
+        let (first, last) = if m1.is_reverse { (m2, m1) } else { (m1, m2) };
+        last.genome_end.saturating_sub(first.genome_start)
+    }
+
     /// Build a STAR-style combined two-mate `Transcript` for transcriptome
     /// projection.
     ///
@@ -719,15 +730,18 @@ pub fn align_paired_read(
     combined_read.extend_from_slice(&rc_mate2);
     let combined_len = combined_read.len();
 
-    // STAR-faithful per-fragment seeding: seed each mate fragment separately using
-    // the fragment length for Nstart/Lstart, then merge into combined_read coords.
-    // STAR uses qualitySplit() starting positions based on fragment length (e.g. 150bp
-    // → Nstart=4, Lstart=37, starts={0,37,74,111}), NOT the combined length (301bp
-    // → Nstart=7, starts={0,43,...,129,...}). Using combined length creates a spurious
-    // start at position 129 (between mates) that can produce anchors widening windows
-    // beyond STAR's range, causing window overflow and eviction of valid 7M exon seeds.
-    let mut combined_seeds = Seed::find_seeds(
+    // STAR-faithful per-fragment seeding: seed each mate fragment separately, then
+    // merge into combined_read coords. STAR's qualitySplit() cuts the combined read
+    // at the spacer, so Nstart/Lstart are per mate piece (e.g. 150bp → Nstart=4,
+    // Lstart=37, starts={0,37,74,111}), NOT one 301bp piece (Nstart=7, with a
+    // spurious start between the mates). The cap on the start spacing, though, is
+    // computed from the whole combined read (`Lread`, ReadAlign_mapOneRead.cpp:41-42):
+    // min(50, 1.0 × (Lread − 1)). With the mate's own length instead, a mate of 50
+    // bases or fewer got an extra start that STAR never makes.
+    let mut combined_seeds = Seed::find_seeds_at(
         &combined_read[..len1],
+        0,
+        combined_len,
         index,
         params.seed_map_min,
         params,
@@ -736,6 +750,7 @@ pub fn align_paired_read(
     let mut m2_seeds = Seed::find_seeds_at(
         &combined_read[len1 + 1..],
         len1 + 1,
+        combined_len,
         index,
         params.seed_map_min,
         params,
@@ -1238,10 +1253,7 @@ pub fn align_paired_read(
         mult_map_order(
             &mut joint_pairs,
             |pa| pa.combined_wt_score,
-            |pa| {
-                let (m1, m2) = (&pa.mate1_transcript, &pa.mate2_transcript);
-                m1.genome_end.max(m2.genome_end) - m1.genome_start.min(m2.genome_start)
-            },
+            PairedAlignment::star_g_length,
             |pa| &mut pa.output_rank,
             params.out_sam_mult_nmax >= 0,
         );
@@ -1759,6 +1771,7 @@ mod tests {
             insert_size: 400,
             combined_wt_score: 200,
         };
+        assert_eq!(pair.star_g_length(), 400);
         let combined = pair.combined_transcript_for_projection();
         assert_eq!(combined.exons.len(), 2);
         assert_eq!(combined.exons[0].i_frag, 0);
@@ -1766,6 +1779,70 @@ mod tests {
         assert_eq!(combined.genome_start, 1000);
         assert_eq!(combined.genome_end, 1400);
         assert_eq!(combined.score, 200);
+    }
+
+    /// Overlapping mates: STAR's `gLength` runs from the first mate's start to
+    /// the second mate's end in transcript order, not over the pair's extent,
+    /// and it decides which of two equal-scoring pairs is primary. The numbers
+    /// are a read of a 45+45 mouse pair where STAR picks the first locus.
+    #[test]
+    fn pair_g_length_is_stars_transcript_order_span() {
+        let tr = |gs: u64, ge: u64, is_reverse: bool| Transcript {
+            output_rank: 0,
+            chr_idx: 0,
+            genome_start: gs,
+            genome_end: ge,
+            is_reverse,
+            exons: vec![Exon {
+                genome_start: gs,
+                genome_end: ge,
+                read_start: 0,
+                read_end: (ge - gs) as usize,
+                i_frag: 0,
+            }],
+            cigar: vec![],
+            score: 0,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            junction_strand: vec![],
+        };
+        let pair = |m1: Transcript, m2: Transcript| PairedAlignment {
+            output_rank: 0,
+            mate1_transcript: m1,
+            mate2_transcript: m2,
+            mate1_region: (0, 45),
+            mate2_region: (0, 45),
+            is_proper_pair: true,
+            insert_size: 0,
+            combined_wt_score: 65,
+        };
+        // Forward pair, mate 2 protruding left of mate 1: extent 42, STAR 32.
+        let a = pair(
+            tr(24_147_556, 24_147_586, false),
+            tr(24_147_546, 24_147_588, true),
+        );
+        // Reverse pair, mate 2 first in transcript order: extent 38, STAR 36.
+        let b = pair(
+            tr(41_027_501, 41_027_535, true),
+            tr(41_027_499, 41_027_537, false),
+        );
+        assert_eq!((a.star_g_length(), b.star_g_length()), (32, 36));
+
+        let mut items = vec![b, a];
+        mult_map_order(
+            &mut items,
+            |p| p.combined_wt_score,
+            PairedAlignment::star_g_length,
+            |p| &mut p.output_rank,
+            false,
+        );
+        assert_eq!(
+            items[0].mate1_transcript.genome_start, 24_147_556,
+            "primary"
+        );
     }
 
     #[test]

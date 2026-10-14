@@ -526,9 +526,11 @@ pub struct Parameters {
     pub genome_transform_vcf: Option<PathBuf>,
 
     // ── Read files ──────────────────────────────────────────────────────
-    /// Input read file(s); second file is mate 2 for paired-end. Several files
-    /// per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`).
-    #[arg(long = "readFilesIn", num_args = 1..=2)]
+    /// Input read file(s): mate 1, then mate 2 for paired-end. Several files
+    /// per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`). A solo
+    /// run adds the barcode read as the last file
+    /// (`cDNA_read [cDNA_read2] barcode_read`).
+    #[arg(long = "readFilesIn", num_args = 1..=3)]
     pub read_files_in: Vec<PathBuf>,
 
     /// Command to decompress input files (e.g. "zcat" for .gz)
@@ -1511,6 +1513,49 @@ impl Parameters {
         self.out_sam_type.format != OutSamFormat::None
     }
 
+    /// Whether the run writes BAM: STAR's `outBAMunsorted || outBAMcoord`,
+    /// set by `--outSAMtype` alone (`--outStd` only redirects one of them).
+    /// STAR emits the STARsolo tags in BAM records only.
+    pub fn bam_output(&self) -> bool {
+        self.out_sam_type.format == OutSamFormat::Bam
+    }
+
+    /// Whether a coordinate-sorted BAM is produced, STAR's `outBAMcoord`.
+    /// `CB`/`UB` can only be written there, since both are known only after
+    /// the solo counting pass.
+    pub fn bam_sorted_output(&self) -> bool {
+        self.bam_output() && self.out_sam_type.bam_sorted
+    }
+
+    /// The STARsolo tags this run actually emits: those requested via
+    /// `--outSAMattributes` that reach a BAM record. Empty for SAM text output,
+    /// which STAR never decorates with them.
+    pub fn solo_sam_tags(&self) -> SamAttributes {
+        if self.bam_output() {
+            self.out_sam_attributes & SamAttributes::SOLO_TAGS
+        } else {
+            SamAttributes::empty()
+        }
+    }
+
+    /// Whether the run has to track STAR's readInfo, the per-read (cell,
+    /// corrected UMI) pair that UMI collapsing fills and the sorted-BAM writer
+    /// turns into `CB`/`UB`. `CB_samTagOut` corrects the barcode inline instead,
+    /// and does no collapsing at all.
+    pub fn solo_read_info_needed(&self) -> bool {
+        self.solo_type != SoloType::CbSamTagOut
+            && self
+                .solo_sam_tags()
+                .intersects(SamAttributes::CB | SamAttributes::UB)
+    }
+
+    /// Whether the whole barcode read has to be kept around (the `sS`/`sQ` tags
+    /// are the only consumers).
+    pub fn solo_keeps_barcode_read(&self) -> bool {
+        self.solo_sam_tags()
+            .intersects(SamAttributes::SS | SamAttributes::SQ)
+    }
+
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
     pub fn chim_out_junctions(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "Junctions")
@@ -1830,6 +1875,20 @@ impl Parameters {
             ));
         }
 
+        // A third read file only means anything to a solo run, where it is the
+        // barcode read (`Parameters.cpp:831-836`).
+        if params.read_files_in.len() > 2 && !params.solo_enabled() {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "EXITING: because of fatal input ERROR: number of read mates files > 2: {}\n\
+                     SOLUTION:specify only one or two files in the --readFilesIn option. If file \
+                     names contain spaces, use quotes: \"file name\"",
+                    params.read_files_in.len()
+                ),
+            ));
+        }
+
         // --genomeTransformType: Haploid and Diploid are implemented. Both require
         // a VCF, and are incompatible with a GTF (STAR itself doesn't combine
         // genomeTransform with sjdb annotation at genomeGenerate).
@@ -2038,10 +2097,13 @@ impl Parameters {
             }
             // CellRanger4 sets one 5' adapter (the TSO), so STAR's per-mate count
             // check fails for two mates (`ParametersClip_initialize.cpp:56-61`).
-            let read_nmates = if params.solo_enabled() {
-                if params.solo_barcode_mate == 1 { 2 } else { 1 }
+            // A separate barcode read is the last file and not a mate
+            // (`ParametersSolo.cpp:130`).
+            let n_files = params.read_files_in.len();
+            let read_nmates = if params.solo_enabled() && params.solo_barcode_mate == 0 {
+                n_files.saturating_sub(1).max(1)
             } else {
-                params.read_files_in.len()
+                n_files
             };
             if read_nmates == 2 {
                 return Err(command.error(
@@ -2275,19 +2337,26 @@ impl Parameters {
                     "--soloType SmartSeq requires --readFilesManifest (a TSV of read1<TAB>read2<TAB>cellID per cell)",
                 ));
             }
-            // CB_UMI_Simple needs exactly two read files: cDNA + barcode read.
+            // Barcode-read chemistries take `cDNA_read [cDNA_read2] barcode_read`:
+            // two files single-end, three when the cDNA is paired-end.
+            // `--soloBarcodeMate 1` is the exception (barcode on mate 1, two cDNA
+            // files, no barcode file), handled below.
             if matches!(
                 params.solo_type,
                 SoloType::CbUmiSimple | SoloType::CbUmiComplex | SoloType::CbSamTagOut
-            ) && params.read_files_in.len() != 2
+            ) && params.solo_barcode_mate == 0
+                && !matches!(params.read_files_in.len(), 2 | 3)
             {
+                // `ParametersSolo.cpp:125-129`; more than three files is refused
+                // by the argument parser.
                 return Err(command.error(
                     ErrorKind::InvalidValue,
-                    format!(
-                        "--soloType {} requires exactly two --readFilesIn files (cDNA read then barcode read); got {}",
-                        params.solo_type,
-                        params.read_files_in.len()
-                    ),
+                    "EXITING because of fatal PARAMETERS error: --soloType (except SmartSeq) with \
+                     --soloBarcodeMate 0 (default) require 2 reads or 3 reads, where the last read \
+                     is the barcode read.\n\
+                     SOLUTION: if barcode is in a separate mate, specify it as the last file in \
+                     --readFilesIn. If barcode sequence is a part of one of the mates, specify that \
+                     mate with --soloBarcodeMate 1 (or 2 or 3)",
                 ));
             }
             // soloBarcodeMate: 0 (separate barcode read) or 1 (barcode on mate 1,
@@ -2299,6 +2368,15 @@ impl Parameters {
                         return Err(command.error(
                             ErrorKind::InvalidValue,
                             "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
+                        ));
+                    }
+                    if params.read_files_in.len() != 2 {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            format!(
+                                "--soloBarcodeMate 1 requires exactly two --readFilesIn cDNA mate files; got {}",
+                                params.read_files_in.len()
+                            ),
                         ));
                     }
                     // The barcode region of that mate is not cDNA, and nothing
@@ -2340,6 +2418,78 @@ impl Parameters {
                     ));
                 }
             }
+            // In STAR's order: the whitelist match type (`init_CBmatchWL`,
+            // `ParametersSolo.cpp:672-683`), then CB/UB (`:403-435`), then the
+            // multimappers (`:478-484`). STAR's default match type, 1MM_multi,
+            // is refused here, so `CB_samTagOut` always needs Exact or 1MM.
+            if params.solo_type == SoloType::CbSamTagOut
+                && !matches!(params.solo_cb_match_wl_type.as_str(), "Exact" | "1MM")
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "EXITING because of fatal PARAMETERS error: --soloCBmatchWLtype {} \
+                         does not work with --soloType CB_samTagOut\n\
+                         SOLUTION: use allowed option: use --soloCBmatchWLtype Exact (exact \
+                         matches only) OR 1MM (one match with 1 mismatched base)",
+                        params.solo_cb_match_wl_type
+                    ),
+                ));
+            }
+            // CB / UB SAM tags (ParametersSolo.cpp:403-435). `CB_samTagOut`
+            // corrects the barcode as the read is processed, so it needs neither
+            // a sorted BAM nor a gene feature, but it has no UMI collapsing,
+            // hence no UB.
+            let cb_ub = params
+                .out_sam_attributes
+                .intersects(SamAttributes::CB | SamAttributes::UB);
+            if params.solo_type == SoloType::CbSamTagOut {
+                if params.out_sam_attributes.contains(SamAttributes::UB) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "EXITING because of fatal PARAMETERS error: UB attribute (corrected UMI) \
+                         in --outSAMattributes cannot be used with --soloType CB_samTagOut \n\
+                         SOLUTION: instead, use UR (uncorrected UMI) in --outSAMattributes",
+                    ));
+                }
+            } else if cb_ub {
+                if !params.bam_sorted_output() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "EXITING because of fatal PARAMETERS error: CB and/or UB attributes in \
+                         --outSAMattributes can only be output in the sorted BAM file.\n\
+                         SOLUTION: re-run STAR with --outSAMtype BAM SortedByCoordinate ...",
+                    ));
+                }
+                // STAR fills readInfo from the FIRST feature on the --soloFeatures
+                // list, which therefore has to be a gene-level one.
+                let first_feature = params.solo_features.first().map(String::as_str);
+                if !matches!(
+                    first_feature,
+                    Some("Gene" | "GeneFull" | "GeneFull_Ex50pAS" | "GeneFull_ExonOverIntron")
+                ) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        "EXITING because of fatal PARAMETERS error: CB and/or UB attributes in \
+                         --outSAMattributes require --soloFeatures Gene OR/AND GeneFull OR/AND \
+                         GeneFull_Ex50pAS.\n\
+                         SOLUTION: re-run STAR adding Gene AND/OR GeneFull OR/AND GeneFull_Ex50pAS \
+                         OR/AND GeneFull_ExonOverIntron to --soloFeatures",
+                    ));
+                }
+            }
+            // `CB_samTagOut` has no counting to spread multi-gene reads over
+            // (`ParametersSolo.cpp:480-483`).
+            if params.solo_type == SoloType::CbSamTagOut
+                && params.solo_multi_mappers.iter().any(|m| m != "Unique")
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "EXITING because of fatal PARAMETERS error: multimapping options do not \
+                     work for --soloType CB_samTagOut\n\
+                     SOLUTION: use default option --soloMultiMappers Unique",
+                ));
+            }
             // soloMultiMappers values.
             for m in &params.solo_multi_mappers {
                 if !matches!(
@@ -2356,6 +2506,8 @@ impl Parameters {
             }
             // Gene-level features need a gene model (SJ does not), from
             // --sjdbGTFfile or the index tables; checked when the index is loaded.
+            // `CB_samTagOut` counts nothing (`Solo.cpp:13`: no SoloFeature is
+            // even constructed), so it needs no gene model.
             // CB length / UMI length sanity.
             if params.solo_type == SoloType::CbUmiSimple
                 && (params.solo_cb_len == 0 || params.solo_umi_len == 0)
@@ -2521,8 +2673,19 @@ impl Parameters {
         if params.run_mode() == RunMode::AlignReads
             && params.out_sam_type.format != OutSamFormat::Bam
         {
+            // `sF` is tested through the `sS` flag (`:235`), so it never fails on
+            // its own, and `gx`/`gn` are not tested at all.
             for (attr, name) in [
                 (SamAttributes::CH, "ch"),
+                (SamAttributes::CR, "CR"),
+                (SamAttributes::CY, "CY"),
+                (SamAttributes::UR, "UR"),
+                (SamAttributes::UY, "UY"),
+                (SamAttributes::CB, "CB"),
+                (SamAttributes::UB, "UB"),
+                (SamAttributes::SM, "sM"),
+                (SamAttributes::SS, "sS"),
+                (SamAttributes::SQ, "sQ"),
                 (SamAttributes::VG, "vG"),
                 (SamAttributes::VA, "vA"),
                 (SamAttributes::VW, "vW"),
@@ -2533,9 +2696,33 @@ impl Parameters {
                     return Err(command.error(
                         ErrorKind::InvalidValue,
                         format!(
-                            "--outSAMattributes contains {name} tag, which requires BAM output. \
-                             Re-run with --outSAMtype BAM Unsorted (and/or SortedByCoordinate), \
-                             or without the {name} tag in --outSAMattributes"
+                            "EXITING because of fatal PARAMETER error: --outSAMattributes contains \
+                             {name} tag, which requires BAM output.\n\
+                             SOLUTION: re-run STAR with --outSAMtype BAM Unsorted (and/or) \
+                             SortedByCoordinate option, or without {name} tag in --outSAMattributes"
+                        ),
+                    ));
+                }
+            }
+            // STAR has no such check for `gx`, `gn` and `sF`, but its SAM writer
+            // has no case for them either (`ReadAlign_outputTranscriptSAM.cpp`),
+            // so the run dies at the first mapped read with "unknown/unimplemented
+            // SAM atrribute (tag)". Refused here instead, before any work; with
+            // `--outSAMtype None` there is no SAM record to stop at.
+            let sam_text = params.out_sam_type.format == OutSamFormat::Sam;
+            for (attr, name) in [
+                (SamAttributes::GXM, "gx"),
+                (SamAttributes::GNM, "gn"),
+                (SamAttributes::SF, "sF"),
+            ] {
+                if sam_text && params.out_sam_attributes.contains(attr) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--outSAMattributes contains {name} tag, which can only be written \
+                             to BAM output (STAR stops at the first SAM record with it). Re-run \
+                             with --outSAMtype BAM Unsorted (and/or) SortedByCoordinate, or \
+                             without {name} tag in --outSAMattributes"
                         ),
                     ));
                 }
@@ -2612,11 +2799,14 @@ impl Parameters {
         self.read_files_names.first().map(Vec::as_slice)
     }
 
-    /// Path to the barcode (CB+UMI) read file — the SECOND `--readFilesIn`
-    /// file when solo is enabled. `None` if absent.
+    /// Files of the barcode (CB+UMI) read: the LAST `--readFilesIn` entry
+    /// when solo is enabled (`cDNA_read [cDNA_read2] barcode_read`,
+    /// `ParametersSolo.cpp:130-131`). `None` if absent, or when the barcode
+    /// sits on mate 1 instead.
     pub fn barcode_read_file(&self) -> Option<&[PathBuf]> {
-        if self.solo_enabled() {
-            self.read_files_names.get(1).map(Vec::as_slice)
+        if self.solo_enabled() && !self.solo_barcode_on_mate1() && self.read_files_names.len() >= 2
+        {
+            self.read_files_names.last().map(Vec::as_slice)
         } else {
             None
         }
@@ -2626,6 +2816,13 @@ impl Parameters {
     /// prefix of mate 1 and both `--readFilesIn` files are cDNA mates.
     pub fn solo_barcode_on_mate1(&self) -> bool {
         self.solo_enabled() && self.solo_barcode_mate == 1
+    }
+
+    /// True when the solo run aligns a cDNA mate PAIR: either the barcode is on
+    /// mate 1 (`--soloBarcodeMate 1`, two files) or a third `--readFilesIn` file
+    /// carries the barcode read (STAR's `cDNA_read1 cDNA_read2 barcode_read`).
+    pub fn solo_paired_cdna(&self) -> bool {
+        self.solo_barcode_on_mate1() || (self.solo_enabled() && self.read_files_in.len() == 3)
     }
 
     /// The two cDNA mate files (mate 1, mate 2) for a `--soloBarcodeMate 1` run.
@@ -3872,6 +4069,152 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// The STARsolo barcode tags parse into their own flags
+    /// (`Parameters_samAttributes.cpp:111-165`).
+    #[test]
+    fn solo_sam_attributes_parse() {
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+            "--outSAMattributes",
+            "NH",
+            "HI",
+            "CR",
+            "CY",
+            "UR",
+            "UY",
+            "sM",
+            "sS",
+            "sQ",
+            "GX",
+            "GN",
+        ])
+        .unwrap();
+        let a = p.out_sam_attributes;
+        for flag in [
+            SamAttributes::CR,
+            SamAttributes::CY,
+            SamAttributes::UR,
+            SamAttributes::UY,
+            SamAttributes::SM,
+            SamAttributes::SS,
+            SamAttributes::SQ,
+            SamAttributes::GX,
+            SamAttributes::GN,
+        ] {
+            assert!(a.contains(flag), "missing {flag:?}");
+        }
+        // Not in the preset sets.
+        assert!(!SamAttributes::ALL.intersects(SamAttributes::SOLO_TAGS));
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "Cb"]).is_err());
+    }
+
+    /// `CB`/`UB` are filled when the sorted BAM is written, so STAR refuses them
+    /// with any other output type, and refuses `UB` outright for `CB_samTagOut`
+    /// (no UMI collapsing there). `ParametersSolo.cpp:403-435`.
+    #[test]
+    fn solo_attributes_require_bam_output() {
+        for tag in ["CR", "UR", "CB", "sM", "sS", "GX", "GN"] {
+            let err = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", tag])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires BAM output"), "{tag}: {err}");
+        }
+        // gx/gn are not in STAR's samAttrRequiresBAM list.
+        let unsorted = ["--outSAMtype", "BAM", "Unsorted"];
+        let mut args = vec!["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "GX"];
+        args.extend_from_slice(&unsorted);
+        assert!(try_parse(&args).is_ok());
+    }
+
+    #[test]
+    fn cb_ub_attributes_require_a_sorted_bam_and_a_gene_feature() {
+        let solo = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBwhitelist",
+            "wl.txt",
+        ];
+        let with = |extra: &[&str]| {
+            let mut v = solo.to_vec();
+            v.extend_from_slice(extra);
+            try_parse(&v)
+        };
+
+        let sorted = ["--outSAMtype", "BAM", "SortedByCoordinate"];
+        let mut ok = solo.to_vec();
+        ok.extend_from_slice(&sorted);
+        ok.extend_from_slice(&["--outSAMattributes", "NH", "CB", "UB"]);
+        assert!(try_parse(&ok).is_ok());
+
+        // SAM text and unsorted BAM: refused.
+        assert!(with(&["--outSAMattributes", "NH", "CB"]).is_err());
+        assert!(
+            with(&[
+                "--outSAMtype",
+                "BAM",
+                "Unsorted",
+                "--outSAMattributes",
+                "NH",
+                "UB"
+            ])
+            .is_err()
+        );
+
+        // `--outStd SAM` means nothing to a BAM run (`Parameters.cpp:668-669`
+        // reads it only under `--outSAMtype SAM`): the sorted BAM is still
+        // written, so CB is accepted.
+        let mut std_sam = solo.to_vec();
+        std_sam.extend_from_slice(&sorted);
+        std_sam.extend_from_slice(&["--outStd", "SAM", "--outSAMattributes", "NH", "CB"]);
+        assert!(try_parse(&std_sam).is_ok());
+
+        // Sorted BAM but a non-gene first feature: refused.
+        let mut sj_first = solo.to_vec();
+        sj_first.extend_from_slice(&sorted);
+        sj_first.extend_from_slice(&[
+            "--soloFeatures",
+            "SJ",
+            "Gene",
+            "--outSAMattributes",
+            "NH",
+            "CB",
+        ]);
+        assert!(try_parse(&sj_first).is_err());
+
+        // CB_samTagOut corrects the barcode inline: CB needs no sorted BAM, and
+        // UB does not exist at all. (Its only allowed match types are Exact and
+        // 1MM, so the 1MM_multi default has to be overridden.)
+        let tag_out = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_samTagOut",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBmatchWLtype",
+            "1MM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
+        ];
+        let mut cb_only = tag_out.to_vec();
+        cb_only.extend_from_slice(&["--outSAMattributes", "NH", "CB"]);
+        assert!(try_parse(&cb_only).is_ok());
+        let mut with_ub = tag_out.to_vec();
+        with_ub.extend_from_slice(&["--outSAMattributes", "NH", "UB"]);
+        assert!(try_parse(&with_ub).is_err());
     }
 
     #[test]

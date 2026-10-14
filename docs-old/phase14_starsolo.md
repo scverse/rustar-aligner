@@ -54,7 +54,7 @@ two files but is a *single-end alignment* run.
 | 14.4 | UMI dedup + raw `matrix.mtx` (**MVP complete**) | ✅ Complete |
 | 14.5 | `Summary.csv` / `Barcodes.stats` / `Features.stats` | ⬜ Planned |
 | 14.6 | Cell filtering (`filtered/` matrix) | ⬜ Planned |
-| 14.7 | `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` | ⬜ Planned |
+| 14.7 | `CB`/`UB`/`GX`/`GN` SAM tags + `CB_samTagOut` | ✅ Complete |
 | 14.8 | More features: GeneFull, SJ, Velocyto | ⬜ Planned |
 | 14.9 | Multi-gene resolution (`--soloMultiMappers`) | ⬜ Planned |
 | 14.10 | Other chemistries: CB_UMI_Complex, SmartSeq | ⬜ Planned |
