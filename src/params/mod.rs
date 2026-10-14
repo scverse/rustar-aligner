@@ -1449,15 +1449,6 @@ pub struct Parameters {
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
 
-    /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
-    /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
-    /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
-    /// `ambiguous`. `no` resolves those molecules to `spliced` (an exon-only read is
-    /// most likely mature mRNA; cf. He, Soneson & Patro 2023) and writes only
-    /// `spliced`/`unspliced`, with no `ambiguous.mtx`.
-    #[arg(long = "soloVelocytoAmbiguous", default_value = "yes")]
-    pub solo_velocyto_ambiguous: String,
-
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
     pub solo_strand: String,
@@ -2417,6 +2408,26 @@ impl Parameters {
                         ),
                     ));
                 }
+            }
+            let velocyto = params.solo_features.iter().any(|f| f == "Velocyto");
+            if velocyto && params.solo_type == SoloType::SmartSeq {
+                // `ParametersSolo.cpp:238-241`.
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "EXITING because of fatal PARAMETERS error: --soloFeatures Velocyto is \
+                     presently not compatible with --soloType SmartSeq .\n\
+                     SOLUTION: re-run without --soloFeatures Velocyto .",
+                ));
+            }
+            // Velocyto takes its cells and UMIs from the Gene feature's readInfo
+            // (`SoloFeature_countVelocyto.cpp:33-34`). STAR does not check that
+            // Gene is listed and crashes without it; refused here instead.
+            if velocyto && !params.solo_features.iter().any(|f| f == "Gene") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--soloFeatures Velocyto requires Gene in --soloFeatures: Velocyto takes \
+                     its cells and UMIs from the Gene feature (STAR crashes without it)",
+                ));
             }
             // In STAR's order: the whitelist match type (`init_CBmatchWL`,
             // `ParametersSolo.cpp:672-683`), then CB/UB (`:403-435`), then the

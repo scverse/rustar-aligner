@@ -213,6 +213,36 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`--soloFeatures Velocyto` counts as STARsolo.** It used its own rule (a
+  junction means spliced, an intronic block unspliced, anything else
+  ambiguous), read by read. It now ports STAR's:
+  - each uniquely mapped read is compared with every transcript that
+    contains it on the `--soloStrand` strand (`alignToTranscriptMinOverlap`,
+    velocyto's 5-base flank, already ported for bulk use in
+    `quant/splice_status.rs`);
+  - a molecule (cell, UMI, taken from the Gene feature's readInfo) keeps the
+    transcripts all its reads share; it is spliced, unspliced or ambiguous by
+    STAR's model flags, and dropped if its transcripts span two genes
+    (`SoloFeature_countVelocyto.cpp`);
+  - all three matrices hold the same (cell, gene) rows, zeros included;
+  - `Velocyto/filtered/` is written, for the Gene feature's called cells that
+    Velocyto detected (`SoloFeature_cellFiltering.cpp:16-30`).
+
+  On the 10x v2 mouse chr19 fixture the raw and filtered matrices are now
+  byte-identical to STARsolo's (spliced/unspliced/ambiguous UMIs 369/57/32,
+  against 52/100/362 before), in 10 configurations: Unstranded, Reverse,
+  `1MM_multi`, GeneFull listed first, with `CB`/`UB` tags, `1MM_Directional`
+  and `Exact` dedup, EmptyDrops_CR, and paired-end cDNA. STAR keeps a readInfo
+  per feature (`CB`/`UB` read the first feature's, Velocyto the Gene
+  feature's), and so does rustar-aligner now. `--soloFeatures Velocyto`
+  without `Gene`, on which STAR crashes, is refused; with `--soloType
+  SmartSeq` it is refused with STAR's message.
+
+  `--soloVelocytoAmbiguous` is removed. It was a rustar-aligner extension
+  that folded ambiguous molecules into spliced, on the premise that exon-only
+  reads land in ambiguous; under STAR's model they are spliced, and ambiguous
+  means exonic in one isoform and intronic in another.
+
 - **Paired-end reads with mates of 50 bases or fewer align as STAR.** STAR
   caps the spacing of its seed search starts by the whole read, both mates
   and the spacer (`ReadAlign_mapOneRead.cpp:41-42`); we capped each mate by

@@ -379,6 +379,17 @@ pub fn collapse_gene_category(
     }
 }
 
+/// STAR's `countVelocyto` call for one molecule from the type bits of its
+/// transcripts (all of one gene; the caller checks that):
+/// `SoloFeature_countVelocyto.cpp:102-133`.
+pub fn velocyto_status(types: impl IntoIterator<Item = u8>) -> SpliceStatus {
+    let mut models = Models::default();
+    for ty in types {
+        models.add(ty);
+    }
+    models.status()
+}
+
 /// The model flags of STAR's `countVelocyto` collapse.
 #[allow(clippy::struct_excessive_bools)] // mirrors STAR's four flags
 struct Models {

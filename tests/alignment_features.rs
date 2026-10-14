@@ -1700,9 +1700,9 @@ fn test_starsolo_smartseq_paired() {
 // ---------------------------------------------------------------------------
 // Test 9f — STARsolo Velocyto (spliced / unspliced / ambiguous)
 //
-// Three reads on gene G1, one per category: a junction-spanning read (spliced),
-// a purely intronic read (unspliced), and a wholly-exonic read with no junction
-// (ambiguous, per Sullivan 2025). Distinct UMIs → one molecule in each matrix.
+// Three reads on gene G1 (one transcript), each its own molecule: across the
+// junction and inside exon 1 are both spliced, inside the intron unspliced, as
+// STAR's model calls them (`SoloFeature_countVelocyto.cpp`).
 // ---------------------------------------------------------------------------
 #[test]
 fn test_starsolo_velocyto() {
@@ -1720,10 +1720,13 @@ fn test_starsolo_velocyto() {
     // category → cDNA read + a distinct (non-homopolymer) 12 bp UMI.
     let mut spliced = genome[10025..10050].to_vec(); // Exon1 end ...
     spliced.extend_from_slice(&genome[10250..10275]); // ... + Exon2 start → junction
+    // STAR's model (`SoloFeature_countVelocyto.cpp`) against T1 alone: a read
+    // inside exons is spliced whether or not it crosses the junction, and a
+    // read inside the intron is unspliced.
     let reads: [(Vec<u8>, &str); 3] = [
-        (spliced, "ACGTACGTACGT"),                       // spliced
+        (spliced, "ACGTACGTACGT"), // across the junction → spliced
         (genome[10100..10150].to_vec(), "TGCATGCATGCA"), // intronic → unspliced
-        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // exonic, no junction → ambiguous
+        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // inside exon 1 → spliced
     ];
     {
         let mut cf = fs::File::create(&cdna_path).unwrap();
@@ -1762,6 +1765,7 @@ fn test_starsolo_velocyto() {
             "--soloUMIlen",
             "12",
             "--soloFeatures",
+            "Gene",
             "Velocyto",
             "--soloStrand",
             "Forward",
@@ -1774,25 +1778,29 @@ fn test_starsolo_velocyto() {
         .success();
 
     let raw = output_dir.join("Solo.out").join("Velocyto").join("raw");
-    // Each category matrix holds exactly its one molecule for G1 (row 1, col 1).
-    for name in ["spliced", "unspliced", "ambiguous"] {
+    // One (G1, cell) row in every matrix, zeros included, as STAR writes them.
+    for (name, want) in [
+        ("spliced", "1 1 2"),
+        ("unspliced", "1 1 1"),
+        ("ambiguous", "1 1 0"),
+    ] {
         let m = fs::read_to_string(raw.join(format!("{name}.mtx"))).unwrap();
         assert_eq!(
-            m.lines().last().unwrap(),
-            "1 1 1",
-            "{name}.mtx should have G1=1:\n{m}"
+            m.lines().nth(2).unwrap(),
+            "1 2 1",
+            "{name}.mtx header:\n{m}"
         );
+        assert_eq!(m.lines().last().unwrap(), want, "{name}.mtx:\n{m}");
     }
 }
 
 // ---------------------------------------------------------------------------
-// Test 9f — Velocyto fold mode (`--soloVelocytoAmbiguous no`): exon-only
-// molecules are folded into spliced and no `ambiguous.mtx` is written
-// (cf. He, Soneson & Patro 2023). Same fixture as Test 9 but the exon-only
-// molecule (distinct UMI) lands in spliced, giving G1 = 2 there.
+// Test 9f2 — Velocyto ambiguous molecules: with a retained-intron isoform, a
+// read in the intron is exonic in one transcript and intronic in the other,
+// which STAR calls ambiguous (`SoloFeature_countVelocyto.cpp:125-133`).
 // ---------------------------------------------------------------------------
 #[test]
-fn test_starsolo_velocyto_fold_ambiguous() {
+fn test_starsolo_velocyto_retained_intron_is_ambiguous() {
     let tmpdir = TempDir::new().unwrap();
     let genome = build_genome();
     let fasta = write_fasta(&tmpdir, &genome);
@@ -1806,10 +1814,12 @@ fn test_starsolo_velocyto_fold_ambiguous() {
     let cb = "AAAACCCCGGGGTTTT";
     let mut spliced = genome[10025..10050].to_vec();
     spliced.extend_from_slice(&genome[10250..10275]);
+    // With T2 retaining the intron, the intronic read is exonic in T2 and
+    // intronic in T1: ambiguous. The other two are spliced in both.
     let reads: [(Vec<u8>, &str); 3] = [
         (spliced, "ACGTACGTACGT"),                       // spliced
-        (genome[10100..10150].to_vec(), "TGCATGCATGCA"), // intronic → unspliced
-        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // exonic, no junction → ambiguous
+        (genome[10100..10150].to_vec(), "TGCATGCATGCA"), // T1 intron, T2 exon → ambiguous
+        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // spliced
     ];
     {
         let mut cf = fs::File::create(&cdna_path).unwrap();
@@ -1823,7 +1833,16 @@ fn test_starsolo_velocyto_fold_ambiguous() {
         fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
     }
 
-    let output_dir = tmpdir.path().join("out_velo_fold");
+    // T2: the same gene with the intron retained.
+    {
+        let mut f = fs::OpenOptions::new().append(true).open(&gtf).unwrap();
+        writeln!(
+            f,
+            "chr1\ttest\texon\t10001\t10300\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T2\";"
+        )
+        .unwrap();
+    }
+    let output_dir = tmpdir.path().join("out_velo_retained");
     fs::create_dir_all(&output_dir).unwrap();
     let prefix = format!("{}/", output_dir.display());
     cargo_bin_cmd!("rustar-aligner")
@@ -1848,9 +1867,8 @@ fn test_starsolo_velocyto_fold_ambiguous() {
             "--soloUMIlen",
             "12",
             "--soloFeatures",
+            "Gene",
             "Velocyto",
-            "--soloVelocytoAmbiguous",
-            "no",
             "--soloStrand",
             "Forward",
             "--sjdbGTFfile",
@@ -1862,22 +1880,14 @@ fn test_starsolo_velocyto_fold_ambiguous() {
         .success();
 
     let raw = output_dir.join("Solo.out").join("Velocyto").join("raw");
-    assert!(
-        !raw.join("ambiguous.mtx").exists(),
-        "ambiguous.mtx must not be written in fold mode"
-    );
-    let unspliced = fs::read_to_string(raw.join("unspliced.mtx")).unwrap();
-    assert_eq!(
-        unspliced.lines().last().unwrap(),
-        "1 1 1",
-        "unspliced unchanged by folding:\n{unspliced}"
-    );
-    let spliced_m = fs::read_to_string(raw.join("spliced.mtx")).unwrap();
-    assert_eq!(
-        spliced_m.lines().last().unwrap(),
-        "1 1 2",
-        "spliced should gain the folded exon-only molecule:\n{spliced_m}"
-    );
+    for (name, want) in [
+        ("spliced", "1 1 2"),
+        ("unspliced", "1 1 0"),
+        ("ambiguous", "1 1 1"),
+    ] {
+        let m = fs::read_to_string(raw.join(format!("{name}.mtx"))).unwrap();
+        assert_eq!(m.lines().last().unwrap(), want, "{name}.mtx:\n{m}");
+    }
 }
 
 // ---------------------------------------------------------------------------

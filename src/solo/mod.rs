@@ -20,8 +20,8 @@ pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
 pub use gene::{
-    GeneAssignment, GeneModel, GeneSets, Region, SoloFeature, SoloStrand, VelocytoCategory,
-    assign_gene_se, classify_align, classify_read, gene_full_sets, velocyto_category,
+    GeneAssignment, GeneModel, GeneSets, Region, SoloFeature, SoloStrand, assign_gene_se,
+    classify_align, classify_read, gene_full_sets, velocyto_transcript_types,
 };
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
@@ -1008,14 +1008,20 @@ pub struct SjCountRecord {
     pub intron_end: u64,
 }
 
-/// One (cell, UMI, gene) observation for the `Velocyto` feature, tagged with the
-/// read's spliced/unspliced/ambiguous category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One read's record for the `Velocyto` feature (STAR writes `iRead nTr tr
+/// type ...`, `SoloReadFeature_record.cpp:160-171`): the read, and the
+/// transcripts its unique alignment is compatible with, each with STAR's type
+/// bits ([`velocyto_transcript_types`]). Its cell and UMI come later, from the
+/// Gene feature's readInfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VelocytoRecord {
-    pub cb: u32,
-    pub umi: u64,
-    pub gene: u32,
-    pub category: VelocytoCategory,
+    pub read_index: u32,
+    pub types: Vec<(u32, u8)>,
+    /// The whitelist entries the read's barcode matched (several for an
+    /// unresolved 1MM_multi barcode): STAR counts each as a cell this feature
+    /// detected (`cbReadCount`, `SoloReadFeature_record.cpp:187-189`), which
+    /// decides the cells of the filtered matrices.
+    pub cbs: Vec<u32>,
 }
 
 /// A read whose cell barcode matched multiple whitelist entries by 1MM
@@ -1108,7 +1114,7 @@ pub struct SoloContext {
     pub sj_records: Mutex<Vec<SjCountRecord>>,
     /// `--soloFeatures Velocyto`: collect spliced/unspliced/ambiguous counts.
     pub velocyto_enabled: bool,
-    /// (cell, UMI, gene, category) observations for the Velocyto feature.
+    /// The Velocyto feature's per-read records.
     pub velocyto_records: Mutex<Vec<VelocytoRecord>>,
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
@@ -1129,7 +1135,14 @@ pub struct SoloContext {
     /// UMI each read ended up counted under, filled by UMI collapsing and read
     /// back when the sorted BAM is written to fill `CB`/`UB`. `None` unless one
     /// of those tags was requested.
-    pub read_info: Option<Mutex<Vec<ReadInfo>>>,
+    ///
+    /// One slot per feature, as STAR keeps a readInfo per feature: the first
+    /// feature's for `CB`/`UB` (`samAttrFeature`), the Gene feature's for
+    /// Velocyto (`ParametersSolo.cpp:420-422`).
+    pub read_info: Vec<Option<Mutex<Vec<ReadInfo>>>>,
+    /// The slot of `read_info` the `CB`/`UB` SAM tags read (the first
+    /// feature's), when those tags were requested.
+    pub tag_read_info_slot: Option<usize>,
 }
 
 /// One `readInfo` entry: what a read was counted as, once collapsing has run.
@@ -1192,6 +1205,9 @@ impl SoloReadOutcome {
             if let Some(m) = &mut fo.no_feature_multi {
                 m.read_index = read_index;
             }
+        }
+        if let Some(v) = &mut self.velocyto {
+            v.read_index = read_index;
         }
     }
 }
@@ -1375,6 +1391,17 @@ impl SoloContext {
         let transcript3p = params.solo_features.iter().any(|f| f == "Transcript3p");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
+        // STAR's readInfo, per feature; sized once the read count is known
+        // (`reserve_read_info`).
+        let read_info = features
+            .iter()
+            .enumerate()
+            .map(|(fi, &f)| {
+                let tags = fi == 0 && params.solo_read_info_needed();
+                let velocyto = velocyto_enabled && f == SoloFeature::Gene;
+                (tags || velocyto).then(|| Mutex::new(Vec::new()))
+            })
+            .collect();
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
             whitelist,
@@ -1420,16 +1447,27 @@ impl SoloContext {
                 .transpose()?,
             transcript3p: transcript3p
                 .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
-            // Sized once the read count is known (`reserve_read_info`).
-            read_info: params
-                .solo_read_info_needed()
-                .then(|| Mutex::new(Vec::new())),
+            read_info,
+            tag_read_info_slot: params.solo_read_info_needed().then_some(0),
         })
     }
 
     /// Whether this run has to track STAR's readInfo (the `CB`/`UB` SAM tags).
     pub fn read_info_enabled(&self) -> bool {
-        self.read_info.is_some()
+        self.read_info.iter().any(Option::is_some)
+    }
+
+    /// The readInfo the `CB`/`UB` tags are filled from (the first feature's),
+    /// when those tags were requested.
+    pub fn tag_read_info(&self) -> Option<&Mutex<Vec<ReadInfo>>> {
+        self.read_info.get(self.tag_read_info_slot?)?.as_ref()
+    }
+
+    /// The Gene feature's readInfo, which Velocyto takes its cells and UMIs
+    /// from.
+    pub fn gene_read_info(&self) -> Option<&Mutex<Vec<ReadInfo>>> {
+        let fi = self.features.iter().position(|&f| f == SoloFeature::Gene)?;
+        self.read_info[fi].as_ref()
     }
 
     /// `--soloType CB_samTagOut`: match the barcode to the whitelist and stop
@@ -1462,7 +1500,7 @@ impl SoloContext {
     /// Size the readInfo array for `n_reads` input reads, once the alignment
     /// pass has counted them. No-op unless `CB`/`UB` were requested.
     pub fn reserve_read_info(&self, n_reads: usize) {
-        if let Some(info) = &self.read_info {
+        for info in self.read_info.iter().flatten() {
             let mut info = info.lock().unwrap();
             info.clear();
             info.resize(n_reads, ReadInfo::default());
@@ -1638,18 +1676,28 @@ impl SoloContext {
                 .collect();
         }
 
-        // Velocyto feature: gene from gene-body overlap, then classify the read
-        // spliced/unspliced/ambiguous. Resolved CB only.
+        // Velocyto: the transcripts a uniquely mapped read is compatible with
+        // (`classifyAlign` computes them only for `nAlignG==1`), recorded for
+        // any read whose barcode and UMI pass (`record` returns before
+        // `cbMatch<0`), counted or not; its cell and UMI come from the Gene
+        // feature's readInfo when the molecules are collapsed.
         if self.velocyto_enabled
-            && let Some(cb) = cb_resolved
-            && let GeneAssignment::Gene(gene) = class.gene_full
+            && n_loci == 1
+            && let [aln] = cdna_transcripts
         {
-            out.velocyto = Some(VelocytoRecord {
-                cb,
-                umi,
-                gene,
-                category: velocyto_category(cdna_transcripts, &self.gene_ann, gene),
-            });
+            let types = velocyto_transcript_types(aln, &self.gene_model, self.strand);
+            if !types.is_empty() {
+                let cbs = match &cb_match {
+                    CbMatch::Exact(i) | CbMatch::Corrected(i) => vec![*i],
+                    CbMatch::Multi(cands) => cands.iter().map(|c| c.wl_index).collect(),
+                    CbMatch::NoMatch | CbMatch::NinCb | CbMatch::MultMatchRejected => Vec::new(),
+                };
+                out.velocyto = Some(VelocytoRecord {
+                    read_index: NO_READ_INDEX,
+                    types,
+                    cbs,
+                });
+            }
         }
 
         // The CB match + UMI are shared across features; reuse the cached
@@ -1664,10 +1712,10 @@ impl SoloContext {
                     SoloFeature::Gene => class.gene,
                     SoloFeature::GeneFull => class.gene_full,
                 };
-                // STAR's no-feature record, feature 0 only: the readInfo of
-                // the `CB`/`UB` tags comes from the tag feature, the first one.
+                // STAR's no-feature record, for the features whose readInfo
+                // is kept (the first for `CB`/`UB`, Gene for Velocyto).
                 let no_feature = |fo: &mut FeatureOutcome| {
-                    if fi != 0 || self.read_info.is_none() {
+                    if self.read_info.get(fi).is_none_or(Option::is_none) {
                         return;
                     }
                     match (cb_resolved, &cb_match) {

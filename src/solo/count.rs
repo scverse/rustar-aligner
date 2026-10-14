@@ -501,8 +501,9 @@ fn build_matrix_body(
     pseudocount: f64,
     dir: &Path,
     n_features: usize,
-    record_read_info: bool,
+    read_info_slot: Option<&std::sync::Mutex<Vec<crate::solo::ReadInfo>>>,
 ) -> Result<(tempfile::NamedTempFile, MatrixStats), Error> {
+    let record_read_info = read_info_slot.is_some();
     let mut body_tmp = tempfile::Builder::new()
         .prefix(".matrix_body")
         .tempfile_in(dir)
@@ -658,9 +659,7 @@ fn build_matrix_body(
             .collect();
 
         // Sequential merge: byte order preserved (CB-ascending, gene-ascending).
-        let mut info_guard = record_read_info
-            .then(|| ctx.read_info.as_ref().map(|m| m.lock().unwrap()))
-            .flatten();
+        let mut info_guard = read_info_slot.map(|m| m.lock().unwrap());
         // No-feature reads keep the cell their barcode resolves to and their
         // raw UMI (`SoloReadFeature_inputRecords.cpp:35-65, 68-103`): the same
         // oneExact and 1MM_multi resolution as counted reads.
@@ -1584,6 +1583,9 @@ pub fn write_gene_matrix(
     let exact_counts = ctx.whitelist.exact_count_snapshot();
     let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
 
+    // The Gene feature's called cells, which Velocyto's filtered matrices use.
+    let mut gene_called: Option<Vec<u32>> = None;
+
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
     for (fi, (feature, recorder)) in ctx.features.iter().zip(&ctx.recorders).enumerate() {
         let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
@@ -1603,7 +1605,7 @@ pub fn write_gene_matrix(
             n_genes,
             // STAR fills readInfo from one feature only: the first on the
             // --soloFeatures list (`ParametersSolo.cpp:423-434`).
-            fi == 0 && ctx.read_info_enabled(),
+            ctx.read_info[fi].as_ref(),
         )?;
         write_features(
             &raw_dir.join(&features_name),
@@ -1673,6 +1675,9 @@ pub fn write_gene_matrix(
         } else {
             called_cells(&mstats.cells, &params.solo_cell_filter)
         };
+        if *feature == crate::solo::SoloFeature::Gene {
+            gene_called.clone_from(&called);
+        }
         if let Some(cbs) = called
             && !cbs.is_empty()
         {
@@ -1859,37 +1864,71 @@ pub fn write_gene_matrix(
             sorted.len(),
             gzip,
         )?;
-        let umi_len = params.solo_umi_len as usize;
-        // `--soloVelocytoAmbiguous no` folds exon-only molecules into spliced and
-        // omits ambiguous.mtx (rustar extension); default `yes` = STARsolo 3-matrix.
-        let keep_ambiguous = !matches!(
-            params.solo_velocyto_ambiguous.as_str(),
-            "no" | "No" | "false"
-        );
-        let mut velocyto_records = ctx.velocyto_records.lock().unwrap();
-        velocyto_records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
-        let nnz = build_velocyto_matrices(
-            &velocyto_records,
-            method,
-            umi_len,
+        // Cells and UMIs come from the Gene feature's readInfo, which UMI
+        // collapsing of that feature filled above.
+        let records = std::mem::take(&mut *ctx.velocyto_records.lock().unwrap());
+        let counts = {
+            let gene_info = ctx
+                .gene_read_info()
+                .expect("Velocyto keeps the Gene feature's readInfo")
+                .lock()
+                .unwrap();
+            count_velocyto(&records, &gene_info, &ctx.gene_model)
+        };
+        let nnz = write_velocyto_matrices(
+            &counts,
+            |cb| Some(cb + 1),
             &velo_dir,
             n_genes,
             sorted.len(),
             gzip,
-            keep_ambiguous,
         )?;
-        if keep_ambiguous {
+        log::info!(
+            "STARsolo: wrote Velocyto/raw matrices ({} entries each)",
+            nnz[0]
+        );
+
+        // Filtered: the Gene feature's called cells that Velocyto detected,
+        // i.e. that a read with a Velocyto record matched
+        // (`SoloFeature_cellFiltering.cpp:16-30`).
+        if let Some(gene_cells) = &gene_called
+            && !gene_cells.is_empty()
+        {
+            let detected: std::collections::HashSet<u32> =
+                records.iter().flat_map(|r| r.cbs.iter().copied()).collect();
+            let mut cells: Vec<u32> = gene_cells
+                .iter()
+                .copied()
+                .filter(|cb| detected.contains(cb))
+                .collect();
+            cells.sort_unstable();
+            let column: HashMap<u32, u32> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, &cb)| (cb, i as u32 + 1))
+                .collect();
+            let filt_dir = params.output_path(&format!("{solo_dir}Velocyto/filtered/"));
+            std::fs::create_dir_all(&filt_dir).map_err(|e| Error::io(e, &filt_dir))?;
+            write_features(
+                &filt_dir.join(&features_name),
+                &ctx.gene_ann.gene_ids,
+                &ctx.gene_ann.gene_names,
+                &params.solo_out_format_features_gene_field3,
+                gzip,
+            )?;
+            write_barcodes_subset(&filt_dir.join(&barcodes_name), &ctx.whitelist, &cells, gzip)?;
+            let fnnz = write_velocyto_matrices(
+                &counts,
+                |cb| column.get(&cb).copied(),
+                &filt_dir,
+                n_genes,
+                cells.len(),
+                gzip,
+            )?;
             log::info!(
-                "STARsolo: wrote Velocyto/raw matrices (spliced={} unspliced={} ambiguous={} entries)",
-                nnz[0],
-                nnz[1],
-                nnz[2],
-            );
-        } else {
-            log::info!(
-                "STARsolo: wrote Velocyto/raw matrices, ambiguous folded into spliced (spliced={} unspliced={} entries)",
-                nnz[0],
-                nnz[1],
+                "STARsolo: wrote Velocyto/filtered matrices ({} cells, {} entries each)",
+                cells.len(),
+                fnnz[0],
             );
         }
     }
@@ -1963,149 +2002,119 @@ fn build_sj_matrix(
     Ok(nnz)
 }
 
-/// Build the `Velocyto` matrices from (cell, UMI, gene, category) records. Per
-/// (cell, gene) each UMI is resolved to one category (priority unspliced over
-/// spliced over ambiguous — any intron evidence makes the molecule nascent), then
-/// UMI-deduplicated per category. Genes are rows, cells columns — same layout as
-/// the Gene matrix, written as files scVelo/dynamo ingest directly.
+/// STAR's `countVelocyto` (`SoloFeature_countVelocyto.cpp`): the counts of
+/// each (cell, gene), `[spliced, unspliced, ambiguous]`, sorted by cell then
+/// gene.
 ///
-/// With `keep_ambiguous` (default, STARsolo-faithful) three matrices are written:
-/// `spliced`/`unspliced`/`ambiguous`. With `keep_ambiguous = false` the exon-only
-/// `ambiguous` molecules are folded into `spliced` (an exon-only read is most
-/// likely mature mRNA; cf. He, Soneson & Patro 2023) and only `spliced`/`unspliced`
-/// are written — no `ambiguous.mtx`. The returned `[usize; 3]` always reports
-/// `[spliced, unspliced, ambiguous]` nnz (ambiguous is 0 when folded).
-#[allow(clippy::too_many_arguments)]
-fn build_velocyto_matrices(
+/// - Each record's cell and UMI are the Gene feature's readInfo (`:33-38`);
+///   a read with either undefined is skipped.
+/// - A molecule (cell, UMI) keeps the transcripts all its reads are
+///   compatible with, their type bits OR-ed (`:43-77`); once that set is
+///   empty, the molecule's later reads are skipped.
+/// - A molecule whose transcripts span more than one gene is dropped; the
+///   others are spliced, unspliced or ambiguous by STAR's model flags
+///   (`:95-136`, [`velocyto_status`]).
+fn count_velocyto(
     records: &[crate::solo::VelocytoRecord],
-    method: UmiDedup,
-    umi_len: usize,
-    dir: &Path,
-    n_genes: usize,
-    n_barcodes: usize,
-    gzip: bool,
-    keep_ambiguous: bool,
-) -> Result<[usize; 3], Error> {
-    use crate::solo::VelocytoCategory;
-    // Category → matrix index (file order) and resolution priority.
-    let cat_idx = |c: VelocytoCategory| match c {
-        VelocytoCategory::Spliced => 0usize,
-        VelocytoCategory::Unspliced => 1,
-        VelocytoCategory::Ambiguous => 2,
-    };
-    let priority = |c: VelocytoCategory| match c {
-        VelocytoCategory::Unspliced => 2u8,
-        VelocytoCategory::Spliced => 1,
-        VelocytoCategory::Ambiguous => 0,
-    };
-    let names = ["spliced.mtx", "unspliced.mtx", "ambiguous.mtx"];
+    read_info: &[crate::solo::ReadInfo],
+    model: &crate::solo::GeneModel,
+) -> Vec<(u32, u32, [u32; 3])> {
+    use crate::quant::splice_status::velocyto_status;
 
-    let mut recs: Vec<&crate::solo::VelocytoRecord> = records.iter().collect();
-    use rayon::prelude::*;
-    recs.par_sort_unstable_by_key(|r| r.cb);
-
-    // One contiguous [start, end) slice per CB.
-    let mut bounds: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < recs.len() {
-        let cb = recs[i].cb;
-        let mut j = i + 1;
-        while j < recs.len() && recs[j].cb == cb {
-            j += 1;
+    // cell -> UMI -> the molecule's transcripts so far.
+    let mut molecules: HashMap<u32, HashMap<u64, Vec<(u32, u8)>>> = HashMap::default();
+    for r in records {
+        let Some(info) = read_info.get(r.read_index as usize) else {
+            continue;
+        };
+        if info.cb == u32::MAX || info.umi == u64::MAX {
+            continue;
         }
-        bounds.push((i, j));
-        i = j;
-    }
-
-    // Per-cell dedup is independent across cells → run in parallel, each cell
-    // producing the three matrices' lines (gene-ascending). Merge sequentially
-    // in CB order so the three .mtx files stay byte-identical to the serial path.
-    type VeloCellOut = ([Vec<u8>; 3], [usize; 3]);
-    let cell_outs: Vec<VeloCellOut> = bounds
-        .par_iter()
-        .map(|&(lo, hi)| {
-            let cb = recs[lo].cb;
-            // gene → umi → (resolved category, read count)
-            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> =
-                HashMap::default();
-            for &r in &recs[lo..hi] {
-                let e = gene_umi
-                    .entry(r.gene)
-                    .or_default()
-                    .entry(r.umi)
-                    .or_insert((r.category, 0));
-                e.1 += 1;
-                if priority(r.category) > priority(e.0) {
-                    e.0 = r.category;
-                }
+        let umis = molecules.entry(info.cb).or_default();
+        match umis.get_mut(&info.umi) {
+            None => {
+                umis.insert(info.umi, r.types.clone());
             }
-            // Per gene, dedup UMIs within each resolved category, emit entries.
-            let mut genes: Vec<&u32> = gene_umi.keys().collect();
-            genes.sort_unstable();
-            let mut bufs: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            let mut cnt = [0usize; 3];
-            for &g in &genes {
-                let umis = &gene_umi[g];
-                let mut by_cat: [HashMap<u64, u32>; 3] =
-                    [HashMap::default(), HashMap::default(), HashMap::default()];
-                for (&umi, &(cat, rc)) in umis {
-                    by_cat[cat_idx(cat)].insert(umi, rc);
-                }
-                // Fold ambiguous (exon-only) molecules into spliced. A UMI resolves
-                // to exactly one category, so spliced/ambiguous keys are disjoint.
-                if !keep_ambiguous {
-                    let amb = std::mem::take(&mut by_cat[2]);
-                    by_cat[0].extend(amb);
-                }
-                for (k, buf) in bufs.iter_mut().enumerate() {
-                    let c = dedup_count(&by_cat[k], method, umi_len);
-                    if c > 0 {
-                        let _ = writeln!(buf, "{} {} {}", g + 1, cb + 1, c);
-                        cnt[k] += 1;
+            Some(kept) if kept.is_empty() => {}
+            Some(kept) => {
+                // Both lists are sorted by transcript (`:66-76`).
+                let mut both = Vec::with_capacity(kept.len());
+                let mut inew = 0;
+                for &(tr, ty) in kept.iter() {
+                    while inew < r.types.len() && tr > r.types[inew].0 {
+                        inew += 1;
+                    }
+                    if inew == r.types.len() {
+                        break;
+                    }
+                    if tr == r.types[inew].0 {
+                        both.push((tr, ty | r.types[inew].1));
                     }
                 }
+                *kept = both;
             }
-            (bufs, cnt)
-        })
-        .collect();
-
-    let mut bodies: Vec<tempfile::NamedTempFile> = Vec::new();
-    for _ in 0..3 {
-        bodies.push(
-            tempfile::Builder::new()
-                .prefix(".velo_body")
-                .tempfile_in(dir)
-                .map_err(|e| Error::io(e, dir))?,
-        );
+        }
     }
+
+    let mut out = Vec::new();
+    let mut cells: Vec<u32> = molecules.keys().copied().collect();
+    cells.sort_unstable();
+    for cb in cells {
+        let mut gene_counts: std::collections::BTreeMap<u32, [u32; 3]> =
+            std::collections::BTreeMap::new();
+        for trs in molecules[&cb].values() {
+            let Some(&(tr0, _)) = trs.first() else {
+                continue; // no transcript in the intersection
+            };
+            let gene = model.tr_gene(tr0 as usize);
+            if gene == u32::MAX
+                || trs
+                    .iter()
+                    .any(|&(tr, _)| model.tr_gene(tr as usize) != gene)
+            {
+                continue; // multi-gene
+            }
+            let status = velocyto_status(trs.iter().map(|&(_, ty)| ty));
+            gene_counts.entry(gene).or_insert([0; 3])[status as usize] += 1;
+        }
+        out.extend(gene_counts.into_iter().map(|(gene, c)| (cb, gene, c)));
+    }
+    out
+}
+
+/// Write the three Velocyto matrices for the cells `column` numbers (1-based
+/// column, `None` to leave a cell out), as STAR's `outputResults` does: each
+/// (cell, gene) row appears once in every matrix, zeros included, since the
+/// three share one `countCellGeneUMI` row per gene. Returns the entries per
+/// matrix.
+fn write_velocyto_matrices(
+    counts: &[(u32, u32, [u32; 3])],
+    column: impl Fn(u32) -> Option<u32>,
+    dir: &Path,
+    n_genes: usize,
+    n_columns: usize,
+    gzip: bool,
+) -> Result<[usize; 3], Error> {
+    let names = ["spliced.mtx", "unspliced.mtx", "ambiguous.mtx"];
+    let mut bodies: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut nnz = [0usize; 3];
-    {
-        let mut writers: Vec<std::io::BufWriter<&mut std::fs::File>> = bodies
-            .iter_mut()
-            .map(|t| std::io::BufWriter::new(t.as_file_mut()))
-            .collect();
-        for (bufs, cnt) in &cell_outs {
-            for (k, w) in writers.iter_mut().enumerate() {
-                w.write_all(&bufs[k]).map_err(|e| Error::io(e, dir))?;
-                nnz[k] += cnt[k];
-            }
-        }
-        for w in &mut writers {
-            w.flush().map_err(|e| Error::io(e, dir))?;
+    for &(cb, gene, c) in counts {
+        let Some(col) = column(cb) else {
+            continue;
+        };
+        for k in 0..3 {
+            let _ = writeln!(bodies[k], "{} {} {}", gene + 1, col, c[k]);
+            nnz[k] += 1;
         }
     }
-
-    // Three files by default; only spliced/unspliced when ambiguous is folded.
-    let n_out = if keep_ambiguous { 3 } else { 2 };
-    for (k, body) in bodies.iter().take(n_out).enumerate() {
+    for (k, body) in bodies.iter().enumerate() {
         let path = dir.join(names[k]);
         write_file(&path, gzip, |w| {
             writeln!(w, "%%MatrixMarket matrix coordinate integer general")
                 .map_err(|e| Error::io(e, &path))?;
             writeln!(w, "%").map_err(|e| Error::io(e, &path))?;
-            writeln!(w, "{n_genes} {n_barcodes} {}", nnz[k]).map_err(|e| Error::io(e, &path))?;
-            let mut r = std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?;
-            std::io::copy(&mut r, w).map_err(|e| Error::io(e, &path))?;
+            writeln!(w, "{n_genes} {n_columns} {}", nnz[k]).map_err(|e| Error::io(e, &path))?;
+            w.write_all(body).map_err(|e| Error::io(e, &path))?;
             Ok(())
         })?;
     }
@@ -2568,6 +2577,49 @@ fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STAR's `countVelocyto` collapse: a molecule keeps the transcripts all
+    /// its reads share, their types OR-ed; an emptied molecule stays empty; a
+    /// multi-gene molecule and a read with no readInfo are dropped.
+    #[test]
+    fn count_velocyto_collapses_molecules_as_star() {
+        use crate::quant::splice_status::AlignVsTranscript as A;
+        use crate::solo::{GeneModel, ReadInfo, VelocytoRecord};
+        let exon = A::Concordant.type_bits();
+        let intron = A::Intron.type_bits();
+        // Transcripts 0 and 1 belong to gene 0, transcript 2 to gene 1.
+        let model = GeneModel::with_tr_genes(vec![0, 0, 1]);
+        let rec = |read_index: u32, types: &[(u32, u8)]| VelocytoRecord {
+            read_index,
+            types: types.to_vec(),
+            cbs: vec![5],
+        };
+        let info = |cb: u32, umi: u64| ReadInfo { cb, umi };
+        let read_info = vec![
+            info(5, 1), // 0, 1: molecule A, reads intersect on transcript 0
+            info(5, 1),
+            info(5, 2), // 2, 3: molecule B, no shared transcript
+            info(5, 2),
+            info(5, 2),          // 4: B again, ignored once B is empty
+            info(5, 3),          // 5: molecule C, two genes
+            ReadInfo::default(), // 6: no cell or UMI
+            info(7, 1),          // 7: another cell, exonic in both isoforms
+        ];
+        let records = vec![
+            rec(0, &[(0, exon), (1, intron)]),
+            rec(1, &[(0, intron)]),
+            rec(2, &[(0, exon)]),
+            rec(3, &[(1, exon)]),
+            rec(4, &[(0, exon)]),
+            rec(5, &[(0, exon), (2, exon)]),
+            rec(6, &[(0, exon)]),
+            rec(7, &[(0, exon), (1, exon)]),
+        ];
+        let counts = count_velocyto(&records, &read_info, &model);
+        // A: transcript 0, exon | intron, with no span → mixed → unspliced.
+        // B dropped (empty), C dropped (two genes), read 6 skipped.
+        assert_eq!(counts, vec![(5, 0, [0, 1, 0]), (7, 0, [1, 0, 0])]);
+    }
     use crate::io::fastq::encode_base;
     use crate::solo::whitelist::pack_barcode;
 
