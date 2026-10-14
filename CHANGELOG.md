@@ -146,6 +146,52 @@ Sections commonly used: Features, Bug fixes, Other changes.
   matching feature stops with an error naming the feature and the
   `--readFilesCommand` alternative. `--readFilesCommand` still takes
   precedence.
+- **STARsolo SAM tags and `CB_samTagOut`, as STAR** (from
+  @BenjaminDEMAILLE's #226). `--outSAMattributes` now takes
+  `CR CY UR UY CB UB gx gn sM sS sQ sF` next to `GX GN`, written in BAM output
+  only and in the order given.
+
+  - The gene tags come from the first `--soloFeatures` entry, STAR's
+    `samAttrFeature`: `classifyAlign`'s per-alignment gene sets for `Gene`,
+    gene-body overlap for `GeneFull` (`ReadAlign_alignBAM.cpp:99-106,
+    420-452`). `gx`/`gn` name every gene of their alignment; `sF` is
+    `(ovType, genes of the read)`, which for `Gene` is 1 when the read has a
+    gene and 0 otherwise, and always 0 for `GeneFull`.
+  - `CB`/`UB` come from STAR's readInfo and are written in the
+    coordinate-sorted BAM only. Counted reads get their cell and corrected
+    UMI. Reads with a valid barcode that are not counted (unmapped, no gene,
+    several genes) get the cell their barcode resolves to and the raw UMI, as
+    STAR's no-feature records give them; reads with no valid barcode get `-`.
+  - On unmapped records the barcode tags follow STAR's fixed order.
+  - `--soloType CB_samTagOut` corrects the barcode into `CB` as each read is
+    processed, with no counting and no matrices.
+  - The refusals are STAR's, in STAR's order and with STAR's text: the
+    barcode tags without BAM output, `CB`/`UB` without a sorted BAM or with a
+    non-gene first feature, `UB` with `CB_samTagOut`, and `CB_samTagOut`
+    with a match type other than `Exact`/`1MM` (so its `1MM_multi` default
+    is refused, as in STAR) or with multimappers. `gx`, `gn` and `sF` with SAM
+    output are refused too: STAR has no check for them but stops at the first
+    SAM record.
+
+  On the 10x v2 mouse chr19 fixture, every tag matches STARsolo on all
+  104,045 records of the sorted BAM, unmapped reads included and in record
+  order. That holds for the default run, for a scrambled tag order with both
+  BAM outputs, for `GeneFull` first, `1MM_multi` with EM multimappers,
+  `1MM_Directional`, `Unstranded` and `CB_samTagOut`, and the matrices are
+  unchanged.
+
+- **Paired-end cDNA with a separate barcode read.** `--readFilesIn` takes
+  STAR's three-file solo layout (`cDNA_read1 cDNA_read2 barcode_read`); a
+  third file without `--soloType` is refused with STAR's message. A mate pair
+  is one alignment for the Gene feature, as in STAR: one transcript has to
+  contain both mates. This also applies to `--soloBarcodeMate 1`, which
+  scored each mate as an alignment of its own.
+
+- **`--soloBarcodeReadLength` is honoured.** As in STAR, the default expects the
+  barcode read to be exactly CB+UMI long and treats any other length as a fatal
+  input error; `0` turns the check off and pads a short read with `N`
+  (quality `H`).
+
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 

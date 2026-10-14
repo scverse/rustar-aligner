@@ -99,6 +99,7 @@ fn strand_keeps(strand: SoloStrand, gene_is_reverse: bool, read_is_reverse: bool
 /// The transcript models of STARsolo's `Gene` feature, each transcript's gene
 /// given as an index into the solo gene list (`GeneAnnotation`, the order of
 /// `features.tsv`).
+#[derive(Default)]
 pub struct GeneModel {
     pub transcripts: TranscriptomeIndex,
     /// Solo gene index per transcript; `u32::MAX` if the gene is not listed.
@@ -295,6 +296,33 @@ pub fn classify_align(
         }
         sets.per_align[iag].sort_unstable();
         sets.per_align[iag].dedup();
+    }
+    sets.genes.sort_unstable();
+    sets.genes.dedup();
+    sets
+}
+
+/// STAR's `GeneFull` annotation of a read (`Transcriptome_geneFullAlignOverlap.cpp`):
+/// per alignment, the genes whose body overlaps one of its blocks on the strand
+/// `--soloStrand` keeps.
+pub fn gene_full_sets(
+    transcripts: &[Transcript],
+    gene_ann: &GeneAnnotation,
+    strand: SoloStrand,
+) -> GeneSets {
+    let mut sets = GeneSets {
+        genes: Vec::new(),
+        per_align: vec![Vec::new(); transcripts.len()],
+    };
+    let mut raw = Vec::new();
+    for (iag, tr) in transcripts.iter().enumerate() {
+        gene_ann.overlapping_genes_full_into(tr, &mut raw);
+        for &g in &raw {
+            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                sets.per_align[iag].push(g as u32);
+                sets.genes.push(g as u32);
+            }
+        }
     }
     sets.genes.sort_unstable();
     sets.genes.dedup();
@@ -777,6 +805,97 @@ mod tests {
         assert_eq!(sets.per_align, vec![vec![0], vec![]]);
     }
 
+    /// A mate pair is one alignment (`pair_alignment`): concordance asks one
+    /// transcript to hold both mates, a deletion inside a mate is not taken
+    /// for a junction, and the pair's strand is mate 1's.
+    #[test]
+    fn classify_align_takes_a_mate_pair_as_one_alignment() {
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
+        let deleted = |a: (u64, u64), b: (u64, u64), is_reverse: bool| {
+            let mut t = read_at(a.0, b.1, is_reverse);
+            let la = (a.1 - a.0) as usize;
+            t.exons = vec![
+                Exon {
+                    genome_start: a.0,
+                    genome_end: a.1,
+                    read_start: 0,
+                    read_end: la,
+                    i_frag: 0,
+                },
+                Exon {
+                    genome_start: b.0,
+                    genome_end: b.1,
+                    read_start: la,
+                    read_end: la + (b.1 - b.0) as usize,
+                    i_frag: 0,
+                },
+            ];
+            t.cigar = vec![
+                Op::new(Kind::Match, la),
+                Op::new(Kind::Deletion, (b.0 - a.1) as usize),
+                Op::new(Kind::Match, (b.1 - b.0) as usize),
+            ];
+            t
+        };
+        let cigar_of = |t: &mut Transcript| {
+            t.cigar = vec![Op::new(
+                Kind::Match,
+                (t.genome_end - t.genome_start) as usize,
+            )];
+        };
+        // Forward pair inside G1's exon, mate 2 with a 1-base deletion.
+        let mut m1 = read_at(120, 150, false);
+        cigar_of(&mut m1);
+        let m2 = deleted((155, 170), (171, 190), true);
+        let pair = crate::solo::pair_alignment(&m1, &m2);
+        assert_eq!(
+            pair.exons.iter().map(|e| e.i_frag).collect::<Vec<_>>(),
+            [0, 1, 1]
+        );
+        let sets = classify_align(std::slice::from_ref(&pair), &model, SoloStrand::Forward);
+        assert_eq!(sets.per_align, vec![vec![0]]);
+
+        // Reverse pair: mate 2 is the left mate and the pair is antisense to G1.
+        let mut r1 = read_at(160, 190, true);
+        cigar_of(&mut r1);
+        let mut r2 = read_at(110, 140, false);
+        cigar_of(&mut r2);
+        let pair = crate::solo::pair_alignment(&r1, &r2);
+        assert_eq!(pair.exons[0].genome_start, 110, "left mate first");
+        assert!(pair.is_reverse);
+        let fwd = classify_align(std::slice::from_ref(&pair), &model, SoloStrand::Forward);
+        assert_eq!(fwd.genes, Vec::<u32>::new());
+        let rev = classify_align(std::slice::from_ref(&pair), &model, SoloStrand::Reverse);
+        assert_eq!(rev.genes, vec![0]);
+
+        // One mate past the transcript's end: not concordant.
+        let mut o2 = read_at(190, 230, true);
+        cigar_of(&mut o2);
+        let pair = crate::solo::pair_alignment(&m1, &o2);
+        let sets = classify_align(std::slice::from_ref(&pair), &model, SoloStrand::Forward);
+        assert_eq!(sets.per_align, vec![Vec::<u32>::new()]);
+    }
+
+    /// `GeneFull` gene sets: per alignment, the sense genes whose body it
+    /// overlaps.
+    #[test]
+    fn gene_full_sets_are_per_alignment() {
+        let ann = annotation();
+        let sets = gene_full_sets(
+            &[
+                read_at(120, 180, false),
+                read_at(120, 180, true),
+                read_at(600, 650, false),
+            ],
+            &ann,
+            SoloStrand::Forward,
+        );
+        assert_eq!(sets.genes, vec![0]);
+        assert_eq!(sets.per_align, vec![vec![0], vec![], vec![]]);
+    }
+
     #[test]
     fn genefull_counts_intronic_read() {
         // Two-exon gene G3 (+): exons [500,600) and [800,900) → gene body
@@ -809,6 +928,11 @@ mod tests {
         }
     }
 
+    /// `gx`/`gn` are per alignment, so two alignments of one read report their
+    /// own genes; `sF` reports the read-level overlap type and gene count, and
+    /// falls back to `(-1, -1)` on an alignment with no gene of its own.
+    /// A read inside an intron is intronic-sense, and carries the gene only on
+    /// the `GeneFull` basis.
     #[test]
     fn classify_read_regions_and_antisense() {
         // Ga (+): exons [100,200) and [400,500) → body [100,500), intron [200,400).

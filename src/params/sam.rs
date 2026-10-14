@@ -37,6 +37,36 @@ pub enum SamAttr {
     /// `ch:A:1`: marks chimeric alignments in `--chimOutType WithinBAM` output
     /// (BAM only).
     CH = 16,
+
+    // ---- STARsolo tags (BAM output only, like STAR) ----
+    /// `CR:Z`: raw (uncorrected) cell barcode sequence.
+    CR = 17,
+    /// `CY:Z`: quality string of the raw cell barcode.
+    CY = 18,
+    /// `UR:Z`: raw (uncorrected) UMI sequence.
+    UR = 19,
+    /// `UY:Z`: quality string of the raw UMI.
+    UY = 20,
+    /// `CB:Z`: whitelist-corrected cell barcode. Filled at sorting time from
+    /// the solo read info (except `--soloType CB_samTagOut`, which corrects
+    /// the barcode as the read is processed).
+    CB = 21,
+    /// `UB:Z`: collapsed (corrected) UMI. Only known after UMI collapsing,
+    /// so it is added when the sorted BAM is written.
+    UB = 22,
+    /// `sM:i`: STAR's `cbMatch` code (its barcode/UMI assessment).
+    SM = 23,
+    /// `sS:Z`: full barcode-read sequence (CB + UMI + any adapter).
+    SS = 24,
+    /// `sQ:Z`: full barcode-read quality string.
+    SQ = 25,
+    /// `gx:Z`: gene ids of THIS alignment, `;`-joined (multi-gene allowed,
+    /// unlike the read-level unique-gene `GX`).
+    GXM = 26,
+    /// `gn:Z`: gene names of this alignment, `;`-joined.
+    GNM = 27,
+    /// `sF:B:i`: `(overlap type, number of genes)` for the read.
+    SF = 28,
 }
 
 impl SamAttr {
@@ -60,11 +90,23 @@ impl SamAttr {
             Self::VG => *b"vG",
             Self::MC => *b"MC",
             Self::CH => *b"ch",
+            Self::CR => *b"CR",
+            Self::CY => *b"CY",
+            Self::UR => *b"UR",
+            Self::UY => *b"UY",
+            Self::CB => *b"CB",
+            Self::UB => *b"UB",
+            Self::SM => *b"sM",
+            Self::SS => *b"sS",
+            Self::SQ => *b"sQ",
+            Self::GXM => *b"gx",
+            Self::GNM => *b"gn",
+            Self::SF => *b"sF",
         }
     }
 }
 
-const MAX_ATTRS: usize = 17;
+const MAX_ATTRS: usize = 29;
 
 /// Ordered set of optional SAM tags (`--outSAMattributes`).
 ///
@@ -107,6 +149,45 @@ impl SamAttributes {
     pub const VG: Self = Self::of(&[SamAttr::VG]);
     pub const MC: Self = Self::of(&[SamAttr::MC]);
     pub const CH: Self = Self::of(&[SamAttr::CH]);
+    pub const CR: Self = Self::of(&[SamAttr::CR]);
+    pub const CY: Self = Self::of(&[SamAttr::CY]);
+    pub const UR: Self = Self::of(&[SamAttr::UR]);
+    pub const UY: Self = Self::of(&[SamAttr::UY]);
+    pub const CB: Self = Self::of(&[SamAttr::CB]);
+    pub const UB: Self = Self::of(&[SamAttr::UB]);
+    pub const SM: Self = Self::of(&[SamAttr::SM]);
+    pub const SS: Self = Self::of(&[SamAttr::SS]);
+    pub const SQ: Self = Self::of(&[SamAttr::SQ]);
+    pub const GXM: Self = Self::of(&[SamAttr::GXM]);
+    pub const GNM: Self = Self::of(&[SamAttr::GNM]);
+    pub const SF: Self = Self::of(&[SamAttr::SF]);
+
+    /// Every STARsolo barcode/gene tag.
+    pub const SOLO_TAGS: Self = Self::of(&[
+        SamAttr::CR,
+        SamAttr::CY,
+        SamAttr::UR,
+        SamAttr::UY,
+        SamAttr::CB,
+        SamAttr::UB,
+        SamAttr::SM,
+        SamAttr::SS,
+        SamAttr::SQ,
+        SamAttr::GX,
+        SamAttr::GN,
+        SamAttr::GXM,
+        SamAttr::GNM,
+        SamAttr::SF,
+    ]);
+
+    /// The tags derived from the gene model rather than the barcode read.
+    pub const SOLO_GENE_TAGS: Self = Self::of(&[
+        SamAttr::GX,
+        SamAttr::GN,
+        SamAttr::GXM,
+        SamAttr::GNM,
+        SamAttr::SF,
+    ]);
 
     /// STAR `Standard` = NH HI AS nM  (the mismatch count nM, NOT edit-distance NM).
     pub const STANDARD: Self = Self::of(&[SamAttr::NH, SamAttr::HI, SamAttr::AS, SamAttr::NMM]);
@@ -208,6 +289,14 @@ impl std::ops::BitOrAssign for SamAttributes {
     }
 }
 
+/// The attributes present in both, in the left-hand order.
+impl std::ops::BitAnd for SamAttributes {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        self - (self - rhs)
+    }
+}
+
 impl std::ops::Sub for SamAttributes {
     type Output = Self;
     fn sub(mut self, rhs: Self) -> Self {
@@ -240,6 +329,18 @@ impl FromStr for SamAttributes {
             "RG" => Self::RG,
             "GX" => Self::GX,
             "GN" => Self::GN,
+            "CR" => Self::CR,
+            "CY" => Self::CY,
+            "UR" => Self::UR,
+            "UY" => Self::UY,
+            "CB" => Self::CB,
+            "UB" => Self::UB,
+            "sM" => Self::SM,
+            "sS" => Self::SS,
+            "sQ" => Self::SQ,
+            "gx" => Self::GXM,
+            "gn" => Self::GNM,
+            "sF" => Self::SF,
             "vW" => Self::VW,
             "vA" => Self::VA,
             "vG" => Self::VG,
@@ -290,7 +391,8 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI MC ch XS RG vW vA vG.",
+                     NH HI AS NM nM MD jM jI MC ch XS RG vW vA vG, plus the STARsolo tags \
+                     CR CY UR UY CB UB GX GN gx gn sM sS sQ sF (BAM output only).",
                 ),
         )
     }

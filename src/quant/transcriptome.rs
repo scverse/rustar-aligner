@@ -175,7 +175,7 @@ pub struct TrExon {
 /// strand, ordered by ascending genome start. `tr_order` / `tr_starts_sorted`
 /// / `tr_end_max_sorted` support STAR's `binarySearch1a` + running-max
 /// early-exit in `quantAlign`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TranscriptomeIndex {
     /// Transcript IDs in insertion order (index = transcript_idx).
     pub tr_ids: Vec<String>,
