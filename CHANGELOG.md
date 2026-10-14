@@ -213,6 +213,21 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **Paired-end reads with mates of 50 bases or fewer align as STAR.** STAR
+  caps the spacing of its seed search starts by the whole read, both mates
+  and the spacer (`ReadAlign_mapOneRead.cpp:41-42`); we capped each mate by
+  its own length, so a mate of 50 bases or fewer got a second search start
+  that STAR never makes, and with it seeds that paired mates STAR leaves
+  unpaired (any mate length is affected with a non-default
+  `--seedSearchStartLmaxOverLread`). Separately, the primary among equal-scoring pairs is now STAR's
+  `trBest` length tie-break over the pair's span in transcript order
+  (`stitchWindowAligns.cpp:94`), not over the mates' extent; the two differ
+  when the mates overlap. On 100,000 45+45 pairs made from the 10x mouse
+  chr19 fixture's cDNA reads, every one of 207,966 records now matches STAR
+  (65,144 before; we mapped 16,033 pairs to STAR's 14,590). Yeast 10k SE/PE
+  and the human chr21 clean pairs (75-base mates) are unchanged and
+  identical to STAR.
+
 - **Several read files per mate, as STAR** (from @BenjaminDEMAILLE's #318).
   `--readFilesIn a_1.fq,b_1.fq a_2.fq,b_2.fq` (e.g. 10x lanes) failed with
   "No such file or directory": the comma list was taken as one path. Each

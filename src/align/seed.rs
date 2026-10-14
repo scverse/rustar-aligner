@@ -64,7 +64,15 @@ impl Seed {
         params: &Parameters,
         debug_name: &str,
     ) -> Result<Vec<Seed>, Error> {
-        Self::find_seeds_at(read_seq, 0, index, min_seed_length, params, debug_name)
+        Self::find_seeds_at(
+            read_seq,
+            0,
+            read_seq.len(),
+            index,
+            min_seed_length,
+            params,
+            debug_name,
+        )
     }
 
     /// [`Self::find_seeds`] for a fragment that starts at `frag_offset` in
@@ -72,9 +80,15 @@ impl Seed {
     /// reads and mate 1, `len1 + 1` for mate 2. The offset only matters for
     /// STAR's `flagDirMap` test, which compares `splitR[0][ip] + L` (the piece
     /// start in the combined read) with the piece length.
+    ///
+    /// `lread` is STAR's `Lread`, the length of the whole read: the fragment's
+    /// own length single-end, `len1 + 1 + len2` for a pair. It caps the spacing
+    /// of the seed search starts (`ReadAlign_mapOneRead.cpp:41-42`).
+    #[allow(clippy::too_many_arguments)]
     pub fn find_seeds_at(
         read_seq: &[u8],
         frag_offset: usize,
+        lread: usize,
         index: &GenomeIndex,
         min_seed_length: usize,
         params: &Parameters,
@@ -112,6 +126,7 @@ impl Seed {
             false,
             debug_name,
             frag_offset,
+            lread,
             &mut flag_dir_map,
             &mut seeds,
         );
@@ -136,6 +151,7 @@ impl Seed {
             true,
             debug_name,
             frag_offset,
+            lread,
             &mut flag_dir_map,
             &mut seeds,
         );
@@ -197,7 +213,9 @@ impl Seed {
         params: &Parameters,
     ) -> Result<Vec<Seed>, Error> {
         // Find seeds from mate1 (tag with mate_id = 0)
-        let mut seeds = Self::find_seeds(mate1_seq, index, min_seed_length, params, "")?;
+        let lread = mate1_seq.len() + 1 + mate2_seq.len();
+        let mut seeds =
+            Self::find_seeds_at(mate1_seq, 0, lread, index, min_seed_length, params, "")?;
         for seed in &mut seeds {
             seed.mate_id = 0;
         }
@@ -207,6 +225,7 @@ impl Seed {
         let mut seeds2 = Self::find_seeds_at(
             mate2_seq,
             mate1_seq.len() + 1,
+            lread,
             index,
             min_seed_length,
             params,
@@ -341,19 +360,20 @@ fn search_direction_sparse(
     is_rc: bool,
     debug_name: &str,
     frag_offset: usize,
+    lread: usize,
     flag_dir_map: &mut [bool],
     seeds: &mut Vec<Seed>,
 ) {
-    let read_len = read_seq.len();
     let n_pieces = pieces.len();
 
     // STAR (ReadAlign_mapOneRead.cpp lines 41-42):
     //   seedSearchStartLmax = min(P.seedSearchStartLmax, seedSearchStartLmaxOverLread*(Lread-1))
-    // Derived from the whole read, outside the per-piece loop, exactly as STAR
+    // Derived from the whole read (`lread`: both mates and the spacer for a
+    // pair, not this fragment), outside the per-piece loop, exactly as STAR
     // does — only Nstart/Lstart below are per piece.
-    let effective_start_lmax = if read_len > 0 {
+    let effective_start_lmax = if lread > 0 {
         let over_lread_limit =
-            (params.seed_search_start_lmax_over_lread * (read_len as f64 - 1.0)) as usize;
+            (params.seed_search_start_lmax_over_lread * (lread as f64 - 1.0)) as usize;
         params.seed_search_start_lmax.min(over_lread_limit)
     } else {
         params.seed_search_start_lmax
@@ -1057,6 +1077,35 @@ mod tests {
         Parameters::parse_from(full_args)
     }
 
+    /// STAR spaces the seed search starts by `min(seedSearchStartLmax,
+    /// seedSearchStartLmaxOverLread * (Lread - 1))` with `Lread` the whole read
+    /// (`ReadAlign_mapOneRead.cpp:41-42`): for a pair, both mates and the
+    /// spacer. A 45-base mate of a 45+45 pair (Lread 91) gets one start per
+    /// direction; capped by its own length (44) it would get a second, at 22,
+    /// which STAR never makes.
+    #[test]
+    fn seed_start_spacing_is_capped_by_the_whole_read() {
+        // A fixed pseudo-random genome, so the 45-base read occurs once.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let genome: String = (0..400)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x % 4) as usize] as char
+            })
+            .collect();
+        let index = make_test_index(&genome);
+        let read = encode_sequence(&genome[100..145]);
+        let params = params(&["--runMode", "alignReads"]);
+        let starts_at_22 = |seeds: &[Seed]| seeds.iter().any(|s| !s.search_rc && s.read_pos == 22);
+
+        let pair = Seed::find_seeds_at(&read, 0, 91, &index, 12, &params, "").unwrap();
+        assert!(!starts_at_22(&pair), "{pair:?}");
+        let alone = Seed::find_seeds_at(&read, 0, 45, &index, 12, &params, "").unwrap();
+        assert!(starts_at_22(&alone), "{alone:?}");
+    }
+
     #[test]
     fn find_exact_match() {
         let index = make_test_index("ACGTACGT");
@@ -1328,6 +1377,7 @@ mod tests {
             true,
             "",
             0,
+            read.len(),
             &mut [true],
             &mut rc_seeds,
         );
@@ -1535,6 +1585,7 @@ mod tests {
             false,
             "",
             0,
+            read.len(),
             &mut [true],
             &mut seeds,
         );
