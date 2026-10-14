@@ -130,7 +130,7 @@ So when `umiL` is still 0 at construction, the loop body never runs and all four
 
 Poly-A being special in RNA does not apply here: the UMI comes from the barcode read, not the cDNA. In oligo-dT chemistries the UMI sits next to the dT, so a UMI that runs into it reads as poly-T, the one homopolymer STAR's complex path lets through. Matching the accident would count poly-T UMIs as molecules.
 
-**Impact.** Under `--soloType CB_UMI_Complex`, reads whose UMI is a non-A homopolymer are dropped here and counted by STAR. On real data these are rare and are sequencing artefacts.
+**Impact.** Under `--soloType CB_UMI_Complex`, reads whose UMI is a non-A homopolymer are dropped here and counted by STAR. On real data these are rare and are sequencing artefacts. The stats files show it too: such reads count as `noUMIhomopolymer` in `Barcodes.stats` here, and under their barcode's match (or `noNoWLmatch`) in STAR's, which also moves `Features.stats` and the "Reads With Valid Barcodes" line of `Summary.csv`. On the 10x v2 mouse chr19 fixture run as `CB_UMI_Complex`, 43 reads; the count matrices are unchanged.
 
 **Source.** `src/solo/whitelist.rs` (`check_umi`, `umi_valid_rejects_every_homopolymer`). STAR: `SoloReadBarcode.cpp:16-21`, `SoloReadBarcode_getCBandUMI.cpp:139` and `:353-354`.
 
@@ -158,6 +158,18 @@ Every STAR record matches the alignment STAR computed only once SEQ is moved by 
 **Impact.** Only `CellRanger4` with a non-zero `--clip5pNbases` (and, by the same code, `--clip5pAfterAdapterNbases`, which has not been run). Without them the two agree (fixture: all 21,732 records identical). With them, every read differs: of the 16,177 reads both map, 9,353 differ only in POS (−N on forward reads, +N on reverse, relative to rustar-aligner), and 6,824 also differ in CIGAR, locus or strand, because STAR aligned a different stretch of the read. The gene matrix differs too (fixture: 21 raw entries, 448 against 443 UMIs).
 
 **Source.** `src/clip/mod.rs` (`clip_mate_cr4`). STAR: `ClipMate_clip.cpp:14-24, 50-57, 64-70`, `readLoad.cpp:60-61`, `ReadAlign_alignBAM.cpp:224-230`, `ReadAlign_calcCIGAR.cpp:16-22`.
+
+### 1.8 `--soloCellRangerSummary`: a CellRanger-style mapping summary
+
+A rustar-aligner extension with no STAR equivalent, off by default (`No`). With the default no output changes.
+
+**What STAR does.** STARsolo writes one `Summary.csv` per feature (`SoloFeature_statsOutput.cpp`), with reads mapped to the genome and to the feature, but no split of the reads by region.
+
+**What rustar-aligner does.** With `--soloCellRangerSummary Yes` and both `Gene` and `GeneFull` in `--soloFeatures`, it also writes `Solo.out/<feature>/CellRanger.summary.csv`: of all input reads, the fractions that map uniquely and fall in exonic, intronic or intergenic regions, or antisense to a gene, under the names CellRanger's `metrics_summary.csv` uses ("Reads Mapped Confidently to Exonic Regions" and so on). The definitions are rustar-aligner's own (exonic and intronic come from the two features' overlaps) and are not claimed to equal CellRanger's. `Summary.csv` itself is never changed.
+
+**Why.** CellRanger users look at these fractions, and the two overlaps needed are computed anyway when both features run.
+
+**Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
 ---
 

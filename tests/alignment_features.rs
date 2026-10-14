@@ -1216,7 +1216,7 @@ fn test_starsolo_gene_matrix() {
         "expected 8 resolved solo records in log, stderr was:\n{stderr}"
     );
     assert!(
-        stderr.contains("exact=8"),
+        stderr.contains("yesWLmatchExact=8"),
         "expected 8 exact CB matches in log, stderr was:\n{stderr}"
     );
 
@@ -1275,7 +1275,8 @@ fn test_starsolo_gene_matrix() {
 // ---------------------------------------------------------------------------
 // Test 9a' — Summary.csv stays STARsolo-faithful; the CellRanger mapping funnel
 // (exonic/intronic/intergenic/antisense) is split out into a separate
-// CellRanger.summary.csv (PR #90 review: keep the faithful Summary.csv unaltered).
+// CellRanger.summary.csv, written only with `--soloCellRangerSummary Yes` (a
+// rustar-aligner extension; the faithful Summary.csv is never altered).
 // Needs Gene + GeneFull — the exonic/intronic split requires both queries.
 // ---------------------------------------------------------------------------
 #[test]
@@ -1304,42 +1305,56 @@ fn test_starsolo_summary_split() {
         fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
     }
 
-    let output_dir = tmpdir.path().join("out_split");
-    fs::create_dir_all(&output_dir).unwrap();
-    let prefix = format!("{}/", output_dir.display());
-    cargo_bin_cmd!("rustar-aligner")
-        .args([
-            "--runMode",
-            "alignReads",
-            "--genomeDir",
-            genome_dir.to_str().unwrap(),
-            "--readFilesIn",
-            cdna_path.to_str().unwrap(),
-            bc_path.to_str().unwrap(),
-            "--soloType",
-            "CB_UMI_Simple",
-            "--soloCBwhitelist",
-            wl_path.to_str().unwrap(),
-            "--soloCBstart",
-            "1",
-            "--soloCBlen",
-            "16",
-            "--soloUMIstart",
-            "17",
-            "--soloUMIlen",
-            "12",
-            "--soloFeatures",
-            "Gene",
-            "GeneFull",
-            "--soloStrand",
-            "Forward",
-            "--sjdbGTFfile",
-            gtf.to_str().unwrap(),
-            "--outFileNamePrefix",
-            &prefix,
-        ])
-        .assert()
-        .success();
+    // Run once with the defaults and once with the extension on.
+    let run = |name: &str, extra: &[&str]| {
+        let output_dir = tmpdir.path().join(name);
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        cargo_bin_cmd!("rustar-aligner")
+            .args([
+                "--runMode",
+                "alignReads",
+                "--genomeDir",
+                genome_dir.to_str().unwrap(),
+                "--readFilesIn",
+                cdna_path.to_str().unwrap(),
+                bc_path.to_str().unwrap(),
+                "--soloType",
+                "CB_UMI_Simple",
+                "--soloCBwhitelist",
+                wl_path.to_str().unwrap(),
+                "--soloCBstart",
+                "1",
+                "--soloCBlen",
+                "16",
+                "--soloUMIstart",
+                "17",
+                "--soloUMIlen",
+                "12",
+                "--soloFeatures",
+                "Gene",
+                "GeneFull",
+                "--soloStrand",
+                "Forward",
+                "--sjdbGTFfile",
+                gtf.to_str().unwrap(),
+                "--outFileNamePrefix",
+                &prefix,
+            ])
+            .args(extra)
+            .assert()
+            .success();
+        output_dir
+    };
+    // A rustar-aligner extension: nothing beyond STARsolo's files by default.
+    let default_dir = run("out_split_default", &[]);
+    assert!(
+        !default_dir
+            .join("Solo.out/Gene/CellRanger.summary.csv")
+            .exists(),
+        "CellRanger.summary.csv must be opt-in"
+    );
+    let output_dir = run("out_split", &["--soloCellRangerSummary", "Yes"]);
 
     let gene = output_dir.join("Solo.out").join("Gene");
     let summary = fs::read_to_string(gene.join("Summary.csv")).unwrap();
@@ -1546,8 +1561,9 @@ fn test_starsolo_multimappers() {
     let um = fs::read_to_string(raw.join("UniqueAndMult-Uniform.mtx")).unwrap();
     assert!(um.contains("coordinate real general"), "um header:\n{um}");
     let rows: Vec<&str> = um.lines().filter(|l| !l.starts_with('%')).skip(1).collect();
-    assert!(rows.contains(&"1 1 0.50000"), "expected G1 0.5, got:\n{um}");
-    assert!(rows.contains(&"2 1 0.50000"), "expected G3 0.5, got:\n{um}");
+    // Written as STAR's `ostream << double` does.
+    assert!(rows.contains(&"1 1 0.5"), "expected G1 0.5, got:\n{um}");
+    assert!(rows.contains(&"2 1 0.5"), "expected G3 0.5, got:\n{um}");
     assert!(rows.contains(&"3 1 1"), "expected G2 1, got:\n{um}");
 }
 
@@ -3371,9 +3387,11 @@ fn test_solo_cb_sam_tag_out() {
     assert_eq!(by_cr["TTTTGGGGCCCCAAAA"]["sM"], "-1");
     // No UB (there is no UMI collapsing at all) and no count matrices.
     assert!(tags.iter().all(|t| !t.contains_key("UB")));
-    assert!(
-        !output_dir.join("Solo.out").exists(),
-        "CB_samTagOut must not write Solo.out"
+    // No count matrices: STAR writes only Barcodes.stats (`Solo::processAndOutput`).
+    assert_eq!(
+        solo_out_files(&output_dir),
+        ["Barcodes.stats"],
+        "CB_samTagOut writes only Barcodes.stats"
     );
 }
 
@@ -3467,5 +3485,27 @@ fn test_solo_paired_cdna_with_separate_barcode_read() {
         // sS is the whole barcode read, not either cDNA mate.
         assert_eq!(t.get("sS").map(|s| s.len()), Some(26));
     }
-    assert!(!output_dir.join("Solo.out").exists());
+    assert_eq!(solo_out_files(&output_dir), ["Barcodes.stats"]);
+}
+
+/// The files under `<prefix>Solo.out/`, relative and sorted.
+fn solo_out_files(output_dir: &Path) -> Vec<String> {
+    let root = output_dir.join("Solo.out");
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p.strip_prefix(&root).unwrap().display().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
 }

@@ -213,6 +213,39 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
+  `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
+  written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull
+  `Summary.csv` lacked the Q30 and "Unique+Multiple" lines, printed fixed
+  decimals, and computed several values its own way. They now come from
+  STAR's counters (`SoloReadBarcodeStats`, `SoloReadFeatureStats`) and its
+  `statsOutput`:
+  - each read counts once in `Barcodes.stats`, under its final `cbMatch`
+    code (a UMI rejection replaces the barcode's); a missing adapter or UMI
+    is counted as STAR counts it;
+  - the per-feature counts come from STAR's three stages: per read
+    (`record`), at counting (oneExact and 1MM_multi rejections) and at UMI
+    collapse; Velocyto keeps only the UMIs and cells, as `countVelocyto`
+    never sums the rest;
+  - "Reads With Valid Barcodes" subtracts both barcode and feature
+    rejections; "Reads Mapped to <feature>: Unique" is the counted reads;
+    means are integer, medians the element at `nCells/2`, the UMI median
+    from every barcode's UMIs;
+  - doubles, here and in `UniqueAndMult-*.mtx` (which printed `0.50000`
+    for STAR's `0.5`), are written as C++'s `ostream` does;
+  - `CB_samTagOut` writes `Barcodes.stats`.
+
+  Also: a barcode's exact-match count (used by oneExact and the 1MM_multi
+  posterior) now counts only reads whose UMI passed too, as STAR's
+  `addStats` does; it counted exact barcodes with a rejected UMI. Across 30
+  STARsolo configurations of the 10x v2 mouse chr19 fixture, 453 of 457
+  `Solo.out` files are byte-identical to STARsolo's; the other four are the
+  `CB_UMI_Complex` homopolymer UMIs of DIVERGENCE.md §1.6.
+
+  `CellRanger.summary.csv`, a rustar-aligner extension written whenever
+  Gene and GeneFull both ran, is now opt-in: `--soloCellRangerSummary Yes`
+  (DIVERGENCE.md §1.8). By default `Solo.out` holds only STARsolo's files.
+
 - **`--soloFeatures Velocyto` counts as STARsolo.** It used its own rule (a
   junction means spliced, an intronic block unspliced, anything else
   ambiguous), read by read. It now ports STAR's:

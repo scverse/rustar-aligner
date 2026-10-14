@@ -162,6 +162,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--quantGeneCoverage` | `No` | rustar-aligner extension. `Yes` writes per-gene exonic coverage to `GeneCoverage.out.bin` for DegNorm. See [DegNorm](/rustar-aligner/guides/degnorm/). |
 | `--degNormSampleId` | basename of `--outFileNamePrefix` | rustar-aligner extension. Sample name stored in `GeneCoverage.out.bin`. |
 | `--degNormCoverageFiles` | — | rustar-aligner extension. Two or more `GeneCoverage.out.bin` files: runs the DegNorm merge (no reads, no `--runMode`) and writes `DegNorm.out/`. Tuning: `--degNormIter`, `--degNormNmfIter`, `--degNormDownsampleRate`, `--degNormMinimaxCoverage`, `--degNormSkipBaselineSelection`, `--degNormBins`, `--degNormMinHighCoverage` (see the guide). |
+| `--soloCellRangerSummary` | `No` | rustar-aligner extension. `Yes` writes `Solo.out/<feature>/CellRanger.summary.csv` for `Gene` and `GeneFull` (both needed): the fractions of all reads that map uniquely in exonic, intronic or intergenic regions, or antisense to a gene, under CellRanger's metric names. STARsolo's `Summary.csv` is unchanged. |
 
 ## Two-pass mode
 

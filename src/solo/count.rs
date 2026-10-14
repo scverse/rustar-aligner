@@ -485,6 +485,13 @@ pub struct MatrixStats {
     pub cells: Vec<CellStat>,
     /// Distinct genes with a nonzero count anywhere in the raw matrix.
     pub genes_detected: u32,
+    /// Counted unique-gene reads, all barcodes (STAR's `nReadPerCBunique`
+    /// summed: `yessubWLmatch_UniqueFeature`).
+    pub unique_reads: u64,
+    /// Reads dropped for a 1MM barcode never seen exactly (`noMMtoWLwithoutExact`).
+    pub dropped_one_exact: u64,
+    /// 1MM_multi reads whose posterior picked no barcode (`noTooManyWLmatches`).
+    pub dropped_posterior: u64,
 }
 
 /// Stream the per-cell deduplicated counts into a plain temporary MatrixMarket
@@ -511,6 +518,8 @@ fn build_matrix_body(
     let mut nnz = 0usize;
     let mut cell_stats: Vec<CellStat> = Vec::new();
     let mut gene_seen = vec![false; n_features];
+    let (unique_reads, dropped_one_exact);
+    let mut dropped_posterior = 0u64;
 
     {
         let mut body = std::io::BufWriter::new(body_tmp.as_file_mut());
@@ -520,7 +529,9 @@ fn build_matrix_body(
         let exact_counts = ctx.whitelist.exact_count_snapshot();
         // `oneExact`: drop single-1MM corrections to a barcode never seen exactly.
         let one_exact = ctx.match_type.one_exact();
+        let before = records.len();
         records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
+        dropped_one_exact = (before - records.len()) as u64;
         let multi = std::mem::take(&mut *recorder.multi_records.lock().unwrap());
         for m in &multi {
             if let Some(cb) = resolve_multi_cb(&m.candidates, &exact_counts, pseudocount) {
@@ -530,9 +541,12 @@ fn build_matrix_body(
                     gene: m.gene,
                     read_index: m.read_index,
                 });
+            } else {
+                dropped_posterior += 1;
             }
         }
         drop(multi);
+        unique_reads = records.len() as u64;
 
         // Group each cell's reads together (parallel sort — the record vec is large).
         use rayon::prelude::*;
@@ -708,6 +722,9 @@ fn build_matrix_body(
             nnz,
             cells: cell_stats,
             genes_detected,
+            unique_reads,
+            dropped_one_exact,
+            dropped_posterior,
         },
     ))
 }
@@ -905,13 +922,10 @@ fn distribute_multi(
     out
 }
 
-/// Format a real matrix value compactly (integers without a decimal point).
+/// Format a real matrix value as STAR's `ostream << double` does
+/// (`SoloFeature_outputResults.cpp:175-213`): [`fmt_double`].
 fn fmt_real(v: f64) -> String {
-    if v.fract().abs() < 1e-9 {
-        format!("{}", v.round() as i64)
-    } else {
-        format!("{v:.5}")
-    }
+    fmt_double(v)
 }
 
 /// Write the `UniqueAndMult-<method>.mtx` matrices (real-valued) for the
@@ -1481,18 +1495,6 @@ fn emptydrops_called(
     Ok(called)
 }
 
-/// Median of an ascending-sorted slice (0 if empty).
-fn median_sorted(sorted: &[u64]) -> u64 {
-    let n = sorted.len();
-    if n == 0 {
-        0
-    } else if n % 2 == 1 {
-        sorted[n / 2]
-    } else {
-        u64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
-    }
-}
-
 /// Write the raw gene-count matrix + `Summary.csv` for a finished solo run.
 /// No-op (with a warning) when there is no explicit whitelist.
 pub fn write_gene_matrix(
@@ -1557,16 +1559,22 @@ pub fn write_gene_matrix(
     let total_reads = align_stats.total_reads.load(Ordering::Relaxed);
     let mapped_unique = align_stats.uniquely_mapped.load(Ordering::Relaxed);
     let mapped_multi = align_stats.multi_mapped.load(Ordering::Relaxed);
-    let valid_barcodes = ctx.stats.yes_exact.load(Ordering::Relaxed)
-        + ctx.stats.yes_one_mm.load(Ordering::Relaxed)
-        + ctx.stats.yes_mult_mm.load(Ordering::Relaxed);
-    let reads_of = |f: crate::solo::SoloFeature| -> u64 {
-        ctx.features
-            .iter()
-            .position(|&x| x == f)
-            .map_or(0, |i| ctx.feature_reads[i].load(Ordering::Relaxed))
+    let summary_run = SummaryContext {
+        n_reads: total_reads,
+        mapped_unique,
+        mapped_multi,
+        barcodes: &ctx.stats,
+        rna_q30: (
+            ctx.rna_q30[0].load(Ordering::Relaxed),
+            ctx.rna_q30[1].load(Ordering::Relaxed),
+        ),
+        multimappers: !MultiMethod::parse_list(&params.solo_multi_mappers).is_empty(),
     };
-    let have_funnel = ctx.features.contains(&crate::solo::SoloFeature::Gene)
+    write_barcode_stats(ctx, params)?;
+    // `--soloCellRangerSummary Yes` only (a rustar-aligner extension): the
+    // funnel needs both the Gene and GeneFull overlaps.
+    let have_funnel = params.solo_cellranger_summary()
+        && ctx.features.contains(&crate::solo::SoloFeature::Gene)
         && ctx.features.contains(&crate::solo::SoloFeature::GeneFull);
     let region = have_funnel.then(|| RegionFunnel {
         exonic: ctx.region_stats.exonic.load(Ordering::Relaxed),
@@ -1678,6 +1686,7 @@ pub fn write_gene_matrix(
         if *feature == crate::solo::SoloFeature::Gene {
             gene_called.clone_from(&called);
         }
+        let called_for_summary = called.clone();
         if let Some(cbs) = called
             && !cbs.is_empty()
         {
@@ -1714,9 +1723,13 @@ pub fn write_gene_matrix(
         }
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
+        let (mut multi_counted, mut multi_dropped) = (0u64, 0u64);
         if !multi_methods.is_empty() {
             let mut mg = recorder.multi_gene.lock().unwrap();
+            let before = mg.len();
             mg.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
+            multi_counted = mg.len() as u64;
+            multi_dropped = (before - mg.len()) as u64;
             build_multi_matrices(
                 &body,
                 &mg,
@@ -1735,16 +1748,46 @@ pub fn write_gene_matrix(
             );
         }
 
+        // Features.stats: the counting-stage figures (`inputRecords`,
+        // `collapseUMIall`) join the per-read ones from `process_read`.
+        {
+            use crate::solo::FeatureStats as F;
+            let st = &ctx.feature_stats[fi];
+            st.add(
+                F::NO_MM_TO_WL_WITHOUT_EXACT,
+                mstats.dropped_one_exact + multi_dropped,
+            );
+            st.add(F::NO_TOO_MANY_WL_MATCHES, mstats.dropped_posterior);
+            st.add(F::YES_WL_MATCH, mstats.unique_reads + multi_counted);
+            st.add(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE, mstats.unique_reads);
+            st.add(F::YES_UMIS, mstats.cells.iter().map(|c| c.n_umis).sum());
+            st.add(
+                F::YES_CELL_BARCODES,
+                mstats.cells.iter().filter(|c| c.n_genes > 0).count() as u64,
+            );
+            let values: Vec<u64> = (0..F::NAMES.len()).map(|i| st.get(i)).collect();
+            write_stats_file(&feature_dir.join("Features.stats"), &F::NAMES, &values)?;
+        }
+        // Summary.csv, with the called-cell block and UMIperCellSorted.txt
+        // unless `--soloCellFilter None`.
+        let cell_summary = match &called_for_summary {
+            Some(cbs) => Some(CellSummary::new(
+                &mstats.cells,
+                cbs,
+                genes_in_cells(&body, cbs)?,
+            )),
+            None => None,
+        };
         write_summary(
             &feature_dir.join("Summary.csv"),
             feature.dir_name(),
-            &mstats,
-            total_reads,
-            valid_barcodes,
-            mapped_unique,
-            mapped_multi,
-            reads_of(*feature),
+            &summary_run,
+            &ctx.feature_stats[fi],
+            cell_summary.as_ref(),
         )?;
+        if called_for_summary.is_some() {
+            write_umi_per_cell_sorted(&feature_dir.join("UMIperCellSorted.txt"), &mstats.cells)?;
+        }
         log::info!("STARsolo: wrote {}/Summary.csv", feature.dir_name());
         // CellRanger-style mapping funnel goes in a SEPARATE additional file so the
         // faithful Summary.csv is never altered (PR #90 review: keep this release a
@@ -1828,8 +1871,10 @@ pub fn write_gene_matrix(
         )?;
         let umi_len = params.solo_umi_len as usize;
         let mut sj_records = ctx.sj_records.lock().unwrap();
+        let before = sj_records.len();
         sj_records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
-        let nnz = build_sj_matrix(
+        let dropped = (before - sj_records.len()) as u64;
+        let sj_counts = build_sj_matrix(
             &sj_records,
             &row,
             method,
@@ -1843,8 +1888,20 @@ pub fn write_gene_matrix(
             "STARsolo: wrote SJ/raw matrix ({} junctions × {} barcodes, {} entries)",
             order.len(),
             sorted.len(),
-            nnz,
+            sj_counts.nnz,
         );
+        {
+            use crate::solo::FeatureStats as F;
+            let st = &ctx.sj_stats;
+            st.add(F::NO_MM_TO_WL_WITHOUT_EXACT, dropped);
+            st.add(F::YES_WL_MATCH, sj_counts.reads);
+            st.add(F::YES_SUB_WL_MATCH_EXACT, sj_counts.exact);
+            st.add(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE, sj_counts.reads);
+            st.add(F::YES_UMIS, sj_counts.umis);
+            st.add(F::YES_CELL_BARCODES, sj_counts.cells);
+            let sj_root = params.output_path(&format!("{solo_dir}SJ/"));
+            write_feature_stats_and_summary(&sj_root, "SJ", &summary_run, st)?;
+        }
     }
 
     // Velocyto feature: spliced / unspliced / ambiguous gene×cell matrices.
@@ -1887,6 +1944,23 @@ pub fn write_gene_matrix(
             "STARsolo: wrote Velocyto/raw matrices ({} entries each)",
             nnz[0]
         );
+        {
+            // `countVelocyto` adds only the UMIs and cells (`:144-145`).
+            use crate::solo::FeatureStats as F;
+            let st = &ctx.velocyto_stats;
+            st.add(
+                F::YES_UMIS,
+                counts
+                    .iter()
+                    .map(|&(_, _, c)| u64::from(c.iter().sum::<u32>()))
+                    .sum(),
+            );
+            let mut cells: Vec<u32> = counts.iter().map(|&(cb, _, _)| cb).collect();
+            cells.dedup();
+            st.add(F::YES_CELL_BARCODES, cells.len() as u64);
+            let velo_root = params.output_path(&format!("{solo_dir}Velocyto/"));
+            write_feature_stats_and_summary(&velo_root, "Velocyto", &summary_run, st)?;
+        }
 
         // Filtered: the Gene feature's called cells that Velocyto detected,
         // i.e. that a read with a Velocyto record matched
@@ -1949,7 +2023,7 @@ fn build_sj_matrix(
     n_junctions: usize,
     n_barcodes: usize,
     gzip: bool,
-) -> Result<usize, Error> {
+) -> Result<SjCounts, Error> {
     // Group by cell barcode (ascending column order).
     use rayon::prelude::*;
     let mut recs: Vec<&crate::solo::SjCountRecord> = records.iter().collect();
@@ -1961,6 +2035,7 @@ fn build_sj_matrix(
         .tempfile_in(dir)
         .map_err(|e| Error::io(e, dir))?;
     let mut nnz = 0usize;
+    let mut counts = SjCounts::default();
     {
         let mut body = std::io::BufWriter::new(body_tmp.as_file_mut());
         let mut i = 0;
@@ -1972,6 +2047,8 @@ fn build_sj_matrix(
                 let r = recs[i];
                 if let Some(&rw) = row.get(&(r.intron_start, r.intron_end)) {
                     *sj_umis.entry(rw).or_default().entry(r.umi).or_insert(0) += 1;
+                    counts.reads += 1;
+                    counts.exact += u64::from(r.exact);
                 }
                 i += 1;
             }
@@ -1981,7 +2058,11 @@ fn build_sj_matrix(
                 .filter(|&(_, c)| c > 0)
                 .collect();
             entries.sort_unstable_by_key(|&(rw, _)| rw);
+            if !entries.is_empty() {
+                counts.cells += 1;
+            }
             for (rw, c) in entries {
+                counts.umis += c;
                 writeln!(body, "{} {} {}", rw + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
                 nnz += 1;
             }
@@ -1999,7 +2080,35 @@ fn build_sj_matrix(
         std::io::copy(&mut r, w).map_err(|e| Error::io(e, matrix_path))?;
         Ok(())
     })?;
-    Ok(nnz)
+    counts.nnz = nnz;
+    Ok(counts)
+}
+
+/// What the SJ matrix counted: its entries, the records whose junction is a
+/// row (STAR's counted SJ "reads", one per junction), their UMIs, and the
+/// cells with any.
+#[derive(Debug, Default)]
+struct SjCounts {
+    nnz: usize,
+    reads: u64,
+    /// Of `reads`, those with an exactly matched barcode.
+    exact: u64,
+    umis: u64,
+    cells: u64,
+}
+
+/// `Features.stats` and `Summary.csv` of a feature without cell calling (SJ,
+/// Velocyto), with its counting-stage figures added.
+fn write_feature_stats_and_summary(
+    dir: &Path,
+    name: &str,
+    run: &SummaryContext<'_>,
+    stats: &crate::solo::FeatureStats,
+) -> Result<(), Error> {
+    use crate::solo::FeatureStats as F;
+    let values: Vec<u64> = (0..F::NAMES.len()).map(|i| stats.get(i)).collect();
+    write_stats_file(&dir.join("Features.stats"), &F::NAMES, &values)?;
+    write_summary(&dir.join("Summary.csv"), name, run, stats, None)
 }
 
 /// STAR's `countVelocyto` (`SoloFeature_countVelocyto.cpp`): the counts of
@@ -2130,128 +2239,261 @@ struct RegionFunnel {
     antisense: u64,
 }
 
-/// Write the STARsolo-faithful `Summary.csv` for one feature: the sequencing /
-/// genome-mapping rows plus per-cell UMI/gene statistics over the CR2.2-knee-called
-/// cells. The CellRanger-style exonic/intronic/intergenic/antisense funnel is a
-/// rustar extension kept in a SEPARATE file (see `write_cellranger_summary`) so
-/// this file is never altered relative to STARsolo's own Summary.csv.
-#[allow(clippy::too_many_arguments)]
-fn write_summary(
-    path: &Path,
-    feature_name: &str,
-    mstats: &MatrixStats,
-    total_reads: u64,
-    valid_barcodes: u64,
+/// A double as C++ `ostream << double` prints it with the default precision:
+/// six significant digits, `%g` style, trailing zeros dropped (`0.0357143`,
+/// `1`, `5e-05`), and `-inf` / `-nan` for STAR's divisions by zero.
+pub(crate) fn fmt_double(v: f64) -> String {
+    if v.is_nan() {
+        return "-nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let trim = |t: String| {
+        if t.contains('.') {
+            t.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            t
+        }
+    };
+    // The exponent after rounding to six significant digits decides the form.
+    let sci = format!("{v:.5e}");
+    let (mantissa, exp) = sci.split_once('e').expect("{:e} has an exponent");
+    let exp: i32 = exp.parse().expect("integer exponent");
+    if !(-4..6).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim(mantissa.to_string()), exp.abs())
+    } else {
+        trim(format!("{v:.*}", (5 - exp) as usize))
+    }
+}
+
+/// Write a STAR stats file: `Barcodes.stats` or `<feature>/Features.stats`
+/// (`statsOut`, one `setw(50)` name and `setw(15)` value per line).
+fn write_stats_file(path: &Path, names: &[&str], values: &[u64]) -> Result<(), Error> {
+    let text: String = names
+        .iter()
+        .zip(values)
+        .map(|(n, &v)| crate::solo::whitelist::stats_line(n, v))
+        .collect();
+    std::fs::write(path, text).map_err(|e| Error::io(e, path))
+}
+
+/// `Solo.out/Barcodes.stats` (`Solo::processAndOutput`).
+pub fn write_barcode_stats(
+    ctx: &SoloContext,
+    params: &crate::params::Parameters,
+) -> Result<(), Error> {
+    let solo_dir = params
+        .solo_out_file_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Solo.out/".to_string());
+    let dir = params.output_path(&solo_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| Error::io(e, &dir))?;
+    write_stats_file(
+        &dir.join("Barcodes.stats"),
+        &crate::solo::BarcodeStats::NAMES,
+        &ctx.stats.values(),
+    )
+}
+
+/// The called-cell figures of one gene feature (`SoloFeature_cellFiltering.cpp:75-125`).
+struct CellSummary {
+    n_cells: u64,
+    reads_in_cells: u64,
+    mean_reads: u64,
+    median_reads: u64,
+    umis_in_cells: u64,
+    mean_umis: u64,
+    median_umis: u64,
+    mean_genes: u64,
+    median_genes: u64,
+    genes_detected: u64,
+}
+
+impl CellSummary {
+    /// STAR's arithmetic: integer means, and the element at `nCells/2` for the
+    /// medians, of the called cells' reads and genes sorted ascending, and of
+    /// every barcode's UMIs sorted descending for the UMI median.
+    fn new(cells: &[CellStat], called: &[u32], genes_detected: u64) -> Self {
+        let called: std::collections::HashSet<u32> = called.iter().copied().collect();
+        let inc: Vec<&CellStat> = cells.iter().filter(|c| called.contains(&c.cb)).collect();
+        let n = inc.len() as u64;
+        if n == 0 {
+            return Self {
+                n_cells: 0,
+                reads_in_cells: 0,
+                mean_reads: 0,
+                median_reads: 0,
+                umis_in_cells: 0,
+                mean_umis: 0,
+                median_umis: 0,
+                mean_genes: 0,
+                median_genes: 0,
+                genes_detected: 0,
+            };
+        }
+        let mut reads: Vec<u64> = inc.iter().map(|c| c.n_reads).collect();
+        let mut genes: Vec<u64> = inc.iter().map(|c| u64::from(c.n_genes)).collect();
+        reads.sort_unstable();
+        genes.sort_unstable();
+        let mut umis_desc: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
+        umis_desc.sort_unstable_by(|a, b| b.cmp(a));
+        let reads_in_cells: u64 = reads.iter().sum();
+        let umis_in_cells: u64 = inc.iter().map(|c| c.n_umis).sum();
+        let mid = (n / 2) as usize;
+        Self {
+            n_cells: n,
+            reads_in_cells,
+            mean_reads: reads_in_cells / n,
+            median_reads: reads[mid],
+            umis_in_cells,
+            mean_umis: umis_in_cells / n,
+            median_umis: umis_desc.get(mid).copied().unwrap_or(0),
+            mean_genes: genes.iter().sum::<u64>() / n,
+            median_genes: genes[mid],
+            genes_detected,
+        }
+    }
+}
+
+/// Run-wide inputs of every feature's `Summary.csv`.
+struct SummaryContext<'a> {
+    n_reads: u64,
     mapped_unique: u64,
     mapped_multi: u64,
-    feature_mapped: u64,
+    barcodes: &'a crate::solo::BarcodeStats,
+    rna_q30: (u64, u64),
+    multimappers: bool,
+}
+
+/// `<feature>/Summary.csv`, STAR's `SoloFeature::statsOutput`
+/// (`SoloFeature_statsOutput.cpp:6-85`).
+fn write_summary(
+    path: &Path,
+    feature: &str,
+    run: &SummaryContext<'_>,
+    stats: &crate::solo::FeatureStats,
+    cells: Option<&CellSummary>,
 ) -> Result<(), Error> {
-    let frac = |num: u64| -> f64 {
-        if total_reads == 0 {
-            0.0
-        } else {
-            num as f64 / total_reads as f64
-        }
-    };
-
-    // Cell calling: CR2.2 knee on per-barcode UMI totals.
-    let mut umis_desc: Vec<u64> = mstats.cells.iter().map(|c| c.n_umis).collect();
-    umis_desc.sort_unstable_by(|a, b| b.cmp(a));
-    let thr = knee_cr22(&umis_desc, 3000, 0.99, 10.0);
-    let cells: Vec<&CellStat> = mstats.cells.iter().filter(|c| c.n_umis >= thr).collect();
-    let n_cells = cells.len();
-
-    // Totals across all barcodes (for sequencing saturation + fraction-in-cells).
-    let total_reads_counted: u64 = mstats.cells.iter().map(|c| c.n_reads).sum();
-    let total_umis_all: u64 = mstats.cells.iter().map(|c| c.n_umis).sum();
-    let saturation = if total_reads_counted > 0 {
-        1.0 - total_umis_all as f64 / total_reads_counted as f64
-    } else {
-        0.0
-    };
-
-    // Per-cell aggregates over called cells.
-    let reads_in_cells: u64 = cells.iter().map(|c| c.n_reads).sum();
-    let umis_in_cells: u64 = cells.iter().map(|c| c.n_umis).sum();
-    let mut reads_sorted: Vec<u64> = cells.iter().map(|c| c.n_reads).collect();
-    let mut umis_sorted: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
-    let mut genes_sorted: Vec<u64> = cells.iter().map(|c| c.n_genes as u64).collect();
-    reads_sorted.sort_unstable();
-    umis_sorted.sort_unstable();
-    genes_sorted.sort_unstable();
-    let mean = |sum: u64| -> u64 {
-        if n_cells == 0 {
-            0
-        } else {
-            sum / n_cells as u64
-        }
-    };
-
+    use crate::solo::FeatureStats as F;
     use std::fmt::Write as _;
+    let n = run.n_reads as f64;
+    let ratio = |num: u64, den: u64| num as f64 / den as f64;
     let mut out = String::new();
     let mut row = |k: &str, v: String| {
         let _ = writeln!(out, "{k},{v}");
     };
-    row("Number of Reads", total_reads.to_string());
+    row("Number of Reads", run.n_reads.to_string());
     row(
         "Reads With Valid Barcodes",
-        format!("{:.6}", frac(valid_barcodes)),
+        fmt_double(1.0 - (run.barcodes.invalid() + stats.invalid()) as f64 / n),
     );
-    row("Sequencing Saturation", format!("{saturation:.6}"));
+    row(
+        "Sequencing Saturation",
+        fmt_double(
+            1.0 - ratio(
+                stats.get(F::YES_UMIS),
+                stats.get(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE),
+            ),
+        ),
+    );
+    let (q30, total) = run.barcodes.q30();
+    row("Q30 Bases in CB+UMI", fmt_double(ratio(q30, total)));
+    row(
+        "Q30 Bases in RNA read",
+        fmt_double(ratio(run.rna_q30.0, run.rna_q30.1)),
+    );
     row(
         "Reads Mapped to Genome: Unique+Multiple",
-        format!("{:.6}", frac(mapped_unique + mapped_multi)),
+        fmt_double((run.mapped_unique + run.mapped_multi) as f64 / n),
     );
     row(
         "Reads Mapped to Genome: Unique",
-        format!("{:.6}", frac(mapped_unique)),
+        fmt_double(run.mapped_unique as f64 / n),
     );
     row(
-        &format!("Reads Mapped to {feature_name}: Unique {feature_name}"),
-        format!("{:.6}", frac(feature_mapped)),
-    );
-    row("Estimated Number of Cells", n_cells.to_string());
-    row(
-        &format!("Unique Reads in Cells Mapped to {feature_name}"),
-        reads_in_cells.to_string(),
-    );
-    row(
-        "Fraction of Unique Reads in Cells",
-        format!(
-            "{:.6}",
-            if total_reads_counted > 0 {
-                reads_in_cells as f64 / total_reads_counted as f64
-            } else {
-                0.0
-            }
-        ),
-    );
-    row("Mean Reads per Cell", mean(reads_in_cells).to_string());
-    row(
-        "Median Reads per Cell",
-        median_sorted(&reads_sorted).to_string(),
-    );
-    row("UMIs in Cells", umis_in_cells.to_string());
-    row("Mean UMI per Cell", mean(umis_in_cells).to_string());
-    row(
-        "Median UMI per Cell",
-        median_sorted(&umis_sorted).to_string(),
+        &format!("Reads Mapped to {feature}: Unique+Multiple {feature}"),
+        if run.multimappers {
+            fmt_double(stats.get(F::YES_WL_MATCH) as f64 / n)
+        } else {
+            "NoMulti".to_string()
+        },
     );
     row(
-        &format!("Mean {feature_name} per Cell"),
-        mean(genes_sorted.iter().sum()).to_string(),
+        &format!("Reads Mapped to {feature}: Unique {feature}"),
+        fmt_double(stats.get(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE) as f64 / n),
     );
-    row(
-        &format!("Median {feature_name} per Cell"),
-        median_sorted(&genes_sorted).to_string(),
-    );
-    row(
-        &format!("Total {feature_name} Detected"),
-        mstats.genes_detected.to_string(),
-    );
-
+    if let Some(c) = cells {
+        row("Estimated Number of Cells", c.n_cells.to_string());
+        row(
+            &format!("Unique Reads in Cells Mapped to {feature}"),
+            c.reads_in_cells.to_string(),
+        );
+        row(
+            "Fraction of Unique Reads in Cells",
+            fmt_double(ratio(
+                c.reads_in_cells,
+                stats.get(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE),
+            )),
+        );
+        row("Mean Reads per Cell", c.mean_reads.to_string());
+        row("Median Reads per Cell", c.median_reads.to_string());
+        row("UMIs in Cells", c.umis_in_cells.to_string());
+        row("Mean UMI per Cell", c.mean_umis.to_string());
+        row("Median UMI per Cell", c.median_umis.to_string());
+        row(
+            &format!("Mean {feature} per Cell"),
+            c.mean_genes.to_string(),
+        );
+        row(
+            &format!("Median {feature} per Cell"),
+            c.median_genes.to_string(),
+        );
+        row(
+            &format!("Total {feature} Detected"),
+            c.genes_detected.to_string(),
+        );
+    }
     std::fs::write(path, out).map_err(|e| Error::io(e, path))?;
     Ok(())
+}
+
+/// `<feature>/UMIperCellSorted.txt`: every barcode's UMIs, descending, up to
+/// the first zero (`SoloFeature_statsOutput.cpp:74-82`).
+fn write_umi_per_cell_sorted(path: &Path, cells: &[CellStat]) -> Result<(), Error> {
+    use std::fmt::Write as _;
+    let mut umis: Vec<u64> = cells.iter().map(|c| c.n_umis).filter(|&u| u > 0).collect();
+    umis.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = String::new();
+    for u in umis {
+        let _ = writeln!(out, "{u}");
+    }
+    std::fs::write(path, out).map_err(|e| Error::io(e, path))
+}
+
+/// Genes with a count in any of the `called` cells, read off the streamed
+/// matrix body (`gene+1 cb+1 count` lines).
+fn genes_in_cells(body: &tempfile::NamedTempFile, called: &[u32]) -> Result<u64, Error> {
+    use std::io::BufRead;
+    let called: std::collections::HashSet<u32> = called.iter().map(|&c| c + 1).collect();
+    let f = std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?;
+    let mut genes = std::collections::HashSet::new();
+    for line in std::io::BufReader::new(f).lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        let mut it = line.split_ascii_whitespace();
+        if let (Some(g), Some(cb), Some(c)) = (it.next(), it.next(), it.next())
+            && c != "0"
+            && cb.parse::<u32>().is_ok_and(|cb| called.contains(&cb))
+        {
+            genes.insert(g.to_string());
+        }
+    }
+    Ok(genes.len() as u64)
 }
 
 /// Write the CellRanger-style positional mapping funnel (exonic / intronic /
@@ -2578,6 +2820,74 @@ fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
 mod tests {
     use super::*;
 
+    /// `fmt_double` against what a C++ program printed for the same values
+    /// with the default `ostream` (g++, libstdc++).
+    #[test]
+    fn fmt_double_matches_cpp_ostream() {
+        let cases: [(f64, &str); 16] = [
+            (1.0 - 432.0 / 0.0, "-inf"),
+            (f64::NAN, "-nan"),
+            (0.05773, "0.05773"),
+            (0.035_714_285_7, "0.0357143"),
+            (1.0, "1"),
+            (0.0, "0"),
+            (0.00448, "0.00448"),
+            (448.0 / 448.0, "1"),
+            (0.000_012_345, "1.2345e-05"),
+            (1_234_567.0, "1.23457e+06"),
+            (123_456.0, "123456"),
+            (0.1591, "0.1591"),
+            (0.962_140_18, "0.96214"),
+            (5.0e-5, "5e-05"),
+            (0.923_089_123, "0.923089"),
+            (0.5, "0.5"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(fmt_double(v), want, "{v}");
+        }
+    }
+
+    /// STAR's `Barcodes.stats` bins: one per final `cbMatch` code, codes it
+    /// does not list counted as multiple matches (`addStats`' `default`).
+    #[test]
+    fn barcode_stats_follow_stars_switch() {
+        let st = crate::solo::BarcodeStats::new();
+        for code in [0, 0, 1, 3, -1, -2, -3, -11, -12, -23, -24, -99] {
+            st.record(code);
+        }
+        st.no_adapter();
+        st.no_umi();
+        assert_eq!(st.values(), [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2]);
+        // numInvalidBarcodes: the first nine.
+        assert_eq!(st.invalid(), 9);
+    }
+
+    /// STAR's called-cell figures: integer means; medians are the element at
+    /// `nCells/2` (no averaging), and the UMI median indexes every barcode's
+    /// UMIs sorted descending.
+    #[test]
+    fn cell_summary_uses_stars_arithmetic() {
+        let cell = |cb, n_reads, n_umis, n_genes| CellStat {
+            cb,
+            n_reads,
+            n_umis,
+            n_genes,
+        };
+        let cells = [
+            cell(0, 10, 9, 3),
+            cell(1, 4, 4, 2),
+            cell(2, 7, 5, 1),
+            cell(3, 2, 20, 1),
+        ];
+        // Called: 0, 1, 2 (cell 3 has the most UMIs but is not called).
+        let c = CellSummary::new(&cells, &[0, 1, 2], 4);
+        assert_eq!((c.n_cells, c.reads_in_cells, c.mean_reads), (3, 21, 7));
+        assert_eq!(c.median_reads, 7); // [4, 7, 10][1]
+        assert_eq!((c.umis_in_cells, c.mean_umis), (18, 6));
+        assert_eq!(c.median_umis, 9); // all barcodes descending [20, 9, 5, 4][1]
+        assert_eq!((c.mean_genes, c.median_genes, c.genes_detected), (2, 2, 4));
+    }
+
     /// STAR's `countVelocyto` collapse: a molecule keeps the transcripts all
     /// its reads share, their types OR-ed; an emptied molecule stays empty; a
     /// multi-gene molecule and a read with no readInfo are dropped.
@@ -2622,14 +2932,6 @@ mod tests {
     }
     use crate::io::fastq::encode_base;
     use crate::solo::whitelist::pack_barcode;
-
-    #[test]
-    fn median_sorted_odd_even_empty() {
-        assert_eq!(median_sorted(&[]), 0);
-        assert_eq!(median_sorted(&[5]), 5);
-        assert_eq!(median_sorted(&[1, 2, 3]), 2);
-        assert_eq!(median_sorted(&[10, 20, 30, 40]), 25); // midpoint(20,30)
-    }
 
     #[test]
     fn distribute_multi_methods() {

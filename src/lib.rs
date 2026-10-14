@@ -616,18 +616,15 @@ fn write_solo_output(
     sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
 ) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-    let s = &sctx.stats;
+    let barcode_counts = sctx.stats.values();
     info!(
-        "STARsolo barcode stats: exact={} 1MM={} multiMM={} noMatch={} N-in-CB={} multReject={} N-in-UMI={} UMIhomopolymer={}",
-        s.yes_exact.load(Ordering::Relaxed),
-        s.yes_one_mm.load(Ordering::Relaxed),
-        s.yes_mult_mm.load(Ordering::Relaxed),
-        s.no_match.load(Ordering::Relaxed),
-        s.n_in_cb.load(Ordering::Relaxed),
-        s.mult_rejected.load(Ordering::Relaxed),
-        s.n_in_umi.load(Ordering::Relaxed),
-        s.umi_homopolymer.load(Ordering::Relaxed),
+        "STARsolo barcode stats: {}",
+        crate::solo::BarcodeStats::NAMES
+            .iter()
+            .zip(barcode_counts)
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
         info!(
@@ -1048,6 +1045,9 @@ fn run_single_pass(
         // `CB_samTagOut` produces no Solo.out matrices at all (`Solo.cpp:13`).
         if params.solo_type != params::SoloType::CbSamTagOut {
             write_solo_output(sctx, params, &stats, &sj_stats, index)?;
+        } else {
+            // STAR still writes Barcodes.stats (`Solo::processAndOutput`).
+            crate::solo::write_barcode_stats(sctx, params)?;
         }
         if let Some(info) = sctx.tag_read_info() {
             let info = info.lock().unwrap();
@@ -2690,13 +2690,18 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             );
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
+                            solo.record_qualities(sread.barcode_q30, &[&clipped_qual]);
 
                             if clipped_seq.is_empty() {
                                 stats.record_alignment(0, max_multimaps);
                                 stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                                 // No alignment → barcode still counts toward stats (unmapped → no gene).
-                                let outcome =
-                                    solo.process_read(&[], 0, sread.barcode.as_ref(), &[]);
+                                let outcome = solo.process_read(
+                                    &[],
+                                    0,
+                                    sread.barcode.as_ref().map_err(|m| *m),
+                                    &[],
+                                );
                                 return Ok(SoloReadProduct {
                                     sam_records: buffer,
                                     per_feature: outcome.per_feature,
@@ -2743,18 +2748,23 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // counted.
                             let (mut outcome, cb_corrected) = if tag_out_only {
                                 let mut outcome = crate::solo::SoloReadOutcome::default();
-                                let corrected = sread.barcode.as_ref().map(|bc| {
-                                    let (tags, corrected) = solo.tag_barcode(bc);
-                                    outcome.barcode = Some(tags);
-                                    corrected
-                                });
+                                let corrected = sread
+                                    .barcode
+                                    .as_ref()
+                                    .map_err(|m| solo.record_barcode_miss(*m))
+                                    .ok()
+                                    .map(|bc| {
+                                        let (tags, corrected) = solo.tag_barcode(bc);
+                                        outcome.barcode = Some(tags);
+                                        corrected
+                                    });
                                 (outcome, corrected)
                             } else {
                                 (
                                     solo.process_read(
                                         &transcripts,
                                         transcripts.len(),
-                                        sread.barcode.as_ref(),
+                                        sread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
@@ -2829,7 +2839,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // the read, mapped or unmapped, as in STAR.
                             if !solo_tags.is_empty() {
                                 let values = crate::solo::SoloTagStrings::build(
-                                    sread.barcode.as_ref(),
+                                    sread.barcode.as_ref().ok(),
                                     sread.barcode_read.as_ref(),
                                     outcome.barcode,
                                     cb_corrected,
@@ -3094,6 +3104,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             );
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
+                            solo.record_qualities(pread.barcode_q30, &[&m1_qual, &m2_qual]);
 
                             let (results, _pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_paired_read(
@@ -3186,11 +3197,16 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             // counts nothing, exactly as in the single-end loop.
                             let (mut outcome, cb_corrected) = if tag_out_only {
                                 let mut outcome = crate::solo::SoloReadOutcome::default();
-                                let corrected = pread.barcode.as_ref().map(|bc| {
-                                    let (tags, corrected) = solo.tag_barcode(bc);
-                                    outcome.barcode = Some(tags);
-                                    corrected
-                                });
+                                let corrected = pread
+                                    .barcode
+                                    .as_ref()
+                                    .map_err(|m| solo.record_barcode_miss(*m))
+                                    .ok()
+                                    .map(|bc| {
+                                        let (tags, corrected) = solo.tag_barcode(bc);
+                                        outcome.barcode = Some(tags);
+                                        corrected
+                                    });
                                 (outcome, corrected)
                             } else if !both_mapped.is_empty() {
                                 let pairs: Vec<_> = both_mapped
@@ -3200,7 +3216,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 (
                                     solo.process_read_pe(
                                         &pairs,
-                                        pread.barcode.as_ref(),
+                                        pread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
@@ -3214,13 +3230,21 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     solo.process_read(
                                         std::slice::from_ref(mapped_transcript),
                                         1,
-                                        pread.barcode.as_ref(),
+                                        pread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
                                 )
                             } else {
-                                (solo.process_read(&[], 0, pread.barcode.as_ref(), &[]), None)
+                                (
+                                    solo.process_read(
+                                        &[],
+                                        0,
+                                        pread.barcode.as_ref().map_err(|m| *m),
+                                        &[],
+                                    ),
+                                    None,
+                                )
                             };
                             let read_index = (base + pair_idx as u64) as u32;
                             if track_read_info {
@@ -3337,7 +3361,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     .as_ref()
                                     .or_else(|| keep_barcode_read.then_some(&pread.mate1));
                                 let values = crate::solo::SoloTagStrings::build(
-                                    pread.barcode.as_ref(),
+                                    pread.barcode.as_ref().ok(),
                                     barcode_read,
                                     outcome.barcode,
                                     cb_corrected,

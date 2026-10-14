@@ -1188,6 +1188,14 @@ pub struct Parameters {
     #[arg(long = "outSAMsplicingStatus", default_value = "No")]
     pub out_sam_splicing_status: String,
 
+    /// rustar-aligner extension (not in STAR): `Yes` writes
+    /// `<feature>/CellRanger.summary.csv` for the `Gene` and `GeneFull`
+    /// features: the fractions of all reads that map uniquely in exonic,
+    /// intronic or intergenic regions, or antisense to a gene, under
+    /// CellRanger's metric names. Needs both features.
+    #[arg(long = "soloCellRangerSummary", default_value = "No")]
+    pub solo_cellranger_summary: String,
+
     // ── DegNorm (rustar-aligner extension, not STAR) ────────────────────
     /// `Yes` writes per-gene, per-exonic-base coverage to
     /// `GeneCoverage.out.bin` for the DegNorm merge (`--degNormCoverageFiles`).
@@ -2179,6 +2187,7 @@ impl Parameters {
             ("--quantGeneSplicing", &params.quant_gene_splicing),
             ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
             ("--quantGeneCoverage", &params.quant_gene_coverage),
+            ("--soloCellRangerSummary", &params.solo_cellranger_summary),
         ] {
             if !matches!(value.as_str(), "Yes" | "No") {
                 return Err(command.error(
@@ -2788,6 +2797,11 @@ impl Parameters {
 
     /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
     /// bulk spliced / unspliced / ambiguous gene counts) was requested.
+    /// `--soloCellRangerSummary Yes` (rustar-aligner extension).
+    pub fn solo_cellranger_summary(&self) -> bool {
+        self.solo_cellranger_summary == "Yes"
+    }
+
     pub fn quant_gene_splicing(&self) -> bool {
         self.quant_gene_splicing == "Yes"
     }
