@@ -6,7 +6,8 @@
 // STAR's clip gate. The TSV it prints is the committed expected output for
 // rustar-aligner's `cr4_tso_matches_star_opal_oracle` test.
 //
-// Regenerate (needs a STAR checkout for opal.cpp — MIT, (c) Alexander Dobin):
+// Regenerate (needs a STAR checkout for its vendored Opal, source/opal/ —
+// MIT, (c) 2014 Martin Sosic; not copied here, only linked at build time):
 //
 //   OPAL=/path/to/STAR/source/opal
 //   g++ -O2 -std=c++11 -I"$OPAL" tests/data/cr4_opal_oracle.cpp "$OPAL/opal.cpp" \
