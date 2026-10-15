@@ -121,6 +121,17 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The release ships THIRD_PARTY_LICENSES.md; generating it here catches a
+  # dependency with an unaccepted licence, or a changed licence file, on the PR
+  # that introduces it rather than on release day.
+  licenses:
+    name: Third-party licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # ratchet:dtolnay/rust-toolchain@stable
+      - run: scripts/third-party-licenses.sh
+
   # Check that all tests defined above pass. This makes it easy to set a single "required" test in branch
   # protection instead of having to update it frequently. See https://github.com/re-actors/alls-green#why.
   check:
@@ -132,6 +143,7 @@ jobs:
       - clippy
       - msrv
       - audit
+      - licenses
     runs-on: ubuntu-latest
     steps:
         - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # ratchet:re-actors/alls-green@v1.3.0
