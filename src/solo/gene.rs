@@ -345,12 +345,14 @@ pub fn gene_full_sets(
 }
 
 /// The Velocyto annotation of one uniquely mapped alignment (STAR's
-/// `trVelocytoType`, `Transcriptome_classifyAlign.cpp:229-254`): for every
-/// transcript that contains it on a strand `--soloStrand` keeps, the
-/// transcript (an index into `model.transcripts`) and STAR's `reAnn1` type
-/// bits from `alignToTranscriptMinOverlap` with velocyto's 5-base flank.
-/// Transcripts the alignment's junctions contradict are left out. Sorted by
-/// transcript, as `SoloReadFeature_record.cpp:164-165` sorts it.
+/// `trVelocytoType`, `Transcriptome_classifyAlign.cpp:227-258`; strand
+/// filter `:207-209`): for every transcript that contains it on a strand
+/// `--soloStrand` keeps, the transcript (an index into `model.transcripts`)
+/// and STAR's `reAnn1` type bits from `alignToTranscriptMinOverlap` with
+/// velocyto's 5-base flank.
+/// A spliced alignment leaves out a transcript whose intron one of its blocks
+/// runs into (its junctions are not compared with the transcript's). Sorted
+/// by transcript, as `SoloReadFeature_record.cpp:164-165` sorts it.
 ///
 /// The alignment's blocks are its exons merged across indels, mate by mate,
 /// in transcript order (STAR expands a block over `canonSJ` -1/-2, not the
@@ -969,6 +971,64 @@ mod tests {
             velocyto_transcript_types(&far, &model, SoloStrand::Unstranded),
             []
         );
+    }
+
+    /// A spliced alignment leaves out a transcript only if one of its blocks
+    /// runs into that transcript's intron: STAR does not ask its junctions to
+    /// be the transcript's (`Transcriptome_classifyAlign.cpp:103-158`). A mate
+    /// pair's gap is not a junction.
+    #[test]
+    fn velocyto_types_drop_transcripts_whose_intron_a_spliced_block_enters() {
+        use crate::quant::splice_status::AlignVsTranscript as A;
+        // G3 (+): T1 spliced, exons [500,600) and [800,900); T2 retains the
+        // intron, [500,900).
+        let g = genome();
+        let mut retained = gtf_exon(501, 900, '+', "G3");
+        retained
+            .attributes
+            .insert("transcript_id".to_string(), "G3_t2".to_string());
+        let exons = vec![
+            gtf_exon(501, 600, '+', "G3"),
+            gtf_exon(801, 900, '+', "G3"),
+            retained,
+        ];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let model = model_of(&exons, &ann);
+        let bits = |t: &Transcript| {
+            let mut b: Vec<u8> = velocyto_transcript_types(t, &model, SoloStrand::Forward)
+                .into_iter()
+                .map(|(_, ty)| ty)
+                .collect();
+            b.sort_unstable();
+            b
+        };
+        let exon = A::Concordant.type_bits();
+        let intron = A::Intron.type_bits();
+        // T1's junction, and one neither transcript has: both blocks are
+        // exonic in both transcripts, so both are kept.
+        assert_eq!(bits(&spliced_read((550, 600), (800, 850))), [exon, exon]);
+        assert_eq!(bits(&spliced_read((550, 580), (820, 850))), [exon, exon]);
+        // A spliced read whose first block runs into T1's intron: T1 is out.
+        assert_eq!(bits(&spliced_read((550, 620), (820, 850))), [exon]);
+        // Unspliced, the same block spans T1's exon and intron.
+        let span = A::ExonIntronSpan.type_bits();
+        let mut both = vec![exon, span];
+        both.sort_unstable();
+        assert_eq!(bits(&read_at(550, 620, false)), both);
+        // In the intron: intronic in T1, exonic in T2.
+        let mut both = vec![exon, intron];
+        both.sort_unstable();
+        assert_eq!(bits(&read_at(650, 700, false)), both);
+        // A pair with a mate in each exon: the mates' gap is no junction, so
+        // T2 keeps it, and both transcripts hold it.
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        let mate = |start: u64, end: u64, is_reverse: bool| {
+            let mut t = read_at(start, end, is_reverse);
+            t.cigar = vec![Op::new(Kind::Match, (end - start) as usize)];
+            t
+        };
+        let pair = crate::solo::pair_alignment(&mate(550, 590, false), &mate(810, 850, true));
+        assert_eq!(bits(&pair), [exon, exon]);
     }
 
     /// `GeneFull` gene sets: per alignment, the sense genes whose body it

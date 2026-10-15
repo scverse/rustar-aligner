@@ -2795,13 +2795,13 @@ impl Parameters {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
     }
 
-    /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
-    /// bulk spliced / unspliced / ambiguous gene counts) was requested.
     /// `--soloCellRangerSummary Yes` (rustar-aligner extension).
     pub fn solo_cellranger_summary(&self) -> bool {
         self.solo_cellranger_summary == "Yes"
     }
 
+    /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
+    /// bulk spliced / unspliced / ambiguous gene counts) was requested.
     pub fn quant_gene_splicing(&self) -> bool {
         self.quant_gene_splicing == "Yes"
     }
@@ -4240,6 +4240,46 @@ mod tests {
         let mut with_ub = tag_out.to_vec();
         with_ub.extend_from_slice(&["--outSAMattributes", "NH", "UB"]);
         assert!(try_parse(&with_ub).is_err());
+    }
+
+    /// Velocyto needs the Gene feature's readInfo, and STAR refuses it with
+    /// SmartSeq (`ParametersSolo.cpp:238-241`).
+    #[test]
+    fn velocyto_refusals() {
+        let base = |features: &[&'static str], solo_type: &'static str| {
+            let mut v = vec![
+                "--readFilesIn",
+                "cdna.fq",
+                "bc.fq",
+                "--soloType",
+                solo_type,
+                "--soloCBwhitelist",
+                "wl.txt",
+                "--soloFeatures",
+            ];
+            v.extend_from_slice(features);
+            v
+        };
+        assert!(try_parse(&base(&["Gene", "Velocyto"], "CB_UMI_Simple")).is_ok());
+        let err = try_parse(&base(&["GeneFull", "Velocyto"], "CB_UMI_Simple")).unwrap_err();
+        assert!(err.to_string().contains("requires Gene"), "{err}");
+        let mut smart_seq = base(&["Gene", "Velocyto"], "SmartSeq");
+        smart_seq.extend_from_slice(&["--readFilesManifest", "manifest.tsv"]);
+        let err = try_parse(&smart_seq).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("presently not compatible with --soloType SmartSeq"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn solo_cellranger_summary_is_yes_or_no() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert!(!p.solo_cellranger_summary());
+        let p = try_parse(&["--readFilesIn", "r.fq", "--soloCellRangerSummary", "Yes"]).unwrap();
+        assert!(p.solo_cellranger_summary());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--soloCellRangerSummary", "yes"]).is_err());
     }
 
     #[test]

@@ -260,6 +260,22 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
+### 3.4 `CB_UMI_Complex`: the `Barcodes.stats` bin of two kinds of rejected read
+
+**What STAR does.** Under `CB_UMI_Complex`, STAR checks the UMI first and then matches each cell-barcode segment to its own whitelist, in order (`SoloReadBarcode_getCBandUMI.cpp:356-420`). The first failure sets `cbMatch`, which picks the read's `Barcodes.stats` bin. Two consequences:
+- a read with one mismatch in each of two segments is `cbMatch` -12, counted as `noTooManyMM`;
+- a read with a rejected UMI keeps the UMI's code (`noNinUMI` or `noUMIhomopolymer`) even when a segment cannot be extracted.
+
+**What rustar-aligner does.** It matches the concatenated segments against the product of the segment whitelists. A read with mismatches in two segments is two mismatches from every entry, so it is counted as `noNoWLmatch`. A barcode read too short for a segment is counted as `noNoCB` before its UMI is checked.
+
+**Why.** Not chosen: per-segment matching is not ported yet. The product whitelist gives the same match as STAR for a read with at most one mismatched segment, which is every read STAR counts.
+
+**Impact.** Only the bins of reads that both tools reject: the count matrices, `Features.stats` and `Summary.csv` are unchanged. On the 10x v2 mouse chr19 fixture run as `CB_UMI_Complex`, `Barcodes.stats` differs from STAR's only by the reads of §1.6.
+
+**Source.** `src/solo/mod.rs` (`SoloBarcodeLayout::extract`), `src/solo/whitelist.rs` (`CbWhitelist::load_complex`). STAR: `SoloReadBarcode_getCBandUMI.cpp:356-420`.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.

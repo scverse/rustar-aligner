@@ -233,7 +233,9 @@ Sections commonly used: Features, Bug fixes, Other changes.
     from every barcode's UMIs;
   - doubles, here and in `UniqueAndMult-*.mtx` (which printed `0.50000`
     for STAR's `0.5`), are written as C++'s `ostream` does;
-  - `CB_samTagOut` writes `Barcodes.stats`.
+  - `CB_samTagOut` writes `Barcodes.stats`, and so does a run with
+    `--soloCBwhitelist None` (all zeros, as STAR's: it bins reads only
+    against a whitelist). That mode still writes no matrices.
 
   Also: a barcode's exact-match count (used by oneExact and the 1MM_multi
   posterior) now counts only reads whose UMI passed too, as STAR's
@@ -242,9 +244,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
   `Solo.out` files are byte-identical to STARsolo's; the other four are the
   `CB_UMI_Complex` homopolymer UMIs of DIVERGENCE.md §1.6.
 
+  STAR's per-line SJ counts are ported too: a junction that is not a matrix
+  row counts nowhere, a read with no junction is `noNoFeature` (a
+  1MM_multi barcode with junctions was too), and 1MM_multi barcodes on SJ
+  records, which were dropped, are resolved by the posterior as for Gene. `CB_UMI_Complex` reads rejected
+  twice can land in a different `Barcodes.stats` bin from STAR's
+  (DIVERGENCE.md §3.4).
+
   `CellRanger.summary.csv`, a rustar-aligner extension written whenever
   Gene and GeneFull both ran, is now opt-in: `--soloCellRangerSummary Yes`
   (DIVERGENCE.md §1.8). By default `Solo.out` holds only STARsolo's files.
+
+- **`--soloCellFilter TopCells N` calls cells as STARsolo.** It took the N
+  barcodes with the most UMIs. STAR keeps every barcode with at least the
+  UMIs of the barcode at index N of the descending list, the (N+1)th, so
+  ties are kept (`SoloFeature_cellFiltering.cpp:46-59`). With `TopCells 100`
+  on the 10x v2 mouse chr19 fixture STAR calls 106 cells and rustar-aligner
+  called 100; the filtered matrices are now identical.
 
 - **`--soloFeatures Velocyto` counts as STARsolo.** It used its own rule (a
   junction means spliced, an intronic block unspliced, anything else
@@ -259,7 +275,8 @@ Sections commonly used: Features, Bug fixes, Other changes.
     (`SoloFeature_countVelocyto.cpp`);
   - all three matrices hold the same (cell, gene) rows, zeros included;
   - `Velocyto/filtered/` is written, for the Gene feature's called cells that
-    Velocyto detected (`SoloFeature_cellFiltering.cpp:16-30`).
+    Velocyto detected (`SoloFeature_cellFiltering.cpp:16-30`), unless there
+    are none (`:106-108`).
 
   On the 10x v2 mouse chr19 fixture the raw and filtered matrices are now
   byte-identical to STARsolo's (spliced/unspliced/ambiguous UMIs 369/57/32,

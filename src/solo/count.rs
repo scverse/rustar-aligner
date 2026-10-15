@@ -483,8 +483,6 @@ pub struct MatrixStats {
     pub nnz: usize,
     /// One entry per barcode that received ≥1 UMI (the raw, unfiltered set).
     pub cells: Vec<CellStat>,
-    /// Distinct genes with a nonzero count anywhere in the raw matrix.
-    pub genes_detected: u32,
     /// Counted unique-gene reads, all barcodes (STAR's `nReadPerCBunique`
     /// summed: `yessubWLmatch_UniqueFeature`).
     pub unique_reads: u64,
@@ -507,7 +505,6 @@ fn build_matrix_body(
     umi_len: usize,
     pseudocount: f64,
     dir: &Path,
-    n_features: usize,
     read_info_slot: Option<&std::sync::Mutex<Vec<crate::solo::ReadInfo>>>,
 ) -> Result<(tempfile::NamedTempFile, MatrixStats), Error> {
     let record_read_info = read_info_slot.is_some();
@@ -517,7 +514,6 @@ fn build_matrix_body(
         .map_err(|e| Error::io(e, dir))?;
     let mut nnz = 0usize;
     let mut cell_stats: Vec<CellStat> = Vec::new();
-    let mut gene_seen = vec![false; n_features];
     let (unique_reads, dropped_one_exact);
     let mut dropped_posterior = 0u64;
 
@@ -697,9 +693,6 @@ fn build_matrix_body(
         for co in cell_outs {
             body.write_all(&co.body).map_err(|e| Error::io(e, dir))?;
             nnz += co.genes.len();
-            for g in co.genes {
-                gene_seen[g as usize] = true;
-            }
             if let Some(s) = co.stat {
                 cell_stats.push(s);
             }
@@ -715,13 +708,11 @@ fn build_matrix_body(
         body.flush().map_err(|e| Error::io(e, dir))?;
     }
 
-    let genes_detected = gene_seen.iter().filter(|&&s| s).count() as u32;
     Ok((
         body_tmp,
         MatrixStats {
             nnz,
             cells: cell_stats,
-            genes_detected,
             unique_reads,
             dropped_one_exact,
             dropped_posterior,
@@ -923,7 +914,7 @@ fn distribute_multi(
 }
 
 /// Format a real matrix value as STAR's `ostream << double` does
-/// (`SoloFeature_outputResults.cpp:175-213`): [`fmt_double`].
+/// (`SoloFeature_outputResults.cpp:181-223`): [`fmt_double`].
 fn fmt_real(v: f64) -> String {
     fmt_double(v)
 }
@@ -1225,11 +1216,23 @@ fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
     let arg = |i: usize, d: f64| filter.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
     let mut cbs: Vec<u32> = match method {
         "None" => return None,
+        // STAR's threshold, not a cut at N (`SoloFeature_cellFiltering.cpp:46-54`):
+        // the UMIs of the barcode at index N of the descending list (the
+        // N+1th), at least 1, and every barcode with at least that many, ties
+        // included.
         "TopCells" => {
             let n = arg(1, 0.0) as usize;
-            let mut idx: Vec<&CellStat> = cells.iter().collect();
-            idx.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
-            idx.into_iter().take(n).map(|c| c.cb).collect()
+            let mut umis: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
+            umis.sort_unstable_by(|a, b| b.cmp(a));
+            let Some(&at_n) = umis.get(n.min(umis.len().saturating_sub(1))) else {
+                return Some(Vec::new());
+            };
+            let min = at_n.max(1);
+            cells
+                .iter()
+                .filter(|c| c.n_umis >= min)
+                .map(|c| c.cb)
+                .collect()
         }
         // EmptyDrops_CR is handled by `emptydrops_called`; the knee here is the
         // fallback / guaranteed-cell base.
@@ -1496,7 +1499,7 @@ fn emptydrops_called(
 }
 
 /// Write the raw gene-count matrix + `Summary.csv` for a finished solo run.
-/// No-op (with a warning) when there is no explicit whitelist.
+/// Only `Barcodes.stats` (with a warning) when there is no explicit whitelist.
 pub fn write_gene_matrix(
     ctx: &SoloContext,
     params: &crate::params::Parameters,
@@ -1504,6 +1507,8 @@ pub fn write_gene_matrix(
     sj_stats: Option<&crate::junction::SpliceJunctionStats>,
     genome: &crate::genome::Genome,
 ) -> Result<(), Error> {
+    // STAR writes it before any feature (`Solo.cpp:53-64`).
+    write_barcode_stats(ctx, params)?;
     let CbWhitelist::List { sorted, .. } = &ctx.whitelist else {
         log::warn!(
             "STARsolo: --soloCBwhitelist None matrix output is not yet supported (Phase 14.4); skipping matrix"
@@ -1570,18 +1575,20 @@ pub fn write_gene_matrix(
         ),
         multimappers: !MultiMethod::parse_list(&params.solo_multi_mappers).is_empty(),
     };
-    write_barcode_stats(ctx, params)?;
     // `--soloCellRangerSummary Yes` only (a rustar-aligner extension): the
     // funnel needs both the Gene and GeneFull overlaps.
-    let have_funnel = params.solo_cellranger_summary()
-        && ctx.features.contains(&crate::solo::SoloFeature::Gene)
+    let have_funnel = ctx.features.contains(&crate::solo::SoloFeature::Gene)
         && ctx.features.contains(&crate::solo::SoloFeature::GeneFull);
-    let region = have_funnel.then(|| RegionFunnel {
-        exonic: ctx.region_stats.exonic.load(Ordering::Relaxed),
-        intronic: ctx.region_stats.intronic.load(Ordering::Relaxed),
-        intergenic: ctx.region_stats.intergenic.load(Ordering::Relaxed),
-        antisense: ctx.region_stats.antisense.load(Ordering::Relaxed),
-    });
+    let region = ctx
+        .region_stats
+        .as_ref()
+        .filter(|_| have_funnel)
+        .map(|r| RegionFunnel {
+            exonic: r.exonic.load(Ordering::Relaxed),
+            intronic: r.intronic.load(Ordering::Relaxed),
+            intergenic: r.intergenic.load(Ordering::Relaxed),
+            antisense: r.antisense.load(Ordering::Relaxed),
+        });
 
     let gzip = matches!(params.solo_out_gzip.as_str(), "yes" | "Yes" | "true");
     let n_genes = ctx.gene_ann.gene_ids.len();
@@ -1610,9 +1617,8 @@ pub fn write_gene_matrix(
             umi_len,
             pseudocount,
             &raw_dir,
-            n_genes,
-            // STAR fills readInfo from one feature only: the first on the
-            // --soloFeatures list (`ParametersSolo.cpp:423-434`).
+            // The feature's readInfo, if it keeps one: the first feature for
+            // the CB/UB tags, Gene for Velocyto (`ParametersSolo.cpp:418-436`).
             ctx.read_info[fi].as_ref(),
         )?;
         write_features(
@@ -1870,10 +1876,33 @@ pub fn write_gene_matrix(
             gzip,
         )?;
         let umi_len = params.solo_umi_len as usize;
-        let mut sj_records = ctx.sj_records.lock().unwrap();
-        let before = sj_records.len();
-        sj_records.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
-        let dropped = (before - sj_records.len()) as u64;
+        // STAR's per-line filters (`SoloReadFeature_inputRecords.cpp:23-104`),
+        // counted only for a junction with a row: STAR skips the others first.
+        let has_row = |start: u64, end: u64| row.contains_key(&(start, end));
+        let crate::solo::SjRecords {
+            unique: mut sj_records,
+            multi,
+        } = std::mem::take(&mut *ctx.sj_records.lock().unwrap());
+        let mut dropped_one_exact = 0u64;
+        sj_records.retain(|r| {
+            let keep = cb_passes_one_exact(one_exact, &exact_counts, r.cb);
+            dropped_one_exact += u64::from(!keep && has_row(r.intron_start, r.intron_end));
+            keep
+        });
+        let mut dropped_posterior = 0u64;
+        for m in multi {
+            if let Some(cb) = resolve_multi_cb(&m.candidates, &exact_counts, pseudocount) {
+                sj_records.push(crate::solo::SjCountRecord {
+                    cb,
+                    umi: m.umi,
+                    intron_start: m.intron_start,
+                    intron_end: m.intron_end,
+                    exact: false,
+                });
+            } else if has_row(m.intron_start, m.intron_end) {
+                dropped_posterior += 1;
+            }
+        }
         let sj_counts = build_sj_matrix(
             &sj_records,
             &row,
@@ -1893,7 +1922,8 @@ pub fn write_gene_matrix(
         {
             use crate::solo::FeatureStats as F;
             let st = &ctx.sj_stats;
-            st.add(F::NO_MM_TO_WL_WITHOUT_EXACT, dropped);
+            st.add(F::NO_MM_TO_WL_WITHOUT_EXACT, dropped_one_exact);
+            st.add(F::NO_TOO_MANY_WL_MATCHES, dropped_posterior);
             st.add(F::YES_WL_MATCH, sj_counts.reads);
             st.add(F::YES_SUB_WL_MATCH_EXACT, sj_counts.exact);
             st.add(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE, sj_counts.reads);
@@ -1968,14 +1998,17 @@ pub fn write_gene_matrix(
         if let Some(gene_cells) = &gene_called
             && !gene_cells.is_empty()
         {
-            let detected: std::collections::HashSet<u32> =
-                records.iter().flat_map(|r| r.cbs.iter().copied()).collect();
             let mut cells: Vec<u32> = gene_cells
                 .iter()
                 .copied()
-                .filter(|cb| detected.contains(cb))
+                .filter(|&cb| records.detected(cb))
                 .collect();
             cells.sort_unstable();
+            // No detected cell: STAR writes no filtered matrices
+            // (`SoloFeature_cellFiltering.cpp:106-108`).
+            if cells.is_empty() {
+                return Ok(());
+            }
             let column: HashMap<u32, u32> = cells
                 .iter()
                 .enumerate()
@@ -2124,7 +2157,7 @@ fn write_feature_stats_and_summary(
 ///   others are spliced, unspliced or ambiguous by STAR's model flags
 ///   (`:95-136`, [`velocyto_status`]).
 fn count_velocyto(
-    records: &[crate::solo::VelocytoRecord],
+    records: &crate::solo::VelocytoRecords,
     read_info: &[crate::solo::ReadInfo],
     model: &crate::solo::GeneModel,
 ) -> Vec<(u32, u32, [u32; 3])> {
@@ -2132,8 +2165,8 @@ fn count_velocyto(
 
     // cell -> UMI -> the molecule's transcripts so far.
     let mut molecules: HashMap<u32, HashMap<u64, Vec<(u32, u8)>>> = HashMap::default();
-    for r in records {
-        let Some(info) = read_info.get(r.read_index as usize) else {
+    for (read_index, types) in records.iter() {
+        let Some(info) = read_info.get(read_index as usize) else {
             continue;
         };
         if info.cb == u32::MAX || info.umi == u64::MAX {
@@ -2142,22 +2175,20 @@ fn count_velocyto(
         let umis = molecules.entry(info.cb).or_default();
         match umis.get_mut(&info.umi) {
             None => {
-                umis.insert(info.umi, r.types.clone());
+                umis.insert(info.umi, types.collect());
             }
             Some(kept) if kept.is_empty() => {}
             Some(kept) => {
                 // Both lists are sorted by transcript (`:66-76`).
+                let mut types = types.peekable();
                 let mut both = Vec::with_capacity(kept.len());
-                let mut inew = 0;
                 for &(tr, ty) in kept.iter() {
-                    while inew < r.types.len() && tr > r.types[inew].0 {
-                        inew += 1;
-                    }
-                    if inew == r.types.len() {
+                    while types.next_if(|&(new, _)| tr > new).is_some() {}
+                    let Some(&(new, new_ty)) = types.peek() else {
                         break;
-                    }
-                    if tr == r.types[inew].0 {
-                        both.push((tr, ty | r.types[inew].1));
+                    };
+                    if tr == new {
+                        both.push((tr, ty | new_ty));
                     }
                 }
                 *kept = both;
@@ -2894,7 +2925,7 @@ mod tests {
     #[test]
     fn count_velocyto_collapses_molecules_as_star() {
         use crate::quant::splice_status::AlignVsTranscript as A;
-        use crate::solo::{GeneModel, ReadInfo, VelocytoRecord};
+        use crate::solo::{GeneModel, ReadInfo, VelocytoRecord, VelocytoRecords};
         let exon = A::Concordant.type_bits();
         let intron = A::Intron.type_bits();
         // Transcripts 0 and 1 belong to gene 0, transcript 2 to gene 1.
@@ -2902,7 +2933,11 @@ mod tests {
         let rec = |read_index: u32, types: &[(u32, u8)]| VelocytoRecord {
             read_index,
             types: types.to_vec(),
-            cbs: vec![5],
+            cbs: if read_index == 7 {
+                vec![7, 70]
+            } else {
+                vec![5]
+            },
         };
         let info = |cb: u32, umi: u64| ReadInfo { cb, umi };
         let read_info = vec![
@@ -2915,7 +2950,8 @@ mod tests {
             ReadInfo::default(), // 6: no cell or UMI
             info(7, 1),          // 7: another cell, exonic in both isoforms
         ];
-        let records = vec![
+        let mut records = VelocytoRecords::default();
+        for r in [
             rec(0, &[(0, exon), (1, intron)]),
             rec(1, &[(0, intron)]),
             rec(2, &[(0, exon)]),
@@ -2924,11 +2960,17 @@ mod tests {
             rec(5, &[(0, exon), (2, exon)]),
             rec(6, &[(0, exon)]),
             rec(7, &[(0, exon), (1, exon)]),
-        ];
+        ] {
+            records.push(&r);
+        }
         let counts = count_velocyto(&records, &read_info, &model);
         // A: transcript 0, exon | intron, with no span → mixed → unspliced.
         // B dropped (empty), C dropped (two genes), read 6 skipped.
         assert_eq!(counts, vec![(5, 0, [0, 1, 0]), (7, 0, [1, 0, 0])]);
+        // Detected cells: every barcode a record matched, a 1MM_multi
+        // read's candidates included (70 is in no readInfo).
+        let detected: Vec<u32> = (0..128).filter(|&cb| records.detected(cb)).collect();
+        assert_eq!(detected, vec![5, 7, 70]);
     }
     use crate::io::fastq::encode_base;
     use crate::solo::whitelist::pack_barcode;
@@ -2972,10 +3014,23 @@ mod tests {
         let cells = vec![mk(5, 1000), mk(2, 900), mk(8, 50), mk(1, 40)];
         let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
 
-        // TopCells 2: the two highest-UMI cells (cb 5, 2), returned cb-ascending.
+        // TopCells 2: every cell with at least the third barcode's 50 UMIs
+        // (cb 5, 2, 8), returned cb-ascending.
         assert_eq!(
             called_cells(&cells, &s(&["TopCells", "2"])).unwrap(),
-            vec![2, 5]
+            vec![2, 5, 8]
+        );
+        // TopCells is STAR's threshold, not a cut: the UMIs of the N+1th
+        // barcode, ties included (`SoloFeature_cellFiltering.cpp:46-54`).
+        let tied = vec![mk(5, 1000), mk(2, 900), mk(8, 900), mk(1, 40)];
+        assert_eq!(
+            called_cells(&tied, &s(&["TopCells", "1"])).unwrap(),
+            vec![2, 5, 8]
+        );
+        // N past the end: the last barcode's UMIs, i.e. every cell.
+        assert_eq!(
+            called_cells(&cells, &s(&["TopCells", "10"])).unwrap(),
+            vec![1, 2, 5, 8]
         );
         // None: no filtered output.
         assert!(called_cells(&cells, &s(&["None"])).is_none());

@@ -630,7 +630,7 @@ impl BarcodeStats {
     }
 
     /// Count one read by its final `cbMatch` code, STAR's
-    /// `SoloReadBarcode::addStats` switch (`SoloReadBarcode_getCBandUMI.cpp:93-123`):
+    /// `SoloReadBarcode::addStats` switch (`SoloReadBarcode_getCBandUMI.cpp:93-130`):
     /// a code it does not list falls to `default`, which counts as a
     /// multiple-match read.
     pub fn record(&self, code: i32) {

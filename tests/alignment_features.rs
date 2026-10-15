@@ -1463,6 +1463,135 @@ fn test_starsolo_sj_feature() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9b2 — STARsolo stats files: Barcodes.stats by final cbMatch code, and
+// SJ Features.stats with a 1MM_multi read resolved by the posterior.
+//
+// The posterior needs the competing barcode's exact count to stay 0: a read
+// that matches it exactly but has an N in its UMI is counted as noNinUMI and
+// does not count as an exact match (`addStats`). If it did, the multi read
+// would fail cbMinP (5/6 < 0.975) and be dropped.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_stats_files() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let cb2 = "AAAACCCCGGGGTTTA";
+    // Spliced across the intron [10050,10250); unspliced inside exon 1.
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    let exonic = genome[10000..10050].to_vec();
+    let reads: Vec<(&[u8], &str, &str)> = vec![
+        (&spliced, cb, "ACGTACGTAC"), // 4 exact reads, one molecule
+        (&spliced, cb, "ACGTACGTAC"),
+        (&spliced, cb, "ACGTACGTAC"),
+        (&spliced, cb, "ACGTACGTAC"),
+        (&spliced, "AAAACCCCGGGGTTTC", "TGCATGCATG"), // 1MM to cb and cb2
+        (&spliced, cb2, "ACGTNCGTAC"),                // exact, N in UMI
+        (&spliced, "ACACACACACACACAC", "GATCGATCGA"), // no whitelist match
+        (&exonic, cb, "CATGCATGCA"),                  // exact, no junction
+    ];
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for (i, (seq, bc, umi)) in reads.iter().enumerate() {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(seq).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+            writeln!(bf, "@r{i}\n{bc}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        fs::write(&wl_path, format!("{cb}\n{cb2}\nCCCCGGGGTTTTAAAA\n")).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_stats");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+            "Gene",
+            "SJ",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let solo = output_dir.join("Solo.out");
+    let stats = |path: PathBuf| -> Vec<(String, u64)> {
+        fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut f = l.split_whitespace();
+                let name = f.next().unwrap().to_string();
+                (name, f.next().unwrap().parse().unwrap())
+            })
+            .collect()
+    };
+    let nonzero = |v: Vec<(String, u64)>| -> Vec<(String, u64)> {
+        v.into_iter().filter(|(_, n)| *n > 0).collect()
+    };
+    let named = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+        v.iter().map(|&(n, c)| (n.to_string(), c)).collect()
+    };
+
+    let barcodes = stats(solo.join("Barcodes.stats"));
+    assert_eq!(barcodes.len(), 12, "{barcodes:?}");
+    assert_eq!(
+        nonzero(barcodes),
+        named(&[
+            ("noNinUMI", 1),
+            ("noNoWLmatch", 1),
+            ("yesWLmatchExact", 5),
+            ("yesMultWLmatchWithMM", 1),
+        ])
+    );
+
+    // SJ: the five spliced reads with a whitelisted barcode, the multi one
+    // resolved to `cb`; the exonic read has no junction.
+    let sj = stats(solo.join("SJ").join("Features.stats"));
+    assert_eq!(sj.len(), 11, "{sj:?}");
+    assert_eq!(
+        nonzero(sj),
+        named(&[
+            ("noNoFeature", 1),
+            ("yesWLmatch", 5),
+            ("yessubWLmatchExact", 4),
+            ("yessubWLmatch_UniqueFeature", 5),
+            ("yesCellBarcodes", 1),
+            ("yesUMIs", 2),
+        ])
+    );
+    let sj_matrix = fs::read_to_string(solo.join("SJ").join("raw").join("matrix.mtx")).unwrap();
+    // Whitelist order: cb2 (…TTTA) is column 1, cb column 2.
+    assert_eq!(sj_matrix.lines().last().unwrap(), "1 2 2", "{sj_matrix}");
+}
+
+// ---------------------------------------------------------------------------
 // Test 9c — STARsolo --soloMultiMappers (gene-ambiguous distribution)
 //
 // G1 and G3 share Exon1 (so a read there is ambiguous {G1,G3}); G2 has Exon2.
@@ -1756,11 +1885,20 @@ fn test_starsolo_velocyto() {
         fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
     }
 
-    let output_dir = tmpdir.path().join("out_velo");
-    fs::create_dir_all(&output_dir).unwrap();
-    let prefix = format!("{}/", output_dir.display());
-    cargo_bin_cmd!("rustar-aligner")
-        .args([
+    // Gene alone, then GeneFull first with CB/UB: the tags then read
+    // GeneFull's readInfo and Velocyto the Gene feature's, as in STAR.
+    for (tag, features, tags) in [
+        ("gene", &["Gene", "Velocyto"][..], false),
+        (
+            "genefull_first",
+            &["GeneFull", "Gene", "Velocyto"][..],
+            true,
+        ),
+    ] {
+        let output_dir = tmpdir.path().join(format!("out_velo_{tag}"));
+        fs::create_dir_all(&output_dir).unwrap();
+        let prefix = format!("{}/", output_dir.display());
+        let mut args = vec![
             "--runMode",
             "alignReads",
             "--genomeDir",
@@ -1780,33 +1918,56 @@ fn test_starsolo_velocyto() {
             "17",
             "--soloUMIlen",
             "12",
-            "--soloFeatures",
-            "Gene",
-            "Velocyto",
             "--soloStrand",
             "Forward",
             "--sjdbGTFfile",
             gtf.to_str().unwrap(),
             "--outFileNamePrefix",
             &prefix,
-        ])
-        .assert()
-        .success();
+            "--soloFeatures",
+        ];
+        args.extend_from_slice(features);
+        if tags {
+            args.extend_from_slice(&[
+                "--outSAMtype",
+                "BAM",
+                "SortedByCoordinate",
+                "--outSAMattributes",
+                "NH",
+                "CB",
+                "UB",
+            ]);
+        }
+        cargo_bin_cmd!("rustar-aligner")
+            .args(&args)
+            .assert()
+            .success();
 
-    let raw = output_dir.join("Solo.out").join("Velocyto").join("raw");
-    // One (G1, cell) row in every matrix, zeros included, as STAR writes them.
-    for (name, want) in [
-        ("spliced", "1 1 2"),
-        ("unspliced", "1 1 1"),
-        ("ambiguous", "1 1 0"),
-    ] {
-        let m = fs::read_to_string(raw.join(format!("{name}.mtx"))).unwrap();
-        assert_eq!(
-            m.lines().nth(2).unwrap(),
-            "1 2 1",
-            "{name}.mtx header:\n{m}"
-        );
-        assert_eq!(m.lines().last().unwrap(), want, "{name}.mtx:\n{m}");
+        // One (G1, cell) row in every matrix, zeros included, as STAR writes
+        // them; the cell is called, so the filtered matrices hold it too.
+        let velo = output_dir.join("Solo.out").join("Velocyto");
+        for (dir, n_cells) in [("raw", 2), ("filtered", 1)] {
+            for (name, want) in [
+                ("spliced", "1 1 2"),
+                ("unspliced", "1 1 1"),
+                ("ambiguous", "1 1 0"),
+            ] {
+                let m = fs::read_to_string(velo.join(dir).join(format!("{name}.mtx"))).unwrap();
+                assert_eq!(
+                    m.lines().nth(2).unwrap(),
+                    format!("1 {n_cells} 1"),
+                    "{tag} {dir}/{name}.mtx header:\n{m}"
+                );
+                assert_eq!(
+                    m.lines().last().unwrap(),
+                    want,
+                    "{tag} {dir}/{name}.mtx:\n{m}"
+                );
+            }
+        }
+        let filtered_barcodes =
+            fs::read_to_string(velo.join("filtered").join("barcodes.tsv")).unwrap();
+        assert_eq!(filtered_barcodes, format!("{cb}\n"), "{tag}");
     }
 }
 
@@ -2597,9 +2758,12 @@ fn test_run_mode_solo_cell_filtering_calls_cells_from_a_raw_matrix() {
             "soloCellFiltering",
             raw.to_str().unwrap(),
             out.to_str().unwrap(),
+            // STAR's TopCells N keeps every barcode with at least the UMIs of
+            // the barcode at index N (`SoloFeature_cellFiltering.cpp:46-54`):
+            // 4 sets the threshold at the fifth deep barcode.
             "--soloCellFilter",
             "TopCells",
-            "5",
+            "4",
         ])
         .assert()
         .success();

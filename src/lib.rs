@@ -2520,7 +2520,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
-        sj: Vec<crate::solo::SjCountRecord>,
+        sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
     }
 
@@ -2568,7 +2568,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
-                let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+                let mut sj_batch = crate::solo::SjRecords::default();
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
                 // STAR's no-feature records, per feature (readInfo is per feature).
                 let mut no_feature: Vec<Vec<SoloCountRecord>> =
@@ -2595,7 +2595,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             no_feature_multi[fi].push(m);
                         }
                     }
-                    sj_batch.extend(product.sj);
+                    sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
                 }
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
@@ -2617,10 +2617,13 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     }
                 }
                 if !sj_batch.is_empty() {
-                    solo.sj_records.lock().unwrap().extend(sj_batch);
+                    solo.sj_records.lock().unwrap().append(sj_batch);
                 }
                 if !velo_batch.is_empty() {
-                    solo.velocyto_records.lock().unwrap().extend(velo_batch);
+                    let mut store = solo.velocyto_records.lock().unwrap();
+                    for r in &velo_batch {
+                        store.push(r);
+                    }
                 }
                 Ok(true)
             };
@@ -2966,7 +2969,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
-        sj: Vec<crate::solo::SjCountRecord>,
+        sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
     }
 
@@ -3002,7 +3005,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
-                let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+                let mut sj_batch = crate::solo::SjRecords::default();
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
                 // STAR's no-feature records, per feature (readInfo is per feature).
                 let mut no_feature: Vec<Vec<SoloCountRecord>> =
@@ -3029,7 +3032,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             no_feature_multi[fi].push(m);
                         }
                     }
-                    sj_batch.extend(product.sj);
+                    sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
                 }
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
@@ -3051,10 +3054,13 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     }
                 }
                 if !sj_batch.is_empty() {
-                    solo.sj_records.lock().unwrap().extend(sj_batch);
+                    solo.sj_records.lock().unwrap().append(sj_batch);
                 }
                 if !velo_batch.is_empty() {
-                    solo.velocyto_records.lock().unwrap().extend(velo_batch);
+                    let mut store = solo.velocyto_records.lock().unwrap();
+                    for r in &velo_batch {
+                        store.push(r);
+                    }
                 }
                 Ok(true)
             };
