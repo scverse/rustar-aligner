@@ -87,6 +87,24 @@ Adding a dependency — **especially a non-Rust one** (a C library via a `-sys` 
 
 If you add a CLI flag that parses but is not yet implemented, mark it as such in the parameter-surface test and document it — do not silently accept a flag that does nothing. A user passing a flag should never be quietly ignored.
 
+## Yeast tier in a minute
+
+The full differential in the next section wants the whole ERR12389696 run.
+`test/yeast_tier.sh` fetches the first ~120 MB of each mate instead — 10 000
+pairs, enough to see a faithfulness regression in the numbers that matter —
+builds both indexes, runs both aligners and prints the per-read agreement.
+
+```bash
+cargo build --release
+test/yeast_tier.sh                       # ~1 minute, needs STAR on PATH
+DATA=~/yeast-tier PAIRS=50000 test/yeast_tier.sh
+```
+
+`test/sam_agreement.py` is the comparison on its own, if you already have two
+SAM files. It prints position agreement and NH agreement separately, because a
+tie broken differently shows up in the first and not the second, while a real
+regression usually moves both.
+
 ## Test data
 
 Integration tests in `tests/` use a bundled synthetic micro-genome and need no downloads. The differential benchmark below uses a small **public** yeast RNA-seq dataset that is not vendored; fetch it once and point `DATA` at wherever you keep it.
