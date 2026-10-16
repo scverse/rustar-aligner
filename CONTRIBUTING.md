@@ -81,7 +81,7 @@ after, so the regression is a recorded step rather than a surprise.
 
 ### New dependencies need prior discussion
 
-Adding a dependency — **especially a non-Rust one** (a C library via a `-sys` crate, anything needing `bindgen`/`libclang` or a system library) — must be raised in an issue *before* the PR. This project is published to crates.io and builds on five platforms including Windows; a new C dependency is a maintenance and supply-chain decision, not an implementation detail.
+Adding a dependency — **especially a non-Rust one** (a C library via a `-sys` crate, anything needing `bindgen`/`libclang` or a system library) — must be raised in an issue *before* the PR. [DEPENDENCIES.md](DEPENDENCIES.md) records what was accepted, what was declined and why, and what is still under evaluation; check it first, and add the row when the decision lands. This project is published to crates.io and builds on five platforms including Windows; a new C dependency is a maintenance and supply-chain decision, not an implementation detail.
 
 ### Accepted-but-inert parameters
 
