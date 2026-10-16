@@ -24,7 +24,7 @@ Phase 1 (CLI) ✅
                                                                         └→ Phase 16.14 (Nstart fix, 99.5% pos) ✅
                                                                              └→ Phase 16.26-16.29 (SA range fix, rev-strand fix, extendAlign fix, STITCH-SJ fix) ✅
                                                                                   └→ Phase 17.A (scoreSeedBest pre-extension on WA entries) ✅
-                                                                                       └→ Phase 17.B (per-mate seeding) [planned]
+                                                                                       └→ Phase 17.B (per-mate seeding) ✅
                                                               └→ Phase 17.1 (Log.final.out) ✅
                                                                    └→ Phase 17.2+ (features + polish)
                                                               └→ Phase 14 (STARsolo) ✅ Gene/GeneFull/SJ/Velocyto, CB/UMI, EmptyDrops_CR
@@ -160,7 +160,7 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 - `src/chimeric/score.rs` — Junction type classification, repeat length
 - `src/chimeric/output.rs` — 14-column Chimeric.out.junction format
 - Detects inter-chr fusions, strand breaks, large-distance breaks
-- PE chimeric detection not yet implemented (Phase 17.3)
+- PE chimeric detection: done in Phase 17.3
 
 ---
 
@@ -258,7 +258,7 @@ All 127 SE position disagreements (100 diff-chr + 27 same-chr) verified as **gen
 
 ## Debugging Tools
 
-**STAR debug tracing** (added 2026-03-19): Instrumented STAR binary at `/home/jamfer/Dropbox/Bioinformatics/tools/repos/STAR/source/STAR` with read-name-filtered trace points.
+**STAR debug tracing** (added 2026-03-19): an instrumented STAR build with read-name-filtered trace points. The patch is not in this repository (it was built on one contributor's machine), so `test/debug_star.sh` needs `STAR_BIN` pointing at such a build.
 
 Usage:
 ```bash
@@ -300,7 +300,6 @@ See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase t
 - Phase G1: `split_combined_wt` junction_idx fix (rDNA cross-copy filter)
 - Phase G2: MAX_RECURSION 10k→100k + `sa_pos_to_forward` overflow fix
 
-**Planned sub-phases:**
 - 17.2: Coordinate-sorted BAM output (`--outSAMtype BAM SortedByCoordinate`)
 - 17.3: Paired-end chimeric detection
 - 17.4: `--outReadsUnmapped Fastx`
