@@ -1,6 +1,11 @@
 //! Bit-exact ports of the three libc++ random facilities STARsolo's
 //! `EmptyDrops_CR` depends on.
 //!
+//! This file reimplements in Rust the behaviour of libc++'s `std::mt19937`,
+//! `std::generate_canonical` and `std::discrete_distribution`. libc++ is part of
+//! the LLVM Project, under the Apache License v2.0 with LLVM Exceptions; its
+//! licence is reproduced in `LICENSES/LIBCXX_LICENSE` for attribution.
+//!
 //! STAR's Monte-Carlo rescue draws from `std::mt19937`, converts to doubles
 //! with `std::generate_canonical<double, 53>`, and samples categories with
 //! `std::discrete_distribution`. All three are implementation-defined in the

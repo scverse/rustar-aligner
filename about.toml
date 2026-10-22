@@ -1,0 +1,76 @@
+# cargo-about configuration: generates THIRD_PARTY_LICENSES.md, the licence
+# notices of every crate linked into rustar-aligner, for the release archives
+# and the Docker image (`.github/workflows/release.yml`, `Dockerfile`).
+#
+# Only these licences are accepted; a dependency under any other licence makes
+# the generation (and so the release) fail until it is reviewed.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+# Build scripts, proc-macro helpers' build deps and test-only crates are not
+# linked into the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Crates whose full licence terms cargo-about cannot find on its own. Each
+# entry pins the file by checksum: if a dependency bump changes it, generation
+# fails, so the new text is reviewed rather than silently dropped.
+
+# rustar-aligner itself: MIT, plus David Elworthy's BSD 2-clause notice for
+# `src/solo/sgt.rs` (the rest of `LICENSES/` ships alongside this file).
+[rustar-aligner.clarify]
+license = "MIT AND BSD-2-Clause"
+
+[[rustar-aligner.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "f9dc772e78386b6f578f34855ca4a3d8e792fe929dd92eafe999ac92f143f138"
+
+[[rustar-aligner.clarify.files]]
+path = "LICENSES/SGT_LICENSE"
+license = "BSD-2-Clause"
+checksum = "bdd557cd4f246cd0f562bdb6c5c69109bdb9c4f1cbdabb726393a40eb254caae"
+
+# libdeflate-sys compiles in the libdeflate C library, whose MIT notice
+# (Eric Biggers, Google) is in `libdeflate/COPYING`, not the crate root.
+[libdeflate-sys.clarify]
+license = "Apache-2.0 AND MIT"
+
+[[libdeflate-sys.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[libdeflate-sys.clarify.files]]
+path = "libdeflate/COPYING"
+license = "MIT"
+checksum = "4ad69099cb4374836fd27583d9991e2838cd86b6e4666ab26b2d32582c91e73a"
+
+# regex-syntax embeds Unicode data tables under the Unicode data licence
+# (`src/unicode_tables/LICENSE-UNICODE`).
+[regex-syntax.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-DFS-2016"
+
+[[regex-syntax.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb"
+
+[[regex-syntax.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[regex-syntax.clarify.files]]
+path = "src/unicode_tables/LICENSE-UNICODE"
+license = "Unicode-DFS-2016"
+checksum = "74db5baf44a41b1000312c673544b3374e4198af5605c7f9080a402cec42cfa3"

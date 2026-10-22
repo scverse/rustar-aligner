@@ -19,6 +19,12 @@ RUN HOST_TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}') && \
     && strip "target/$HOST_TRIPLE/release/rustar-aligner" \
     && cp "target/$HOST_TRIPLE/release/rustar-aligner" /rustar-aligner
 
+# Licence notices of every crate linked into the binary (see about.toml).
+COPY scripts/third-party-licenses.sh scripts/
+COPY about.toml about.hbs LICENSE ./
+COPY LICENSES/ LICENSES/
+RUN scripts/third-party-licenses.sh /THIRD_PARTY_LICENSES.md
+
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 
@@ -29,5 +35,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /rustar-aligner /usr/local/bin/rustar-aligner
 COPY --from=builder /rustar-aligner /usr/local/bin/STAR
+# rustar-aligner's licence and the third-party notices required in binary
+# distributions: ported code (LICENSES/) and linked crates.
+COPY LICENSE /usr/share/doc/rustar-aligner/LICENSE
+COPY LICENSES/ /usr/share/doc/rustar-aligner/LICENSES/
+COPY --from=builder /THIRD_PARTY_LICENSES.md /usr/share/doc/rustar-aligner/THIRD_PARTY_LICENSES.md
 
 CMD ["rustar-aligner"]

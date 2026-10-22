@@ -265,4 +265,8 @@ The majority of rustar-aligner's code was written by [Claude Code](https://claud
 
 ## License
 
-MIT (matching the original STAR license)
+MIT (matching the original STAR license). Code ported from STAR, STAR-rs, DegNorm and
+David Elworthy's `sgt.h` stays under its own licence, and libc++ is credited for the
+random-number behaviour STARsolo's EmptyDrops_CR depends on; all of these notices are in
+[`LICENSES/`](LICENSES/). The licences of the crates linked into the binaries ship with
+them as `THIRD_PARTY_LICENSES.md` (`scripts/third-party-licenses.sh`).
