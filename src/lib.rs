@@ -616,18 +616,15 @@ fn write_solo_output(
     sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
     index: &std::sync::Arc<crate::index::GenomeIndex>,
 ) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-    let s = &sctx.stats;
+    let barcode_counts = sctx.stats.values();
     info!(
-        "STARsolo barcode stats: exact={} 1MM={} multiMM={} noMatch={} N-in-CB={} multReject={} N-in-UMI={} UMIhomopolymer={}",
-        s.yes_exact.load(Ordering::Relaxed),
-        s.yes_one_mm.load(Ordering::Relaxed),
-        s.yes_mult_mm.load(Ordering::Relaxed),
-        s.no_match.load(Ordering::Relaxed),
-        s.n_in_cb.load(Ordering::Relaxed),
-        s.mult_rejected.load(Ordering::Relaxed),
-        s.n_in_umi.load(Ordering::Relaxed),
-        s.umi_homopolymer.load(Ordering::Relaxed),
+        "STARsolo barcode stats: {}",
+        crate::solo::BarcodeStats::NAMES
+            .iter()
+            .zip(barcode_counts)
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
         info!(
@@ -1048,14 +1045,12 @@ fn run_single_pass(
         // `CB_samTagOut` produces no Solo.out matrices at all (`Solo.cpp:13`).
         if params.solo_type != params::SoloType::CbSamTagOut {
             write_solo_output(sctx, params, &stats, &sj_stats, index)?;
+        } else {
+            // STAR still writes Barcodes.stats (`Solo::processAndOutput`).
+            crate::solo::write_barcode_stats(sctx, params)?;
         }
-        if sctx.read_info_enabled() {
-            let info = sctx
-                .read_info
-                .as_ref()
-                .expect("readInfo enabled")
-                .lock()
-                .unwrap();
+        if let Some(info) = sctx.tag_read_info() {
+            let info = info.lock().unwrap();
             let umi_len = params.solo_umi_len as usize;
             writer.finish_with(&mut |record| {
                 crate::io::sam::apply_solo_read_info(record, &info, &sctx.whitelist, umi_len);
@@ -2512,7 +2507,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     } else {
         crate::params::SamAttributes::empty()
     };
-    let track_read_info = emit_sam && solo_ctx.read_info_enabled();
+    // Read indices for STAR's readInfo (the CB/UB tags, Velocyto), and the
+    // private tag that carries them to the sorted BAM's CB/UB pass.
+    let track_read_info = solo_ctx.read_info_enabled();
+    let stamp_read_index = emit_sam && solo_ctx.tag_read_info().is_some();
     // `--soloType CB_samTagOut`: barcodes become SAM tags, nothing is counted.
     let tag_out_only = params.solo_type == params::SoloType::CbSamTagOut;
     // Shared, 'static parameters for the per-batch aligner tasks spawned below.
@@ -2522,7 +2520,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
-        sj: Vec<crate::solo::SjCountRecord>,
+        sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
     }
 
@@ -2570,10 +2568,13 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
-                let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+                let mut sj_batch = crate::solo::SjRecords::default();
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
-                let mut no_feature: Vec<crate::solo::SoloCountRecord> = Vec::new();
-                let mut no_feature_multi: Vec<crate::solo::SoloMultiRecord> = Vec::new();
+                // STAR's no-feature records, per feature (readInfo is per feature).
+                let mut no_feature: Vec<Vec<SoloCountRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
+                let mut no_feature_multi: Vec<Vec<SoloMultiRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
                 for result in products {
                     let product = result?;
                     writer.write_batch(&product.sam_records.records)?;
@@ -2588,13 +2589,13 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             feat_multi_gene[fi].push(mg);
                         }
                         if let Some(r) = fo.no_feature {
-                            no_feature.push(r);
+                            no_feature[fi].push(r);
                         }
                         if let Some(m) = fo.no_feature_multi {
-                            no_feature_multi.push(m);
+                            no_feature_multi[fi].push(m);
                         }
                     }
-                    sj_batch.extend(product.sj);
+                    sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
                 }
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
@@ -2606,24 +2607,23 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     if !mg.is_empty() {
                         recorder.multi_gene.lock().unwrap().extend(mg);
                     }
-                }
-                if let Some(recorder) = solo.recorders.first() {
-                    if !no_feature.is_empty() {
-                        recorder.no_feature.lock().unwrap().extend(no_feature);
+                    let nf = std::mem::take(&mut no_feature[fi]);
+                    if !nf.is_empty() {
+                        recorder.no_feature.lock().unwrap().extend(nf);
                     }
-                    if !no_feature_multi.is_empty() {
-                        recorder
-                            .no_feature_multi
-                            .lock()
-                            .unwrap()
-                            .extend(no_feature_multi);
+                    let nfm = std::mem::take(&mut no_feature_multi[fi]);
+                    if !nfm.is_empty() {
+                        recorder.no_feature_multi.lock().unwrap().extend(nfm);
                     }
                 }
                 if !sj_batch.is_empty() {
-                    solo.sj_records.lock().unwrap().extend(sj_batch);
+                    solo.sj_records.lock().unwrap().append(sj_batch);
                 }
                 if !velo_batch.is_empty() {
-                    solo.velocyto_records.lock().unwrap().extend(velo_batch);
+                    let mut store = solo.velocyto_records.lock().unwrap();
+                    for r in &velo_batch {
+                        store.push(r);
+                    }
                 }
                 Ok(true)
             };
@@ -2693,13 +2693,18 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             );
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases(clipped_seq.len() as u64);
+                            solo.record_qualities(sread.barcode_q30, &[&clipped_qual]);
 
                             if clipped_seq.is_empty() {
                                 stats.record_alignment(0, max_multimaps);
                                 stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                                 // No alignment → barcode still counts toward stats (unmapped → no gene).
-                                let outcome =
-                                    solo.process_read(&[], 0, sread.barcode.as_ref(), &[]);
+                                let outcome = solo.process_read(
+                                    &[],
+                                    0,
+                                    sread.barcode.as_ref().map_err(|m| *m),
+                                    &[],
+                                );
                                 return Ok(SoloReadProduct {
                                     sam_records: buffer,
                                     per_feature: outcome.per_feature,
@@ -2746,18 +2751,23 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // counted.
                             let (mut outcome, cb_corrected) = if tag_out_only {
                                 let mut outcome = crate::solo::SoloReadOutcome::default();
-                                let corrected = sread.barcode.as_ref().map(|bc| {
-                                    let (tags, corrected) = solo.tag_barcode(bc);
-                                    outcome.barcode = Some(tags);
-                                    corrected
-                                });
+                                let corrected = sread
+                                    .barcode
+                                    .as_ref()
+                                    .map_err(|m| solo.record_barcode_miss(*m))
+                                    .ok()
+                                    .map(|bc| {
+                                        let (tags, corrected) = solo.tag_barcode(bc);
+                                        outcome.barcode = Some(tags);
+                                        corrected
+                                    });
                                 (outcome, corrected)
                             } else {
                                 (
                                     solo.process_read(
                                         &transcripts,
                                         transcripts.len(),
-                                        sread.barcode.as_ref(),
+                                        sread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
@@ -2832,7 +2842,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             // the read, mapped or unmapped, as in STAR.
                             if !solo_tags.is_empty() {
                                 let values = crate::solo::SoloTagStrings::build(
-                                    sread.barcode.as_ref(),
+                                    sread.barcode.as_ref().ok(),
                                     sread.barcode_read.as_ref(),
                                     outcome.barcode,
                                     cb_corrected,
@@ -2851,7 +2861,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                     );
                                 }
                             }
-                            if track_read_info {
+                            if stamp_read_index {
                                 crate::io::sam::add_solo_read_index(
                                     &mut buffer.records,
                                     read_index,
@@ -2948,7 +2958,10 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     } else {
         crate::params::SamAttributes::empty()
     };
-    let track_read_info = emit_sam && solo_ctx.read_info_enabled();
+    // Read indices for STAR's readInfo (the CB/UB tags, Velocyto), and the
+    // private tag that carries them to the sorted BAM's CB/UB pass.
+    let track_read_info = solo_ctx.read_info_enabled();
+    let stamp_read_index = emit_sam && solo_ctx.tag_read_info().is_some();
     let tag_out_only = params.solo_type == params::SoloType::CbSamTagOut;
     let keep_barcode_read = params.solo_keeps_barcode_read();
     let params_arc = Arc::new(params.clone());
@@ -2956,7 +2969,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
-        sj: Vec<crate::solo::SjCountRecord>,
+        sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
     }
 
@@ -2992,10 +3005,13 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
-                let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+                let mut sj_batch = crate::solo::SjRecords::default();
                 let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
-                let mut no_feature: Vec<crate::solo::SoloCountRecord> = Vec::new();
-                let mut no_feature_multi: Vec<crate::solo::SoloMultiRecord> = Vec::new();
+                // STAR's no-feature records, per feature (readInfo is per feature).
+                let mut no_feature: Vec<Vec<SoloCountRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
+                let mut no_feature_multi: Vec<Vec<SoloMultiRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
                 for result in products {
                     let product = result?;
                     writer.write_batch(&product.sam_records.records)?;
@@ -3010,13 +3026,13 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             feat_multi_gene[fi].push(mg);
                         }
                         if let Some(r) = fo.no_feature {
-                            no_feature.push(r);
+                            no_feature[fi].push(r);
                         }
                         if let Some(m) = fo.no_feature_multi {
-                            no_feature_multi.push(m);
+                            no_feature_multi[fi].push(m);
                         }
                     }
-                    sj_batch.extend(product.sj);
+                    sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
                 }
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
@@ -3028,24 +3044,23 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     if !mg.is_empty() {
                         recorder.multi_gene.lock().unwrap().extend(mg);
                     }
-                }
-                if let Some(recorder) = solo.recorders.first() {
-                    if !no_feature.is_empty() {
-                        recorder.no_feature.lock().unwrap().extend(no_feature);
+                    let nf = std::mem::take(&mut no_feature[fi]);
+                    if !nf.is_empty() {
+                        recorder.no_feature.lock().unwrap().extend(nf);
                     }
-                    if !no_feature_multi.is_empty() {
-                        recorder
-                            .no_feature_multi
-                            .lock()
-                            .unwrap()
-                            .extend(no_feature_multi);
+                    let nfm = std::mem::take(&mut no_feature_multi[fi]);
+                    if !nfm.is_empty() {
+                        recorder.no_feature_multi.lock().unwrap().extend(nfm);
                     }
                 }
                 if !sj_batch.is_empty() {
-                    solo.sj_records.lock().unwrap().extend(sj_batch);
+                    solo.sj_records.lock().unwrap().append(sj_batch);
                 }
                 if !velo_batch.is_empty() {
-                    solo.velocyto_records.lock().unwrap().extend(velo_batch);
+                    let mut store = solo.velocyto_records.lock().unwrap();
+                    for r in &velo_batch {
+                        store.push(r);
+                    }
                 }
                 Ok(true)
             };
@@ -3095,6 +3110,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             );
                             let mut buffer = BufferedSamRecords::new(params.out_sam_attributes);
                             stats.record_read_bases((m1_seq.len() + m2_seq.len()) as u64);
+                            solo.record_qualities(pread.barcode_q30, &[&m1_qual, &m2_qual]);
 
                             let (results, _pe_chimeric, n_for_mapq, unmapped_reason, best_tr) =
                                 align_paired_read(
@@ -3187,11 +3203,16 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             // counts nothing, exactly as in the single-end loop.
                             let (mut outcome, cb_corrected) = if tag_out_only {
                                 let mut outcome = crate::solo::SoloReadOutcome::default();
-                                let corrected = pread.barcode.as_ref().map(|bc| {
-                                    let (tags, corrected) = solo.tag_barcode(bc);
-                                    outcome.barcode = Some(tags);
-                                    corrected
-                                });
+                                let corrected = pread
+                                    .barcode
+                                    .as_ref()
+                                    .map_err(|m| solo.record_barcode_miss(*m))
+                                    .ok()
+                                    .map(|bc| {
+                                        let (tags, corrected) = solo.tag_barcode(bc);
+                                        outcome.barcode = Some(tags);
+                                        corrected
+                                    });
                                 (outcome, corrected)
                             } else if !both_mapped.is_empty() {
                                 let pairs: Vec<_> = both_mapped
@@ -3201,7 +3222,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 (
                                     solo.process_read_pe(
                                         &pairs,
-                                        pread.barcode.as_ref(),
+                                        pread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
@@ -3215,13 +3236,21 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     solo.process_read(
                                         std::slice::from_ref(mapped_transcript),
                                         1,
-                                        pread.barcode.as_ref(),
+                                        pread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
                                     None,
                                 )
                             } else {
-                                (solo.process_read(&[], 0, pread.barcode.as_ref(), &[]), None)
+                                (
+                                    solo.process_read(
+                                        &[],
+                                        0,
+                                        pread.barcode.as_ref().map_err(|m| *m),
+                                        &[],
+                                    ),
+                                    None,
+                                )
                             };
                             let read_index = (base + pair_idx as u64) as u32;
                             if track_read_info {
@@ -3338,7 +3367,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     .as_ref()
                                     .or_else(|| keep_barcode_read.then_some(&pread.mate1));
                                 let values = crate::solo::SoloTagStrings::build(
-                                    pread.barcode.as_ref(),
+                                    pread.barcode.as_ref().ok(),
                                     barcode_read,
                                     outcome.barcode,
                                     cb_corrected,
@@ -3357,7 +3386,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     );
                                 }
                             }
-                            if track_read_info {
+                            if stamp_read_index {
                                 crate::io::sam::add_solo_read_index(
                                     &mut buffer.records,
                                     read_index,

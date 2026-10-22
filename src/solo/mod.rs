@@ -18,13 +18,13 @@ pub mod smartseq;
 pub mod transcript3p;
 pub mod whitelist;
 
-pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
+pub use count::{UmiDedup, UmiFiltering, write_barcode_stats, write_gene_matrix};
 pub use gene::{
-    GeneAssignment, GeneModel, GeneSets, Region, SoloFeature, SoloStrand, VelocytoCategory,
-    assign_gene_se, classify_align, classify_read, gene_full_sets, velocyto_category,
+    GeneAssignment, GeneModel, GeneSets, ReadClass, Region, SoloFeature, SoloStrand,
+    assign_gene_se, classify_align, classify_read, gene_full_sets, velocyto_transcript_types,
 };
 pub use whitelist::{
-    CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
+    BarcodeStats, CbCandidate, CbMatch, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
 };
 
 use crate::align::transcript::Transcript;
@@ -269,25 +269,28 @@ impl SoloBarcodeLayout {
     }
 
     /// Extract the CB (concatenating segments for `Complex`) and UMI from one
-    /// barcode read. `None` if the read is shorter than [`Self::min_read_len`].
-    pub fn extract(&self, barcode_read: &EncodedRead) -> Option<CellBarcode> {
+    /// barcode read, or why it cannot be (STAR's `getCBandUMI`: no adapter,
+    /// then no UMI, then no CB).
+    pub fn extract(&self, barcode_read: &EncodedRead) -> Result<CellBarcode, BarcodeMiss> {
         let seq = &barcode_read.sequence;
         let qual = &barcode_read.quality;
-        if seq.len() < self.min_read_len() {
-            return None;
-        }
         match self {
             Self::Simple {
                 cb_start,
                 cb_len,
                 umi_start,
                 umi_len,
-            } => Some(CellBarcode {
-                cb_seq: seq[*cb_start..cb_start + cb_len].to_vec(),
-                cb_qual: slice_or_empty(qual, *cb_start, *cb_len),
-                umi_seq: seq[*umi_start..umi_start + umi_len].to_vec(),
-                umi_qual: slice_or_empty(qual, *umi_start, *umi_len),
-            }),
+            } => {
+                if seq.len() < self.min_read_len() {
+                    return Err(BarcodeMiss::NoCb);
+                }
+                Ok(CellBarcode {
+                    cb_seq: seq[*cb_start..cb_start + cb_len].to_vec(),
+                    cb_qual: slice_or_empty(qual, *cb_start, *cb_len),
+                    umi_seq: seq[*umi_start..umi_start + umi_len].to_vec(),
+                    umi_qual: slice_or_empty(qual, *umi_start, *umi_len),
+                })
+            }
             Self::Anchored {
                 cb_segments,
                 umi,
@@ -299,7 +302,7 @@ impl SoloBarcodeLayout {
                 // whatever the anchors; then the UMI, then each CB segment.
                 let (dist, adapter_start) = local_align_hamming_dist(seq, adapter);
                 if dist > *max_mismatches {
-                    return None;
+                    return Err(BarcodeMiss::NoAdapter);
                 }
                 let span = |(a, b): &(Anchored, Anchored)| {
                     barcode_span(
@@ -308,15 +311,15 @@ impl SoloBarcodeLayout {
                         seq.len(),
                     )
                 };
-                let (us, ul) = span(umi)?;
+                let (us, ul) = span(umi).ok_or(BarcodeMiss::NoUmi)?;
                 let mut cb_seq = Vec::new();
                 let mut cb_qual = Vec::new();
                 for segment in cb_segments {
-                    let (s0, l) = span(segment)?;
+                    let (s0, l) = span(segment).ok_or(BarcodeMiss::NoCb)?;
                     cb_seq.extend_from_slice(&seq[s0..s0 + l]);
                     cb_qual.extend_from_slice(&slice_or_empty(qual, s0, l));
                 }
-                Some(CellBarcode {
+                Ok(CellBarcode {
                     cb_seq,
                     cb_qual,
                     umi_seq: seq[us..us + ul].to_vec(),
@@ -324,19 +327,68 @@ impl SoloBarcodeLayout {
                 })
             }
             Self::Complex { cb_segments, umi } => {
+                if seq.len() < umi.0 + umi.1 {
+                    return Err(BarcodeMiss::NoUmi);
+                }
+                if seq.len() < self.min_read_len() {
+                    return Err(BarcodeMiss::NoCb);
+                }
                 let mut cb_seq = Vec::new();
                 let mut cb_qual = Vec::new();
                 for &(s, l) in cb_segments {
                     cb_seq.extend_from_slice(&seq[s..s + l]);
                     cb_qual.extend_from_slice(&slice_or_empty(qual, s, l));
                 }
-                Some(CellBarcode {
+                Ok(CellBarcode {
                     cb_seq,
                     cb_qual,
                     umi_seq: seq[umi.0..umi.0 + umi.1].to_vec(),
                     umi_qual: slice_or_empty(qual, umi.0, umi.1),
                 })
             }
+        }
+    }
+}
+
+/// Why no barcode could be read, as STAR counts it in `Barcodes.stats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarcodeMiss {
+    /// No adapter within `--soloAdapterMismatchesNmax` (`noNoAdapter`).
+    NoAdapter,
+    /// The UMI cannot be extracted (`noNoUMI`).
+    NoUmi,
+    /// A cell barcode cannot be extracted (`noNoCB`, `cbMatch` -11).
+    NoCb,
+}
+
+/// The `(Q30 bases, bases)` of a barcode read that STAR adds to its CB+UMI
+/// quality histogram (`SoloReadBarcode_getCBandUMI.cpp:243-266`): the CB and
+/// UMI qualities for `CB_UMI_Simple`, else the whole barcode read (its first
+/// `--soloBarcodeReadLength` bases when that is set), extracted or not.
+pub fn barcode_q30(
+    layout: &SoloBarcodeLayout,
+    read: &EncodedRead,
+    bc: Result<&CellBarcode, BarcodeMiss>,
+    read_len: Option<usize>,
+) -> (u64, u64) {
+    let q30 = |q: &[u8]| {
+        (
+            q.iter().filter(|&&b| b >= 33 + 30).count() as u64,
+            q.len() as u64,
+        )
+    };
+    match (layout, bc) {
+        (SoloBarcodeLayout::Simple { .. }, Ok(bc)) => {
+            let (a, b) = q30(&bc.cb_qual);
+            let (c, d) = q30(&bc.umi_qual);
+            (a + c, b + d)
+        }
+        (SoloBarcodeLayout::Simple { .. }, Err(_)) => (0, 0),
+        _ => {
+            let n = read_len
+                .unwrap_or(read.quality.len())
+                .min(read.quality.len());
+            q30(&read.quality[..n])
         }
     }
 }
@@ -534,8 +586,10 @@ pub struct SoloReadReader {
 /// One cDNA read paired with its (optional) extracted barcode.
 pub struct SoloRead {
     pub cdna: EncodedRead,
-    /// `None` when the barcode read was too short to extract CB+UMI.
-    pub barcode: Option<CellBarcode>,
+    /// The extracted barcode, or why there is none.
+    pub barcode: Result<CellBarcode, BarcodeMiss>,
+    /// The barcode read's `(Q30 bases, bases)` for `Summary.csv` ([`barcode_q30`]).
+    pub barcode_q30: (u64, u64),
     /// The whole barcode read, kept only for the `sS`/`sQ` SAM tags.
     pub barcode_read: Option<EncodedRead>,
 }
@@ -568,10 +622,17 @@ impl SoloReadReader {
             (Some(cdna), Some(mut bc)) => {
                 self.barcode_len.apply(&mut bc)?;
                 let barcode = self.layout.extract(&bc);
+                let barcode_q30 = barcode_q30(
+                    &self.layout,
+                    &bc,
+                    barcode.as_ref().map_err(|m| *m),
+                    self.barcode_len.expected,
+                );
                 let barcode_read = self.keep_barcode_read.then_some(bc);
                 Ok(Some(SoloRead {
                     cdna,
                     barcode,
+                    barcode_q30,
                     barcode_read,
                 }))
             }
@@ -636,8 +697,10 @@ pub fn open_reader(params: &Parameters) -> Result<SoloReadReader, Error> {
 pub struct SoloPairedRead {
     pub mate1: EncodedRead,
     pub mate2: EncodedRead,
-    /// `None` when the barcode read (or mate 1) was too short to extract CB+UMI.
-    pub barcode: Option<CellBarcode>,
+    /// The extracted barcode, or why there is none.
+    pub barcode: Result<CellBarcode, BarcodeMiss>,
+    /// The barcode read's `(Q30 bases, bases)` for `Summary.csv` ([`barcode_q30`]).
+    pub barcode_q30: (u64, u64),
     /// The whole barcode read, kept only for the `sS`/`sQ` SAM tags. `None` for
     /// a `--soloBarcodeMate 1` run, where mate 1 itself is the barcode read.
     pub barcode_read: Option<EncodedRead>,
@@ -682,26 +745,39 @@ impl SoloPairedReader {
     pub fn next_read(&mut self) -> Result<Option<SoloPairedRead>, Error> {
         match (self.mate1.next_encoded()?, self.mate2.next_encoded()?) {
             (Some(mate1), Some(mate2)) => {
-                let (barcode, barcode_read) = match &mut self.barcode {
-                    // Separate barcode read: must stay in lockstep with the mates.
-                    Some(reader) => {
-                        let mut bc = reader.next_encoded()?.ok_or_else(|| {
-                            Error::from(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "solo: barcode read file has fewer reads than the cDNA mate files",
-                            ))
-                        })?;
-                        self.barcode_len.apply(&mut bc)?;
-                        let extracted = self.layout.extract(&bc);
-                        (extracted, self.keep_barcode_read.then_some(bc))
-                    }
-                    // `--soloBarcodeMate 1`: the barcode is a prefix of mate 1.
-                    None => (self.layout.extract(&mate1), None),
+                // A separate barcode read must stay in lockstep with the mates;
+                // with `--soloBarcodeMate 1` the barcode is a prefix of mate 1.
+                let (barcode, barcode_q30, barcode_read) = if let Some(reader) = &mut self.barcode {
+                    let mut bc = reader.next_encoded()?.ok_or_else(|| {
+                        Error::from(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "solo: barcode read file has fewer reads than the cDNA mate files",
+                        ))
+                    })?;
+                    self.barcode_len.apply(&mut bc)?;
+                    let extracted = self.layout.extract(&bc);
+                    let q = barcode_q30(
+                        &self.layout,
+                        &bc,
+                        extracted.as_ref().map_err(|m| *m),
+                        self.barcode_len.expected,
+                    );
+                    (extracted, q, self.keep_barcode_read.then_some(bc))
+                } else {
+                    let extracted = self.layout.extract(&mate1);
+                    let q = barcode_q30(
+                        &self.layout,
+                        &mate1,
+                        extracted.as_ref().map_err(|m| *m),
+                        None,
+                    );
+                    (extracted, q, None)
                 };
                 Ok(Some(SoloPairedRead {
                     mate1,
                     mate2,
                     barcode,
+                    barcode_q30,
                     barcode_read,
                 }))
             }
@@ -990,12 +1066,44 @@ pub struct SoloCountRecord {
     pub read_index: u32,
 }
 
-/// `read_index` of a record from a run that does not need STAR's readInfo.
+/// `read_index` of a record from a run that does not need STAR's readInfo
+/// (before [`SoloReadOutcome::set_read_index`] stamps it).
 pub const NO_READ_INDEX: u32 = u32::MAX;
 
 /// `gene` of a no-feature record ([`FeatureOutcome::no_feature`]), STAR's
 /// feature `-1`.
 pub const NO_FEATURE: u32 = u32::MAX;
+
+/// The SJ feature's records: one per junction a uniquely mapped read crosses,
+/// as STAR writes one line per junction (`outputReadCB`,
+/// `SoloReadFeature_record.cpp:253-262`).
+#[derive(Debug, Default)]
+pub struct SjRecords {
+    pub unique: Vec<SjCountRecord>,
+    /// Records of 1MM_multi barcodes, resolved by the posterior when the matrix
+    /// is built (`SoloReadFeature_inputRecords.cpp:66-104`).
+    pub multi: Vec<SjMultiRecord>,
+}
+
+impl SjRecords {
+    pub fn is_empty(&self) -> bool {
+        self.unique.is_empty() && self.multi.is_empty()
+    }
+
+    pub fn append(&mut self, other: SjRecords) {
+        self.unique.extend(other.unique);
+        self.multi.extend(other.multi);
+    }
+}
+
+/// An SJ record whose barcode matched several whitelist entries by 1MM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SjMultiRecord {
+    pub candidates: Vec<CbCandidate>,
+    pub umi: u64,
+    pub intron_start: u64,
+    pub intron_end: u64,
+}
 
 /// One (cell, UMI, splice-junction) observation for the `SJ` feature. The
 /// junction is identified by its absolute intron coordinates; it is mapped to a
@@ -1006,16 +1114,78 @@ pub struct SjCountRecord {
     pub umi: u64,
     pub intron_start: u64,
     pub intron_end: u64,
+    /// The read's barcode matched the whitelist exactly (`cbMatch` 0), for
+    /// `yessubWLmatchExact`.
+    pub exact: bool,
 }
 
-/// One (cell, UMI, gene) observation for the `Velocyto` feature, tagged with the
-/// read's spliced/unspliced/ambiguous category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One read's record for the `Velocyto` feature (STAR writes `iRead nTr tr
+/// type ...`, `SoloReadFeature_record.cpp:160-171`): the read, and the
+/// transcripts its unique alignment is compatible with, each with STAR's type
+/// bits ([`velocyto_transcript_types`]). Its cell and UMI come later, from the
+/// Gene feature's readInfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VelocytoRecord {
-    pub cb: u32,
-    pub umi: u64,
-    pub gene: u32,
-    pub category: VelocytoCategory,
+    pub read_index: u32,
+    pub types: Vec<(u32, u8)>,
+    /// The whitelist entries the read's barcode matched (several for an
+    /// unresolved 1MM_multi barcode): STAR counts each as a cell this feature
+    /// detected (`cbReadCount`, `SoloReadFeature_record.cpp:187-189`), which
+    /// decides the cells of the filtered matrices.
+    pub cbs: Vec<u32>,
+}
+
+/// The Velocyto feature's records for the whole run, kept compact: STAR
+/// writes them to a temporary file, and a run can have hundreds of millions.
+/// Each read is its index and transcript count, and each transcript its index
+/// and type bits packed in one `u32` (`tr << 4 | bits`; STAR's transcript
+/// index is a `uint32`, and the type bits are the four of
+/// [`AlignVsTranscript`](crate::quant::splice_status::AlignVsTranscript)).
+/// The cells the records' barcodes matched are a bitset over the barcode
+/// index.
+#[derive(Debug, Default)]
+pub struct VelocytoRecords {
+    reads: Vec<(u32, u32)>,
+    types: Vec<u32>,
+    cells: Vec<u64>,
+}
+
+impl VelocytoRecords {
+    pub fn push(&mut self, r: &VelocytoRecord) {
+        self.reads.push((r.read_index, r.types.len() as u32));
+        self.types.extend(r.types.iter().map(|&(tr, ty)| {
+            debug_assert!(tr < 1 << 28 && ty < 1 << 4);
+            tr << 4 | u32::from(ty)
+        }));
+        for &cb in &r.cbs {
+            let word = cb as usize / 64;
+            if word >= self.cells.len() {
+                self.cells.resize(word + 1, 0);
+            }
+            self.cells[word] |= 1 << (cb % 64);
+        }
+    }
+
+    /// Each read's index and its `(transcript, type bits)`, sorted by
+    /// transcript.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, impl Iterator<Item = (u32, u8)> + '_)> {
+        let mut start = 0;
+        self.reads.iter().map(move |&(read_index, n)| {
+            let packed = &self.types[start..start + n as usize];
+            start += n as usize;
+            (
+                read_index,
+                packed.iter().map(|&p| (p >> 4, (p & 0xf) as u8)),
+            )
+        })
+    }
+
+    /// Whether a record's barcode matched cell `cb`.
+    pub fn detected(&self, cb: u32) -> bool {
+        self.cells
+            .get(cb as usize / 64)
+            .is_some_and(|w| w & (1 << (cb % 64)) != 0)
+    }
 }
 
 /// A read whose cell barcode matched multiple whitelist entries by 1MM
@@ -1089,27 +1259,32 @@ pub struct SoloContext {
     pub gene_ann: GeneAnnotation,
     /// Transcript models for the `Gene` feature and GX/GN (`classifyAlign`).
     pub gene_model: GeneModel,
-    pub stats: CbMatchStats,
+    /// `Barcodes.stats` and the CB+UMI Q30 tally.
+    pub stats: BarcodeStats,
+    /// `Features.stats` per quantified feature, parallel to `features`.
+    pub feature_stats: Vec<FeatureStats>,
+    /// `Features.stats` of the SJ and Velocyto features.
+    pub sj_stats: FeatureStats,
+    pub velocyto_stats: FeatureStats,
+    /// `(Q30 bases, bases)` of the cDNA reads' clipped sequence, for
+    /// "Q30 Bases in RNA read" (`ReadAlign_oneRead.cpp:27-33`).
+    pub rna_q30: [AtomicU64; 2],
     /// Quantified features (`Gene`, `GeneFull`, …), each with its own recorder
     /// and `Solo.out/<feature>/raw/` output. Parallel to `recorders`.
     pub features: Vec<SoloFeature>,
     pub recorders: Vec<SoloRecorder>,
-    /// Reads uniquely assigned to a gene per feature (parallel to `features`),
-    /// among valid-barcode reads — the STARsolo "Reads Mapped to <feature>:
-    /// Unique" metric.
-    pub feature_reads: Vec<AtomicU64>,
     /// CellRanger-style positional mapping funnel over uniquely-mapped reads
-    /// (independent of barcode), populated only when both `Gene` and `GeneFull`
-    /// features run.
-    pub region_stats: RegionStats,
+    /// (independent of barcode), kept only for `--soloCellRangerSummary Yes`
+    /// and written only when both `Gene` and `GeneFull` features run.
+    pub region_stats: Option<RegionStats>,
     /// `--soloFeatures SJ`: collect per-cell splice-junction counts.
     pub sj_enabled: bool,
     /// (cell, UMI, junction) observations for the SJ feature.
-    pub sj_records: Mutex<Vec<SjCountRecord>>,
+    pub sj_records: Mutex<SjRecords>,
     /// `--soloFeatures Velocyto`: collect spliced/unspliced/ambiguous counts.
     pub velocyto_enabled: bool,
-    /// (cell, UMI, gene, category) observations for the Velocyto feature.
-    pub velocyto_records: Mutex<Vec<VelocytoRecord>>,
+    /// The Velocyto feature's per-read records.
+    pub velocyto_records: Mutex<VelocytoRecords>,
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
     pub want_multi: bool,
@@ -1129,7 +1304,14 @@ pub struct SoloContext {
     /// UMI each read ended up counted under, filled by UMI collapsing and read
     /// back when the sorted BAM is written to fill `CB`/`UB`. `None` unless one
     /// of those tags was requested.
-    pub read_info: Option<Mutex<Vec<ReadInfo>>>,
+    ///
+    /// One slot per feature, as STAR keeps a readInfo per feature: the first
+    /// feature's for `CB`/`UB` (`samAttrFeature`), the Gene feature's for
+    /// Velocyto (`ParametersSolo.cpp:420-422`).
+    pub read_info: Vec<Option<Mutex<Vec<ReadInfo>>>>,
+    /// The slot of `read_info` the `CB`/`UB` SAM tags read (the first
+    /// feature's), when those tags were requested.
+    pub tag_read_info_slot: Option<usize>,
 }
 
 /// One `readInfo` entry: what a read was counted as, once collapsing has run.
@@ -1150,6 +1332,54 @@ impl Default for ReadInfo {
     }
 }
 
+/// STAR's `SoloReadFeatureStats` (`SoloReadFeatureStats.h`) for one feature,
+/// written to `Solo.out/<feature>/Features.stats` and behind `Summary.csv`.
+#[derive(Debug, Default)]
+pub struct FeatureStats {
+    counts: [AtomicU64; FeatureStats::NAMES.len()],
+}
+
+impl FeatureStats {
+    /// STAR's names, in its order.
+    pub const NAMES: [&'static str; 11] = [
+        "noUnmapped",
+        "noNoFeature",
+        "MultiFeature",
+        "subMultiFeatureMultiGenomic",
+        "noTooManyWLmatches",
+        "noMMtoWLwithoutExact",
+        "yesWLmatch",
+        "yessubWLmatchExact",
+        "yessubWLmatch_UniqueFeature",
+        "yesCellBarcodes",
+        "yesUMIs",
+    ];
+    pub const NO_UNMAPPED: usize = 0;
+    pub const NO_NO_FEATURE: usize = 1;
+    pub const MULTI_FEATURE: usize = 2;
+    pub const SUB_MULTI_FEATURE_MULTI_GENOMIC: usize = 3;
+    pub const NO_TOO_MANY_WL_MATCHES: usize = 4;
+    pub const NO_MM_TO_WL_WITHOUT_EXACT: usize = 5;
+    pub const YES_WL_MATCH: usize = 6;
+    pub const YES_SUB_WL_MATCH_EXACT: usize = 7;
+    pub const YES_SUB_WL_MATCH_UNIQUE_FEATURE: usize = 8;
+    pub const YES_CELL_BARCODES: usize = 9;
+    pub const YES_UMIS: usize = 10;
+
+    pub fn add(&self, i: usize, n: u64) {
+        self.counts[i].fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn get(&self, i: usize) -> u64 {
+        self.counts[i].load(Ordering::Relaxed)
+    }
+
+    /// STAR's `numInvalidBarcodes`: reads dropped for their barcode at counting.
+    pub fn invalid(&self) -> u64 {
+        self.get(Self::NO_TOO_MANY_WL_MATCHES) + self.get(Self::NO_MM_TO_WL_WITHOUT_EXACT)
+    }
+}
+
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
 /// reads, mirroring CellRanger's "confidently mapped to ... regions").
 #[derive(Default)]
@@ -1166,8 +1396,9 @@ pub struct RegionStats {
 pub struct SoloReadOutcome {
     pub per_feature: Vec<FeatureOutcome>,
     /// SJ-feature records for this read (one per crossed junction); empty unless
-    /// `--soloFeatures SJ` and the read is uniquely mapped with a resolved CB.
-    pub sj: Vec<SjCountRecord>,
+    /// `--soloFeatures SJ` and the read is uniquely mapped with a whitelisted
+    /// barcode and a valid UMI.
+    pub sj: SjRecords,
     /// Velocyto record for this read (resolved CB, gene-assigned), if enabled.
     pub velocyto: Option<VelocytoRecord>,
     /// Barcode facts for the per-read SAM tags. `None` when the barcode read was
@@ -1177,7 +1408,8 @@ pub struct SoloReadOutcome {
 
 impl SoloReadOutcome {
     /// Stamp the input read index onto every count record this read produced, so
-    /// UMI collapsing can fill STAR's readInfo (the `CB`/`UB` SAM tags).
+    /// UMI collapsing can fill STAR's readInfo (for the `CB`/`UB` SAM tags and
+    /// Velocyto).
     pub fn set_read_index(&mut self, read_index: u32) {
         for fo in &mut self.per_feature {
             if let Some(r) = &mut fo.record {
@@ -1192,6 +1424,9 @@ impl SoloReadOutcome {
             if let Some(m) = &mut fo.no_feature_multi {
                 m.read_index = read_index;
             }
+        }
+        if let Some(v) = &mut self.velocyto {
+            v.read_index = read_index;
         }
     }
 }
@@ -1278,8 +1513,9 @@ pub struct FeatureOutcome {
     pub multi_gene: Option<MultiGeneRecord>,
     /// STAR's no-feature record (`SoloReadFeature_record.cpp:180-182`): a read
     /// with a valid barcode that this feature does not count to a single gene,
-    /// kept only to fill readInfo (the `CB`/`UB` tags). `gene` is [`NO_FEATURE`]; a 1MM_multi
-    /// barcode goes in `no_feature_multi` instead.
+    /// kept only to fill readInfo (for the `CB`/`UB` tags or Velocyto). `gene`
+    /// is [`NO_FEATURE`]; a 1MM_multi barcode goes in `no_feature_multi`
+    /// instead.
     pub no_feature: Option<SoloCountRecord>,
     pub no_feature_multi: Option<SoloMultiRecord>,
 }
@@ -1369,12 +1605,22 @@ impl SoloContext {
             }
         };
         let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
-        let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
         let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
         let velocyto_enabled = params.solo_features.iter().any(|f| f == "Velocyto");
         let transcript3p = params.solo_features.iter().any(|f| f == "Transcript3p");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
+        // STAR's readInfo, per feature; sized once the read count is known
+        // (`reserve_read_info`).
+        let read_info = features
+            .iter()
+            .enumerate()
+            .map(|(fi, &f)| {
+                let tags = fi == 0 && params.solo_read_info_needed();
+                let velocyto = velocyto_enabled && f == SoloFeature::Gene;
+                (tags || velocyto).then(|| Mutex::new(Vec::new()))
+            })
+            .collect();
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
             whitelist,
@@ -1382,15 +1628,18 @@ impl SoloContext {
             strand,
             gene_ann,
             gene_model,
-            stats: CbMatchStats::new(),
+            stats: BarcodeStats::new(),
+            feature_stats: features.iter().map(|_| FeatureStats::default()).collect(),
+            sj_stats: FeatureStats::default(),
+            velocyto_stats: FeatureStats::default(),
+            rna_q30: [AtomicU64::new(0), AtomicU64::new(0)],
             features,
             recorders,
-            feature_reads,
-            region_stats: RegionStats::default(),
+            region_stats: params.solo_cellranger_summary().then(RegionStats::default),
             sj_enabled,
-            sj_records: Mutex::new(Vec::new()),
+            sj_records: Mutex::new(SjRecords::default()),
             velocyto_enabled,
-            velocyto_records: Mutex::new(Vec::new()),
+            velocyto_records: Mutex::new(VelocytoRecords::default()),
             want_multi,
             cell_read_stats: (params.solo_cell_read_stats == "CB")
                 .then(|| Mutex::new(crate::solo::cell_reads::CellReadStats::new())),
@@ -1420,16 +1669,28 @@ impl SoloContext {
                 .transpose()?,
             transcript3p: transcript3p
                 .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
-            // Sized once the read count is known (`reserve_read_info`).
-            read_info: params
-                .solo_read_info_needed()
-                .then(|| Mutex::new(Vec::new())),
+            read_info,
+            tag_read_info_slot: params.solo_read_info_needed().then_some(0),
         })
     }
 
-    /// Whether this run has to track STAR's readInfo (the `CB`/`UB` SAM tags).
+    /// Whether this run has to track STAR's readInfo (for the `CB`/`UB` SAM
+    /// tags or Velocyto).
     pub fn read_info_enabled(&self) -> bool {
-        self.read_info.is_some()
+        self.read_info.iter().any(Option::is_some)
+    }
+
+    /// The readInfo the `CB`/`UB` tags are filled from (the first feature's),
+    /// when those tags were requested.
+    pub fn tag_read_info(&self) -> Option<&Mutex<Vec<ReadInfo>>> {
+        self.read_info.get(self.tag_read_info_slot?)?.as_ref()
+    }
+
+    /// The Gene feature's readInfo, which Velocyto takes its cells and UMIs
+    /// from.
+    pub fn gene_read_info(&self) -> Option<&Mutex<Vec<ReadInfo>>> {
+        let fi = self.features.iter().position(|&f| f == SoloFeature::Gene)?;
+        self.read_info[fi].as_ref()
     }
 
     /// `--soloType CB_samTagOut`: match the barcode to the whitelist and stop
@@ -1441,7 +1702,7 @@ impl SoloContext {
         let cb_match = self
             .whitelist
             .match_cb(&bc.cb_seq, &bc.cb_qual, self.match_type);
-        self.stats.record_cb(&cb_match);
+        self.record_barcode_code(cb_match.star_code(), &cb_match);
         let corrected = match cb_match.resolved_index() {
             Some(idx) => self
                 .whitelist
@@ -1462,7 +1723,7 @@ impl SoloContext {
     /// Size the readInfo array for `n_reads` input reads, once the alignment
     /// pass has counted them. No-op unless `CB`/`UB` were requested.
     pub fn reserve_read_info(&self, n_reads: usize) {
-        if let Some(info) = &self.read_info {
+        for info in self.read_info.iter().flatten() {
             let mut info = info.lock().unwrap();
             info.clear();
             info.resize(n_reads, ReadInfo::default());
@@ -1531,6 +1792,113 @@ impl SoloContext {
             .collect()
     }
 
+    /// Count a read with no barcode in `Barcodes.stats`: a missing adapter or
+    /// UMI directly (`SoloReadBarcode_getCBandUMI.cpp:340-350`), a missing CB
+    /// as `cbMatch` -11.
+    pub fn record_barcode_miss(&self, miss: BarcodeMiss) {
+        match miss {
+            BarcodeMiss::NoAdapter => self.stats.no_adapter(),
+            BarcodeMiss::NoUmi => self.stats.no_umi(),
+            BarcodeMiss::NoCb => self.add_stats(-11),
+        }
+    }
+
+    /// STAR's `addStats`: a read's bin by its final `cbMatch`, none without a
+    /// whitelist (`SoloReadBarcode_getCBandUMI.cpp:95-96`).
+    fn add_stats(&self, code: i32) {
+        if !matches!(self.whitelist, CbWhitelist::NoWhitelist { .. }) {
+            self.stats.record(code);
+        }
+    }
+
+    /// Add one read's quality tallies: its barcode read's (`barcode_q30`) and
+    /// its cDNA mates' clipped qualities (STAR's `qualHist`, bases at or above
+    /// `readQualityScoreBase + 30`).
+    pub fn record_qualities(&self, barcode_q30: (u64, u64), mates: &[&[u8]]) {
+        self.stats.add_q30(barcode_q30.0, barcode_q30.1);
+        for q in mates {
+            let q30 = q.iter().filter(|&&b| b >= 33 + 30).count() as u64;
+            self.rna_q30[0].fetch_add(q30, Ordering::Relaxed);
+            self.rna_q30[1].fetch_add(q.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Count a read by its final `cbMatch` code (`addStats`), and for an exact
+    /// match with a valid UMI (code 0), its barcode's exact count.
+    fn record_barcode_code(&self, code: i32, cb_match: &CbMatch) {
+        self.add_stats(code);
+        if code == 0
+            && let CbMatch::Exact(idx) = cb_match
+        {
+            self.whitelist.bump_exact(*idx);
+        }
+    }
+
+    /// STAR's per-read feature counts for a read with a valid barcode and UMI
+    /// (`SoloReadFeature_record.cpp:75-176`), plus `yessubWLmatchExact` for
+    /// its counted records (`SoloReadFeature_inputRecords.cpp:111-113`; an
+    /// exact barcode always survives the later filters).
+    fn record_feature_stats(
+        &self,
+        n_loci: usize,
+        class: &ReadClass,
+        out: &SoloReadOutcome,
+        exact: bool,
+        junctions: &[(u64, u64)],
+    ) {
+        use FeatureStats as F;
+        for (fi, (&feature, st)) in self.features.iter().zip(&self.feature_stats).enumerate() {
+            if n_loci == 0 {
+                st.add(F::NO_UNMAPPED, 1);
+                continue;
+            }
+            let assignment = match feature {
+                SoloFeature::Gene => class.gene,
+                SoloFeature::GeneFull => class.gene_full,
+            };
+            match assignment {
+                GeneAssignment::Gene(_) => {
+                    if exact {
+                        st.add(F::YES_SUB_WL_MATCH_EXACT, 1);
+                    }
+                }
+                GeneAssignment::Ambiguous => {
+                    st.add(F::MULTI_FEATURE, 1);
+                    if n_loci > 1 {
+                        st.add(F::SUB_MULTI_FEATURE_MULTI_GENOMIC, 1);
+                    }
+                    let counted = out
+                        .per_feature
+                        .get(fi)
+                        .is_some_and(|fo| fo.multi_gene.is_some());
+                    if exact && counted {
+                        st.add(F::YES_SUB_WL_MATCH_EXACT, 1);
+                    }
+                }
+                GeneAssignment::NoFeature | GeneAssignment::Unmapped => {
+                    st.add(F::NO_NO_FEATURE, 1);
+                }
+            }
+        }
+        if self.sj_enabled {
+            let st = &self.sj_stats;
+            if n_loci == 0 {
+                st.add(F::NO_UNMAPPED, 1);
+            } else if n_loci > 1 {
+                st.add(F::SUB_MULTI_FEATURE_MULTI_GENOMIC, 1);
+                st.add(F::MULTI_FEATURE, 1);
+            } else if junctions.is_empty() {
+                st.add(F::NO_NO_FEATURE, 1);
+            }
+            // The rest are counted per junction record that has a matrix row,
+            // when the matrix is built (`SoloReadFeature_inputRecords.cpp:23-27`).
+        }
+        // Velocyto: STAR's `record` counts its reads too, but `countVelocyto`
+        // never sums the per-thread stats into the feature's (only
+        // `countCBgeneUMI` calls `addStats`, `SoloFeature_countCBgeneUMI.cpp:47`),
+        // so Velocyto's Features.stats carries only the UMIs and cells.
+    }
+
     /// Process one solo read: match the cell barcode, validate the UMI, assign
     /// a gene, and (on success) produce a count record. Stats are recorded
     /// here; the returned records are appended to the recorder by the caller.
@@ -1538,7 +1906,7 @@ impl SoloContext {
         &self,
         cdna_transcripts: &[Transcript],
         n_loci: usize,
-        barcode: Option<&CellBarcode>,
+        barcode: Result<&CellBarcode, BarcodeMiss>,
         junctions: &[(u64, u64)],
     ) -> SoloReadOutcome {
         let mut out = SoloReadOutcome::default();
@@ -1547,8 +1915,7 @@ impl SoloContext {
         // per-feature gene assignment and the CellRanger-style mapping funnel, so
         // this is no more work than the old per-feature `assign_gene_se` calls.
         let want_exon = self.features.contains(&SoloFeature::Gene);
-        // Velocyto assigns its gene by gene-body overlap, so it needs `want_body`.
-        let want_body = self.features.contains(&SoloFeature::GeneFull) || self.velocyto_enabled;
+        let want_body = self.features.contains(&SoloFeature::GeneFull);
         let class = classify_read(
             cdna_transcripts,
             &self.gene_ann,
@@ -1563,43 +1930,50 @@ impl SoloContext {
         // "confidently mapped" = MAPQ 255 ≈ a single alignment), independent of
         // barcode validity. `n_loci` is the number of genomic loci the read (or
         // pair) maps to — for SE this equals `cdna_transcripts.len()`.
-        if n_loci == 1 {
+        if let Some(funnel) = &self.region_stats
+            && n_loci == 1
+        {
             match class.region {
                 Some(Region::Exonic) => {
-                    self.region_stats.exonic.fetch_add(1, Ordering::Relaxed);
+                    funnel.exonic.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(Region::Intronic) => {
-                    self.region_stats.intronic.fetch_add(1, Ordering::Relaxed);
+                    funnel.intronic.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(Region::Intergenic) => {
-                    self.region_stats.intergenic.fetch_add(1, Ordering::Relaxed);
+                    funnel.intergenic.fetch_add(1, Ordering::Relaxed);
                 }
                 None => {}
             }
             if class.antisense {
-                self.region_stats.antisense.fetch_add(1, Ordering::Relaxed);
+                funnel.antisense.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        // No barcode read (too short) → nothing to count (region already tallied).
-        let Some(bc) = barcode else {
-            return out;
+        // No barcode → nothing to count.
+        let bc = match barcode {
+            Ok(bc) => bc,
+            Err(miss) => {
+                self.record_barcode_miss(miss);
+                return out;
+            }
         };
 
         // Cell-barcode match.
         let cb_match = self
             .whitelist
             .match_cb(&bc.cb_seq, &bc.cb_qual, self.match_type);
-        self.stats.record_cb(&cb_match);
 
         // Per-read SAM-tag facts, recorded before any early return so that a
         // rejected barcode still tags its alignments. STAR reports a UMI
         // rejection in place of the CB code (`getCBandUMI.cpp:304`).
         let umi_status = check_umi(&bc.umi_seq);
+        let code = umi_status
+            .star_code()
+            .unwrap_or_else(|| cb_match.star_code());
+        self.record_barcode_code(code, &cb_match);
         out.barcode = Some(SoloBarcodeTags {
-            cb_match: umi_status
-                .star_code()
-                .unwrap_or_else(|| cb_match.star_code()),
+            cb_match: code,
             cb_index: cb_match.resolved_index(),
         });
 
@@ -1610,46 +1984,63 @@ impl SoloContext {
         };
 
         // UMI validity.
-        let umi = match umi_status {
-            UmiCheck::Ok(packed) => {
-                self.stats.record_umi(&UmiCheck::Ok(packed));
-                packed
-            }
-            rejected => {
-                self.stats.record_umi(&rejected);
-                return out;
-            }
+        let UmiCheck::Ok(umi) = umi_status else {
+            return out;
         };
 
-        // SJ feature: record (cell, UMI, junction) for each crossed junction.
-        // Only for resolved CBs (1MM_multi deferral is not applied to SJ).
-        if self.sj_enabled
-            && !junctions.is_empty()
-            && let Some(cb) = cb_resolved
-        {
-            out.sj = junctions
-                .iter()
-                .map(|&(intron_start, intron_end)| SjCountRecord {
-                    cb,
-                    umi,
-                    intron_start,
-                    intron_end,
-                })
-                .collect();
+        // SJ feature: record (cell, UMI, junction) for each crossed junction;
+        // a 1MM_multi barcode's cell is resolved when the matrix is built.
+        if self.sj_enabled && !junctions.is_empty() {
+            match (cb_resolved, &cb_match) {
+                (Some(cb), _) => {
+                    out.sj.unique = junctions
+                        .iter()
+                        .map(|&(intron_start, intron_end)| SjCountRecord {
+                            cb,
+                            umi,
+                            intron_start,
+                            intron_end,
+                            exact: code == 0,
+                        })
+                        .collect();
+                }
+                (None, CbMatch::Multi(cands)) => {
+                    out.sj.multi = junctions
+                        .iter()
+                        .map(|&(intron_start, intron_end)| SjMultiRecord {
+                            candidates: cands.clone(),
+                            umi,
+                            intron_start,
+                            intron_end,
+                        })
+                        .collect();
+                }
+                (None, _) => {}
+            }
         }
 
-        // Velocyto feature: gene from gene-body overlap, then classify the read
-        // spliced/unspliced/ambiguous. Resolved CB only.
+        // Velocyto: the transcripts a uniquely mapped read is compatible with
+        // (`classifyAlign` computes them only for `nAlignG==1`), recorded for
+        // any read whose barcode and UMI pass (`record` returns before
+        // `cbMatch<0`), counted or not; its cell and UMI come from the Gene
+        // feature's readInfo when the molecules are collapsed.
         if self.velocyto_enabled
-            && let Some(cb) = cb_resolved
-            && let GeneAssignment::Gene(gene) = class.gene_full
+            && n_loci == 1
+            && let [aln] = cdna_transcripts
         {
-            out.velocyto = Some(VelocytoRecord {
-                cb,
-                umi,
-                gene,
-                category: velocyto_category(cdna_transcripts, &self.gene_ann, gene),
-            });
+            let types = velocyto_transcript_types(aln, &self.gene_model, self.strand);
+            if !types.is_empty() {
+                let cbs = match &cb_match {
+                    CbMatch::Exact(i) | CbMatch::Corrected(i) => vec![*i],
+                    CbMatch::Multi(cands) => cands.iter().map(|c| c.wl_index).collect(),
+                    CbMatch::NoMatch | CbMatch::NinCb | CbMatch::MultMatchRejected => Vec::new(),
+                };
+                out.velocyto = Some(VelocytoRecord {
+                    read_index: NO_READ_INDEX,
+                    types,
+                    cbs,
+                });
+            }
         }
 
         // The CB match + UMI are shared across features; reuse the cached
@@ -1664,10 +2055,10 @@ impl SoloContext {
                     SoloFeature::Gene => class.gene,
                     SoloFeature::GeneFull => class.gene_full,
                 };
-                // STAR's no-feature record, feature 0 only: the readInfo of
-                // the `CB`/`UB` tags comes from the tag feature, the first one.
+                // STAR's no-feature record, for the features whose readInfo
+                // is kept (the first for `CB`/`UB`, Gene for Velocyto).
                 let no_feature = |fo: &mut FeatureOutcome| {
-                    if fi != 0 || self.read_info.is_none() {
+                    if self.read_info.get(fi).is_none_or(Option::is_none) {
                         return;
                     }
                     match (cb_resolved, &cb_match) {
@@ -1719,9 +2110,6 @@ impl SoloContext {
                         return fo;
                     }
                 };
-                // Reads uniquely mapped to a gene under this feature, among
-                // valid-barcode reads (STARsolo "Reads Mapped to <feature>").
-                self.feature_reads[fi].fetch_add(1, Ordering::Relaxed);
                 match (cb_resolved, &cb_match) {
                     (Some(cb), _) => {
                         fo.record = Some(SoloCountRecord {
@@ -1745,6 +2133,9 @@ impl SoloContext {
             })
             .collect();
 
+        // The read's `cbMatch` is >= 0 here: STAR's `SoloReadFeature::record`
+        // counts it for every feature.
+        self.record_feature_stats(n_loci, &class, &out, code == 0, junctions);
         self.record_cell_read(
             cb_resolved,
             &cb_match,
@@ -1834,7 +2225,7 @@ impl SoloContext {
     pub fn process_read_pe(
         &self,
         pairs: &[(&Transcript, &Transcript)],
-        barcode: Option<&CellBarcode>,
+        barcode: Result<&CellBarcode, BarcodeMiss>,
         junctions: &[(u64, u64)],
     ) -> SoloReadOutcome {
         // A mate pair is one alignment in STAR (one `Transcript`, both mates'
@@ -2308,10 +2699,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_too_short_returns_none() {
+    fn extract_too_short_is_no_cb() {
         let layout = v2_layout();
         let read = encoded_read("short", "AAAAAAAACCCC", "IIIIIIIIIIII");
-        assert!(layout.extract(&read).is_none());
+        assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoCb));
     }
 
     #[test]
@@ -2522,7 +2913,7 @@ mod tests {
             quality: vec![b'I'; 12],
             file_index: 0,
         };
-        assert!(layout.extract(&read).is_some());
+        assert!(layout.extract(&read).is_ok());
 
         // No adapter at all: no barcode. A barcode read at an unknown offset
         // is not salvageable, so guessing would be worse than declining.
@@ -2532,7 +2923,7 @@ mod tests {
             quality: vec![b'I'; 12],
             file_index: 0,
         };
-        assert!(layout.extract(&read).is_none());
+        assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoAdapter));
     }
 
     /// The discriminating case: an early offset that fits the budget against a
@@ -2609,7 +3000,7 @@ mod tests {
             quality: vec![b'I'; 12],
             file_index: 0,
         };
-        assert!(layout.extract(&read).is_none());
+        assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoAdapter));
     }
 
     #[test]
@@ -2639,6 +3030,6 @@ mod tests {
             quality: vec![b'I'; 7],
             file_index: 0,
         };
-        assert!(layout.extract(&read).is_none());
+        assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoCb));
     }
 }

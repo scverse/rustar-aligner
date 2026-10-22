@@ -232,6 +232,86 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
+  `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
+  written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull
+  `Summary.csv` lacked the Q30 and "Unique+Multiple" lines, printed fixed
+  decimals, and computed several values its own way. They now come from
+  STAR's counters (`SoloReadBarcodeStats`, `SoloReadFeatureStats`) and its
+  `statsOutput`:
+  - each read counts once in `Barcodes.stats`, under its final `cbMatch`
+    code (a UMI rejection replaces the barcode's); a missing adapter or UMI
+    is counted as STAR counts it;
+  - the per-feature counts come from STAR's three stages: per read
+    (`record`), at counting (oneExact and 1MM_multi rejections) and at UMI
+    collapse; Velocyto keeps only the UMIs and cells, as `countVelocyto`
+    never sums the rest;
+  - "Reads With Valid Barcodes" subtracts both barcode and feature
+    rejections; "Reads Mapped to <feature>: Unique" is the counted reads;
+    means are integer, medians the element at `nCells/2`, the UMI median
+    from every barcode's UMIs;
+  - doubles, here and in `UniqueAndMult-*.mtx` (which printed `0.50000`
+    for STAR's `0.5`), are written as C++'s `ostream` does;
+  - `CB_samTagOut` writes `Barcodes.stats`, and so does a run with
+    `--soloCBwhitelist None` (all zeros, as STAR's: it bins reads only
+    against a whitelist). That mode still writes no matrices.
+
+  Also: a barcode's exact-match count (used by oneExact and the 1MM_multi
+  posterior) now counts only reads whose UMI passed too, as STAR's
+  `addStats` does; it counted exact barcodes with a rejected UMI. Across 30
+  STARsolo configurations of the 10x v2 mouse chr19 fixture, 453 of 457
+  `Solo.out` files are byte-identical to STARsolo's; the other four are the
+  `CB_UMI_Complex` homopolymer UMIs of DIVERGENCE.md §1.6.
+
+  STAR's per-line SJ counts are ported too: a junction that is not a matrix
+  row counts nowhere, a read with no junction is `noNoFeature` (a
+  1MM_multi barcode with junctions was too), and 1MM_multi barcodes on SJ
+  records, which were dropped, are resolved by the posterior as for Gene. `CB_UMI_Complex` reads rejected
+  twice can land in a different `Barcodes.stats` bin from STAR's
+  (DIVERGENCE.md §3.4).
+
+  `CellRanger.summary.csv`, a rustar-aligner extension written whenever
+  Gene and GeneFull both ran, is now opt-in: `--soloCellRangerSummary Yes`
+  (DIVERGENCE.md §1.8). By default `Solo.out` holds only STARsolo's files.
+
+- **`--soloCellFilter TopCells N` calls cells as STARsolo.** It took the N
+  barcodes with the most UMIs. STAR keeps every barcode with at least the
+  UMIs of the barcode at index N of the descending list, the (N+1)th, so
+  ties are kept (`SoloFeature_cellFiltering.cpp:46-59`). With `TopCells 100`
+  on the 10x v2 mouse chr19 fixture STAR calls 106 cells and rustar-aligner
+  called 100; the filtered matrices are now identical.
+
+- **`--soloFeatures Velocyto` counts as STARsolo.** It used its own rule (a
+  junction means spliced, an intronic block unspliced, anything else
+  ambiguous), read by read. It now ports STAR's:
+  - each uniquely mapped read is compared with every transcript that
+    contains it on the `--soloStrand` strand (`alignToTranscriptMinOverlap`,
+    velocyto's 5-base flank, already ported for bulk use in
+    `quant/splice_status.rs`);
+  - a molecule (cell, UMI, taken from the Gene feature's readInfo) keeps the
+    transcripts all its reads share; it is spliced, unspliced or ambiguous by
+    STAR's model flags, and dropped if its transcripts span two genes
+    (`SoloFeature_countVelocyto.cpp`);
+  - all three matrices hold the same (cell, gene) rows, zeros included;
+  - `Velocyto/filtered/` is written, for the Gene feature's called cells that
+    Velocyto detected (`SoloFeature_cellFiltering.cpp:16-30`), unless there
+    are none (`:106-108`).
+
+  On the 10x v2 mouse chr19 fixture the raw and filtered matrices are now
+  byte-identical to STARsolo's (spliced/unspliced/ambiguous UMIs 369/57/32,
+  against 52/100/362 before), in 10 configurations: Unstranded, Reverse,
+  `1MM_multi`, GeneFull listed first, with `CB`/`UB` tags, `1MM_Directional`
+  and `Exact` dedup, EmptyDrops_CR, and paired-end cDNA. STAR keeps a readInfo
+  per feature (`CB`/`UB` read the first feature's, Velocyto the Gene
+  feature's), and so does rustar-aligner now. `--soloFeatures Velocyto`
+  without `Gene`, on which STAR crashes, is refused; with `--soloType
+  SmartSeq` it is refused with STAR's message.
+
+  `--soloVelocytoAmbiguous` is removed. It was a rustar-aligner extension
+  that folded ambiguous molecules into spliced, on the premise that exon-only
+  reads land in ambiguous; under STAR's model they are spliced, and ambiguous
+  means exonic in one isoform and intronic in another.
+
 - **Paired-end reads with mates of 50 bases or fewer align as STAR.** STAR
   caps the spacing of its seed search starts by the whole read, both mates
   and the spacer (`ReadAlign_mapOneRead.cpp:41-42`); we capped each mate by

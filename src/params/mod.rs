@@ -1188,6 +1188,14 @@ pub struct Parameters {
     #[arg(long = "outSAMsplicingStatus", default_value = "No")]
     pub out_sam_splicing_status: String,
 
+    /// rustar-aligner extension (not in STAR): `Yes` writes
+    /// `<feature>/CellRanger.summary.csv` for the `Gene` and `GeneFull`
+    /// features: the fractions of all reads that map uniquely in exonic,
+    /// intronic or intergenic regions, or antisense to a gene, under
+    /// CellRanger's metric names. Needs both features.
+    #[arg(long = "soloCellRangerSummary", default_value = "No")]
+    pub solo_cellranger_summary: String,
+
     // ── DegNorm (rustar-aligner extension, not STAR) ────────────────────
     /// `Yes` writes per-gene, per-exonic-base coverage to
     /// `GeneCoverage.out.bin` for the DegNorm merge (`--degNormCoverageFiles`).
@@ -1448,15 +1456,6 @@ pub struct Parameters {
     /// that STARsolo writes (so the byte-for-byte STARsolo comparison still holds).
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
-
-    /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
-    /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
-    /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
-    /// `ambiguous`. `no` resolves those molecules to `spliced` (an exon-only read is
-    /// most likely mature mRNA; cf. He, Soneson & Patro 2023) and writes only
-    /// `spliced`/`unspliced`, with no `ambiguous.mtx`.
-    #[arg(long = "soloVelocytoAmbiguous", default_value = "yes")]
-    pub solo_velocyto_ambiguous: String,
 
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
@@ -2188,6 +2187,7 @@ impl Parameters {
             ("--quantGeneSplicing", &params.quant_gene_splicing),
             ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
             ("--quantGeneCoverage", &params.quant_gene_coverage),
+            ("--soloCellRangerSummary", &params.solo_cellranger_summary),
         ] {
             if !matches!(value.as_str(), "Yes" | "No") {
                 return Err(command.error(
@@ -2417,6 +2417,26 @@ impl Parameters {
                         ),
                     ));
                 }
+            }
+            let velocyto = params.solo_features.iter().any(|f| f == "Velocyto");
+            if velocyto && params.solo_type == SoloType::SmartSeq {
+                // `ParametersSolo.cpp:238-241`.
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "EXITING because of fatal PARAMETERS error: --soloFeatures Velocyto is \
+                     presently not compatible with --soloType SmartSeq .\n\
+                     SOLUTION: re-run without --soloFeatures Velocyto .",
+                ));
+            }
+            // Velocyto takes its cells and UMIs from the Gene feature's readInfo
+            // (`SoloFeature_countVelocyto.cpp:33-34`). STAR does not check that
+            // Gene is listed and crashes without it; refused here instead.
+            if velocyto && !params.solo_features.iter().any(|f| f == "Gene") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--soloFeatures Velocyto requires Gene in --soloFeatures: Velocyto takes \
+                     its cells and UMIs from the Gene feature (STAR crashes without it)",
+                ));
             }
             // In STAR's order: the whitelist match type (`init_CBmatchWL`,
             // `ParametersSolo.cpp:672-683`), then CB/UB (`:403-435`), then the
@@ -2773,6 +2793,11 @@ impl Parameters {
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// `--soloCellRangerSummary Yes` (rustar-aligner extension).
+    pub fn solo_cellranger_summary(&self) -> bool {
+        self.solo_cellranger_summary == "Yes"
     }
 
     /// Returns true if `--quantGeneSplicing Yes` (rustar-aligner extension:
@@ -4215,6 +4240,46 @@ mod tests {
         let mut with_ub = tag_out.to_vec();
         with_ub.extend_from_slice(&["--outSAMattributes", "NH", "UB"]);
         assert!(try_parse(&with_ub).is_err());
+    }
+
+    /// Velocyto needs the Gene feature's readInfo, and STAR refuses it with
+    /// SmartSeq (`ParametersSolo.cpp:238-241`).
+    #[test]
+    fn velocyto_refusals() {
+        let base = |features: &[&'static str], solo_type: &'static str| {
+            let mut v = vec![
+                "--readFilesIn",
+                "cdna.fq",
+                "bc.fq",
+                "--soloType",
+                solo_type,
+                "--soloCBwhitelist",
+                "wl.txt",
+                "--soloFeatures",
+            ];
+            v.extend_from_slice(features);
+            v
+        };
+        assert!(try_parse(&base(&["Gene", "Velocyto"], "CB_UMI_Simple")).is_ok());
+        let err = try_parse(&base(&["GeneFull", "Velocyto"], "CB_UMI_Simple")).unwrap_err();
+        assert!(err.to_string().contains("requires Gene"), "{err}");
+        let mut smart_seq = base(&["Gene", "Velocyto"], "SmartSeq");
+        smart_seq.extend_from_slice(&["--readFilesManifest", "manifest.tsv"]);
+        let err = try_parse(&smart_seq).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("presently not compatible with --soloType SmartSeq"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn solo_cellranger_summary_is_yes_or_no() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert!(!p.solo_cellranger_summary());
+        let p = try_parse(&["--readFilesIn", "r.fq", "--soloCellRangerSummary", "Yes"]).unwrap();
+        assert!(p.solo_cellranger_summary());
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--soloCellRangerSummary", "yes"]).is_err());
     }
 
     #[test]

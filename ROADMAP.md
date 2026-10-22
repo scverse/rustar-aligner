@@ -312,7 +312,7 @@ See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase t
 
 **Prerequisite met**: position agreement >99% (SE 99.815% tie-adj, PE 99.883%). Phase unblocked 2026-06-10.
 
-**Status**: A STARsolo-faithful single-cell pipeline, Gene count matrix **byte-identical to STARsolo's**, with GeneFull/SJ/Velocyto features, CB_UMI_Simple/Complex/SmartSeq chemistries, EmptyDrops_CR + CellRanger2.2 cell calling, multi-mapper resolution, `Summary.csv`, and the per-read STARsolo SAM tags. Validated in a native three-way benchmark against STARsolo and CellRanger (see below). Remaining: the Velocyto feature's counts differ from STARsolo's, and `Barcodes.stats`/`Features.stats` are not written.
+**Status**: A STARsolo-faithful single-cell pipeline, Gene count matrix **byte-identical to STARsolo's**, with GeneFull/SJ/Velocyto features, CB_UMI_Simple/Complex/SmartSeq chemistries, EmptyDrops_CR + CellRanger2.2 cell calling, multi-mapper resolution, `Summary.csv`, and the per-read STARsolo SAM tags. Validated in a native three-way benchmark against STARsolo and CellRanger (see below).
 
 Single-cell quantification layered around the existing aligner: the cDNA read aligns through the normal SE path; a paired **barcode read** (R1 = cell barcode + UMI) is parsed, corrected against a whitelist, assigned to a gene, UMI-deduplicated, and emitted as a sparse per-cell count matrix. Target: faithful port of STARsolo (all features). See [docs-old/phase14_starsolo.md](docs-old/phase14_starsolo.md) for the full design and sub-phase tracking.
 

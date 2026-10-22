@@ -107,6 +107,21 @@ pub struct GeneModel {
 }
 
 impl GeneModel {
+    /// Solo gene index of transcript `tr`; `u32::MAX` if its gene is not listed.
+    pub fn tr_gene(&self, tr: usize) -> u32 {
+        self.tr_gene[tr]
+    }
+
+    /// A model that knows only each transcript's gene, for tests of the
+    /// per-molecule steps.
+    #[cfg(test)]
+    pub(crate) fn with_tr_genes(tr_gene: Vec<u32>) -> Self {
+        Self {
+            transcripts: TranscriptomeIndex::default(),
+            tr_gene,
+        }
+    }
+
     pub fn new(transcripts: TranscriptomeIndex, gene_ann: &GeneAnnotation) -> Self {
         let pos: std::collections::HashMap<&str, u32> = gene_ann
             .gene_ids
@@ -329,41 +344,91 @@ pub fn gene_full_sets(
     sets
 }
 
-/// RNA-velocity read category (Sullivan et al. 2025 mature/nascent/ambiguous,
-/// reported as scVelo's spliced/unspliced/ambiguous).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VelocytoCategory {
-    /// Spans an exon–exon junction → processed (mature) mRNA.
-    Spliced,
-    /// No junction, but a block extends into an intron → nascent mRNA.
-    Unspliced,
-    /// No junction, all blocks wholly within exons → origin indistinguishable.
-    Ambiguous,
-}
-
-/// Classify a uniquely-mapped read (assigned to gene `g` by gene-body overlap)
-/// into its velocity category from the alignment: a splice in the CIGAR means
-/// the read is mature; otherwise an aligned block that leaves the exons (into an
-/// intron) means nascent; a wholly-exonic block is ambiguous.
-pub fn velocyto_category(
-    transcripts: &[Transcript],
-    gene_ann: &GeneAnnotation,
-    g: u32,
-) -> VelocytoCategory {
-    if transcripts.iter().any(|t| t.n_junction > 0) {
-        return VelocytoCategory::Spliced;
+/// The Velocyto annotation of one uniquely mapped alignment (STAR's
+/// `trVelocytoType`, `Transcriptome_classifyAlign.cpp:227-258`; strand
+/// filter `:207-209`): for every transcript that contains it on a strand
+/// `--soloStrand` keeps, the transcript (an index into `model.transcripts`)
+/// and STAR's `reAnn1` type bits from `alignToTranscriptMinOverlap` with
+/// velocyto's 5-base flank.
+/// A spliced alignment leaves out a transcript whose intron one of its blocks
+/// runs into (its junctions are not compared with the transcript's). Sorted
+/// by transcript, as `SoloReadFeature_record.cpp:164-165` sorts it.
+///
+/// The alignment's blocks are its exons merged across indels, mate by mate,
+/// in transcript order (STAR expands a block over `canonSJ` -1/-2, not the
+/// mate gap -3); `sjYes` is whether any mate crosses a junction.
+pub fn velocyto_transcript_types(
+    aln: &Transcript,
+    model: &GeneModel,
+    strand: SoloStrand,
+) -> Vec<(u32, u8)> {
+    use crate::quant::splice_status::{MIN_OVERLAP_MINUS_ONE, align_to_transcript_min_overlap};
+    let idx = &model.transcripts;
+    let mut out = Vec::new();
+    let (Some(first), Some(last)) = (aln.exons.first(), aln.exons.last()) else {
+        return out;
+    };
+    if idx.tr_starts_sorted.is_empty() {
+        return out;
     }
-    let g = g as usize;
-    let all_exonic = transcripts.iter().all(|t| {
-        t.exons
-            .iter()
-            .all(|e| gene_ann.block_is_exonic(g, e.genome_start, e.genome_end))
-    });
-    if all_exonic {
-        VelocytoCategory::Ambiguous
-    } else {
-        VelocytoCategory::Unspliced
+    // Blocks: exons merged across indels within a mate.
+    let gaps = block_gaps(aln);
+    let mut blocks: Vec<(u64, u64)> = Vec::with_capacity(aln.exons.len());
+    let mut has_junction = false;
+    for (i, e) in aln.exons.iter().enumerate() {
+        let joins = i > 0
+            && e.i_frag == aln.exons[i - 1].i_frag
+            && gaps.get(i - 1) != Some(&BlockGap::Junction);
+        if i > 0 && e.i_frag == aln.exons[i - 1].i_frag && !joins {
+            has_junction = true;
+        }
+        match blocks.last_mut() {
+            Some(b) if joins => b.1 = e.genome_end - 1,
+            _ => blocks.push((e.genome_start, e.genome_end - 1)),
+        }
     }
+    // STAR's transcript walk (`binarySearch1a`, then back while `trEmax` covers
+    // the alignment end), with the `--soloStrand` filter applied before the
+    // Velocyto call, as in `classifyAlign`.
+    let pp = idx
+        .tr_starts_sorted
+        .partition_point(|&s| s <= first.genome_start);
+    if pp == 0 {
+        return out;
+    }
+    let a_g_end = last.genome_end - 1;
+    let read_str = u32::from(aln.is_reverse);
+    let mut k = pp - 1;
+    loop {
+        let tr = idx.tr_order[k];
+        let rel_str = if idx.tr_strand[tr] == 1 {
+            read_str
+        } else {
+            1 - read_str
+        };
+        let strand_ok = match strand {
+            SoloStrand::Unstranded => true,
+            SoloStrand::Forward => rel_str == 0,
+            SoloStrand::Reverse => rel_str == 1,
+        };
+        if a_g_end < idx.tr_end[tr]
+            && strand_ok
+            && let Some(status) = align_to_transcript_min_overlap(
+                &blocks,
+                has_junction,
+                &idx.tr_exons[tr],
+                MIN_OVERLAP_MINUS_ONE,
+            )
+        {
+            out.push((tr as u32, status.type_bits()));
+        }
+        if !(idx.tr_end_max_sorted[k] > a_g_end && k > 0) {
+            break;
+        }
+        k -= 1;
+    }
+    out.sort_unstable_by_key(|&(tr, _)| tr);
+    out
 }
 
 /// CellRanger-style positional region of a uniquely-mapped read (independent of
@@ -876,6 +941,94 @@ mod tests {
         let pair = crate::solo::pair_alignment(&m1, &o2);
         let sets = classify_align(std::slice::from_ref(&pair), &model, SoloStrand::Forward);
         assert_eq!(sets.per_align, vec![Vec::<u32>::new()]);
+    }
+
+    /// Velocyto's per-read transcript types: only transcripts on the strand
+    /// `--soloStrand` keeps, each with STAR's type bits.
+    #[test]
+    fn velocyto_types_follow_the_strand_and_the_exons() {
+        use crate::quant::splice_status::AlignVsTranscript as A;
+        let ann = annotation();
+        let model = model_of(&annotation_exons(), &ann);
+        // G1 (+) is a single exon [100, 200): a read inside it is concordant.
+        let sense = read_at(120, 180, false);
+        let types = velocyto_transcript_types(&sense, &model, SoloStrand::Forward);
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].1, A::Concordant.type_bits());
+        // The same read on the other strand: kept only when unstranded.
+        let anti = read_at(120, 180, true);
+        assert_eq!(
+            velocyto_transcript_types(&anti, &model, SoloStrand::Forward),
+            []
+        );
+        assert_eq!(
+            velocyto_transcript_types(&anti, &model, SoloStrand::Unstranded).len(),
+            1
+        );
+        // Outside every transcript: nothing.
+        let far = read_at(600, 650, false);
+        assert_eq!(
+            velocyto_transcript_types(&far, &model, SoloStrand::Unstranded),
+            []
+        );
+    }
+
+    /// A spliced alignment leaves out a transcript only if one of its blocks
+    /// runs into that transcript's intron: STAR does not ask its junctions to
+    /// be the transcript's (`Transcriptome_classifyAlign.cpp:103-158`). A mate
+    /// pair's gap is not a junction.
+    #[test]
+    fn velocyto_types_drop_transcripts_whose_intron_a_spliced_block_enters() {
+        use crate::quant::splice_status::AlignVsTranscript as A;
+        // G3 (+): T1 spliced, exons [500,600) and [800,900); T2 retains the
+        // intron, [500,900).
+        let g = genome();
+        let mut retained = gtf_exon(501, 900, '+', "G3");
+        retained
+            .attributes
+            .insert("transcript_id".to_string(), "G3_t2".to_string());
+        let exons = vec![
+            gtf_exon(501, 600, '+', "G3"),
+            gtf_exon(801, 900, '+', "G3"),
+            retained,
+        ];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let model = model_of(&exons, &ann);
+        let bits = |t: &Transcript| {
+            let mut b: Vec<u8> = velocyto_transcript_types(t, &model, SoloStrand::Forward)
+                .into_iter()
+                .map(|(_, ty)| ty)
+                .collect();
+            b.sort_unstable();
+            b
+        };
+        let exon = A::Concordant.type_bits();
+        let intron = A::Intron.type_bits();
+        // T1's junction, and one neither transcript has: both blocks are
+        // exonic in both transcripts, so both are kept.
+        assert_eq!(bits(&spliced_read((550, 600), (800, 850))), [exon, exon]);
+        assert_eq!(bits(&spliced_read((550, 580), (820, 850))), [exon, exon]);
+        // A spliced read whose first block runs into T1's intron: T1 is out.
+        assert_eq!(bits(&spliced_read((550, 620), (820, 850))), [exon]);
+        // Unspliced, the same block spans T1's exon and intron.
+        let span = A::ExonIntronSpan.type_bits();
+        let mut both = vec![exon, span];
+        both.sort_unstable();
+        assert_eq!(bits(&read_at(550, 620, false)), both);
+        // In the intron: intronic in T1, exonic in T2.
+        let mut both = vec![exon, intron];
+        both.sort_unstable();
+        assert_eq!(bits(&read_at(650, 700, false)), both);
+        // A pair with a mate in each exon: the mates' gap is no junction, so
+        // T2 keeps it, and both transcripts hold it.
+        use noodles::sam::alignment::record::cigar::{Op, op::Kind};
+        let mate = |start: u64, end: u64, is_reverse: bool| {
+            let mut t = read_at(start, end, is_reverse);
+            t.cigar = vec![Op::new(Kind::Match, (end - start) as usize)];
+            t
+        };
+        let pair = crate::solo::pair_alignment(&mate(550, 590, false), &mate(810, 850, true));
+        assert_eq!(bits(&pair), [exon, exon]);
     }
 
     /// `GeneFull` gene sets: per alignment, the sense genes whose body it

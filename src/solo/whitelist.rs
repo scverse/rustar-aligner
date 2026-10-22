@@ -466,7 +466,14 @@ impl CbWhitelist {
     }
 
     /// Increment the exact-match count for sorted whitelist index `idx`.
-    fn bump_exact(&self, idx: u32) {
+    ///
+    /// STAR counts a read here only when its final `cbMatch` is 0, i.e. the
+    /// barcode matched exactly *and* the UMI passed
+    /// (`SoloReadBarcode::addStats`, `SoloReadBarcode_getCBandUMI.cpp:93-100`;
+    /// only a `MATCH_CellRanger` build also counts reads whose UMI fails), so
+    /// the caller bumps it once the read's code is known. These counts feed
+    /// `oneExact` and the 1MM_multi posterior.
+    pub fn bump_exact(&self, idx: u32) {
         if let Self::List { exact_counts, .. } = self {
             exact_counts[idx as usize].fetch_add(1, Ordering::Relaxed);
         }
@@ -502,7 +509,6 @@ impl CbWhitelist {
                 PackResult::ManyN => CbMatch::NinCb,
                 PackResult::NoN(packed) => {
                     if let Some(idx) = self.search(packed) {
-                        self.bump_exact(idx);
                         return CbMatch::Exact(idx);
                     }
                     if !match_type.mm1 {
@@ -590,49 +596,100 @@ fn open_maybe_gzip(path: &Path) -> Result<Box<dyn BufRead>, Error> {
 // Stats (STAR cbMatch categories)
 // ---------------------------------------------------------------------------
 
-/// Per-run barcode-matching statistics, mirroring STAR's `SoloReadBarcodeStats`.
+/// STAR's `SoloReadBarcodeStats` (`SoloReadBarcodeStats.h`), written to
+/// `Solo.out/Barcodes.stats`, plus the CB+UMI base-quality tally behind
+/// `Summary.csv`'s "Q30 Bases in CB+UMI".
 #[derive(Debug, Default)]
-pub struct CbMatchStats {
-    pub yes_exact: AtomicU64,
-    pub yes_one_mm: AtomicU64,
-    pub yes_mult_mm: AtomicU64,
-    pub no_match: AtomicU64,
-    pub n_in_cb: AtomicU64,
-    pub mult_rejected: AtomicU64,
-    pub n_in_umi: AtomicU64,
-    pub umi_homopolymer: AtomicU64,
+pub struct BarcodeStats {
+    counts: [AtomicU64; BarcodeStats::NAMES.len()],
+    q30_bases: AtomicU64,
+    bases: AtomicU64,
 }
 
-impl CbMatchStats {
+impl BarcodeStats {
+    /// STAR's names, in its order.
+    pub const NAMES: [&'static str; 12] = [
+        "noNoAdapter",
+        "noNoUMI",
+        "noNoCB",
+        "noNinCB",
+        "noNinUMI",
+        "noUMIhomopolymer",
+        "noNoWLmatch",
+        "noTooManyMM",
+        "noTooManyWLmatches",
+        "yesWLmatchExact",
+        "yesOneWLmatchWithMM",
+        "yesMultWLmatchWithMM",
+    ];
+    const NO_NO_ADAPTER: usize = 0;
+    const NO_NO_UMI: usize = 1;
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record one CB match outcome.
-    pub fn record_cb(&self, m: &CbMatch) {
-        let c = match m {
-            CbMatch::Exact(_) => &self.yes_exact,
-            CbMatch::Corrected(_) => &self.yes_one_mm,
-            CbMatch::Multi(_) => &self.yes_mult_mm,
-            CbMatch::NoMatch => &self.no_match,
-            CbMatch::NinCb => &self.n_in_cb,
-            CbMatch::MultMatchRejected => &self.mult_rejected,
+    /// Count one read by its final `cbMatch` code, STAR's
+    /// `SoloReadBarcode::addStats` switch (`SoloReadBarcode_getCBandUMI.cpp:93-130`):
+    /// a code it does not list falls to `default`, which counts as a
+    /// multiple-match read.
+    pub fn record(&self, code: i32) {
+        let i = match code {
+            0 => 9,
+            1 => 10,
+            -1 => 6,
+            -2 => 3,
+            -3 => 8,
+            -11 => 2,
+            -12 => 7,
+            -23 => 4,
+            -24 => 5,
+            _ => 11,
         };
-        c.fetch_add(1, Ordering::Relaxed);
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record one UMI check outcome (only the rejection cases are counted).
-    pub fn record_umi(&self, u: &UmiCheck) {
-        match u {
-            UmiCheck::NinUmi => {
-                self.n_in_umi.fetch_add(1, Ordering::Relaxed);
-            }
-            UmiCheck::Homopolymer => {
-                self.umi_homopolymer.fetch_add(1, Ordering::Relaxed);
-            }
-            UmiCheck::Ok(_) => {}
-        }
+    /// `CB_UMI_Complex` with no adapter within the mismatch budget: STAR counts
+    /// it directly, outside `addStats` (`:340-343`).
+    pub fn no_adapter(&self) {
+        self.counts[Self::NO_NO_ADAPTER].fetch_add(1, Ordering::Relaxed);
     }
+
+    /// `CB_UMI_Complex` with no extractable UMI (`:347-350`).
+    pub fn no_umi(&self) {
+        self.counts[Self::NO_NO_UMI].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add one read's CB+UMI `(Q30 bases, bases)` (`qualHist`, counted
+    /// against `readQualityScoreBase + 30`).
+    pub fn add_q30(&self, q30: u64, bases: u64) {
+        self.q30_bases.fetch_add(q30, Ordering::Relaxed);
+        self.bases.fetch_add(bases, Ordering::Relaxed);
+    }
+
+    /// The counts, in [`Self::NAMES`] order.
+    pub fn values(&self) -> [u64; 12] {
+        std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed))
+    }
+
+    /// STAR's `numInvalidBarcodes`: the first nine counts.
+    pub fn invalid(&self) -> u64 {
+        self.values()[..9].iter().sum()
+    }
+
+    /// `(Q30 bases, all bases)` of the CB+UMI qualities.
+    pub fn q30(&self) -> (u64, u64) {
+        (
+            self.q30_bases.load(Ordering::Relaxed),
+            self.bases.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// One line of a STAR stats file: the name right-aligned in 50 columns, the
+/// value in 15 (`statsOut`: `setw(50) << name << setw(15) << value`).
+pub fn stats_line(name: &str, value: u64) -> String {
+    format!("{name:>50}{value:>15}\n")
 }
 
 #[cfg(test)]
@@ -682,8 +739,13 @@ mod tests {
             CbMatch::Exact(idx) => assert_eq!(wl.barcode_string(idx).unwrap(), "ACGT"),
             other => panic!("expected exact, got {other:?}"),
         }
-        let counts = wl.exact_count_snapshot();
-        assert_eq!(counts.iter().sum::<u64>(), 1);
+        // Matching does not count: STAR counts an exact read only once its
+        // UMI has passed too, so the caller bumps it then.
+        assert_eq!(wl.exact_count_snapshot().iter().sum::<u64>(), 0);
+        if let CbMatch::Exact(idx) = m {
+            wl.bump_exact(idx);
+        }
+        assert_eq!(wl.exact_count_snapshot().iter().sum::<u64>(), 1);
     }
 
     #[test]
