@@ -2,6 +2,19 @@
 
 Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs-old/` (the published Astro Starlight docs site lives in `docs/`).
 
+## Release plan
+
+| Version | Theme | Done when |
+|---|---|---|
+| v0.1.0 | First release | Released 2026-05-04. |
+| v0.2.0 | STAR parity build | Default output matches STAR 2.7.11b on the validation sets in `CONTRIBUTING.md`. Every known difference is listed in `DIVERGENCE.md`. Non-STAR additions sit behind their own flag or cargo feature and are off by default. Every open PR has been dealt with. |
+| v0.3.0 | Wider testing and fixes | Parity checked through nf-core pipelines (Nextflow) on a range of datasets, species and library types. Whatever that turns up is fixed. A few more extras, still behind flags or features. |
+| v0.4.0 | Performance | A dedicated pass over the whole pipeline for speed and memory, beyond the performance work already in v0.2.0, with output unchanged: every performance change is checked against the same differential as a parity change. |
+| v0.5.0 | Parity release | The release we publish as a STAR 2.7.11b parity aligner. |
+| after v0.5.0 | Normal development | rustar-aligner extends and diverges from STAR through regular development cycles with scverse and contributors. |
+
+Until v0.5.0 the rule is: port STAR as written, and anything that isn't STAR is opt-in.
+
 ## Phase Dependency Graph
 
 ```

@@ -83,6 +83,39 @@ after, so the regression is a recorded step rather than a surprise.
 
 Adding a dependency — **especially a non-Rust one** (a C library via a `-sys` crate, anything needing `bindgen`/`libclang` or a system library) — must be raised in an issue *before* the PR. This project is published to crates.io and builds on five platforms including Windows; a new C dependency is a maintenance and supply-chain decision, not an implementation detail.
 
+### Code under a sensitive licence needs discussion before any work starts
+
+rustar-aligner is MIT-licensed and published. Code that is ported from, adapted from, or written
+while reading another project's source carries that project's licence with it. A permissive
+licence (MIT, BSD, Apache 2.0) is fine with a notice in `LICENSES/`. Anything else is a
+**sensitive licence**, and a contribution that touches one will most likely not be accepted
+unless the way it was developed has been discussed and agreed with the maintainers first. This
+is a legal question, not a code-quality one, so a good implementation does not change the answer.
+
+A licence is sensitive if it:
+
+- restricts use or redistribution: proprietary, "internal use only", source-available,
+  non-commercial, or tied to a vendor's product;
+- is copyleft (GPL, LGPL, AGPL, MPL and similar), whose terms would reach our MIT code;
+- is missing: code with no licence is all rights reserved.
+
+If your work reproduces the behaviour of a tool under a sensitive licence:
+
+1. **Open an issue before writing code.** Say which tool, which behaviour, and how you intend to
+   develop it (for example from public documentation, published papers, or observed inputs and
+   outputs). A maintainer will apply the `sensitive license` label and the discussion
+   happens there.
+2. **Do not read, port, or paraphrase the source.** That includes having an AI assistant read it
+   for you. A rewrite done by someone (or something) that has read the source is not a clean
+   room, and deleting a ported module and rewriting it in the same branch does not remove the
+   derivation. Git history keeps the ported commits even after a squash.
+3. **State the provenance in the PR**: what each part was developed from, and confirm that no
+   source under a sensitive licence was consulted.
+
+PRs found to contain code derived from source under a sensitive licence are labelled
+`sensitive license` and are not merged while the question is open. If the derivation is
+confirmed, the PR is closed. Its history cannot be cleaned up after the fact.
+
 ### Accepted-but-inert parameters
 
 If you add a CLI flag that parses but is not yet implemented, mark it as such in the parameter-surface test and document it — do not silently accept a flag that does nothing. A user passing a flag should never be quietly ignored.
@@ -177,9 +210,9 @@ Report the harness used and the raw before/after counts in the PR. "Tests pass" 
 
 ## Project history
 
-rustar-aligner was written as a faithful port of [STAR](https://github.com/alexdobin/STAR) by Alexander Dobin. Up to the initial release, the goal was behavioral parity with STAR — matching its algorithms, thresholds, and output formats as closely as possible. Notes from that development phase are in `docs-old/` (`docs-old/dev/` and the `phase*.md` files).
+rustar-aligner was written as a faithful port of [STAR](https://github.com/alexdobin/STAR) by Alexander Dobin. Up to the parity release (v0.5.0, see the release plan in [`ROADMAP.md`](ROADMAP.md)), the goal is behavioural parity with STAR 2.7.11b: matching its algorithms, thresholds, and output formats as closely as possible. Notes from the early development phase are in `docs-old/` (`docs-old/dev/` and the `phase*.md` files).
 
-Future development is not bound by that constraint. Adding STARsolo, new features, or diverging from STAR behavior is entirely welcome AFTER a parity version has been released. Additions that don't impact parity are welcome before that point.
+Before v0.5.0, additions that don't change default output are welcome behind their own flag or cargo feature, with a [`DIVERGENCE.md`](DIVERGENCE.md) entry. After v0.5.0, development is no longer bound by parity: new features and deliberate divergence from STAR follow a normal development cycle with scverse and contributors.
 
 ## Documentation site
 
