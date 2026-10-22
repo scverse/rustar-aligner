@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STAR_BIN="/home/jamfer/Dropbox/Bioinformatics/tools/repos/STAR/source/STAR"
+STAR_BIN="${STAR_BIN:?set STAR_BIN to an instrumented STAR build (see ROADMAP.md, Debugging Tools)}"
 GENOME_DIR="$SCRIPT_DIR/data/small/yeast/star_genome"
 READS1="$SCRIPT_DIR/data/small/yeast/reads/ERR12389696_sub_1_10k.fastq.gz"
 READS2="$SCRIPT_DIR/data/small/yeast/reads/ERR12389696_sub_2_10k.fastq.gz"
