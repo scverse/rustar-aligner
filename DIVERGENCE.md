@@ -175,18 +175,9 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 ## 2. Cases where rustar-aligner outperforms STAR
 
-These are not chosen divergences and not bugs: rustar-aligner reports a **higher-scoring, correct** alignment that STAR misses. They are listed here so the differential benchmark's non-exact reads are fully accounted for.
+These are not chosen divergences and not bugs: rustar-aligner reports a **higher-scoring, correct** alignment that STAR misses.
 
-### 2.1 Four PE alignments scored better than STAR
-
-On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because STAR's combined-window stitching fails to place the pair at the better location:
-
-- `ERR12389696.844151` — rustar-aligner finds VIII:451791 with 0 mismatches; STAR reports VII:1001391 with 6 mismatches.
-- `ERR12389696.4972950` — rustar-aligner finds the correct **spliced** mate 2; STAR reports it unspliced.
-
-**Impact.** rustar-aligner's result is the better alignment in each case. These are counted against exact faithfulness in the raw metric but are improvements, not regressions.
-
-**Source.** See `STAR-RS-COMPARISON.md`, and the PE benchmark section of `CONTRIBUTING.md`.
+There are none at present. The four yeast PE reads once listed here now match STAR exactly, as does every record of the yeast 10k and 100k SE and PE benchmarks.
 
 ---
 
@@ -328,13 +319,14 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 ## 5. Known residual single-read differences
 
-These are **not** deliberate divergences — they are tracked residual diffs on the 10k yeast benchmark, kept here for completeness. Each is a single read; none is a systematic behaviour difference.
+These are **not** deliberate divergences. They are the differences `test/parity_suite.sh` finds, kept here so that each one is fixed or explained before v0.2.0 (README, *Comparison with STAR 2.7.11b*). Read names are from that suite's datasets.
 
-- **1 SE CIGAR-only diff** — `ERR12389696.13573895`: both tools align to XV:218357, MAPQ 255, identical score (AS=133), but place a 1-base insertion differently (`100M1I45M4S` vs STAR's `108M1I37M4S`). The 71-base seed is found at a different position within a long homopolymer run (a seed-level tie); resolving it requires reproducing STAR's exact Lmapped chain path.
-- **1 STAR-only PE mate** — `ERR12389696.18919121`: an SA-level difference.
-- **1 rustar-aligner-only PE mate** — `ERR12389696.6302610`: a pre-existing false positive.
-
-See `ROADMAP.md` and `STAR-RS-COMPARISON.md` for the current status of these.
+- **`nM` and mate order on multi-mapping pairs.** Human chr21 `ERR188021.1648513` and `ERR188021.1662773`, plus 21 pairs of the fusion set (e.g. `fustut00000271e5`, `fustut00000282b2`). The loci, CIGARs, `AS` and MAPQ match STAR's. On some alignments `nM` is 1–2 lower than STAR's, and in 11 of the 21 fusion pairs the mates are written in the opposite order.
+- **Same-span alignments collapsed.** Fusion set `fustut000009a03e`, `fustut000009a03f`, `fustut0000167ff6`. STAR keeps two alignments with the same mate positions but different indel or splice placement inside one mate; rustar-aligner keeps one, so `NH` is one lower.
+- **A pair STAR leaves unmapped.** Human chr21 `ERR188021.1789477`: rustar-aligner maps it to 10 loci (`AS` 136, spliced), adding 2 lines to `SJ.out.tab`.
+- **Unmapped-read category.** Some unmapped reads are counted as "too short" in `Log.final.out` (and `uT:1`), where STAR has "other" (`uT:0`): yeast 100k PE 1 (`ERR12389696.13360341`), human chr21 PE 17, fusion 73. For the yeast pair, STAR builds no alignment window, while rustar-aligner builds one, aligns 31 points and rejects it as too short.
+- **STARsolo `GeneFull` multi-mappers.** With `--soloMultiMappers`, STAR counts one multi-gene read whose barcode needed 1MM_multi correction, and rustar-aligner drops it (`UniqueAndMult-*.mtx`, one `Features.stats` line).
+- **STARsolo `SJ` with `--soloUMIdedup 1MM_CR`.** STAR collapses 4 more SJ UMIs than rustar-aligner on the mouse chr19 fixture (SJ `matrix.mtx`, `Features.stats`, `Summary.csv`).
 
 ---
 

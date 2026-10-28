@@ -6,7 +6,7 @@ A Rust reimplementation of [STAR](https://github.com/alexdobin/STAR) (Spliced Tr
 
 rustar-aligner aims to be a faithful port of STAR, matching the original behavior as closely as possible. It uses the same genome index format, accepts the same `--camelCase` command-line parameters, and produces compatible SAM/BAM output.
 
-**Current status**: End-to-end single-end and paired-end RNA-seq alignment with splice junction detection, two-pass mode, chimeric alignment detection (including multi-junction Tier 3), gene-level quantification, **single-cell quantification (STARsolo: Gene / GeneFull / SJ / Velocyto features, barcode correction, UMI dedup, EmptyDrops_CR cell calling)**, WASP allele-specific filtering, paired-end mate-overlap merging, coverage-track output, adapter/CellRanger clipping, and multi-threaded parallel processing. Default SAM output is byte-identical to STAR's (`NH HI AS nM` attributes); solo count matrices are byte-identical to STARsolo's. Pure-Rust core with an in-tree deterministic RNG (no `rand` dependency). 578 tests passing (553 unit + 25 integration), 0 clippy warnings. See [Performance & Benchmarks](#performance--benchmarks) for a native three-way comparison against STARsolo and CellRanger.
+**Current status (v0.1, working toward v0.2.0):** single-end and paired-end alignment, splice junctions, two-pass mode, chimeric detection, `--quantMode GeneCounts` / `TranscriptomeSAM`, STARsolo (Gene / GeneFull / SJ / Velocyto, barcode correction, UMI dedup, multi-mapper resolution, cell calling), WASP filtering, mate-overlap merging, coverage tracks, adapter clipping, sparse suffix arrays and multi-threading. On the [parity suite](#comparison-with-star-2711b) the genome indices are byte-identical to STAR's, and alignments, `SJ.out.tab`, gene counts, chimeric junctions and STARsolo output match STAR 2.7.11b record for record, apart from the [residual differences](#residual-differences) listed below. Every deliberate difference is in [DIVERGENCE.md](DIVERGENCE.md); the release plan is in [ROADMAP.md](ROADMAP.md#release-plan).
 
 ## Quick Start
 
@@ -106,103 +106,91 @@ target/release/rustar-aligner \
   --outFileNamePrefix /path/to/output_
 ```
 
-## Accuracy Comparison vs STAR
+## Comparison with STAR 2.7.11b
 
-Benchmarked on 10,000 yeast RNA-seq reads (150 bp, ERR12389696), compared to STAR 2.7.x with identical parameters and genome index.
+Measured on 2026-10-28 with `main` at e598b5d and the STAR 2.7.11b release binary, 8 threads, on an 8-core Intel i7-11800H. [`test/parity_suite.sh`](test/parity_suite.sh) reproduces every number here. It downloads the public data (ENA runs and pinned nf-core/test-datasets commits), builds both indices, runs both tools with the same flags and compares every output file:
 
-### Single-End (10k reads, 150 bp SE)
+```bash
+DATA=path/to/testdata STAR=path/to/STAR-2.7.11b RUSTAR=target/release/rustar-aligner \
+  test/parity_suite.sh all
+```
 
-| Metric | rustar-aligner | STAR |
-|--------|----------------|------|
-| Unique mapped | 82.6% | 82.6% |
-| Multi-mapped | 7.4% | 7.4% |
-| Total mapped | 90.0% | 90.0% |
-| Position agreement | 96.5% raw / **99.815% tie-adjusted** | — |
-| STAR-only reads | **0** | — |
-| rustar-aligner-only reads | **0** | — |
-| CIGAR-only diffs | 1 (seed-level tie in homopolymer) | — |
+Alignment records are compared per read: with more than one thread STAR writes reads in a thread-dependent order, while rustar-aligner always writes them in input order.
 
-> **Tie-adjusted**: 299 of 313 disagreements are verified genuine ties — both tools find identical alignment sets but select different copies due to SA-order or RNG tie-breaking differences. Excluding these, faithfulness is 99.815% (8,611/8,627 non-tie reads exact).
+| Dataset | Source |
+|---------|--------|
+| Yeast | *S. cerevisiae* R64-1-1 + Ensembl 110 GTF; [ERR12389696](https://www.ebi.ac.uk/ena/browser/view/ERR12389696), 150 bp PE, 10k and 100k pairs (`seqtk sample -s100`) |
+| Human chr21 | GRCh38 chr21 + GENCODE chr21 GTF (nf-core/test-datasets); first 2M pairs of GEUVADIS [ERR188021](https://www.ebi.ac.uk/ena/browser/view/ERR188021), 75 bp PE. Whole-transcriptome reads, so ~90% don't map to chr21 |
+| Fusion | nf-core/test-datasets 40 kb chr22 slice + STAR-Fusion test reads (733k pairs) |
+| Single-cell | nf-core/test-datasets scrnaseq: mouse chr19 (GRCm38.p6, GENCODE vM19), 10x v2 sample S10, 50k-barcode whitelist |
 
-### Paired-End (10k read pairs, 150 bp)
+### Genome indices
 
-| Metric | rustar-aligner | STAR |
-|--------|----------------|------|
-| Both mates mapped | **8,390** | 8,390 |
-| Half-mapped pairs | **0** | 0 |
-| Unmapped pairs | 0 | 0 |
-| PE faithfulness (tie-adjusted) | **99.883%** | — |
-| MAPQ inflations | **0** | — |
-| MAPQ deflations | **0** | — |
-| NH tag diffs | **0** | — |
-| Proper-pair diffs | **0** | — |
+`Genome`, `SA`, `SAindex`, the chromosome tables and all the annotation tables (`sjdbList.out.tab`, `exonInfo.tab`, `transcriptInfo.tab`, `geneInfo.tab`, `exonGeTrInfo.tab`, `sjdbInfo.txt`, ...) are byte-identical to STAR's for yeast, yeast with `--genomeSAsparseD 2`, human chr21, the chr22 slice and mouse chr19. Only `genomeParameters.txt` (command line) and `Log.out` differ.
 
-> **PE faithfulness**: 16,284 / 16,306 mate alignments exactly match STAR (same position, CIGAR, MAPQ, proper-pair flag, and NH tag). 475 diffs excluded as tie-breaking differences (same MAPQ+NH, different repeat copy chosen).
+### Alignment
 
-## Performance & Benchmarks
+| Dataset | Options | Records identical / STAR's records | Reads differing | `SJ.out.tab` |
+|---------|---------|-------------------|-----------------|--------------|
+| Yeast 10k | SE | 9,724 / 9,724 | 0 | identical |
+| Yeast 10k | PE | 18,600 / 18,600 | 0 | identical |
+| Yeast 100k | SE | 97,754 / 97,754 | 0 | identical |
+| Yeast 100k | PE | 188,258 / 188,258 | 0 | identical |
+| Yeast 100k | PE, `--quantMode TranscriptomeSAM GeneCounts`, sorted BAM | 188,258 / 188,258 | 0 | identical |
+| Yeast 100k | PE, `--twopassMode Basic` | 188,262 / 188,262 | 0 | identical |
+| Yeast 100k | PE, `--outFilterType BySJout` | 187,646 / 187,646 | 0 | identical |
+| Yeast 100k | PE, `--outSAMattributes All --outSAMstrandField intronMotif --outSAMunmapped Within` | 218,994 / 218,996 | 1 (unmapped pair, `uT`) | identical |
+| Yeast 100k | PE, `--genomeSAsparseD 2` index | 188,436 / 188,436 | 0 | identical |
+| Yeast 100k | SE / PE, chimeric (`--chimSegmentMin 12`, `--chimMultimapNmax` 0 and 10) | all | 0 | identical |
+| Human chr21 | SE (mate 1) | 541,935 / 541,935 | 0 | identical |
+| Human chr21 | PE | 902,186 / 902,190 | 3 | 3,071 / 3,073 lines shared |
+| Fusion | PE, chimeric (`--chimMultimapNmax` 0 and 10) | 80,592 / 80,656 | 24 | identical |
 
-Two single-cell benchmarks: a **mouse** three-way against STARsolo and CellRanger
-(throughput on a compute-bound run), and a **human** run that is memory-bound,
-where the sparse suffix array is the deciding factor.
+- **Gene counts** (`ReadsPerGene.out.tab`): identical on yeast. On chr21 PE, 274 of 276 lines are identical; the other 2 come from the reads that differ.
+- **Transcriptome BAM** (`--quantMode TranscriptomeSAM`): every record is identical on yeast (138,084) and chr21 (28,972) except for *which* alignment of a multi-mapping read carries the primary flag. STAR draws that from a per-thread random stream, so its choice depends on how reads are split across threads. rustar-aligner reproduces STAR's `--runThreadN 1` choice at any thread count, and against STAR run single-threaded the yeast transcriptome BAM is identical record for record. See [DIVERGENCE.md §1.1](DIVERGENCE.md#11-multimapper-tie-breaking--rng).
+- **Chimeric junctions** (`Chimeric.out.junction`): the same lines as STAR in every configuration: yeast SE 194, PE 717 / 882 (`--chimMultimapNmax` 0 / 10); chr21 PE 301 / 3,643; fusion 31 / 675. Only the order differs, for the threading reason above.
+- **`Log.final.out`**: identical on yeast SE and 10k PE. Elsewhere the mapped counts differ only by the reads in the table, and a few unmapped reads are counted as "too short" rather than "other" (yeast 100k PE 1, chr21 PE 17, fusion 73).
 
-### Mouse — 5k PBMC, three-way vs STARsolo and CellRanger
+### Single-cell (STARsolo)
 
-Single-cell (STARsolo) throughput and memory, benchmarked native x86_64 against
-**STARsolo 2.7.11b** and **CellRanger 10.0.0** on a real 10x dataset
-(`5k_Mouse_PBMCs_5p_gem-x_GEX`, 5′ GEM-X, GRCm39-2024-A reference). All three
-tools ran on the **same EC2 instance, same NVMe-staged inputs, 10 threads, page
-cache dropped between reps, no BAM output** — the only fair substrate, since
-CellRanger is x86-only and STAR can't run natively on Apple Silicon. Harness:
-[`test/aws/`](test/aws/).
+Mouse chr19, 10x v2, `--soloType CB_UMI_Simple --soloFeatures Gene GeneFull SJ Velocyto`:
 
-| Tool | Wall time | Peak RSS | Cells called | Genes detected |
-|------|-----------|----------|--------------|----------------|
-| STARsolo 2.7.11b | **87 s** | 28.3 GB | 4,061 | 15,439 |
-| rustar-aligner | 121 s | 25.7 GB | 3,689 | 16,284 |
-| rustar-aligner `--genomeSAsparseD 2` | 119 s | **17.7 GB** | 3,692 | 16,311 |
-| CellRanger 10.0.0 | 347 s | 13.1 GB | 3,858 | 16,858 |
+| Options | BAM records identical | `Solo.out` files identical |
+|---------|-----------------------|----------------------------|
+| defaults, sorted BAM with `CR UR CB UB GX GN sS sQ sM` | 19,955 / 19,955 | 36 / 36 |
+| `--soloCellFilter EmptyDrops_CR --soloMultiMappers Uniform EM --soloUMIdedup 1MM_CR --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts --soloUMIfiltering MultiGeneUMI_CR` | (no BAM) | 34 / 40 |
 
-- **Correctness**: rustar-aligner's `Solo.out/Gene/raw` count matrix is
-  **byte-identical to STARsolo's** on the CellRanger-style flag set (verified
-  deterministically, 3/3 runs). Differing "cells called" / "genes detected"
-  reflect the cell-calling filter (`EmptyDrops_CR` Monte-Carlo), not the counts.
-- **Memory**: `--genomeSAsparseD 2` (sparse suffix array, byte-identical to
-  STAR's own D=2 SA) trades ~2% wall time for a **31% smaller peak RSS**,
-  giving rustar the smallest memory footprint of any suffix-array aligner here.
-  rustar's reported RSS includes reclaimable mmap'd index pages, so it overstates
-  real memory pressure.
-- **Since this run**: a segment-tree gene-assignment optimization (O(log n + k)
-  overlap query, replacing STAR's linear scan) landed in `main` and independently
-  measured a **further ~14% reduction in rustar's solo wall time (→ ~105 s)** on
-  the same dataset/instance — the table above predates it and is a conservative
-  floor. Count matrices are unchanged.
+In the default run every file matches: raw and filtered matrices, `barcodes.tsv` / `features.tsv`, `Summary.csv`, `Features.stats`, `Barcodes.stats` and `UMIperCellSorted.txt`. In the second run the EmptyDrops_CR cell calls match too, because rustar-aligner draws from the same random-number generator as STAR. The 6 files that differ are explained under [residual differences](#residual-differences).
 
-### Human — GRCh38, memory-bound (sparse vs dense index)
+### Residual differences
 
-A full human snRNA-seq sample (GSE163577 `SRR13278444`, ~155M reads, 10x 3′ v3,
-GRCh38) hits a different bottleneck. The **32 GB dense index does not stay
-resident in 48 GB RAM**, so the run is dominated by page faults rather than
-alignment — a production dense run took **9.5 h with 558M page faults** (≈4 h of
-it kernel time). The **sparse suffix array (`--genomeSAsparseD 2`)** shrinks the
-index to **16 GB** so it fits in RAM. Measured on a 500k-read subset of the same
-sample (8 threads, warm cache):
+These aren't deliberate. Each is tracked to be fixed or explained before v0.2.0; [DIVERGENCE.md §5](DIVERGENCE.md#5-known-residual-single-read-differences) has the read names.
 
-| rustar-aligner (500k subset) | Wall | Page faults | Unique mapping |
-|------------------------------|------|-------------|----------------|
-| dense index (32 GB)          | 165–460 s\* | 5.1 M | 77.0% |
-| `--genomeSAsparseD 2` (16 GB) | **54 s** | **0.32 M** | 77.6% |
+- **`nM` and mate order on some multi-mapping pairs** (chr21 2 pairs, fusion 21 pairs). Same loci, CIGARs, `AS` and MAPQ. On some alignments `nM` is 1–2 lower than STAR's, and in about half of these pairs the two mates are written in the opposite order.
+- **Same-span alignments collapsed** (fusion, 3 pairs). STAR reports two alignments with the same mate positions but different indel or splice placement inside a mate; rustar-aligner reports one, so `NH` is one lower.
+- **A pair STAR leaves unmapped** (chr21, 1 pair). rustar-aligner maps it to 10 loci (`AS` 136, spliced). This adds 2 lines to `SJ.out.tab`.
+- **Unmapped-read category** ("too short" versus "other", `uT`), for the counts listed above. The yeast pair: STAR finds no alignment window (`uT:0`); rustar-aligner finds a 31-point alignment and rejects it as too short (`uT:1`).
+- **STARsolo `GeneFull` multi-mappers** (`--soloMultiMappers`). STAR counts one multi-gene read whose barcode needed 1MM_multi correction, and rustar-aligner drops it. This changes `UniqueAndMult-*.mtx` and one `Features.stats` line.
+- **STARsolo `SJ` with `--soloUMIdedup 1MM_CR`**. STAR collapses 4 more SJ UMIs than rustar-aligner does (SJ `matrix.mtx`, `Features.stats`, `Summary.csv`).
 
-<sub>\*dense wall swings with cache pressure because the 32 GB index can't stay
-resident; the 16 GB sparse index is stable at ~54 s.</sub>
+### Speed and memory
 
-- **~3× faster resident, up to ~8× when the dense index is paging**, with **16×
-  fewer page faults** — purely because 16 GB fits in 48 GB RAM and 32 GB does not.
-- **Sensitivity is equal** (sparse 77.6% vs dense 77.0% unique). Sparse output is
-  byte-identical to STAR's own **D=2** SA (not to a dense D=1 run), so counts
-  differ from a dense run by ~1% of matrix entries — run a whole cohort on one
-  index for consistency.
-- **Takeaway**: on a RAM-constrained box, index size — not raw aligner speed — is
-  the dominant cost for a human genome; `--genomeSAsparseD 2` is the lever.
+Same machine, inputs read from a warm page cache, `--outSAMtype BAM Unsorted`. Yeast is the median of 3 alternating runs; chr21 is a single run.
+
+| Run | Threads | STAR wall | rustar-aligner wall | STAR peak RSS | rustar-aligner peak RSS |
+|-----|---------|-----------|---------------------|---------------|-------------------------|
+| Yeast, 1M pairs (150 bp) | 8 | 131.9 s | 85.4 s | 1.26 GB | 0.23 GB |
+| Yeast, 1M pairs (150 bp) | 16 | 128.2 s | 81.6 s | 2.18 GB | 0.28 GB |
+| Human chr21, 2M pairs (75 bp) | 16 | 1,073 s | 594 s | 2.05 GB | 0.52 GB |
+
+Index builds at 8 threads are slower than STAR's (yeast 3.0 s vs 2.5 s, chr21 12.4 s vs 10.5 s, mouse chr19 20.2 s vs 16.0 s) and use much less memory (222 MB vs 341 MB, 388 MB vs 1,084 MB, 459 MB vs 1,645 MB). rustar-aligner memory-maps the index, so its peak RSS counts only the index pages a run touches. These are small genomes; whole-genome numbers on server hardware are still to come.
+
+The yeast reads are `seqtk sample -s100` 1,000,000-pair subsamples of ERR12389696 (the same procedure as the parity data), decompressed. Each run was (and the same with `--runThreadN 16`):
+
+```bash
+/usr/bin/time -f "%e s %M KB" $BIN --runThreadN 8 --genomeDir $INDEX \
+  --readFilesIn y1m_1.fq y1m_2.fq --outSAMtype BAM Unsorted --outFileNamePrefix out/
+```
 
 ## Supported Features
 
@@ -241,16 +229,20 @@ resident; the 16 GB sparse index is stable at ~54 s.</sub>
 
 ## Known Limitations
 
-- Solo cell-calling counts can differ from STARsolo by a few cells due to the
-  Monte-Carlo `EmptyDrops_CR` rescue; the underlying count matrix is identical.
-- A handful of SE/PE tie-breaking differences vs STAR remain (verified genuine
-  ties; see the accuracy tables above and [ROADMAP.md](ROADMAP.md)).
+Beyond the [residual differences](#residual-differences) above:
 
-See [ROADMAP.md](ROADMAP.md) for detailed implementation tracking.
+- **SmartSeq** (`--soloType SmartSeq`) runs, but its output is far from STARsolo's: only `Gene/raw` is written, and its counts differ.
+- **`--soloCBwhitelist None`** writes no count matrices yet.
+- **`CB_UMI_Complex`** barcode matching differs from STAR's for some rejected reads ([DIVERGENCE.md §3.4](DIVERGENCE.md)), and `EditDist_2` matching isn't implemented.
+- **Not implemented** (rejected with an error): `--outWigType wiggle`, `--outWigStrand Unstranded`, `--chimOutType SeparateSAMold`, `--outSAMfilter KeepOnlyAddedReferences` / `KeepAllAddedReferences`, `--readFilesType SAM`, `--soloCBtype String`, `--soloBarcodeMate 2`.
+- **`--genomeLoad`** is accepted but has no effect: the index is always memory-mapped, and STAR's shared-memory modes aren't implemented.
+- **STARlong** (long-read alignment) isn't ported.
+
+See [ROADMAP.md](ROADMAP.md) for the plan and [DIVERGENCE.md](DIVERGENCE.md) for every known difference.
 
 ## Building from Source
 
-Requires Rust 2024 edition (rustc 1.85+).
+Requires Rust 2024 edition (rustc 1.89+).
 
 ```bash
 cargo build --release       # Release build

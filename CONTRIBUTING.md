@@ -200,7 +200,7 @@ python3 test/compare_sam.py \
 python3 test/compare_pe.py "$DATA/rustar_10k_pe_/Aligned.out.sam" "$DATA/star_10k_pe_/Aligned.out.sam"
 ```
 
-Baseline to beat: SE ~99.8% and PE ~99.9% tie-adjusted faithfulness (see `ROADMAP.md`). Faithfulness must not regress; if a STAR-faithful change regresses a metric, the fix is more STAR-matching work, not a revert (a deliberate, signed-off divergence is the documented exception).
+Baseline: every SAM record is identical to STAR's on both runs (SE 9,724 records, PE 18,600), and `SJ.out.tab` and `Log.final.out` are identical too. For wider changes, `test/parity_suite.sh` runs the same comparison over yeast, human chr21, a fusion set and a 10x single-cell set, with quantification, two-pass, BySJout, chimeric and STARsolo options; the README's *Comparison with STAR 2.7.11b* section lists its current results. Faithfulness must not regress; if a STAR-faithful change regresses a metric, the fix is more STAR-matching work, not a revert (a deliberate, signed-off divergence is the documented exception).
 
 - **STARsolo** counting changes: run `test/solo_diff_docker.sh` against a real STARsolo oracle. A change to default barcode/UMI counting is not validated by unit tests alone.
 - **STARlong / long-read** changes: validate against real STARlong output, not just synthetic unit fixtures.
