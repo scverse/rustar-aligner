@@ -1,5 +1,7 @@
 # STAR-rs vs rustar-aligner — Comprehensive Review & Comparison
 
+> **Dated snapshot (2026-07-24).** Both projects have changed a lot since this was written; in particular, the rustar-aligner figures and feature list below are out of date. See the [README](README.md#comparison-with-star-2711b) for rustar-aligner's current comparison with STAR.
+
 *Prepared 2026-07-24. STAR-rs reviewed at `/home/jamfer/repos/STAR-rs` (v3.1.0, commit `f475924`); rustar-aligner reviewed at `/home/jamfer/repos/rustar-aligner` (v0.1.0, branch `fix/log-out-files`). STAR-rs was built and smoke-tested on this machine; both codebases were reviewed at source level by a fan-out of specialist agents.*
 
 ---

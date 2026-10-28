@@ -5,7 +5,9 @@
 #   DATA=path/to/testdata STAR=path/to/STAR RUSTAR=target/release/rustar-aligner \
 #     test/parity_suite.sh fetch|index|run|compare|all
 #
-# Needs curl, seqtk, samtools and python3. THREADS (default 8) sets --runThreadN.
+# Needs curl, seqtk, samtools and python3. THREADS (default 8) sets --runThreadN. Files already
+# in $DATA are reused, so a slow download (the two ERR12389696 files are 1.6 GB each) can be
+# replaced by copies checked against ENA's MD5s.
 # Data (all public, pinned):
 #   yeast   Ensembl R64-1-1 release 110 + ENA ERR12389696 (seqtk -s100 subsamples, as in
 #           CONTRIBUTING.md)
@@ -25,31 +27,41 @@ MODULES=39ab78127391a80748b062614735329dffd351ef
 SCRNASEQ=d934d6e8367fe2626184496b1889671cf2b02dab
 P=$DATA/parity
 
-get() { [ -s "$2" ] || curl -fsSL -o "$2" "$1"; }
+# make FILE CMD...: run CMD with stdout to FILE.part, then rename, so an interrupted run never
+# leaves a partial FILE behind. A FILE that already exists is kept (you can put copies there).
+make() {
+  local f=$1; shift
+  [ -s "$f" ] && return
+  "$@" > "$f.part" && mv "$f.part" "$f"
+}
+get() { make "$2" curl -fsSL "$1"; }
+gz() { curl -fsSL "$1" | gunzip; }
+# The first N lines of a gzipped FASTQ, streamed. head closes the pipe early, which makes
+# curl and gunzip fail with SIGPIPE, so their status is ignored; the caller checks the count.
+head_fq() { { curl -fsSL "$1" | gunzip | head -n "$2" || true; } | gzip; }
+subsample() { seqtk sample -s100 "$1" "$2" | gzip; }
 
 fetch() {
   mkdir -p "$DATA"/{reference,reads} "$P"/{chr21,fusion,solo}
-  local e=https://ftp.ensembl.org/pub/release-110
-  ( cd "$DATA/reference"
-    [ -s Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa ] || {
-      curl -fsSL "$e/fasta/saccharomyces_cerevisiae/dna/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa.gz" | gunzip > Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa; }
-    [ -s Saccharomyces_cerevisiae.R64-1-1.110.gtf ] || {
-      curl -fsSL "$e/gtf/saccharomyces_cerevisiae/Saccharomyces_cerevisiae.R64-1-1.110.gtf.gz" | gunzip > Saccharomyces_cerevisiae.R64-1-1.110.gtf; } )
-  ( cd "$DATA/reads"
-    for m in 1 2; do
-      get "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/096/ERR12389696/ERR12389696_$m.fastq.gz" "ERR12389696_$m.fastq.gz"
-      for tier in 10k:10000 100k:100000; do
-        f="ERR12389696_sub_${m}_${tier%%:*}.fastq.gz"
-        [ -s "$f" ] || seqtk sample -s100 "ERR12389696_$m.fastq.gz" "${tier##*:}" | gzip > "$f"
-      done
-    done )
+  local e=https://ftp.ensembl.org/pub/release-110 y=Saccharomyces_cerevisiae.R64-1-1
+  make "$DATA/reference/$y.dna.toplevel.fa" gz "$e/fasta/saccharomyces_cerevisiae/dna/$y.dna.toplevel.fa.gz"
+  make "$DATA/reference/$y.110.gtf" gz "$e/gtf/saccharomyces_cerevisiae/$y.110.gtf.gz"
+  local r=$DATA/reads/ERR12389696
+  for m in 1 2; do
+    get "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR123/096/ERR12389696/ERR12389696_$m.fastq.gz" "${r}_$m.fastq.gz"
+    make "${r}_sub_${m}_10k.fastq.gz" subsample "${r}_$m.fastq.gz" 10000
+    make "${r}_sub_${m}_100k.fastq.gz" subsample "${r}_$m.fastq.gz" 100000
+  done
   local g=data/genomics/homo_sapiens/genome
   get "$NFC/$MODULES/$g/chr21/sequence/genome.fasta" "$P/chr21/genome.fasta"
   get "$NFC/$MODULES/$g/chr21/sequence/chr21_gencode.gtf" "$P/chr21/genes.gtf"
-  for m in 1 2; do  # first 2M pairs (8M lines); head closes the pipe early, so no pipefail
-    [ -s "$P/chr21/ERR188021_2M_$m.fastq.gz" ] || { set +o pipefail
-      curl -fsSL "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR188/ERR188021/ERR188021_$m.fastq.gz" \
-        | gunzip | head -n 8000000 | gzip > "$P/chr21/ERR188021_2M_$m.fastq.gz"; set -o pipefail; }
+  for m in 1 2; do  # the first 2M pairs (8M lines)
+    local h=$P/chr21/ERR188021_2M_$m.fastq.gz
+    if [ ! -s "$h" ]; then
+      head_fq "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR188/ERR188021/ERR188021_$m.fastq.gz" 8000000 > "$h.part"
+      [ "$(gunzip -c "$h.part" | wc -l)" = 8000000 ] && mv "$h.part" "$h" \
+        || { echo "ERR188021_$m: download incomplete" >&2; exit 1; }
+    fi
     get "$NFC/$MODULES/$g/test_starfusion_rnaseq_$m.fastq.gz" "$P/fusion/test_starfusion_rnaseq_$m.fastq.gz"
   done
   get "$NFC/$MODULES/$g/genome.fasta" "$P/fusion/genome.fasta"
