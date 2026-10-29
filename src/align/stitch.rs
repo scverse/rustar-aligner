@@ -137,53 +137,6 @@ fn score_region(
 /// staging copy is amortized, small enough to sit on the stack.
 const SCORE_REGION_CHUNK: usize = 256;
 
-fn count_mismatches(
-    read_seq: &[u8],
-    cigar_ops: &[cigar::Op],
-    genome_start: u64,
-    read_start: usize,
-    index: &GenomeIndex,
-    is_reverse: bool,
-) -> u32 {
-    use cigar::op::Kind;
-    // Add n_genome offset for reverse-strand genome access
-    let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
-
-    let mut n_mismatch = 0u32;
-    let mut read_pos = read_start;
-    let mut genome_pos = genome_start;
-
-    for op in cigar_ops {
-        match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                for _i in 0..op.len() {
-                    if read_pos < read_seq.len() {
-                        let read_base = read_seq[read_pos];
-                        if let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset)
-                            && read_base != genome_base
-                            && read_base != 4
-                            && genome_base != 4
-                        {
-                            n_mismatch += 1;
-                        }
-                    }
-                    read_pos += 1;
-                    genome_pos += 1;
-                }
-            }
-            Kind::Insertion | Kind::SoftClip => {
-                read_pos += op.len();
-            }
-            Kind::Deletion | Kind::Skip => {
-                genome_pos += op.len() as u64;
-            }
-            Kind::HardClip | Kind::Pad => {}
-        }
-    }
-
-    n_mismatch
-}
-
 /// Result of extending an alignment into flanking regions
 #[derive(Debug, Clone)]
 struct ExtendResult {
@@ -989,14 +942,20 @@ pub fn cluster_seeds(
 
             // Capacity check (seedPerWindowNmax) with anchor protection
             if window.alignments.len() >= seed_per_window_nmax {
-                // Find min length of non-anchor entries (STAR: recalculate WALrec)
-                let min_non_anchor_len = window
+                // Find min length of non-anchor entries (STAR: recalculate WALrec).
+                // With none, STAR drops the whole read before it looks at the new
+                // align, so a non-anchor arriving at a window full of anchors still
+                // triggers it: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0.
+                let Some(min_non_anchor_len) = window
                     .alignments
                     .iter()
                     .filter(|wa| !wa.is_anchor)
                     .map(|wa| wa.length)
                     .min()
-                    .unwrap_or(usize::MAX);
+                else {
+                    too_many_anchors = true;
+                    break 'outer;
+                };
 
                 // Update persistent threshold
                 window.wa_lrec = min_non_anchor_len;
@@ -1011,12 +970,6 @@ pub fn cluster_seeds(
                 window
                     .alignments
                     .retain(|wa| wa.is_anchor || wa.length > min_non_anchor_len);
-
-                if window.alignments.len() >= seed_per_window_nmax {
-                    // STAR: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0, abort entire read
-                    too_many_anchors = true;
-                    break 'outer;
-                }
             }
 
             // STAR's addition condition: if (aAnchor || aLength > WALrec[iW])
@@ -2199,15 +2152,14 @@ pub(crate) fn finalize_transcript(
     // Adjust score: add both left and right extensions (STAR adds both at finalization)
     let adjusted_score = wt.score + left_extend.max_score + right_extend.max_score;
 
-    // Count mismatches — MUST be called BEFORE CIGAR reversal
-    let n_mismatch = count_mismatches(
-        read_seq,
-        &final_cigar,
-        adjusted_genome_start,
-        0,
-        index,
-        cluster.is_reverse,
-    );
+    // STAR's nMM is accumulated while the transcript is built (stitch gaps,
+    // junction scans, extensions), never recounted from the final alignment.
+    // The two differ when a junction scan moves the junction back into exon A
+    // (jR < 0) over bases A had already counted as mismatches against the
+    // other flank: STAR counts them again against the acceptor and does not
+    // take the first count back (stitchAlignToTranscript.cpp, the commented-out
+    // `nMM--`). `wt.n_mismatch` keeps that count, as nMM does.
+    let n_mismatch = wt.n_mismatch + left_extend.n_mismatch + right_extend.n_mismatch;
 
     // Reverse CIGAR for reverse strand
     if cluster.is_reverse {
@@ -4314,6 +4266,45 @@ mod tests {
         let additive_buggy = baseline + motif_score + scorer.sjdb_score;
         let replacement_correct = baseline + scorer.sjdb_score;
         assert_ne!(additive_buggy, replacement_correct);
+    }
+
+    /// `nM` is STAR's `trA.nMM` as accumulated while stitching, not a recount of
+    /// the final alignment: a mismatch the stitcher counted stays counted even
+    /// where the final exons match the genome (the junction-scan case in
+    /// `finalize_transcript`).
+    #[test]
+    fn finalize_keeps_the_stitched_mismatch_count() {
+        let index = make_simple_index();
+        let scorer = AlignmentScorer::from_params_minimal();
+        let cluster = SeedCluster {
+            alignments: vec![],
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 8,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        let read = [0u8, 1, 2, 3, 0, 1, 2, 3]; // genome[0..8], no mismatch
+        let mut wt = WorkingTranscript::new();
+        wt.exons.push(ExonBlock {
+            read_start: 0,
+            read_end: 8,
+            genome_start: 0,
+            genome_end: 8,
+            mate_id: 2,
+            sj_a: None,
+        });
+        wt.read_end = 8;
+        wt.genome_end = 8;
+        wt.score = 6;
+        wt.n_mismatch = 1;
+        let t = finalize_transcript(
+            &wt, &read, &index, &scorer, &cluster, false, false, false, 0,
+        )
+        .expect("finalizes");
+        assert_eq!(t.cigar_string(), "8M");
+        assert_eq!(t.n_mismatch, 1);
     }
 
     /// STAR never stitches two seeds that sit on one diagonal (`rGap == gGap`):

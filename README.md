@@ -139,17 +139,17 @@ Alignment records are compared per read: with more than one thread STAR writes r
 | Yeast 100k | PE, `--quantMode TranscriptomeSAM GeneCounts`, sorted BAM | 188,258 / 188,258 | 0 | identical |
 | Yeast 100k | PE, `--twopassMode Basic` | 188,262 / 188,262 | 0 | identical |
 | Yeast 100k | PE, `--outFilterType BySJout` | 187,646 / 187,646 | 0 | identical |
-| Yeast 100k | PE, `--outSAMattributes All --outSAMstrandField intronMotif --outSAMunmapped Within` | 218,994 / 218,996 | 1 (unmapped pair, `uT`) | identical |
+| Yeast 100k | PE, `--outSAMattributes All --outSAMstrandField intronMotif --outSAMunmapped Within` | 218,996 / 218,996 | 0 | identical |
 | Yeast 100k | PE, `--genomeSAsparseD 2` index | 188,436 / 188,436 | 0 | identical |
 | Yeast 100k | SE / PE, chimeric (`--chimSegmentMin 12`, `--chimMultimapNmax` 0 and 10) | all | 0 | identical |
 | Human chr21 | SE (mate 1) | 541,935 / 541,935 | 0 | identical |
-| Human chr21 | PE | 902,186 / 902,190 | 3 | 3,071 / 3,073 lines shared |
-| Fusion | PE, chimeric (`--chimMultimapNmax` 0 and 10) | 80,592 / 80,656 | 24 | identical |
+| Human chr21 | PE | 902,190 / 902,190 | 0 | identical |
+| Fusion | PE, chimeric (`--chimMultimapNmax` 0 and 10) | 80,656 / 80,656 | 0 | identical |
 
 - **Gene counts** (`ReadsPerGene.out.tab`): identical on yeast. On chr21 PE, 274 of 276 lines are identical; the other 2 come from the reads that differ.
 - **Transcriptome BAM** (`--quantMode TranscriptomeSAM`): every record is identical on yeast (138,084) and chr21 (28,972) except for *which* alignment of a multi-mapping read carries the primary flag. STAR draws that from a per-thread random stream, so its choice depends on how reads are split across threads. rustar-aligner reproduces STAR's `--runThreadN 1` choice at any thread count, and against STAR run single-threaded the yeast transcriptome BAM is identical record for record. See [DIVERGENCE.md §1.1](DIVERGENCE.md#11-multimapper-tie-breaking--rng).
 - **Chimeric junctions** (`Chimeric.out.junction`): the same lines as STAR in every configuration: yeast SE 194, PE 717 / 882 (`--chimMultimapNmax` 0 / 10); chr21 PE 301 / 3,643; fusion 31 / 675. Only the order differs, for the threading reason above.
-- **`Log.final.out`**: identical on yeast SE and 10k PE. Elsewhere the mapped counts differ only by the reads in the table, and a few unmapped reads are counted as "too short" rather than "other" (yeast 100k PE 1, chr21 PE 17, fusion 73).
+- **`Log.final.out`**: identical on yeast (10k and 100k, SE and PE, chimeric, `--outSAMunmapped Within`), chr21 SE and PE, and fusion.
 
 ### Single-cell (STARsolo)
 
@@ -166,10 +166,6 @@ In the default run every file matches: raw and filtered matrices, `barcodes.tsv`
 
 These aren't deliberate. Each is tracked to be fixed or explained before v0.2.0; [DIVERGENCE.md §5](DIVERGENCE.md#5-known-residual-single-read-differences) has the read names.
 
-- **`nM` and mate order on some multi-mapping pairs** (chr21 2 pairs, fusion 21 pairs). Same loci, CIGARs, `AS` and MAPQ. On some alignments `nM` is 1–2 lower than STAR's, and in about half of these pairs the two mates are written in the opposite order.
-- **Same-span alignments collapsed** (fusion, 3 pairs). STAR reports two alignments with the same mate positions but different indel or splice placement inside a mate; rustar-aligner reports one, so `NH` is one lower.
-- **A pair STAR leaves unmapped** (chr21, 1 pair). rustar-aligner maps it to 10 loci (`AS` 136, spliced). This adds 2 lines to `SJ.out.tab`.
-- **Unmapped-read category** ("too short" versus "other", `uT`), for the counts listed above. The yeast pair: STAR finds no alignment window (`uT:0`); rustar-aligner finds a 31-point alignment and rejects it as too short (`uT:1`).
 - **STARsolo `GeneFull` multi-mappers** (`--soloMultiMappers`). STAR counts one multi-gene read whose barcode needed 1MM_multi correction, and rustar-aligner drops it. This changes `UniqueAndMult-*.mtx` and one `Features.stats` line.
 - **STARsolo `SJ` with `--soloUMIdedup 1MM_CR`**. STAR collapses 4 more SJ UMIs than rustar-aligner does (SJ `matrix.mtx`, `Features.stats`, `Summary.csv`).
 

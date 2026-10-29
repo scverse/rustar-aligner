@@ -526,8 +526,17 @@ impl SamWriter {
             if attrs.contains(SamAttributes::MC) {
                 insert_mate_cigar_tags(&mut rec1, &mut rec2);
             }
-            records.push(rec1);
-            records.push(rec2);
+            // STAR writes the mate of the transcript's first exon first
+            // (ReadAlign_outputTranscriptSAM.cpp / ReadAlign_alignBAM.cpp: the mate loop
+            // starts at exons[0], whose EX_iFrag is trOut.Str): mate1 when it is on the
+            // forward strand, mate2 otherwise.
+            if paired_aln.mate1_transcript.is_reverse {
+                records.push(rec2);
+                records.push(rec1);
+            } else {
+                records.push(rec1);
+                records.push(rec2);
+            }
         }
 
         Ok(records)
@@ -5368,6 +5377,76 @@ mod tests {
         assert!(records_m2[1].flags().is_last_segment()); // Second record = mate2 (mapped)
         assert!(records_m2[0].flags().is_unmapped()); // mate1 is unmapped
         assert!(!records_m2[1].flags().is_unmapped()); // mate2 is mapped
+    }
+
+    /// STAR writes the mate on the forward strand first (the mate of the
+    /// transcript's first exon), so mate2 leads when mate1 is reverse.
+    #[test]
+    fn test_build_paired_records_forward_mate_first() {
+        use crate::align::transcript::Exon;
+        use cigar::op::{Kind, Op};
+
+        let genome = make_test_genome();
+        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
+        let tr = |start: u64, is_reverse: bool| Transcript {
+            output_rank: 0,
+            chr_idx: 0,
+            genome_start: start,
+            genome_end: start + 4,
+            is_reverse,
+            exons: vec![Exon {
+                genome_start: start,
+                genome_end: start + 4,
+                read_start: 0,
+                read_end: 4,
+                i_frag: 0,
+            }],
+            cigar: vec![Op::new(Kind::Match, 4)],
+            score: 4,
+            n_mismatch: 0,
+            n_gap: 0,
+            n_junction: 0,
+            junction_motifs: vec![],
+            junction_annotated: vec![],
+            junction_strand: vec![],
+        };
+        let pair = |m1: Transcript, m2: Transcript| PairedAlignment {
+            output_rank: 0,
+            mate1_transcript: m1,
+            mate2_transcript: m2,
+            mate1_region: (0, 4),
+            mate2_region: (0, 4),
+            is_proper_pair: true,
+            insert_size: 8,
+            combined_wt_score: 8,
+        };
+        let seq = vec![0, 1, 2, 3];
+        let qual = vec![30, 30, 30, 30];
+        let first_record = |p: PairedAlignment| {
+            let recs = SamWriter::build_paired_records(
+                "read1",
+                &seq,
+                &qual,
+                &seq,
+                &qual,
+                0,
+                0,
+                0,
+                0,
+                &[p],
+                &genome,
+                &params,
+                1,
+            )
+            .unwrap();
+            assert_eq!(recs.len(), 2);
+            recs[0].flags().is_first_segment()
+        };
+
+        // mate1 forward on the left, mate2 reverse: mate1 first.
+        assert!(first_record(pair(tr(0, false), tr(4, true))));
+        // mate2 forward on the left, mate1 reverse: mate2 first.
+        assert!(!first_record(pair(tr(4, true), tr(0, false))));
     }
 
     #[test]

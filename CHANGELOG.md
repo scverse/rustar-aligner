@@ -11,6 +11,28 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- The four alignment residuals of DIVERGENCE.md §5 are fixed. On the parity
+  suite's yeast (10k and 100k, SE and PE, chimeric, `--outSAMunmapped
+  Within`), human chr21 (SE, PE) and fusion runs, alignments, `SJ.out.tab`
+  and `Log.final.out` now match STAR 2.7.11b, mate order included.
+  - `nM` is STAR's mismatch count as accumulated while stitching, not a
+    recount of the final alignment. The two differ when a junction scan moves
+    a junction back over bases already counted as mismatches against the
+    intron: STAR counts them again and keeps both counts.
+  - The two mates of a pair are written in STAR's order: the one on the
+    forward strand first, so mate 2 leads when mate 1 is reverse. Every
+    paired alignment was mate 1 first before, about half of STAR's.
+  - A pair whose two alignments share their mate positions but place an
+    indel or junction differently inside one mate is no longer collapsed to
+    one alignment. The extra mate-2 dedup that did it is gone; STAR's window
+    dedup compares the whole pair.
+  - A read is dropped as "other" when a window full of anchors receives one
+    more align, whatever that align is (STAR's
+    `MARKER_TOO_MANY_ANCHORS_PER_WINDOW`). A non-anchor arriving there was
+    skipped instead, so the read could map or count as "too short".
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
