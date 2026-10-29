@@ -1208,6 +1208,10 @@ pub struct MultiGeneRecord {
     pub cb: u32,
     pub umi: u64,
     pub genes: Vec<u32>,
+    /// The whitelist candidates of a 1MM_multi barcode, resolved at counting
+    /// time as for a unique-gene read (`cb` is meaningless until then); empty
+    /// when the barcode was resolved per read.
+    pub candidates: Vec<CbCandidate>,
 }
 
 /// Thread-safe sink for the records produced during alignment.
@@ -2085,19 +2089,28 @@ impl SoloContext {
                     GeneAssignment::Gene(g) => g,
                     GeneAssignment::Ambiguous => {
                         // Gene-ambiguous read: record its gene set for
-                        // --soloMultiMappers distribution (resolved CB only).
-                        if let Some(cb) = cb_resolved {
-                            let genes = match feature {
-                                SoloFeature::Gene => &class.gene_multi,
-                                SoloFeature::GeneFull => &class.gene_full_multi,
-                            };
-                            if !genes.is_empty() {
-                                fo.multi_gene = Some(MultiGeneRecord {
-                                    cb,
-                                    umi,
-                                    genes: genes.clone(),
-                                });
-                            }
+                        // --soloMultiMappers distribution. A 1MM_multi barcode
+                        // goes along with its candidates: STAR records these
+                        // reads too and resolves the barcode when it counts
+                        // (`SoloReadFeature_inputRecords.cpp`).
+                        let genes = match feature {
+                            SoloFeature::Gene => &class.gene_multi,
+                            SoloFeature::GeneFull => &class.gene_full_multi,
+                        };
+                        let cb_and_candidates = match (cb_resolved, &cb_match) {
+                            (Some(cb), _) => Some((cb, Vec::new())),
+                            (None, CbMatch::Multi(cands)) => Some((0, cands.clone())),
+                            (None, _) => None,
+                        };
+                        if let Some((cb, candidates)) = cb_and_candidates
+                            && !genes.is_empty()
+                        {
+                            fo.multi_gene = Some(MultiGeneRecord {
+                                cb,
+                                umi,
+                                genes: genes.clone(),
+                                candidates,
+                            });
                         }
                         // readInfo: the resolved cell and the raw UMI, whether
                         // the read is left uncounted or goes to the multi-gene

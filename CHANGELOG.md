@@ -11,6 +11,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- The two STARsolo residuals of DIVERGENCE.md §5 are fixed. On the parity
+  suite's mouse chr19 runs every `Solo.out` file matches STAR 2.7.11b.
+  - STARsolo `--soloMultiMappers EM` is STAR's EM: it starts from the unique
+    counts plus the uniform spread, zeroes values below 0.01 at the start of
+    each round, and stops once no gene moves by 0.01 (or after 101 rounds),
+    so a gene can keep a value below 0.01. Every gene of a cell's unique or
+    multi-gene counts is written to `UniqueAndMult-*.mtx`, a zero included.
+  - A gene-ambiguous read whose barcode has several 1MM whitelist matches is
+    kept for `--soloMultiMappers` and its barcode resolved at counting time,
+    as for a unique-gene read; one it cannot resolve counts as
+    `noTooManyWLmatches`. It was dropped before.
+  - `--soloUMIfiltering` applies to the STARsolo `SJ` feature as it does to
+    genes: a read that crosses two junctions is one UMI on two features, a
+    tie `MultiGeneUMI_CR` drops.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

@@ -158,9 +158,9 @@ Mouse chr19, 10x v2, `--soloType CB_UMI_Simple --soloFeatures Gene GeneFull SJ V
 | Options | BAM records identical | `Solo.out` files identical |
 |---------|-----------------------|----------------------------|
 | defaults, sorted BAM with `CR UR CB UB GX GN sS sQ sM` | 19,955 / 19,955 | 36 / 36 |
-| `--soloCellFilter EmptyDrops_CR --soloMultiMappers Uniform EM --soloUMIdedup 1MM_CR --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts --soloUMIfiltering MultiGeneUMI_CR` | (no BAM) | 34 / 40 |
+| `--soloCellFilter EmptyDrops_CR --soloMultiMappers Uniform EM --soloUMIdedup 1MM_CR --soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts --soloUMIfiltering MultiGeneUMI_CR` | (no BAM) | 40 / 40 |
 
-In the default run every file matches: raw and filtered matrices, `barcodes.tsv` / `features.tsv`, `Summary.csv`, `Features.stats`, `Barcodes.stats` and `UMIperCellSorted.txt`. In the second run the EmptyDrops_CR cell calls match too, because rustar-aligner draws from the same random-number generator as STAR. The 6 files that differ are explained under [residual differences](#residual-differences).
+In the default run every file matches: raw and filtered matrices, `barcodes.tsv` / `features.tsv`, `Summary.csv`, `Features.stats`, `Barcodes.stats` and `UMIperCellSorted.txt`. In the second run the EmptyDrops_CR cell calls match too, because rustar-aligner draws from the same random-number generator as STAR.
 
 ### Residual differences
 
@@ -170,8 +170,6 @@ These aren't deliberate. Each is tracked to be fixed or explained before v0.2.0;
 - **Same-span alignments collapsed** (fusion, 3 pairs). STAR reports two alignments with the same mate positions but different indel or splice placement inside a mate; rustar-aligner reports one, so `NH` is one lower.
 - **A pair STAR leaves unmapped** (chr21, 1 pair). rustar-aligner maps it to 10 loci (`AS` 136, spliced). This adds 2 lines to `SJ.out.tab`.
 - **Unmapped-read category** ("too short" versus "other", `uT`), for the counts listed above. The yeast pair: STAR finds no alignment window (`uT:0`); rustar-aligner finds a 31-point alignment and rejects it as too short (`uT:1`).
-- **STARsolo `GeneFull` multi-mappers** (`--soloMultiMappers`). STAR counts one multi-gene read whose barcode needed 1MM_multi correction, and rustar-aligner drops it. This changes `UniqueAndMult-*.mtx` and one `Features.stats` line.
-- **STARsolo `SJ` with `--soloUMIdedup 1MM_CR`**. STAR collapses 4 more SJ UMIs than rustar-aligner does (SJ `matrix.mtx`, `Features.stats`, `Summary.csv`).
 
 ### Speed and memory
 
