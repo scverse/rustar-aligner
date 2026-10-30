@@ -321,12 +321,7 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 These are **not** deliberate divergences. They are the differences `test/parity_suite.sh` finds, kept here so that each one is fixed or explained before v0.2.0 (README, *Comparison with STAR 2.7.11b*). Read names are from that suite's datasets.
 
-- **`nM` and mate order on multi-mapping pairs.** Human chr21 `ERR188021.1648513` and `ERR188021.1662773`, plus 21 pairs of the fusion set (e.g. `fustut00000271e5`, `fustut00000282b2`). The loci, CIGARs, `AS` and MAPQ match STAR's. On some alignments `nM` is 1–2 lower than STAR's, and in 11 of the 21 fusion pairs the mates are written in the opposite order.
-- **Same-span alignments collapsed.** Fusion set `fustut000009a03e`, `fustut000009a03f`, `fustut0000167ff6`. STAR keeps two alignments with the same mate positions but different indel or splice placement inside one mate; rustar-aligner keeps one, so `NH` is one lower.
-- **A pair STAR leaves unmapped.** Human chr21 `ERR188021.1789477`: rustar-aligner maps it to 10 loci (`AS` 136, spliced), adding 2 lines to `SJ.out.tab`.
-- **Unmapped-read category.** Some unmapped reads are counted as "too short" in `Log.final.out` (and `uT:1`), where STAR has "other" (`uT:0`): yeast 100k PE 1 (`ERR12389696.13360341`), human chr21 PE 17, fusion 73. For the yeast pair, STAR builds no alignment window, while rustar-aligner builds one, aligns 31 points and rejects it as too short.
-- **STARsolo `GeneFull` multi-mappers.** With `--soloMultiMappers`, STAR counts one multi-gene read whose barcode needed 1MM_multi correction, and rustar-aligner drops it (`UniqueAndMult-*.mtx`, one `Features.stats` line).
-- **STARsolo `SJ` with `--soloUMIdedup 1MM_CR`.** STAR collapses 4 more SJ UMIs than rustar-aligner on the mouse chr19 fixture (SJ `matrix.mtx`, `Features.stats`, `Summary.csv`).
+There are none at present. The six once listed here (`nM` and mate order, same-span alignments, a pair STAR leaves unmapped, the unmapped-read category, STARsolo `GeneFull` multi-mappers and `SJ` UMI filtering) now match STAR on the suite's yeast, chr21, fusion and STARsolo runs.
 
 ---
 

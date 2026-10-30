@@ -137,51 +137,94 @@ fn score_region(
 /// staging copy is amortized, small enough to sit on the stack.
 const SCORE_REGION_CHUNK: usize = 256;
 
-fn count_mismatches(
+/// Windows with fewer seeds than this have few recursion leaves, and hashing
+/// the extension costs more there than it saves.
+const MEMO_EXTENSIONS_MIN_SEEDS: usize = 25;
+
+/// Most extensions memoized per window. The table is kept for the thread's
+/// lifetime, so this bounds what it holds. 7/8 of a power of two, so the table
+/// does not grow again on reaching it. Results past the limit are not stored.
+const MEMO_EXTENSIONS_MAX: usize = (1 << 14) / 8 * 7;
+
+thread_local! {
+    /// The memo tables of the window being stitched, kept between windows:
+    /// allocating them per window fragments the heap, which costs more memory
+    /// than the tables themselves.
+    static JUNCTION_SCAN_CACHE: std::cell::Cell<crate::align::score::JunctionScanCache> =
+        std::cell::Cell::default();
+}
+
+/// [`extend_alignment`] memoized in the window's cache. Within one window the
+/// read, genome strand and mismatch limits are fixed, so the [`ExtendKey`]
+/// fields decide the result; the recursion's leaves repeat many of them.
+#[allow(clippy::too_many_arguments)]
+fn extend_alignment_cached(
+    jcache: &mut crate::align::score::JunctionScanCache,
     read_seq: &[u8],
-    cigar_ops: &[cigar::Op],
-    genome_start: u64,
     read_start: usize,
+    genome_start: u64,
+    direction: i32,
+    max_extend: usize,
+    n_mm_prev: u32,
+    len_prev: usize,
+    n_mm_max: u32,
+    p_mm_max: f64,
     index: &GenomeIndex,
     is_reverse: bool,
-) -> u32 {
-    use cigar::op::Kind;
-    // Add n_genome offset for reverse-strand genome access
-    let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
-
-    let mut n_mismatch = 0u32;
-    let mut read_pos = read_start;
-    let mut genome_pos = genome_start;
-
-    for op in cigar_ops {
-        match op.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                for _i in 0..op.len() {
-                    if read_pos < read_seq.len() {
-                        let read_base = read_seq[read_pos];
-                        if let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset)
-                            && read_base != genome_base
-                            && read_base != 4
-                            && genome_base != 4
-                        {
-                            n_mismatch += 1;
-                        }
-                    }
-                    read_pos += 1;
-                    genome_pos += 1;
-                }
-            }
-            Kind::Insertion | Kind::SoftClip => {
-                read_pos += op.len();
-            }
-            Kind::Deletion | Kind::Skip => {
-                genome_pos += op.len() as u64;
-            }
-            Kind::HardClip | Kind::Pad => {}
-        }
+    extend_to_end: bool,
+) -> ExtendResult {
+    if !jcache.memo_extensions {
+        return extend_alignment(
+            read_seq,
+            read_start,
+            genome_start,
+            direction,
+            max_extend,
+            n_mm_prev,
+            len_prev,
+            n_mm_max,
+            p_mm_max,
+            index,
+            is_reverse,
+            extend_to_end,
+        );
     }
-
-    n_mismatch
+    // Lengths are bounded by the read's, so they fit; the two flags take the low
+    // bits of the last field to keep the entry small.
+    let key = (
+        genome_start,
+        read_start as u32,
+        max_extend as u32,
+        n_mm_prev,
+        (len_prev as u32) << 2 | u32::from(direction > 0) << 1 | u32::from(extend_to_end),
+    );
+    if let Some(&(extend_len, max_score, n_mismatch)) = jcache.ext.get(&key) {
+        return ExtendResult {
+            extend_len: extend_len as usize,
+            max_score,
+            n_mismatch,
+        };
+    }
+    let r = extend_alignment(
+        read_seq,
+        read_start,
+        genome_start,
+        direction,
+        max_extend,
+        n_mm_prev,
+        len_prev,
+        n_mm_max,
+        p_mm_max,
+        index,
+        is_reverse,
+        extend_to_end,
+    );
+    if jcache.ext.len() < MEMO_EXTENSIONS_MAX {
+        jcache
+            .ext
+            .insert(key, (r.extend_len as u32, r.max_score, r.n_mismatch));
+    }
+    r
 }
 
 /// Result of extending an alignment into flanking regions
@@ -989,14 +1032,20 @@ pub fn cluster_seeds(
 
             // Capacity check (seedPerWindowNmax) with anchor protection
             if window.alignments.len() >= seed_per_window_nmax {
-                // Find min length of non-anchor entries (STAR: recalculate WALrec)
-                let min_non_anchor_len = window
+                // Find min length of non-anchor entries (STAR: recalculate WALrec).
+                // With none, STAR drops the whole read before it looks at the new
+                // align, so a non-anchor arriving at a window full of anchors still
+                // triggers it: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0.
+                let Some(min_non_anchor_len) = window
                     .alignments
                     .iter()
                     .filter(|wa| !wa.is_anchor)
                     .map(|wa| wa.length)
                     .min()
-                    .unwrap_or(usize::MAX);
+                else {
+                    too_many_anchors = true;
+                    break 'outer;
+                };
 
                 // Update persistent threshold
                 window.wa_lrec = min_non_anchor_len;
@@ -1011,12 +1060,6 @@ pub fn cluster_seeds(
                 window
                     .alignments
                     .retain(|wa| wa.is_anchor || wa.length > min_non_anchor_len);
-
-                if window.alignments.len() >= seed_per_window_nmax {
-                    // STAR: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0, abort entire read
-                    too_many_anchors = true;
-                    break 'outer;
-                }
             }
 
             // STAR's addition condition: if (aAnchor || aLength > WALrec[iW])
@@ -1090,7 +1133,7 @@ pub fn cluster_seeds(
 }
 
 /// Lightweight exon block for in-progress transcript during recursion
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ExonBlock {
     pub(crate) read_start: usize, // 0-based inclusive
     pub(crate) read_end: usize,   // 0-based exclusive
@@ -1124,6 +1167,11 @@ pub(crate) struct WorkingTranscript {
     pub(crate) read_end: usize,
     pub(crate) genome_start: u64,
     pub(crate) genome_end: u64,
+    /// Final score ([`wt_final_score`]) and mapped length ([`wt_mapped_length`]),
+    /// stored when the transcript is recorded in its window: every later
+    /// transcript of the window is compared against them.
+    pub(crate) window_score: i32,
+    pub(crate) mapped_len: u32,
 }
 
 impl WorkingTranscript {
@@ -1143,7 +1191,83 @@ impl WorkingTranscript {
             read_end: 0,
             genome_start: 0,
             genome_end: 0,
+            window_score: 0,
+            mapped_len: 0,
         }
+    }
+}
+
+/// What [`WorkingTranscript::restore`] needs to undo a stitch or a leaf's
+/// extensions: they only push exons and junctions (the four junction vectors
+/// together), change the last exon (and, for a leaf, the first) in place, and
+/// update the scalar fields.
+struct WtMark {
+    n_exons: usize,
+    first: Option<ExonBlock>,
+    last: Option<ExonBlock>,
+    n_junctions: usize,
+    score: i32,
+    n_mismatch: u32,
+    n_gap: u32,
+    n_junction: u32,
+    n_anchor: u32,
+    read_start: usize,
+    read_end: usize,
+    genome_start: u64,
+    genome_end: u64,
+}
+
+impl WorkingTranscript {
+    /// Mark before a stitch, which leaves every exon but the last alone.
+    fn mark(&self) -> WtMark {
+        WtMark {
+            n_exons: self.exons.len(),
+            first: None,
+            last: self.exons.last().copied(),
+            n_junctions: self.junction_motifs.len(),
+            score: self.score,
+            n_mismatch: self.n_mismatch,
+            n_gap: self.n_gap,
+            n_junction: self.n_junction,
+            n_anchor: self.n_anchor,
+            read_start: self.read_start,
+            read_end: self.read_end,
+            genome_start: self.genome_start,
+            genome_end: self.genome_end,
+        }
+    }
+
+    /// Mark before a leaf's extensions, which change the first exon as well.
+    fn mark_ends(&self) -> WtMark {
+        WtMark {
+            first: self.exons.first().copied(),
+            ..self.mark()
+        }
+    }
+
+    fn restore(&mut self, m: &WtMark) {
+        self.exons.truncate(m.n_exons);
+        if let Some(first) = m.first {
+            self.exons[0] = first;
+        }
+        if let Some(last) = m.last {
+            self.exons[m.n_exons - 1] = last;
+        }
+        if self.junction_motifs.len() != m.n_junctions {
+            self.junction_motifs.truncate(m.n_junctions);
+            self.junction_annotated.truncate(m.n_junctions);
+            self.junction_strand.truncate(m.n_junctions);
+            self.junction_shifts.truncate(m.n_junctions);
+        }
+        self.score = m.score;
+        self.n_mismatch = m.n_mismatch;
+        self.n_gap = m.n_gap;
+        self.n_junction = m.n_junction;
+        self.n_anchor = m.n_anchor;
+        self.read_start = m.read_start;
+        self.read_end = m.read_end;
+        self.genome_start = m.genome_start;
+        self.genome_end = m.genome_end;
     }
 }
 
@@ -1151,8 +1275,8 @@ impl WorkingTranscript {
 /// Returns None if stitching fails (mismatch limit, overhang too short, etc.).
 /// Matches STAR's stitchAlignToTranscript.cpp logic.
 #[allow(clippy::too_many_arguments)]
-fn stitch_align_to_transcript(
-    wt: &WorkingTranscript,
+fn stitch_align_in_place(
+    new_wt: &mut WorkingTranscript,
     wa: &WindowAlignment,
     read_seq: &[u8],
     index: &GenomeIndex,
@@ -1162,8 +1286,10 @@ fn stitch_align_to_transcript(
     align_mates_gap_max: u64,
     jcache: &mut crate::align::score::JunctionScanCache,
     _debug_name: &str,
-) -> Option<WorkingTranscript> {
-    let last_exon = wt.exons.last().unwrap();
+) -> bool {
+    // A copy: exon A is extended in place below, and its original ends are
+    // still read afterwards.
+    let last_exon = *new_wt.exons.last().unwrap();
 
     // Mate-boundary detection: STAR canonSJ[iex] = -3 (stitchAlignToTranscript.cpp:402)
     // When crossing from mate1 to mate2 (or vice versa), skip junction scoring and
@@ -1177,10 +1303,10 @@ fn stitch_align_to_transcript(
         // mates overlap (genome positions interleaved), naturally limiting WTs to 2 exons.
         // rustar-aligner's overlap-trimming allows continued stitching, inflating the matched-base count.
         // Fix: if the WT already has exons from BOTH mates, a second crossing is invalid.
-        let has_m0 = wt.exons.iter().any(|e| e.mate_id == 0);
-        let has_m1 = wt.exons.iter().any(|e| e.mate_id == 1);
+        let has_m0 = new_wt.exons.iter().any(|e| e.mate_id == 0);
+        let has_m1 = new_wt.exons.iter().any(|e| e.mate_id == 1);
         if has_m0 && has_m1 {
-            return None;
+            return false;
         }
         // STAR condition (stitchAlignToTranscript.cpp:352):
         // gBstart + trA->exons[0][EX_R] + nBasesMax >= trA->exons[0][EX_G] || EX_G < EX_R
@@ -1196,15 +1322,15 @@ fn stitch_align_to_transcript(
             //   combined_start_mate1 < len_mate2_exon - len_mate1 + (P_mate2 - P_mate1)
             let combined_start_mate1 =
                 (read_seq.len() as i64) - (wa.read_pos as i64) - (wa.length as i64);
-            let first_exon = &wt.exons[0];
+            let first_exon = &new_wt.exons[0];
             let len_mate2_exon = (first_exon.read_end - first_exon.read_start) as i64;
             let len_mate1 = wa.length as i64;
             let p_diff = first_exon.genome_start as i64 - wa.sa_pos as i64; // P_mate2 - P_mate1
             if combined_start_mate1 < len_mate2_exon - len_mate1 + p_diff {
-                return None;
+                return false;
             }
         } else {
-            let first_exon = &wt.exons[0];
+            let first_exon = &new_wt.exons[0];
             let ex_g = first_exon.genome_start;
             let ex_r = first_exon.read_start as u64;
             // STAR stitchAlignToTranscript.cpp line 352:
@@ -1213,28 +1339,28 @@ fn stitch_align_to_transcript(
             // reject if EX_G >= EX_R && gBstart + EX_R < EX_G
             let fwd_reject = ex_g >= ex_r && wa.genome_pos + ex_r < ex_g;
             if fwd_reject {
-                return None;
+                return false;
             }
         }
         // Forward-gap check: alignMatesGapMax (disabled when 0)
         let genome_gap = wa.genome_pos.saturating_sub(last_exon.genome_end);
         if align_mates_gap_max > 0 && genome_gap > align_mates_gap_max {
-            return None;
+            return false;
         }
-        let mut new_wt = wt.clone();
 
         // STAR stitchAlignToTranscript.cpp:374-381: right-extend mate A to fragment boundary.
         // extendAlign(R, G, rAend+1, gAend+1, 1, 1, DEF_readSeqLengthMax, nMatch, nMM, ...)
         // extendToEnd=false (local mode); spacer at position 150 naturally stops the extension.
         // nMatch approximated as score + n_mismatch (exact for seeds-only paths, approx otherwise).
-        let n_match_m1 = (wt.score + wt.n_mismatch as i32).max(0) as usize;
-        let right_ext = extend_alignment(
+        let n_match_m1 = (new_wt.score + new_wt.n_mismatch as i32).max(0) as usize;
+        let right_ext = extend_alignment_cached(
+            jcache,
             read_seq,
             last_exon.read_end,
             last_exon.genome_end,
             1,
             10_000, // DEF_readSeqLengthMax (STAR); SPACER stop applies before this limit
-            wt.n_mismatch,
+            new_wt.n_mismatch,
             n_match_m1,
             scorer.n_mm_max,
             scorer.p_mm_max,
@@ -1288,7 +1414,8 @@ fn stitch_align_to_transcript(
             }
         };
         let n_match_for_left = n_match_m1 + right_ext.extend_len + wa.length;
-        let left_ext = extend_alignment(
+        let left_ext = extend_alignment_cached(
+            jcache,
             read_seq,
             wa.read_pos,
             wa.sa_pos,
@@ -1310,7 +1437,7 @@ fn stitch_align_to_transcript(
             new_wt.n_mismatch += left_ext.n_mismatch;
         }
 
-        return Some(new_wt);
+        return true;
     }
 
     // Overlap trimming: if new WA overlaps previous exon in read coords, shift start right
@@ -1321,7 +1448,7 @@ fn stitch_align_to_transcript(
     if last_exon.read_end > eff_read_pos {
         let overlap = last_exon.read_end - eff_read_pos;
         if overlap >= eff_length {
-            return None; // Fully consumed
+            return false; // Fully consumed
         }
         eff_read_pos = last_exon.read_end;
         eff_genome_pos += overlap as u64;
@@ -1332,7 +1459,7 @@ fn stitch_align_to_transcript(
     if last_exon.genome_end > eff_genome_pos && eff_genome_pos > last_exon.genome_start {
         let g_overlap = (last_exon.genome_end - eff_genome_pos) as usize;
         if g_overlap >= eff_length {
-            return None; // Fully consumed
+            return false; // Fully consumed
         }
         eff_read_pos += g_overlap;
         eff_genome_pos += g_overlap as u64;
@@ -1346,7 +1473,7 @@ fn stitch_align_to_transcript(
     // that only starts before A's genome end (`genome_gap < 0`) is an
     // insertion with overlapping seeds: its score drops by the overlap below.
     if read_gap < 0 || eff_genome_pos + eff_length as u64 <= last_exon.genome_end {
-        return None;
+        return false;
     }
 
     // Seeds on one diagonal (adjacent or separated by a gap-free filler) are
@@ -1356,10 +1483,9 @@ fn stitch_align_to_transcript(
     // end extension of whichever seed is kept, which is bounded by the
     // max-score and mismatch rules of `extendAlign`, not by the gap scoring.
     if read_gap == genome_gap {
-        return None;
+        return false;
     }
 
-    let mut new_wt = wt.clone();
     let mut d_score: i32 = 0;
     let mut gap_mm: u32 = 0;
 
@@ -1372,7 +1498,7 @@ fn stitch_align_to_transcript(
 
         // STAR: Del > alignIntronMax → reject (return -1000003)
         if del > scorer.align_intron_max && scorer.align_intron_max > 0 {
-            return None;
+            return false;
         }
 
         // No early exit on a short exon B: after the overlap trim B can be shorter than
@@ -1406,7 +1532,7 @@ fn stitch_align_to_transcript(
             if pj.motif == 0
                 && (eff_length <= pj.shift_right as usize || prev_len <= pj.shift_left as usize)
             {
-                return None; // STAR -1000006: repeats around a non-canonical junction
+                return false; // STAR -1000006: repeats around a non-canonical junction
             }
             let donor_fwd = index.sa_pos_to_forward(donor_sa, cluster.is_reverse, del as usize);
             let motif = scorer.detect_splice_motif(donor_fwd, del, &index.genome);
@@ -1444,7 +1570,7 @@ fn stitch_align_to_transcript(
                 (last_exon.read_end - last_exon.read_start) as i32 + jr_shift
             };
             if shrunk_len < 1 {
-                return None;
+                return false;
             }
         }
 
@@ -1540,7 +1666,7 @@ fn stitch_align_to_transcript(
         if is_splice {
             // Check stitch mismatch limit
             if !scorer.stitch_mismatch_allowed(&motif, gap_mm) {
-                return None;
+                return false;
             }
 
             // Annotated strand of a database hit (STAR `sjdbStrand`); the sjdb
@@ -1586,7 +1712,7 @@ fn stitch_align_to_transcript(
                     let sl = pj.shift_left as usize;
                     let prev_len = last_exon.read_end - last_exon.read_start;
                     if eff_length <= sl || prev_len <= sl {
-                        return None; // STAR -1000006
+                        return false; // STAR -1000006
                     }
                     let shifted = if cluster.is_reverse {
                         jr_shift - pj.shift_left as i32
@@ -1596,7 +1722,7 @@ fn stitch_align_to_transcript(
                     // STAR: rAend+jR >= rBend, i.e. the shift runs past B. In the
                     // reverse scan space the roles of A and B are exchanged.
                     if shifted >= (shared + eff_length) as i32 || prev_len as i32 + shifted < 1 {
-                        return None; // STAR -1000006
+                        return false; // STAR -1000006
                     }
                     jr_exon = shifted;
                     jj_l = u32::from(pj.shift_left);
@@ -1771,7 +1897,7 @@ fn stitch_align_to_transcript(
     // `outFilterMismatchNmaxTotal`; the mismatch ratio is applied to the final
     // best transcript by `mappedFilter`, not while stitching.
     if total_mm > scorer.n_mm_max {
-        return None;
+        return false;
     }
 
     // Update working transcript
@@ -1792,7 +1918,7 @@ fn stitch_align_to_transcript(
         new_wt.n_anchor += 1;
     }
 
-    Some(new_wt)
+    true
 }
 
 /// Stitch seeds within a cluster using recursive combinatorial stitching.
@@ -1845,6 +1971,37 @@ pub fn stitch_seeds_with_jdb(
 /// Check if two transcripts overlap in their exon blocks.
 /// Returns total overlapping bases (where exons share the same read-genome diagonal).
 /// Used for deduplication: if new transcript is a subset of existing, drop it.
+/// [`stitch_align_in_place`] on a copy of `wt`: the stitched transcript, or
+/// `None` where STAR rejects the stitch.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn stitch_align_to_transcript(
+    wt: &WorkingTranscript,
+    wa: &WindowAlignment,
+    read_seq: &[u8],
+    index: &GenomeIndex,
+    scorer: &AlignmentScorer,
+    cluster: &SeedCluster,
+    junction_db: Option<&crate::junction::SpliceJunctionDb>,
+    align_mates_gap_max: u64,
+    jcache: &mut crate::align::score::JunctionScanCache,
+    debug_name: &str,
+) -> Option<WorkingTranscript> {
+    let mut new_wt = wt.clone();
+    stitch_align_in_place(
+        &mut new_wt,
+        wa,
+        read_seq,
+        index,
+        scorer,
+        cluster,
+        junction_db,
+        align_mates_gap_max,
+        jcache,
+        debug_name,
+    )
+    .then_some(new_wt)
+}
 fn blocks_overlap(t1_exons: &[ExonBlock], t2_exons: &[ExonBlock]) -> u32 {
     let mut overlap = 0u32;
     let mut i = 0;
@@ -2199,15 +2356,14 @@ pub(crate) fn finalize_transcript(
     // Adjust score: add both left and right extensions (STAR adds both at finalization)
     let adjusted_score = wt.score + left_extend.max_score + right_extend.max_score;
 
-    // Count mismatches — MUST be called BEFORE CIGAR reversal
-    let n_mismatch = count_mismatches(
-        read_seq,
-        &final_cigar,
-        adjusted_genome_start,
-        0,
-        index,
-        cluster.is_reverse,
-    );
+    // STAR's nMM is accumulated while the transcript is built (stitch gaps,
+    // junction scans, extensions), never recounted from the final alignment.
+    // The two differ when a junction scan moves the junction back into exon A
+    // (jR < 0) over bases A had already counted as mismatches against the
+    // other flank: STAR counts them again against the acceptor and does not
+    // take the first count back (stitchAlignToTranscript.cpp, the commented-out
+    // `nMM--`). `wt.n_mismatch` keeps that count, as nMM does.
+    let n_mismatch = wt.n_mismatch + left_extend.n_mismatch + right_extend.n_mismatch;
 
     // Reverse CIGAR for reverse strand
     if cluster.is_reverse {
@@ -2562,7 +2718,7 @@ fn passes_finalization_filters(
 #[allow(clippy::too_many_arguments)]
 fn stitch_recurse(
     i_a: usize,
-    wt: WorkingTranscript,
+    wt: &mut WorkingTranscript,
     wa_entries: &[WindowAlignment],
     read_seq: &[u8],
     index: &GenomeIndex,
@@ -2591,233 +2747,251 @@ fn stitch_recurse(
     // Base case: all entries considered
     if i_a >= wa_entries.len() {
         if !wt.exons.is_empty() {
-            // STAR stitchWindowAligns.cpp lines 21-81: apply left and right extensions
-            // inside the stitcher BEFORE the score-gate/dedup. This matches STAR's behavior
-            // where extensions boost the correct WT's score so the score-range filter can
-            // correctly eliminate spurious WTs with short first exons.
-            // EXTEND_ORDER=1: extend 5' of read first (left for fwd, right for rev).
-            let mut wt = wt;
-            let zero_ext = ExtendResult {
-                extend_len: 0,
-                max_score: 0,
-                n_mismatch: 0,
-            };
+            // The leaf extends `wt` in place; the branches above it still need
+            // it as it was, so it is put back once the leaf is done (only the
+            // extensions change it).
+            let mut mark = None;
+            'leaf: {
+                // STAR stitchWindowAligns.cpp lines 21-81: apply left and right extensions
+                // inside the stitcher BEFORE the score-gate/dedup. This matches STAR's behavior
+                // where extensions boost the correct WT's score so the score-range filter can
+                // correctly eliminate spurious WTs with short first exons.
+                // EXTEND_ORDER=1: extend 5' of read first (left for fwd, right for rev).
+                let zero_ext = ExtendResult {
+                    extend_len: 0,
+                    max_score: 0,
+                    n_mismatch: 0,
+                };
 
-            let do_left_first = !original_is_reverse;
-            let first_ext = if do_left_first {
-                // Left extension (5' of forward read)
-                if wt.read_start > 0 {
-                    extend_alignment(
-                        read_seq,
-                        wt.read_start,
-                        wt.genome_start,
-                        -1,
-                        wt.read_start,
-                        wt.n_mismatch,
-                        wt.read_end - wt.read_start,
-                        scorer.n_mm_max,
-                        scorer.p_mm_max,
-                        index,
-                        cluster.is_reverse,
-                        false, // internal stitch extension: alignEndsType applied at finalize
-                    )
-                } else {
-                    zero_ext.clone()
-                }
-            } else {
-                // Right extension (5' of reverse read)
-                if wt.read_end < read_seq.len() {
-                    extend_alignment(
-                        read_seq,
-                        wt.read_end,
-                        wt.genome_end,
-                        1,
-                        read_seq.len() - wt.read_end,
-                        wt.n_mismatch,
-                        wt.read_end - wt.read_start,
-                        scorer.n_mm_max,
-                        scorer.p_mm_max,
-                        index,
-                        cluster.is_reverse,
-                        false, // internal stitch extension: alignEndsType applied at finalize
-                    )
-                } else {
-                    zero_ext.clone()
-                }
-            };
-
-            let len_after_first = (wt.read_end - wt.read_start) + first_ext.extend_len;
-            let mm_after_first = wt.n_mismatch + first_ext.n_mismatch;
-
-            let second_ext = if do_left_first {
-                // Right extension (3' of forward read)
-                let read_end_after = wt.read_end; // right boundary unchanged by left ext
-                if read_end_after < read_seq.len() {
-                    extend_alignment(
-                        read_seq,
-                        read_end_after,
-                        wt.genome_end,
-                        1,
-                        read_seq.len() - read_end_after,
-                        mm_after_first,
-                        len_after_first,
-                        scorer.n_mm_max,
-                        scorer.p_mm_max,
-                        index,
-                        cluster.is_reverse,
-                        false, // internal stitch extension: alignEndsType applied at finalize
-                    )
-                } else {
-                    zero_ext
-                }
-            } else {
-                // Left extension (3' of reverse read)
-                let read_start_after = wt.read_start; // left boundary unchanged by right ext
-                if read_start_after > 0 {
-                    extend_alignment(
-                        read_seq,
-                        read_start_after,
-                        wt.genome_start,
-                        -1,
-                        read_start_after,
-                        mm_after_first,
-                        len_after_first,
-                        scorer.n_mm_max,
-                        scorer.p_mm_max,
-                        index,
-                        cluster.is_reverse,
-                        false, // internal stitch extension: alignEndsType applied at finalize
-                    )
-                } else {
-                    zero_ext
-                }
-            };
-
-            // Apply the extensions to wt
-            if do_left_first {
-                if first_ext.extend_len > 0 {
-                    let first = wt.exons.first_mut().unwrap();
-                    first.read_start -= first_ext.extend_len;
-                    first.genome_start -= first_ext.extend_len as u64;
-                    wt.score += first_ext.max_score;
-                    wt.n_mismatch += first_ext.n_mismatch;
-                    wt.read_start = first.read_start;
-                    wt.genome_start = first.genome_start;
-                }
-                if second_ext.extend_len > 0 {
-                    let last = wt.exons.last_mut().unwrap();
-                    last.read_end += second_ext.extend_len;
-                    last.genome_end += second_ext.extend_len as u64;
-                    wt.score += second_ext.max_score;
-                    wt.n_mismatch += second_ext.n_mismatch;
-                    wt.read_end = last.read_end;
-                    wt.genome_end = last.genome_end;
-                }
-            } else {
-                if first_ext.extend_len > 0 {
-                    let last = wt.exons.last_mut().unwrap();
-                    last.read_end += first_ext.extend_len;
-                    last.genome_end += first_ext.extend_len as u64;
-                    wt.score += first_ext.max_score;
-                    wt.n_mismatch += first_ext.n_mismatch;
-                    wt.read_end = last.read_end;
-                    wt.genome_end = last.genome_end;
-                }
-                if second_ext.extend_len > 0 {
-                    let first = wt.exons.first_mut().unwrap();
-                    first.read_start -= second_ext.extend_len;
-                    first.genome_start -= second_ext.extend_len as u64;
-                    wt.score += second_ext.max_score;
-                    wt.n_mismatch += second_ext.n_mismatch;
-                    wt.read_start = first.read_start;
-                    wt.genome_start = first.genome_start;
-                }
-            }
-
-            // STAR's intron filters run here, after the extensions and before the
-            // window's dedup (`stitchWindowAligns.cpp:130-152` vs `:260-302`): a
-            // rejected transcript must not evict one it covers. For a pair the
-            // junctions of both mates are on this one transcript.
-            if !scorer.intron_filter.passes(
-                wt.junction_motifs
-                    .iter()
-                    .zip(wt.junction_annotated.iter())
-                    .zip(wt.junction_strand.iter())
-                    .map(|((m, a), s)| (m, a, s)),
-            ) {
-                return;
-            }
-
-            // STAR rejects a transcript on its exon overhangs, spliced-mate length and
-            // mate placement before the window's dedup (`stitchWindowAligns.cpp:96-219`),
-            // so a rejected transcript never evicts the one it covers.
-            if !passes_finalization_filters(&wt, read_seq, scorer) {
-                return;
-            }
-
-            // STAR's score gate (`stitchWindowAligns.cpp:244-250`); see
-            // [`window_score_gate`].
-            {
-                let score = wt_final_score(&wt, scorer);
-                // Single-end seeds carry mate_id 2; STAR's iFrag is 0 there.
-                let frag = match (wt.exons.first(), wt.exons.last()) {
-                    (Some(f), Some(l)) if f.mate_id == l.mate_id => Some(if f.mate_id >= 2 {
-                        0
+                let do_left_first = !original_is_reverse;
+                let first_ext = if do_left_first {
+                    // Left extension (5' of forward read)
+                    if wt.read_start > 0 {
+                        extend_alignment_cached(
+                            jcache,
+                            read_seq,
+                            wt.read_start,
+                            wt.genome_start,
+                            -1,
+                            wt.read_start,
+                            wt.n_mismatch,
+                            wt.read_end - wt.read_start,
+                            scorer.n_mm_max,
+                            scorer.p_mm_max,
+                            index,
+                            cluster.is_reverse,
+                            false, // internal stitch extension: alignEndsType applied at finalize
+                        )
                     } else {
-                        f.mate_id as usize
-                    }),
-                    _ => None,
-                };
-                // An empty window compares against STAR's `trInit`, score 0.
-                let window_best = transcripts.first().map_or(0, |t| wt_final_score(t, scorer));
-                if !window_score_gate(score, frag, window_best, max_score_mate, scorer) {
-                    return;
-                }
-            }
-
-            // Dedup like STAR (`stitchWindowAligns.cpp:260-285`). The score compared is
-            // the final one, with the genomic-length penalty. A transcript that
-            // contains an older one replaces it whatever their scores: only a
-            // contained transcript scoring lower than its container is dropped.
-            let wt_score = wt_final_score(&wt, scorer);
-            let wt_len = wt_mapped_length(&wt);
-            let mut dominated = false;
-            let mut idx = 0;
-            while idx < transcripts.len() {
-                let existing = &transcripts[idx];
-                let overlap = blocks_overlap(&wt.exons, &existing.exons);
-                let u_new = wt_len - overlap;
-                let u_old = wt_mapped_length(existing) - overlap;
-                if u_new == 0 && wt_score < wt_final_score(existing, scorer) {
-                    dominated = true;
-                    break;
-                } else if u_old == 0 {
-                    // STAR drops the contained transcript on the spot, even if a
-                    // later one then dominates the new transcript.
-                    transcripts.remove(idx);
+                        zero_ext.clone()
+                    }
                 } else {
-                    idx += 1;
+                    // Right extension (5' of reverse read)
+                    if wt.read_end < read_seq.len() {
+                        extend_alignment_cached(
+                            jcache,
+                            read_seq,
+                            wt.read_end,
+                            wt.genome_end,
+                            1,
+                            read_seq.len() - wt.read_end,
+                            wt.n_mismatch,
+                            wt.read_end - wt.read_start,
+                            scorer.n_mm_max,
+                            scorer.p_mm_max,
+                            index,
+                            cluster.is_reverse,
+                            false, // internal stitch extension: alignEndsType applied at finalize
+                        )
+                    } else {
+                        zero_ext.clone()
+                    }
+                };
+
+                let len_after_first = (wt.read_end - wt.read_start) + first_ext.extend_len;
+                let mm_after_first = wt.n_mismatch + first_ext.n_mismatch;
+
+                let second_ext = if do_left_first {
+                    // Right extension (3' of forward read)
+                    let read_end_after = wt.read_end; // right boundary unchanged by left ext
+                    if read_end_after < read_seq.len() {
+                        extend_alignment_cached(
+                            jcache,
+                            read_seq,
+                            read_end_after,
+                            wt.genome_end,
+                            1,
+                            read_seq.len() - read_end_after,
+                            mm_after_first,
+                            len_after_first,
+                            scorer.n_mm_max,
+                            scorer.p_mm_max,
+                            index,
+                            cluster.is_reverse,
+                            false, // internal stitch extension: alignEndsType applied at finalize
+                        )
+                    } else {
+                        zero_ext
+                    }
+                } else {
+                    // Left extension (3' of reverse read)
+                    let read_start_after = wt.read_start; // left boundary unchanged by right ext
+                    if read_start_after > 0 {
+                        extend_alignment_cached(
+                            jcache,
+                            read_seq,
+                            read_start_after,
+                            wt.genome_start,
+                            -1,
+                            read_start_after,
+                            mm_after_first,
+                            len_after_first,
+                            scorer.n_mm_max,
+                            scorer.p_mm_max,
+                            index,
+                            cluster.is_reverse,
+                            false, // internal stitch extension: alignEndsType applied at finalize
+                        )
+                    } else {
+                        zero_ext
+                    }
+                };
+
+                // Apply the extensions to wt
+                if first_ext.extend_len > 0 || second_ext.extend_len > 0 {
+                    mark = Some(wt.mark_ends());
+                }
+                if do_left_first {
+                    if first_ext.extend_len > 0 {
+                        let first = wt.exons.first_mut().unwrap();
+                        first.read_start -= first_ext.extend_len;
+                        first.genome_start -= first_ext.extend_len as u64;
+                        wt.score += first_ext.max_score;
+                        wt.n_mismatch += first_ext.n_mismatch;
+                        wt.read_start = first.read_start;
+                        wt.genome_start = first.genome_start;
+                    }
+                    if second_ext.extend_len > 0 {
+                        let last = wt.exons.last_mut().unwrap();
+                        last.read_end += second_ext.extend_len;
+                        last.genome_end += second_ext.extend_len as u64;
+                        wt.score += second_ext.max_score;
+                        wt.n_mismatch += second_ext.n_mismatch;
+                        wt.read_end = last.read_end;
+                        wt.genome_end = last.genome_end;
+                    }
+                } else {
+                    if first_ext.extend_len > 0 {
+                        let last = wt.exons.last_mut().unwrap();
+                        last.read_end += first_ext.extend_len;
+                        last.genome_end += first_ext.extend_len as u64;
+                        wt.score += first_ext.max_score;
+                        wt.n_mismatch += first_ext.n_mismatch;
+                        wt.read_end = last.read_end;
+                        wt.genome_end = last.genome_end;
+                    }
+                    if second_ext.extend_len > 0 {
+                        let first = wt.exons.first_mut().unwrap();
+                        first.read_start -= second_ext.extend_len;
+                        first.genome_start -= second_ext.extend_len as u64;
+                        wt.score += second_ext.max_score;
+                        wt.n_mismatch += second_ext.n_mismatch;
+                        wt.read_start = first.read_start;
+                        wt.genome_start = first.genome_start;
+                    }
+                }
+
+                // STAR's intron filters run here, after the extensions and before the
+                // window's dedup (`stitchWindowAligns.cpp:130-152` vs `:260-302`): a
+                // rejected transcript must not evict one it covers. For a pair the
+                // junctions of both mates are on this one transcript.
+                if !scorer.intron_filter.passes(
+                    wt.junction_motifs
+                        .iter()
+                        .zip(wt.junction_annotated.iter())
+                        .zip(wt.junction_strand.iter())
+                        .map(|((m, a), s)| (m, a, s)),
+                ) {
+                    break 'leaf;
+                }
+
+                // STAR rejects a transcript on its exon overhangs, spliced-mate length and
+                // mate placement before the window's dedup (`stitchWindowAligns.cpp:96-219`),
+                // so a rejected transcript never evicts the one it covers.
+                if !passes_finalization_filters(wt, read_seq, scorer) {
+                    break 'leaf;
+                }
+
+                // STAR's score gate (`stitchWindowAligns.cpp:244-250`); see
+                // [`window_score_gate`].
+                {
+                    let score = wt_final_score(wt, scorer);
+                    // Single-end seeds carry mate_id 2; STAR's iFrag is 0 there.
+                    let frag = match (wt.exons.first(), wt.exons.last()) {
+                        (Some(f), Some(l)) if f.mate_id == l.mate_id => Some(if f.mate_id >= 2 {
+                            0
+                        } else {
+                            f.mate_id as usize
+                        }),
+                        _ => None,
+                    };
+                    // An empty window compares against STAR's `trInit`, score 0.
+                    let window_best = transcripts.first().map_or(0, |t| t.window_score);
+                    if !window_score_gate(score, frag, window_best, max_score_mate, scorer) {
+                        break 'leaf;
+                    }
+                }
+
+                // Dedup like STAR (`stitchWindowAligns.cpp:260-285`). The score compared is
+                // the final one, with the genomic-length penalty. A transcript that
+                // contains an older one replaces it whatever their scores: only a
+                // contained transcript scoring lower than its container is dropped.
+                let wt_score = wt_final_score(wt, scorer);
+                let wt_len = wt_mapped_length(wt);
+                let mut dominated = false;
+                let mut idx = 0;
+                while idx < transcripts.len() {
+                    let existing = &transcripts[idx];
+                    let overlap = blocks_overlap(&wt.exons, &existing.exons);
+                    let u_new = wt_len - overlap;
+                    let u_old = existing.mapped_len - overlap;
+                    if u_new == 0 && wt_score < existing.window_score {
+                        dominated = true;
+                        break;
+                    } else if u_old == 0 {
+                        // STAR drops the contained transcript on the spot, even if a
+                        // later one then dominates the new transcript.
+                        transcripts.remove(idx);
+                    } else {
+                        idx += 1;
+                    }
+                }
+
+                if !dominated {
+                    // STAR keeps the window's transcripts sorted by score, then by shorter
+                    // genomic span; a full list drops its last transcript. The order
+                    // decides ties downstream.
+                    let span = |t: &WorkingTranscript| match (t.exons.first(), t.exons.last()) {
+                        (Some(first), Some(last)) => last.genome_end - first.genome_start,
+                        _ => 0,
+                    };
+                    let wt_span = span(wt);
+                    let pos = transcripts
+                        .iter()
+                        .position(|t| {
+                            let score = t.window_score;
+                            wt_score > score || (wt_score == score && wt_span < span(t))
+                        })
+                        .unwrap_or(transcripts.len());
+                    let mut recorded = wt.clone();
+                    recorded.window_score = wt_score;
+                    recorded.mapped_len = wt_len;
+                    transcripts.insert(pos, recorded);
+                    transcripts.truncate(max_transcripts);
                 }
             }
-
-            if !dominated {
-                // STAR keeps the window's transcripts sorted by score, then by shorter
-                // genomic span; a full list drops its last transcript. The order
-                // decides ties downstream.
-                let span = |t: &WorkingTranscript| match (t.exons.first(), t.exons.last()) {
-                    (Some(first), Some(last)) => last.genome_end - first.genome_start,
-                    _ => 0,
-                };
-                let wt_span = span(&wt);
-                let pos = transcripts
-                    .iter()
-                    .position(|t| {
-                        let score = wt_final_score(t, scorer);
-                        wt_score > score || (wt_score == score && wt_span < span(t))
-                    })
-                    .unwrap_or(transcripts.len());
-                transcripts.insert(pos, wt);
-                transcripts.truncate(max_transcripts);
+            if let Some(mark) = mark {
+                wt.restore(&mark);
             }
         }
         return;
@@ -2828,7 +3002,8 @@ fn stitch_recurse(
     // INCLUDE branch: try stitching wa_entries[i_a] to transcript
     if wt.exons.is_empty() {
         // First seed: create initial transcript
-        let mut new_wt = wt.clone();
+        let mark = wt.mark();
+        let new_wt = &mut *wt;
         new_wt.exons.push(ExonBlock {
             read_start: wa.read_pos,
             read_end: wa.read_pos + wa.length,
@@ -2864,10 +3039,13 @@ fn stitch_recurse(
             jcache,
             debug_name,
         );
+        wt.restore(&mark);
     } else {
-        // Try stitching this seed onto the existing transcript
-        if let Some(new_wt) = stitch_align_to_transcript(
-            &wt,
+        // Try stitching this seed onto the existing transcript, in place;
+        // the exclude branch below gets it back as it was.
+        let mark = wt.mark();
+        if stitch_align_in_place(
+            wt,
             wa,
             read_seq,
             index,
@@ -2880,7 +3058,7 @@ fn stitch_recurse(
         ) {
             stitch_recurse(
                 i_a + 1,
-                new_wt,
+                wt,
                 wa_entries,
                 read_seq,
                 index,
@@ -2897,6 +3075,7 @@ fn stitch_recurse(
                 debug_name,
             );
         }
+        wt.restore(&mark);
     }
 
     // EXCLUDE branch: skip wa_entries[i_a].
@@ -3023,12 +3202,12 @@ pub(crate) fn split_combined_wt(
 
     for (i, ex) in wt.exons.iter().enumerate() {
         if ex.mate_id == 0 {
-            let mut ex1 = ex.clone();
+            let mut ex1 = *ex;
             ex1.read_start = ex1.read_start.saturating_sub(m1_offset);
             ex1.read_end -= m1_offset;
             m1_exons.push(ex1);
         } else if ex.mate_id == 1 {
-            let mut ex2 = ex.clone();
+            let mut ex2 = *ex;
             ex2.read_start = ex2.read_start.saturating_sub(m2_offset);
             ex2.read_end -= m2_offset;
             m2_exons.push(ex2);
@@ -3125,6 +3304,8 @@ pub(crate) fn split_combined_wt(
             read_end: m1_read_end,
             genome_start: m1_genome_start,
             genome_end: m1_genome_end,
+            window_score: 0,
+            mapped_len: 0,
         },
         WorkingTranscript {
             exons: m2_exons,
@@ -3141,6 +3322,8 @@ pub(crate) fn split_combined_wt(
             read_end: m2_read_end,
             genome_start: m2_genome_start,
             genome_end: m2_genome_end,
+            window_score: 0,
+            mapped_len: 0,
         },
     ))
 }
@@ -3460,11 +3643,13 @@ pub(crate) fn stitch_seeds_core(
     // One memo table per window. `stitch_read`, the genome and the strand are
     // fixed for the whole recursion below, which is what makes the six-field
     // key in `JunctionScanCache` a complete identifier for a scan.
-    let mut jcache = crate::align::score::JunctionScanCache::new();
+    let mut jcache = JUNCTION_SCAN_CACHE.take();
+    // Memoizing extensions pays only where the recursion has many leaves.
+    jcache.memo_extensions = wa_entries.len() >= MEMO_EXTENSIONS_MIN_SEEDS;
 
     stitch_recurse(
         0,
-        WorkingTranscript::new(),
+        &mut WorkingTranscript::new(),
         &wa_entries,
         stitch_read,
         index,
@@ -3480,6 +3665,8 @@ pub(crate) fn stitch_seeds_core(
         &mut jcache,
         debug_read_name,
     );
+    jcache.clear();
+    JUNCTION_SCAN_CACHE.set(jcache);
 
     if debug {
         eprintln!(
@@ -4314,6 +4501,45 @@ mod tests {
         let additive_buggy = baseline + motif_score + scorer.sjdb_score;
         let replacement_correct = baseline + scorer.sjdb_score;
         assert_ne!(additive_buggy, replacement_correct);
+    }
+
+    /// `nM` is STAR's `trA.nMM` as accumulated while stitching, not a recount of
+    /// the final alignment: a mismatch the stitcher counted stays counted even
+    /// where the final exons match the genome (the junction-scan case in
+    /// `finalize_transcript`).
+    #[test]
+    fn finalize_keeps_the_stitched_mismatch_count() {
+        let index = make_simple_index();
+        let scorer = AlignmentScorer::from_params_minimal();
+        let cluster = SeedCluster {
+            alignments: vec![],
+            chr_idx: 0,
+            genome_start: 0,
+            genome_end: 8,
+            is_reverse: false,
+            anchor_idx: 0,
+            anchor_bin: 0,
+        };
+        let read = [0u8, 1, 2, 3, 0, 1, 2, 3]; // genome[0..8], no mismatch
+        let mut wt = WorkingTranscript::new();
+        wt.exons.push(ExonBlock {
+            read_start: 0,
+            read_end: 8,
+            genome_start: 0,
+            genome_end: 8,
+            mate_id: 2,
+            sj_a: None,
+        });
+        wt.read_end = 8;
+        wt.genome_end = 8;
+        wt.score = 6;
+        wt.n_mismatch = 1;
+        let t = finalize_transcript(
+            &wt, &read, &index, &scorer, &cluster, false, false, false, 0,
+        )
+        .expect("finalizes");
+        assert_eq!(t.cigar_string(), "8M");
+        assert_eq!(t.n_mismatch, 1);
     }
 
     /// STAR never stitches two seeds that sit on one diagonal (`rGap == gGap`):

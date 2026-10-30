@@ -478,93 +478,27 @@ impl AlignmentScorer {
         // jr1 is now one past where we stopped; the scan will start from jr1
 
         // Phase 2: Scan RIGHT through all jR1 positions
-        score1 = 0;
-        let mut max_score2 = i32::MIN;
-        let mut best_jr: i32 = 0;
-        let mut best_motif = SpliceMotif::NonCanonical;
-        let mut best_motif_score = self.score_gap_noncan;
-
         // `del` does not change across the scan, so whether the motif branch
         // runs is decided once rather than per iteration.
         let motif_in_range =
             del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64;
-
-        // The four motif bases sit at `donor`, `donor+1`, `donor+del-2` and
-        // `donor+del-1`, and `donor` moves exactly one base per iteration, so
-        // consecutive iterations share two of the four. Carrying the window
-        // instead of re-fetching it turns four genome reads per position into
-        // two. `window` is `None` until the first motif iteration primes it.
-        let mut window: Option<MotifWindow> = None;
-
-        loop {
-            let ri = r_a_end_inc as i64 + jr1 as i64;
-            if ri >= 0 && (ri as usize) < read_seq.len() {
-                let read_base = read_seq[ri as usize];
-                let g_up_pos = g_a_end_inc as i64 + jr1 as i64;
-                let g_dn_pos = g_b_start1 + jr1 as i64;
-
-                if g_up_pos >= 0 && g_dn_pos >= 0 {
-                    let gu = seq.base((g_up_pos as u64 + genome_offset) as usize);
-                    let gd = seq.base((g_dn_pos as u64 + genome_offset) as usize);
-
-                    if gu < 4 && gd < 4 {
-                        if read_base == gu && read_base != gd {
-                            score1 += 1;
-                        } else if read_base != gu && read_base == gd {
-                            score1 -= 1;
-                        }
-                    }
-                }
-            }
-
-            // Check splice motif at this junction position
-            if motif_in_range {
-                // Donor position in SA space: one past the last donor-exon base
-                let donor_sa = (g_a_end_inc as i64 + jr1 as i64 + 1) as u64;
-                // Convert to forward genome coordinates for motif detection
-                let donor_fwd = if is_reverse {
-                    n_genome - donor_sa - del as u64
-                } else {
-                    donor_sa
-                };
-                let w = match window.as_mut() {
-                    Some(w) => {
-                        w.slide_to(donor_fwd, del as u64, seq);
-                        &*w
-                    }
-                    None => window.insert(MotifWindow::at(donor_fwd, del as u64, seq)),
-                };
-                let motif = w.motif();
-                let motif_score = self.score_splice_junction(motif);
-                let score2 = score1 + motif_score;
-
-                if score2 > max_score2 {
-                    max_score2 = score2;
-                    best_jr = jr1;
-                    best_motif = motif;
-                    best_motif_score = motif_score;
-                }
-            } else {
-                // Deletion (Del < alignIntronMin) or out-of-range gap — no motif,
-                // pure positional score. STAR: jCan1=-1, jPen1=0, Score2=Score1.
-                // For reverse strand, rightmost-in-RC wins ties (= leftmost in forward).
-                if score1 > max_score2 || (is_reverse && score1 == max_score2) {
-                    max_score2 = score1;
-                    best_jr = jr1;
-                    best_motif = SpliceMotif::NonCanonical;
-                    best_motif_score = 0;
-                }
-            }
-
-            jr1 += 1;
-            // STAR: jR1 < int(rBend) - int(rAend) where rBend = rBstart + L - 1
-            // This equals jR1 < rGap + L, allowing the scan to extend into the B seed.
-            // This is critical for finding canonical junctions when seeds are adjacent
-            // (rGap=0) but the junction needs to shift into the B seed's territory.
-            if jr1 >= r_gap as i32 + next_seed_len as i32 {
-                break;
-            }
-        }
+        let scan = ScanArgs {
+            read_seq,
+            r_a_end_inc: r_a_end_inc as i64,
+            g_a_end_inc: g_a_end_inc as i64,
+            g_b_start1,
+            jr_start: jr1,
+            scan_end: r_gap as i32 + next_seed_len as i32,
+            del,
+            motif_in_range,
+            is_reverse,
+            n_genome,
+            genome_offset,
+            seq,
+        };
+        let (mut best_jr, mut best_motif, mut best_motif_score) = self
+            .scan_phase2_buffered(&scan)
+            .unwrap_or_else(|| self.scan_phase2_scalar(&scan));
 
         // Phase 3: Repeat detection around best_jr + left-flush for non-canonical/deletion
         // Count matching bases between donor and acceptor sides around best_jr
@@ -650,6 +584,228 @@ impl AlignmentScorer {
         )
     }
 
+    /// The best motif score: the most a position's motif can add in the scan.
+    fn max_motif_score(&self) -> i32 {
+        self.score_gap
+            .max(self.score_gap_gcag)
+            .max(self.score_gap_atac)
+            .max(self.score_gap_noncan)
+    }
+
+    /// Phase 2 of [`Self::find_best_junction_position`] on bases fetched in
+    /// bulk: the read, upstream and downstream bases (and, for an intron, the
+    /// donor and acceptor runs) of every position are copied into stack
+    /// buffers first, so the scan itself is plain array reads. Same positions,
+    /// same order, same ties and same early stop as [`Self::scan_phase2_scalar`];
+    /// `None` hands the rare scans that do not fit the buffers to it.
+    fn scan_phase2_buffered(&self, scan: &ScanArgs<'_>) -> Option<(i32, SpliceMotif, i32)> {
+        use crate::genome::OUT_OF_RANGE;
+        let n = (scan.scan_end - scan.jr_start).max(1) as usize;
+        if n + 1 > SCAN_BUF {
+            return None;
+        }
+        let j0 = scan.jr_start as i64;
+        let up0 = scan.g_a_end_inc + j0;
+        let dn0 = scan.g_b_start1 + j0;
+        let donor_sa0 = scan.g_a_end_inc + j0 + 1;
+        if up0 < 0 || dn0 < 0 || donor_sa0 < 0 {
+            return None;
+        }
+
+        let mut read = [OUT_OF_RANGE; SCAN_BUF];
+        for (k, slot) in read[..n].iter_mut().enumerate() {
+            let ri = scan.r_a_end_inc + j0 + k as i64;
+            if ri >= 0 && (ri as usize) < scan.read_seq.len() {
+                *slot = scan.read_seq[ri as usize];
+            }
+        }
+        let mut up = [OUT_OF_RANGE; SCAN_BUF];
+        let mut dn = [OUT_OF_RANGE; SCAN_BUF];
+        scan.seq
+            .bases_into(up0 as usize + scan.genome_offset as usize, &mut up[..n]);
+        scan.seq
+            .bases_into(dn0 as usize + scan.genome_offset as usize, &mut dn[..n]);
+        // score1 change at each position: +1 where the read matches upstream
+        // only, -1 where it matches downstream only, 0 otherwise or where
+        // either genome base is not A/C/G/T (the sentinel included).
+        let mut delta = [0i8; SCAN_BUF];
+        for k in 0..n {
+            let (rb, ub, db) = (read[k], up[k], dn[k]);
+            let ok = ub < 4 && db < 4;
+            let plus = ok && rb == ub && rb != db;
+            let minus = ok && rb != ub && rb == db;
+            delta[k] = plus as i8 - minus as i8;
+        }
+
+        // Donor and acceptor runs, forward strand. Forward reads move the
+        // donor right one base a position; reverse reads move it left, so
+        // their run starts at the last position's donor and is read backwards.
+        let mut don = [OUT_OF_RANGE; SCAN_BUF];
+        let mut acc = [OUT_OF_RANGE; SCAN_BUF];
+        let del = scan.del as u64;
+        if scan.motif_in_range {
+            let lo = if scan.is_reverse {
+                let last = donor_sa0 as u64 + (n as u64 - 1) + del;
+                if last > scan.n_genome {
+                    return None;
+                }
+                scan.n_genome - last
+            } else {
+                donor_sa0 as u64
+            };
+            scan.seq.bases_into(lo as usize, &mut don[..=n]);
+            scan.seq.bases_into((lo + del - 2) as usize, &mut acc[..=n]);
+        }
+
+        let max_motif = self.max_motif_score();
+        let mut score1: i32 = 0;
+        let mut max_score2 = i32::MIN;
+        let mut best_jr: i32 = 0;
+        let mut best_motif = SpliceMotif::NonCanonical;
+        let mut best_motif_score = self.score_gap_noncan;
+        for (k, &step) in delta[..n].iter().enumerate() {
+            let jr1 = scan.jr_start + k as i32;
+            score1 += i32::from(step);
+            if scan.motif_in_range {
+                let i = if scan.is_reverse { n - 1 - k } else { k };
+                let motif = MotifWindow {
+                    donor: 0,
+                    d1: don[i],
+                    d2: don[i + 1],
+                    a1: acc[i],
+                    a2: acc[i + 1],
+                }
+                .motif();
+                let motif_score = self.score_splice_junction(motif);
+                let score2 = score1 + motif_score;
+                if score2 > max_score2 {
+                    max_score2 = score2;
+                    best_jr = jr1;
+                    best_motif = motif;
+                    best_motif_score = motif_score;
+                }
+            } else if score1 > max_score2 || (scan.is_reverse && score1 == max_score2) {
+                max_score2 = score1;
+                best_jr = jr1;
+                best_motif = SpliceMotif::NonCanonical;
+                best_motif_score = 0;
+            }
+            let bound = score1
+                + (scan.scan_end - 1 - jr1)
+                + if scan.motif_in_range { max_motif } else { 0 };
+            let tie_wins = !scan.motif_in_range && scan.is_reverse;
+            if bound < max_score2 || (bound == max_score2 && !tie_wins) {
+                break;
+            }
+        }
+        Some((best_jr, best_motif, best_motif_score))
+    }
+
+    /// Phase 2 of [`Self::find_best_junction_position`], one position at a
+    /// time: the reference for [`Self::scan_phase2_buffered`].
+    fn scan_phase2_scalar(&self, scan: &ScanArgs<'_>) -> (i32, SpliceMotif, i32) {
+        let mut jr1 = scan.jr_start;
+        let mut score1: i32 = 0;
+        let mut max_score2 = i32::MIN;
+        let mut best_jr: i32 = 0;
+        let mut best_motif = SpliceMotif::NonCanonical;
+        let mut best_motif_score = self.score_gap_noncan;
+        let max_motif = self.max_motif_score();
+
+        // The four motif bases sit at `donor`, `donor+1`, `donor+del-2` and
+        // `donor+del-1`, and `donor` moves exactly one base per iteration, so
+        // consecutive iterations share two of the four. Carrying the window
+        // instead of re-fetching it turns four genome reads per position into
+        // two. `window` is `None` until the first motif iteration primes it.
+        let mut window: Option<MotifWindow> = None;
+
+        loop {
+            let ri = scan.r_a_end_inc + jr1 as i64;
+            if ri >= 0 && (ri as usize) < scan.read_seq.len() {
+                let read_base = scan.read_seq[ri as usize];
+                let g_up_pos = scan.g_a_end_inc + jr1 as i64;
+                let g_dn_pos = scan.g_b_start1 + jr1 as i64;
+
+                if g_up_pos >= 0 && g_dn_pos >= 0 {
+                    let gu = scan
+                        .seq
+                        .base((g_up_pos as u64 + scan.genome_offset) as usize);
+                    let gd = scan
+                        .seq
+                        .base((g_dn_pos as u64 + scan.genome_offset) as usize);
+
+                    if gu < 4 && gd < 4 {
+                        if read_base == gu && read_base != gd {
+                            score1 += 1;
+                        } else if read_base != gu && read_base == gd {
+                            score1 -= 1;
+                        }
+                    }
+                }
+            }
+
+            // Check splice motif at this junction position
+            if scan.motif_in_range {
+                // Donor position in SA space: one past the last donor-exon base
+                let donor_sa = (scan.g_a_end_inc + jr1 as i64 + 1) as u64;
+                // Convert to forward genome coordinates for motif detection
+                let donor_fwd = if scan.is_reverse {
+                    scan.n_genome - donor_sa - scan.del as u64
+                } else {
+                    donor_sa
+                };
+                let w = match window.as_mut() {
+                    Some(w) => {
+                        w.slide_to(donor_fwd, scan.del as u64, scan.seq);
+                        &*w
+                    }
+                    None => window.insert(MotifWindow::at(donor_fwd, scan.del as u64, scan.seq)),
+                };
+                let motif = w.motif();
+                let motif_score = self.score_splice_junction(motif);
+                let score2 = score1 + motif_score;
+
+                if score2 > max_score2 {
+                    max_score2 = score2;
+                    best_jr = jr1;
+                    best_motif = motif;
+                    best_motif_score = motif_score;
+                }
+            } else {
+                // Deletion (Del < alignIntronMin) or out-of-range gap — no motif,
+                // pure positional score. STAR: jCan1=-1, jPen1=0, Score2=Score1.
+                // For reverse strand, rightmost-in-RC wins ties (= leftmost in forward).
+                if score1 > max_score2 || (scan.is_reverse && score1 == max_score2) {
+                    max_score2 = score1;
+                    best_jr = jr1;
+                    best_motif = SpliceMotif::NonCanonical;
+                    best_motif_score = 0;
+                }
+            }
+
+            // `score1` rises by at most 1 a position, so once even that cannot
+            // lift a later position past the best one the rest of the scan is
+            // settled. Ties win only in the reverse-strand deletion case.
+            let scan_end = scan.scan_end;
+            let bound =
+                score1 + (scan_end - 1 - jr1) + if scan.motif_in_range { max_motif } else { 0 };
+            let tie_wins = !scan.motif_in_range && scan.is_reverse;
+            if bound < max_score2 || (bound == max_score2 && !tie_wins) {
+                break;
+            }
+
+            jr1 += 1;
+            // STAR: jR1 < int(rBend) - int(rAend) where rBend = rBstart + L - 1
+            // This equals jR1 < rGap + L, allowing the scan to extend into the B seed.
+            // This is critical for finding canonical junctions when seeds are adjacent
+            // (rGap=0) but the junction needs to shift into the B seed's territory.
+            if jr1 >= scan.scan_end {
+                break;
+            }
+        }
+        (best_jr, best_motif, best_motif_score)
+    }
+
     /// Detect splice junction motif (thin wrapper over the free function
     /// so `AlignmentScorer` callers keep working).
     pub fn detect_splice_motif(
@@ -681,6 +837,27 @@ impl AlignmentScorer {
 /// forward strand; `intron_len` is the intron length in bases.
 pub fn detect_splice_motif(donor_pos: u64, intron_len: u32, genome: &Genome) -> SpliceMotif {
     MotifWindow::at(donor_pos, intron_len as u64, genome.sequence.view()).motif()
+}
+
+/// Positions a buffered junction scan holds; longer scans take the scalar path.
+const SCAN_BUF: usize = 512;
+
+/// The inputs of a junction scan's phase 2, in STAR's inclusive coordinates.
+struct ScanArgs<'a> {
+    read_seq: &'a [u8],
+    r_a_end_inc: i64,
+    g_a_end_inc: i64,
+    g_b_start1: i64,
+    /// First position, where phase 1 stopped.
+    jr_start: i32,
+    /// One past the last position: rGap + the B seed's length.
+    scan_end: i32,
+    del: i64,
+    motif_in_range: bool,
+    is_reverse: bool,
+    n_genome: u64,
+    genome_offset: u64,
+    seq: SeqView<'a>,
 }
 
 /// The four bases that decide a splice motif: the intron's first two and last
@@ -792,17 +969,33 @@ struct JunctionScanKey {
 
 /// Per-window memo table for the junction-position scan.
 ///
-/// Create one per `stitch_seeds_core` call and pass it down the recursion; it
-/// must not outlive the read, genome and strand it was filled for; the
-/// per-window lifetime guarantees by construction.
+/// Filled by one `stitch_seeds_core` call and passed down the recursion; it
+/// must be cleared before another read, genome or strand uses it, which that
+/// function does before handing the storage to the next window.
 #[derive(Default)]
 pub struct JunctionScanCache {
     map: rustc_hash::FxHashMap<JunctionScanKey, (i32, SpliceMotif, i32, u32, u32)>,
+    /// Flank extensions of the same window, for `stitch::extend_alignment_cached`.
+    pub(crate) ext: rustc_hash::FxHashMap<ExtendKey, (u32, i32, u32)>,
+    /// Whether `ext` is used for this window.
+    pub(crate) memo_extensions: bool,
 }
+
+/// What a flank extension depends on within one window: where it starts, which
+/// way and how far it may go, the transcript's mismatches and length so far,
+/// and whether it must reach the read end: genome start, read start, maximum
+/// length, mismatches, then length with the direction and end flags packed in.
+pub(crate) type ExtendKey = (u64, u32, u32, u32, u32);
 
 impl JunctionScanCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forget every entry and keep the storage for the next window.
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.ext.clear();
     }
 }
 
@@ -944,6 +1137,79 @@ mod tests {
             chr_length: vec![seq.len() as u64],
             chr_start: vec![0, n_genome],
         }
+    }
+
+    /// The buffered phase 2 of the junction scan must pick the same position,
+    /// motif and motif score as the position-by-position one, on both strands,
+    /// for deletions and introns, near the genome's ends, with N bases in the
+    /// read and the genome, and with the early stop in play.
+    #[test]
+    fn buffered_junction_scan_matches_the_scalar_one() {
+        let mut state = 12345u64;
+        let mut next = move |m: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % m
+        };
+        // Splice motifs are rare in random sequence: seed GT..AG pairs.
+        let mut fwd: Vec<u8> = (0..3000).map(|_| next(4) as u8).collect();
+        for _ in 0..120 {
+            let i = next(2900) as usize;
+            fwd[i] = 2;
+            fwd[i + 1] = 3;
+        }
+        for _ in 0..120 {
+            let i = next(2900) as usize;
+            fwd[i] = 0;
+            fwd[i + 1] = 2;
+        }
+        for _ in 0..30 {
+            fwd[next(3000) as usize] = 4;
+        }
+        let genome = make_test_genome(&fwd);
+        let seq = genome.sequence.view();
+        let scorer = AlignmentScorer::from_params_minimal();
+        let mut compared = 0;
+        for _ in 0..20_000 {
+            let is_reverse = next(2) == 1;
+            let read: Vec<u8> = (0..150)
+                .map(|_| if next(40) == 0 { 4 } else { next(4) as u8 })
+                .collect();
+            let del = if next(2) == 0 {
+                1 + next(20) as i64
+            } else {
+                21 + next(1500) as i64
+            };
+            let r_gap = next(6) as i64;
+            let a = ScanArgs {
+                read_seq: &read,
+                r_a_end_inc: next(150) as i64,
+                g_a_end_inc: next(genome.n_genome) as i64,
+                g_b_start1: 0,
+                jr_start: -(next(40) as i32),
+                scan_end: (r_gap + next(80) as i64) as i32,
+                del,
+                motif_in_range: del >= scorer.align_intron_min as i64
+                    && del <= scorer.align_intron_max as i64,
+                is_reverse,
+                n_genome: genome.n_genome,
+                genome_offset: if is_reverse { genome.n_genome } else { 0 },
+                seq,
+            };
+            let a = ScanArgs {
+                g_b_start1: a.g_a_end_inc + del,
+                ..a
+            };
+            if let Some(buffered) = scorer.scan_phase2_buffered(&a) {
+                assert_eq!(buffered, scorer.scan_phase2_scalar(&a));
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 15_000,
+            "only {compared} scans took the buffered path"
+        );
     }
 
     #[test]

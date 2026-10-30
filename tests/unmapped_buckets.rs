@@ -221,3 +221,67 @@ fn single_end_unmapped_reads_split_between_too_short_and_other() {
         "single-end `too short` bucket: {rows:?}"
     );
 }
+
+#[test]
+fn window_full_of_anchors_drops_the_read_as_other() {
+    // STAR's assignAlignToWindow: once a window holds seedPerWindowNmax (50)
+    // aligns, the next align makes it recompute the shortest non-anchor; when
+    // every align in the window is an anchor there is none, and STAR drops the
+    // whole read (MARKER_TOO_MANY_ANCHORS_PER_WINDOW, nW=0), so it is counted
+    // as "other". That happens whatever the incoming align is, a non-anchor
+    // included. Here the non-anchor is the poly-A tail each mate ends in: the
+    // 40 kb genome (one window) has 100 poly-A runs, so the tail maps more than
+    // winAnchorMultimapNmax times. STAR 2.7.11b reports both pairs as "other".
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let mut genome = Vec::new();
+    for k in 0..100u32 {
+        genome.extend_from_slice(&lcg_seq(88_888 + k, 400));
+        genome.extend_from_slice(b"AAAAAAAAAAAA");
+    }
+    let genome_dir = root.join("genome");
+    build_index(&write_fasta(root, &genome), &genome_dir);
+
+    let (p1, p2) = (root.join("r1.fq"), root.join("r2.fq"));
+    let mut f1 = fs::File::create(&p1).unwrap();
+    let mut f2 = fs::File::create(&p2).unwrap();
+    for i in [115u32, 1603] {
+        for (f, seed) in [(&mut f1, 700_000 + i), (&mut f2, 900_000 + i)] {
+            let mut seq = lcg_seq(seed, READ_LEN - 8);
+            seq.extend_from_slice(b"AAAAAAAA");
+            writeln!(f, "@pair{i}").unwrap();
+            f.write_all(&seq).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(READ_LEN)).unwrap();
+        }
+    }
+    drop((f1, f2));
+
+    let prefix = format!("{}/anchors_", root.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            p1.to_str().unwrap(),
+            p2.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let rows = parse_final_log(Path::new(&format!("{prefix}Log.final.out")));
+    assert_eq!(get(&rows, "Number of input reads"), 2, "fixture size");
+    assert_eq!(
+        get(&rows, "Number of reads unmapped: other"),
+        2,
+        "a window full of anchors drops the read as `other`: {rows:?}"
+    );
+    assert_eq!(
+        get(&rows, "Number of reads unmapped: too short"),
+        0,
+        "{rows:?}"
+    );
+}
