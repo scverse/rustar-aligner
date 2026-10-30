@@ -319,3 +319,201 @@ fn gene_counts_from_index_tables_without_gtf() {
     c.failure()
         .stderr(predicates::str::contains("geneInfo.tab"));
 }
+
+/// `--quantTranscriptomeBAMattrAS` fixture: an index on the test genome, single
+/// reads and read pairs from T1 and T2.
+fn as_tag_fixture(tmp: &TempDir) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (fasta, seq) = create_fasta(tmp);
+    let gtf = create_gtf(tmp);
+    let genome = tmp.path().join("idx");
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "genomeGenerate",
+            "--genomeDir",
+            genome.to_str().unwrap(),
+            "--genomeFastaFiles",
+            fasta.to_str().unwrap(),
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--genomeSAindexNbases",
+            "5",
+            "--outFileNamePrefix",
+            genome.join("run_").to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let complement = |b: u8| match b {
+        b'A' => 'T',
+        b'C' => 'G',
+        b'G' => 'C',
+        _ => 'A',
+    };
+    let (m1, m2) = (tmp.path().join("r1.fq"), tmp.path().join("r2.fq"));
+    let mut f1 = fs::File::create(&m1).unwrap();
+    let mut f2 = fs::File::create(&m2).unwrap();
+    for i in 0..20 {
+        let start = if i % 2 == 0 { 120 } else { 620 } + i * 3;
+        let mate2: String = seq.as_bytes()[start + 100..start + 150]
+            .iter()
+            .rev()
+            .map(|&b| complement(b))
+            .collect();
+        let qual = "I".repeat(50);
+        writeln!(f1, "@p{i}\n{}\n+\n{qual}", &seq[start..start + 50]).unwrap();
+        writeln!(f2, "@p{i}\n{mate2}\n+\n{qual}").unwrap();
+    }
+    (genome, gtf, m1, m2)
+}
+
+fn as_tag_align(
+    tmp: &TempDir,
+    genome: &std::path::Path,
+    gtf: &std::path::Path,
+    name: &str,
+    reads: &[&std::path::Path],
+    extra: &[&str],
+) -> PathBuf {
+    let out = tmp.path().join(name);
+    fs::create_dir_all(&out).unwrap();
+    cargo_bin_cmd!("rustar-aligner")
+        .args(["--genomeDir", genome.to_str().unwrap(), "--readFilesIn"])
+        .args(reads)
+        .args([
+            "--outFileNamePrefix",
+            &format!("{}/", out.display()),
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--runThreadN",
+            "1",
+        ])
+        .args(extra)
+        .assert()
+        .success();
+    out
+}
+
+/// (read name, `AS`, tag names, the rest of the record) of each record of the
+/// transcriptome BAM, in file order.
+fn transcriptome_records(dir: &std::path::Path) -> Vec<(String, Option<i64>, Vec<String>, String)> {
+    use noodles::bam;
+    use noodles::sam::alignment::record::data::field::Tag;
+    let mut reader =
+        bam::io::Reader::new(fs::File::open(dir.join("Aligned.toTranscriptome.out.bam")).unwrap());
+    let header = reader.read_header().unwrap();
+    reader
+        .record_bufs(&header)
+        .map(|r| {
+            let r = r.unwrap();
+            let score = r.data().get(&Tag::ALIGNMENT_SCORE).and_then(|v| v.as_int());
+            let tags = r
+                .data()
+                .iter()
+                .map(|(t, _)| String::from_utf8_lossy(t.as_ref()).into_owned())
+                .collect();
+            let name = r.name().unwrap().to_string();
+            let core = format!(
+                "{:?} {:?} {:?} {:?} {:?} {:?}",
+                r.flags(),
+                r.reference_sequence_id(),
+                r.alignment_start(),
+                r.mapping_quality(),
+                r.cigar(),
+                r.sequence(),
+            );
+            (name, score, tags, core)
+        })
+        .collect()
+}
+
+/// `AS` of each read name in the genomic `Aligned.out.sam`.
+fn genomic_scores(dir: &std::path::Path) -> std::collections::HashMap<String, i64> {
+    fs::read_to_string(dir.join("Aligned.out.sam"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let score = f.iter().find_map(|t| t.strip_prefix("AS:i:"))?;
+            Some((f[0].to_string(), score.parse().unwrap()))
+        })
+        .collect()
+}
+
+#[test]
+fn transcriptome_as_tag_holds_the_genomic_score() {
+    let tmp = TempDir::new().unwrap();
+    let (genome, gtf, m1, m2) = as_tag_fixture(&tmp);
+    let flag = ["--quantTranscriptomeBAMattrAS", "Yes"];
+
+    // Single-end: the read's own score.
+    let se = as_tag_align(&tmp, &genome, &gtf, "se", &[&m1], &flag);
+    let se_scores = genomic_scores(&se);
+    let records = transcriptome_records(&se);
+    assert!(!records.is_empty());
+    for (name, score, tags, _) in &records {
+        assert_eq!(tags, &["NH", "HI", "AS"], "{name}");
+        assert_eq!(*score, Some(se_scores[name]), "{name}");
+    }
+
+    // Paired-end: the pair's score on both mates, not each mate's share.
+    let pe = as_tag_align(&tmp, &genome, &gtf, "pe", &[&m1, &m2], &flag);
+    let pe_scores = genomic_scores(&pe);
+    let records = transcriptome_records(&pe);
+    assert!(!records.is_empty());
+    for (name, score, _, _) in &records {
+        assert_eq!(*score, Some(pe_scores[name]), "{name}");
+        assert!(
+            pe_scores[name] > se_scores[name],
+            "{name}: {} is not a whole pair's score",
+            pe_scores[name]
+        );
+    }
+    assert_eq!(records.len() % 2, 0);
+}
+
+#[test]
+fn transcriptome_records_are_unchanged_without_the_as_tag() {
+    let tmp = TempDir::new().unwrap();
+    let (genome, gtf, m1, m2) = as_tag_fixture(&tmp);
+    let reads: [&std::path::Path; 2] = [&m1, &m2];
+
+    let default = as_tag_align(&tmp, &genome, &gtf, "default", &reads, &[]);
+    let no = as_tag_align(
+        &tmp,
+        &genome,
+        &gtf,
+        "no",
+        &reads,
+        &["--quantTranscriptomeBAMattrAS", "No"],
+    );
+    let yes = as_tag_align(
+        &tmp,
+        &genome,
+        &gtf,
+        "yes",
+        &reads,
+        &["--quantTranscriptomeBAMattrAS", "Yes"],
+    );
+
+    let base = transcriptome_records(&default);
+    assert!(!base.is_empty());
+    for (name, score, tags, _) in &base {
+        assert_eq!(*score, None, "{name}");
+        assert_eq!(tags, &["NH", "HI"], "{name}");
+    }
+    assert_eq!(base, transcriptome_records(&no));
+
+    // The tag is all that the flag changes.
+    let without_as: Vec<_> = transcriptome_records(&yes)
+        .into_iter()
+        .map(|(name, _, tags, core)| {
+            let tags = tags.into_iter().filter(|t| t != "AS").collect();
+            (name, None, tags, core)
+        })
+        .collect();
+    assert_eq!(base, without_as);
+}

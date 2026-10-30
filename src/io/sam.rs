@@ -776,7 +776,8 @@ impl SamWriter {
     ///   * splice-aware tags (`jM`, `jI`, `XS`) are not emitted (splices
     ///     collapse in t-space and have no meaning there),
     ///   * the tags are STAR's quantification set `NH HI` (+ `RG`), whatever
-    ///     `--outSAMattributes` says (outSAMattrOrderQuant).
+    ///     `--outSAMattributes` says (outSAMattrOrderQuant), plus `AS`
+    ///     (`Transcript::score`) with `--quantTranscriptomeBAMattrAS Yes`.
     ///
     /// `primary_hit_idx` (0-based) is the projected alignment selected as
     /// primary (randomly among ties per STAR's `rngUniformReal0to1`).  All
@@ -852,8 +853,9 @@ impl SamWriter {
 
             // Optional tags: STAR's quantification order (outSAMattrOrderQuant) is
             // NH HI, then RG when a read group is set, regardless of
-            // --outSAMattributes (Parameters_samAttributes.cpp). AS, nM, NM and
-            // the splice tags are not written.
+            // --outSAMattributes (Parameters_samAttributes.cpp). nM, NM and the
+            // splice tags are not written, nor is AS unless the rustar-aligner
+            // extension asks for it (in the place it has in the genomic BAM).
             let data = record.data_mut();
             data.insert(Tag::ALIGNMENT_HIT_COUNT, Value::from(n_alignments as i32));
             // HI defaults to 1-based (primary = 1, secondaries > 1 in emission order);
@@ -862,6 +864,9 @@ impl SamWriter {
                 Tag::HIT_INDEX,
                 Value::from(hit_idx as i32 + params.out_sam_attr_ih_start as i32),
             );
+            if params.quant_transcriptome_bam_attr_as() {
+                data.insert(Tag::ALIGNMENT_SCORE, Value::from(t.score));
+            }
             maybe_insert_rg_tag(&mut record, rg_id);
 
             records.push(record);
@@ -5664,6 +5669,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tag_names(&recs[0]), ["NH", "HI", "RG"]);
+    }
+
+    #[test]
+    fn transcriptome_as_tag_is_written_on_request() {
+        let params = Parameters::parse_from(vec![
+            "rustar-aligner",
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantTranscriptomeBAMattrAS",
+            "Yes",
+            "--outSAMattrRGline",
+            "ID:g1",
+        ]);
+        let mut projected = spliced_gtag_transcript();
+        projected.score = 77;
+        let recs = SamWriter::build_transcriptome_records(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &[projected],
+            255,
+            &params,
+            0,
+        )
+        .unwrap();
+        assert_eq!(tag_names(&recs[0]), ["NH", "HI", "AS", "RG"]);
+        assert_eq!(
+            recs[0].data().get(&Tag::ALIGNMENT_SCORE),
+            Some(&Value::from(77_i32))
+        );
     }
 
     #[test]

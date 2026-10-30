@@ -171,6 +171,22 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
+### 1.9 `--quantTranscriptomeBAMattrAS`: an `AS` tag in the transcriptome BAM
+
+A rustar-aligner extension with no STAR equivalent, off by default (`No`). With the default `Aligned.toTranscriptome.out.bam` is byte-identical to the previous behaviour, which `tests/transcriptome_sam.rs` (`transcriptome_records_are_unchanged_without_the_as_tag`) checks at the record level. It is its own flag because `AS` in `--outSAMattributes` already means the genomic BAM only, so a STAR command line never means something different here.
+
+**What STAR does.** The transcriptome BAM is written with `outSAMattrOrderQuant`, which starts with `NH HI` and never receives `AS`, even when `--outSAMattributes` lists it (`Parameters_samAttributes.cpp`, `ReadAlign_quantTranscriptome.cpp`). There is no alignment score.
+
+**What rustar-aligner does.** With `Yes`, each record also has `AS` (order `NH HI AS RG`), the score of the genomic alignment it was projected from, which is what `AS` holds in the genomic BAM: the read's score, and for a pair the whole pair's score on both mates. It is not recomputed in transcript space, so all projections of one genomic alignment have the same `AS`, and the mismatches in soft clips that the default `--quantTranscriptomeSAMoutput` extends back into matches do not lower it.
+
+**Why.** salmon's alignment mode weights the placements of a fragment by `exp(-scoreExp*(best-score))` from `AS`, and warns when no record carries it: without it all placements get the same weight.
+
+**Consequences for a consumer.** salmon sums the `AS` of a fragment's mates (`bam_rad.rs`, `WriteWorker::handle`), so a pair counts twice its score, and `best-score` is doubled compared with what the genomic alignments differ by. The file holds only pairs or only single-end reads, so no pair is compared with an orphan: the doubling acts as `--scoreExp` doubled, on paired-end data. A pair one point below the best gets weight `exp(-2)` (0.14) rather than `exp(-1)` (0.37); pass `--scoreExp 0.5` to undo it. Only different genomic alignments can differ in score, and the default `--outFilterMultimapScoreRange 1` keeps them within one point, so the effect on counts is small: on 100k yeast read pairs the tag moved 0.014% of the counts and undoing the doubling 0.006%. With `--outFilterMultimapScoreRange 5` it was 0.69% and 0.095% (see the PR).
+
+**Impact.** Only when the option is given: one tag per record, and a larger file.
+
+**Source.** `src/io/sam.rs` (`build_transcriptome_records`), `src/lib.rs` (`build_transcriptome_records_pe`), `src/params/mod.rs`. STAR: `Parameters_samAttributes.cpp`. salmon: `crates/salmon-align/src/bam_rad.rs`, `crates/salmon-align/src/rad.rs` (`score_weight_basis`).
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

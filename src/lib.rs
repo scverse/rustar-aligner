@@ -1614,9 +1614,19 @@ where
         let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
         let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
         let spliced = m1.n_junction + m2.n_junction > 0;
-        all_projected.extend(filter_and_project_pair(
-            m1, m2, m1_bases, m2_bases, genome, tr_idx, lread1, lread2, mode, params, spliced,
-        ));
+        all_projected.extend(
+            filter_and_project_pair(
+                m1, m2, m1_bases, m2_bases, genome, tr_idx, lread1, lread2, mode, params, spliced,
+            )
+            .into_iter()
+            .map(|(mut q1, mut q2)| {
+                // A mate's own score is only its share: both mates report the
+                // pair's, as `AS` does in the genomic BAM.
+                q1.score = pair.combined_wt_score;
+                q2.score = pair.combined_wt_score;
+                (q1, q2)
+            }),
+        );
     }
 
     if all_projected.is_empty() {

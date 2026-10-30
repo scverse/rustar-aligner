@@ -1173,6 +1173,14 @@ pub struct Parameters {
     #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
     pub quant_transcriptome_unspliced_fasta: String,
 
+    /// rustar-aligner extension (not in STAR): `Yes` adds an `AS` tag to the
+    /// records of `Aligned.toTranscriptome.out.bam`, the score of the genomic
+    /// alignment each was projected from (the whole pair's on both mates, as
+    /// in the genomic BAM). Kept out of `--outSAMattributes`, whose `AS` is
+    /// for the genomic BAM only, so that STAR's parameter keeps STAR's meaning.
+    #[arg(long = "quantTranscriptomeBAMattrAS", default_value = "No")]
+    pub quant_transcriptome_bam_attr_as: String,
+
     /// rustar-aligner extension (not in STAR): `Yes` writes per-gene spliced /
     /// unspliced / ambiguous counts for bulk data
     /// (`ReadsPerGeneSplicing.out.tab` and `.summary.tsv`), using STARsolo's
@@ -2185,6 +2193,10 @@ impl Parameters {
 
         for (flag, value) in [
             ("--quantGeneSplicing", &params.quant_gene_splicing),
+            (
+                "--quantTranscriptomeBAMattrAS",
+                &params.quant_transcriptome_bam_attr_as,
+            ),
             ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
             ("--quantGeneCoverage", &params.quant_gene_coverage),
             ("--soloCellRangerSummary", &params.solo_cellranger_summary),
@@ -2214,6 +2226,12 @@ impl Parameters {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
+            ));
+        }
+        if params.quant_transcriptome_bam_attr_as() && !params.quant_transcriptome_sam() {
+            return Err(command.error(
+                ErrorKind::MissingRequiredArgument,
+                "--quantTranscriptomeBAMattrAS requires --quantMode TranscriptomeSAM",
             ));
         }
 
@@ -2804,6 +2822,12 @@ impl Parameters {
     /// bulk spliced / unspliced / ambiguous gene counts) was requested.
     pub fn quant_gene_splicing(&self) -> bool {
         self.quant_gene_splicing == "Yes"
+    }
+
+    /// Returns true if `--quantTranscriptomeBAMattrAS Yes` (rustar-aligner
+    /// extension: `AS` tag in the transcriptome BAM) was requested.
+    pub fn quant_transcriptome_bam_attr_as(&self) -> bool {
+        self.quant_transcriptome_bam_attr_as == "Yes"
     }
 
     /// Returns true if `--outSAMsplicingStatus Yes` (rustar-aligner extension:
@@ -3848,6 +3872,43 @@ mod tests {
         assert!(p.quant_gene_splicing());
         assert!(p.quant_transcriptome_sam());
         assert!(try_parse(&["--readFilesIn", "r.fq", "--quantGeneSplicing", "1"]).is_err());
+    }
+
+    #[test]
+    fn quant_transcriptome_bam_attr_as_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantMode", "TranscriptomeSAM"]).unwrap();
+        assert!(!p.quant_transcriptome_bam_attr_as());
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r.fq",
+            "--quantMode",
+            "TranscriptomeSAM",
+            "--quantTranscriptomeBAMattrAS",
+            "Yes",
+        ])
+        .unwrap();
+        assert!(p.quant_transcriptome_bam_attr_as());
+        // No transcriptome BAM to put the tag in.
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantTranscriptomeBAMattrAS",
+                "Yes"
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantMode",
+                "TranscriptomeSAM",
+                "--quantTranscriptomeBAMattrAS",
+                "AS"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -11,6 +11,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- `--quantTranscriptomeBAMattrAS Yes` (rustar-aligner extension, default `No`)
+  adds an `AS` tag to `Aligned.toTranscriptome.out.bam`, the score of the
+  genomic alignment each record was projected from (a pair's whole score on
+  both mates), so that `salmon quant -a` can weight placements by it. With the
+  default the file is unchanged. See `DIVERGENCE.md` §1.9.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

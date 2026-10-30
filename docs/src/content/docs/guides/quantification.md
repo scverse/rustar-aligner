@@ -79,6 +79,12 @@ You can request both modes in the same run:
 
 This emits `ReadsPerGene.out.tab` *and* `Aligned.toTranscriptome.out.bam` in addition to the normal alignment output.
 
+## Scores for salmon
+
+STAR's transcriptome BAM has no `AS` tag, and `salmon quant -a` warns about that, as it weights a fragment's placements by `exp(-scoreExp*(best-score))` from `AS`. `--quantTranscriptomeBAMattrAS Yes` (a rustar-aligner extension) adds the tag: the score of the genomic alignment each record was projected from, the whole pair's on both mates.
+
+salmon sums the `AS` of the two mates, so on paired-end data score differences count double. Pass `--scoreExp 0.5` to salmon to undo it. Only different genomic alignments can differ in score and, with the default `--outFilterMultimapScoreRange 1`, by at most one point, so the tag changes few counts unless that range is widened.
+
 ## Total RNA (ribo-depleted) libraries
 
 For libraries with a large pre-mRNA content, `--quantTranscriptomeUnspliced` adds one unspliced `<gene_id>-I` target per gene to the transcriptome BAM (so pre-mRNA reads stop landing on retained-intron isoforms), `--outSAMsplicingStatus Yes` tags genomic alignments with their splicing status, and `--quantGeneSplicing Yes` counts spliced / unspliced / ambiguous reads per gene. All three are rustar-aligner extensions; see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
