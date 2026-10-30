@@ -1173,6 +1173,15 @@ pub struct Parameters {
     #[arg(long = "quantTranscriptomeUnsplicedFasta", default_value = "No")]
     pub quant_transcriptome_unspliced_fasta: String,
 
+    /// rustar-aligner extension (not in STAR): `Yes` writes the transcriptome
+    /// alignments of `--quantMode TranscriptomeSAM` to
+    /// `Aligned.toTranscriptome.out.rad`, for `salmon quant --rad`. Goes through
+    /// the same projection and `--quantTranscriptomeSAMoutput` filters, without
+    /// needing the BAM: give `--quantMode TranscriptomeSAM` as well to get both.
+    /// Needs a GTF-aware index.
+    #[arg(long = "quantTranscriptomeRAD", default_value = "No")]
+    pub quant_transcriptome_rad: String,
+
     /// rustar-aligner extension (not in STAR): `Yes` writes per-gene spliced /
     /// unspliced / ambiguous counts for bulk data
     /// (`ReadsPerGeneSplicing.out.tab` and `.summary.tsv`), using STARsolo's
@@ -2185,6 +2194,7 @@ impl Parameters {
 
         for (flag, value) in [
             ("--quantGeneSplicing", &params.quant_gene_splicing),
+            ("--quantTranscriptomeRAD", &params.quant_transcriptome_rad),
             ("--outSAMsplicingStatus", &params.out_sam_splicing_status),
             ("--quantGeneCoverage", &params.quant_gene_coverage),
             ("--soloCellRangerSummary", &params.solo_cellranger_summary),
@@ -2197,7 +2207,16 @@ impl Parameters {
             }
         }
 
-        // --quantTranscriptomeUnspliced* only make sense with TranscriptomeSAM.
+        // Solo runs have no transcriptome output: refuse rather than write an
+        // empty file that would quantify to nothing.
+        if params.quant_transcriptome_rad() && params.solo_enabled() {
+            return Err(command.error(
+                ErrorKind::ArgumentConflict,
+                "--quantTranscriptomeRAD is not available with --soloType",
+            ));
+        }
+
+        // --quantTranscriptomeUnspliced* only make sense with a transcriptome output.
         if !matches!(
             params.quant_transcriptome_unspliced_fasta.as_str(),
             "Yes" | "No"
@@ -2209,11 +2228,12 @@ impl Parameters {
         }
         if params.quant_transcriptome_unspliced
             != crate::quant::transcriptome::QuantTranscriptomeUnspliced::None
-            && !params.quant_transcriptome_sam()
+            && !params.quant_transcriptome()
         {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
-                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM",
+                "--quantTranscriptomeUnspliced requires --quantMode TranscriptomeSAM or \
+                 --quantTranscriptomeRAD Yes",
             ));
         }
 
@@ -2793,6 +2813,16 @@ impl Parameters {
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// `--quantTranscriptomeRAD Yes` (rustar-aligner extension).
+    pub fn quant_transcriptome_rad(&self) -> bool {
+        self.quant_transcriptome_rad == "Yes"
+    }
+
+    /// Whether any transcriptome-space output was requested (BAM or RAD).
+    pub fn quant_transcriptome(&self) -> bool {
+        self.quant_transcriptome_sam() || self.quant_transcriptome_rad()
     }
 
     /// `--soloCellRangerSummary Yes` (rustar-aligner extension).
@@ -3830,6 +3860,53 @@ mod tests {
             .is_err()
         );
         assert!(try_parse(&["--readFilesIn", "r.fq", "--outSAMsplicingStatus", "yes"]).is_err());
+    }
+
+    #[test]
+    fn quant_transcriptome_rad_is_opt_in() {
+        let p = try_parse(&["--readFilesIn", "r.fq"]).unwrap();
+        assert!(!p.quant_transcriptome_rad());
+        assert!(!p.quant_transcriptome());
+
+        let p = try_parse(&["--readFilesIn", "r.fq", "--quantTranscriptomeRAD", "Yes"]).unwrap();
+        assert!(p.quant_transcriptome_rad());
+        assert!(p.quant_transcriptome());
+        assert!(
+            !p.quant_transcriptome_sam(),
+            "the RAD does not imply the BAM"
+        );
+
+        assert!(try_parse(&["--readFilesIn", "r.fq", "--quantTranscriptomeRAD", "Maybe"]).is_err());
+    }
+
+    #[test]
+    fn quant_transcriptome_rad_is_refused_with_solo() {
+        let err = try_parse(&[
+            "--readFilesIn",
+            "c.fq",
+            "b.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--quantTranscriptomeRAD",
+            "Yes",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("--quantTranscriptomeRAD"));
+    }
+
+    #[test]
+    fn unspliced_targets_accept_the_rad_output() {
+        assert!(
+            try_parse(&[
+                "--readFilesIn",
+                "r.fq",
+                "--quantTranscriptomeRAD",
+                "Yes",
+                "--quantTranscriptomeUnspliced",
+                "Intron",
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

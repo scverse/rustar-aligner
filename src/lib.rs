@@ -416,17 +416,17 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
     // Use the transcriptome index loaded alongside the genome (populated
     // from transcriptInfo.tab / exonInfo.tab / geneInfo.tab at load time
     // — see GenomeIndex::load). Only wire it through to the pipeline when
-    // `--quantMode TranscriptomeSAM`, `--quantGeneSplicing Yes` or
+    // `--quantMode TranscriptomeSAM`, `--quantTranscriptomeRAD Yes`, `--quantGeneSplicing Yes` or
     // `--outSAMsplicingStatus Yes` is requested.
     let tr_idx_all: Option<std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>> =
-        if params.quant_transcriptome_sam()
+        if params.quant_transcriptome()
             || params.quant_gene_splicing()
             || params.out_sam_splicing_status()
         {
             let tr = index.transcriptome.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--quantMode TranscriptomeSAM, --quantGeneSplicing and --outSAMsplicingStatus \
-                     require a GTF-aware index; \
+                    "--quantMode TranscriptomeSAM, --quantTranscriptomeRAD, --quantGeneSplicing \
+                     and --outSAMsplicingStatus require a GTF-aware index; \
                      re-run genomeGenerate with --sjdbGTFfile or pass --sjdbGTFfile \
                      at alignReads so transcriptInfo.tab can be (re)built"
                 )
@@ -441,7 +441,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
         };
     let tr_idx = tr_idx_all
         .as_ref()
-        .filter(|_| params.quant_transcriptome_sam())
+        .filter(|_| params.quant_transcriptome())
         .map(std::sync::Arc::clone);
 
     // --quantTranscriptomeUnspliced: append one `<gene_id>-I` target per gene
@@ -887,16 +887,36 @@ fn run_single_pass(
     let tr = tr_idx.map(Arc::clone);
 
     // Open transcriptome BAM writer if requested.
-    let mut tr_writer: Option<BamWriter> = if let Some(tidx) = tr.as_ref() {
-        let path = params.output_path("Aligned.toTranscriptome.out.bam");
-        info!("Writing transcriptome BAM to {}", path.display());
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Some(BamWriter::create_transcriptome(&path, tidx, params)?)
-    } else {
-        None
-    };
+    let mut tr_writer: Option<BamWriter> =
+        if let Some(tidx) = tr.as_ref().filter(|_| params.quant_transcriptome_sam()) {
+            let path = params.output_path("Aligned.toTranscriptome.out.bam");
+            info!("Writing transcriptome BAM to {}", path.display());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Some(BamWriter::create_transcriptome(&path, tidx, params)?)
+        } else {
+            None
+        };
+
+    // Open transcriptome RAD writer if requested.
+    let mut tr_rad_writer: Option<crate::io::rad::RadWriter> =
+        if let Some(tidx) = tr.as_ref().filter(|_| params.quant_transcriptome_rad()) {
+            let path = params.output_path("Aligned.toTranscriptome.out.rad");
+            info!("Writing transcriptome RAD to {}", path.display());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Some(crate::io::rad::RadWriter::create(
+                &path,
+                &tidx.tr_ids,
+                &tidx.tr_length,
+                params.read_files_in.len() == 2,
+                &crate::io::sam::program_line(params),
+            )?)
+        } else {
+            None
+        };
 
     // Create unmapped FASTQ writers if --outReadsUnmapped Fastx
     use crate::io::fastq::UnmappedFastqWriter;
@@ -1073,6 +1093,7 @@ fn run_single_pass(
             quant.as_ref(),
             tr.as_ref(),
             tr_writer.as_mut(),
+            tr_rad_writer.as_mut(),
             unmapped_w1.as_mut(),
         ),
         2 => align_reads_paired_end(
@@ -1084,6 +1105,7 @@ fn run_single_pass(
             quant.as_ref(),
             tr.as_ref(),
             tr_writer.as_mut(),
+            tr_rad_writer.as_mut(),
             unmapped_w1.as_mut(),
             unmapped_w2.as_mut(),
         ),
@@ -1095,6 +1117,9 @@ fn run_single_pass(
     // Flush transcriptome BAM.
     if let Some(ref mut w) = tr_writer {
         w.finish()?;
+    }
+    if let Some(w) = tr_rad_writer {
+        w.finish(stats.total_reads())?;
     }
 
     // 5. Write SJ.out.tab file
@@ -1210,6 +1235,7 @@ fn run_pass1(
             None,
             None,
             None,
+            None,
         )?,
         2 => align_reads_paired_end(
             &params_pass1,
@@ -1217,6 +1243,7 @@ fn run_pass1(
             &mut null_writer,
             &stats,
             &sj_stats,
+            None,
             None,
             None,
             None,
@@ -1269,6 +1296,9 @@ struct TrRecords {
     /// Records per alignment (1 SE, 2 PE); 0 when the read is not mapped, in
     /// which case STAR does not call the generator for it.
     mates: usize,
+    /// The same alignments for `--quantTranscriptomeRAD Yes`. `None` when the
+    /// option is off or the read has no transcript alignment.
+    rad: Option<crate::io::rad::RadFragment>,
 }
 
 impl TrRecords {
@@ -1507,8 +1537,8 @@ fn build_transcriptome_records_se(
     let mates = usize::from(mapped);
     if transcripts.is_empty() || tr_idx.n_transcripts() == 0 {
         return Ok(TrRecords {
-            records: Vec::new(),
             mates,
+            ..TrRecords::default()
         });
     }
 
@@ -1539,8 +1569,18 @@ fn build_transcriptome_records_se(
 
     if projected_all.is_empty() {
         return Ok(TrRecords {
-            records: Vec::new(),
             mates,
+            ..TrRecords::default()
+        });
+    }
+
+    let rad = params
+        .quant_transcriptome_rad()
+        .then(|| crate::io::rad::RadFragment::single_end(&projected_all));
+    if !params.quant_transcriptome_sam() {
+        return Ok(TrRecords {
+            rad,
+            ..TrRecords::default()
         });
     }
 
@@ -1555,7 +1595,11 @@ fn build_transcriptome_records_se(
         params,
         usize::MAX,
     )?;
-    Ok(TrRecords { records, mates })
+    Ok(TrRecords {
+        records,
+        mates,
+        rad,
+    })
 }
 
 /// Paired-end version of `build_transcriptome_records_se`.
@@ -1586,8 +1630,8 @@ where
     let mates = if mapped { 2 } else { 0 };
     if tr_idx.n_transcripts() == 0 {
         return Ok(TrRecords {
-            records: Vec::new(),
             mates,
+            ..TrRecords::default()
         });
     }
 
@@ -1603,6 +1647,9 @@ where
         crate::align::transcript::Transcript,
         crate::align::transcript::Transcript,
     )> = Vec::new();
+    // The genomic alignment's score, one per projected pair. A projected mate's
+    // own `score` is only its share of the pair's.
+    let mut pair_scores: Vec<i32> = Vec::new();
     // STAR walks its alignments in `trMult` order, which the genomic output
     // does not keep (it sorts by score and position).
     let mut both_mapped: Vec<&crate::align::read_align::PairedAlignment> =
@@ -1614,15 +1661,27 @@ where
         let m1_bases: &[u8] = if m1.is_reverse { &m1_rc } else { m1_seq };
         let m2_bases: &[u8] = if m2.is_reverse { &m2_rc } else { m2_seq };
         let spliced = m1.n_junction + m2.n_junction > 0;
-        all_projected.extend(filter_and_project_pair(
+        let projected = filter_and_project_pair(
             m1, m2, m1_bases, m2_bases, genome, tr_idx, lread1, lread2, mode, params, spliced,
-        ));
+        );
+        pair_scores.extend(std::iter::repeat_n(pair.combined_wt_score, projected.len()));
+        all_projected.extend(projected);
     }
 
     if all_projected.is_empty() {
         return Ok(TrRecords {
-            records: Vec::new(),
             mates,
+            ..TrRecords::default()
+        });
+    }
+
+    let rad = params
+        .quant_transcriptome_rad()
+        .then(|| crate::io::rad::RadFragment::paired(&all_projected, &pair_scores));
+    if !params.quant_transcriptome_sam() {
+        return Ok(TrRecords {
+            rad,
+            ..TrRecords::default()
         });
     }
 
@@ -1686,6 +1745,7 @@ where
     Ok(TrRecords {
         records: out,
         mates,
+        rad,
     })
 }
 
@@ -1834,6 +1894,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
     tr_writer: Option<&mut crate::io::bam::BamWriter>,
+    tr_rad_writer: Option<&mut crate::io::rad::RadWriter>,
     unmapped_writer: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
     use crate::align::read_align::align_read;
@@ -2294,6 +2355,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             let index = index_writer;
             let writer = writer;
             let mut tr_writer = tr_writer;
+            let mut tr_rad_writer = tr_rad_writer;
             let mut tr_rng = tr_primary_rng(params);
             let mut unmapped_writer = unmapped_writer;
             let mut chimeric_writer = chimeric_writer;
@@ -2341,6 +2403,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                 writer.write_batch(&batch.sam_records.records)?;
 
                 // Write transcriptome-space records (if enabled)
+                if let Some(ref mut rw) = tr_rad_writer
+                    && let Some(fragment) = &batch.transcriptome_records.rad
+                {
+                    rw.write(fragment)?;
+                }
                 if let Some(ref mut tw) = tr_writer {
                     tw.write_batch(&batch.transcriptome_records.finalize(&mut tr_rng))?;
                 }
@@ -3441,6 +3508,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     quant_ctx: Option<&std::sync::Arc<crate::quant::QuantContext>>,
     tr_idx: Option<&std::sync::Arc<crate::quant::transcriptome::TranscriptomeIndex>>,
     tr_writer: Option<&mut crate::io::bam::BamWriter>,
+    tr_rad_writer: Option<&mut crate::io::rad::RadWriter>,
     unmapped_writer1: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
     unmapped_writer2: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
@@ -4035,6 +4103,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             let index = index_writer;
             let writer = writer;
             let mut tr_writer = tr_writer;
+            let mut tr_rad_writer = tr_rad_writer;
             let mut tr_rng = tr_primary_rng(params);
             let mut unmapped_writer1 = unmapped_writer1;
             let mut unmapped_writer2 = unmapped_writer2;
@@ -4078,6 +4147,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
                 }
                 writer.write_batch(&batch.sam_records.records)?;
+                if let Some(ref mut rw) = tr_rad_writer
+                    && let Some(fragment) = &batch.transcriptome_records.rad
+                {
+                    rw.write(fragment)?;
+                }
                 if let Some(ref mut tw) = tr_writer {
                     tw.write_batch(&batch.transcriptome_records.finalize(&mut tr_rng))?;
                 }

@@ -27,6 +27,10 @@ Coordinate-sorted BAM. Written when `--outSAMtype BAM SortedByCoordinate`. The s
 
 Transcriptome-coordinate BAM. Written when `--quantMode TranscriptomeSAM` is set. Each record's reference is a transcript ID rather than a chromosome; one record (one per mate for a pair) is emitted per transcript that the read aligns within, in STAR's order. MAPQ comes from the number of transcript alignments, and one of them is marked primary at random, as STAR does (see the migration guide's tie-breaking notes). With `--quantTranscriptomeUnspliced Intron|PreMRNA` (rustar-aligner extension) the references also include one `<gene_id>-I` unspliced target per gene, and `sample_Aligned.toTranscriptome.targets.tsv` (target, gene, `spliced`/`unspliced` status, length) is written next to it, plus `sample_Aligned.toTranscriptome.unspliced.fa` with `--quantTranscriptomeUnsplicedFasta Yes`. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/).
 
+### `sample_Aligned.toTranscriptome.out.rad`
+
+The same transcriptome alignments in binary RAD format, for `salmon quant --rad`. Written when `--quantTranscriptomeRAD Yes` is set (a rustar-aligner extension). See [Quantification](/rustar-aligner/guides/quantification/).
+
 ## Log files
 
 ### `sample_Log.final.out`

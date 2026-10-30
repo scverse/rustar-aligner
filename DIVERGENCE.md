@@ -171,6 +171,20 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
+### 1.9 `--quantTranscriptomeRAD`: transcriptome alignments as a RAD file for salmon
+
+A rustar-aligner extension with no STAR equivalent, off by default (`No`). With the default no output changes, and `Aligned.toTranscriptome.out.bam` stays byte-identical when the option is on, which `tests/transcriptome_rad.rs` checks.
+
+**What STAR does.** `--quantMode TranscriptomeSAM` writes `Aligned.toTranscriptome.out.bam`, with read names, sequences, qualities and CIGARs that transcript quantification does not use.
+
+**What rustar-aligner does.** `--quantTranscriptomeRAD Yes` writes the same alignments to `Aligned.toTranscriptome.out.rad`, for `salmon quant --rad` (salmon 2.x; tested with 2.8.0). They come from the same projection and the same `--quantTranscriptomeSAMoutput` filters, in the same order. Without `--quantMode TranscriptomeSAM` the BAM is not written at all. The file uses salmon's `salmon_bulk_sa` profile, with `mapping_type` `alignment`, and holds one thing the BAM does not: each placement's alignment score. STAR's transcriptome BAM has no `AS` tag (`outSAMattrOrderQuant`), so salmon gives every placement of a BAM fragment equal weight, while from the RAD it weights them by `exp(-scoreExp * (best - score))`. The header also records the number of input reads, so salmon reports the real mapping rate rather than 100%.
+
+**Why.** It avoids the size and the read and write cost of an intermediate BAM when salmon is the only consumer.
+
+**Impact.** Only when the option is given. `salmon quant --rad <file> --scoreExp 0` gives a `quant.sf` byte-identical to `salmon quant -a` on the BAM (yeast PE and SE, chr21 PE, 5M yeast pairs). Without `--scoreExp 0` the scores move a few reads: on yeast 100k PE, 27 of 58,065 fragments have placements with different scores, and the sum of absolute count differences is 9 reads. With `--seqBias --gcBias -t` the counts differ from the BAM's by at most 0.06 read on chr21 (sum 0.16 of 10,141), from salmon's own handling of a RAD that has no baked abundances: salmon's RAD for the same BAM gives exactly the same numbers once those flags are cleared. salmon needs the library type from `-l` for single-end data (`-l A` treats it as paired, with `-a` as well). `--errorModel` has no effect, as the RAD has no read bases (salmon 2.8 ignores it without saying so). The file cannot be piped into salmon: `--rad` opens its input more than once and needs a seekable file.
+
+**Source.** `src/io/rad.rs`, `src/lib.rs` (`build_transcriptome_records_se`, `build_transcriptome_records_pe`), `tests/transcriptome_rad.rs`. salmon: `crates/salmon-rad`, `crates/salmon-align/src/rad.rs`, `crates/salmon-align/src/bam_rad.rs`.
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

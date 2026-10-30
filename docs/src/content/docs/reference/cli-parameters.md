@@ -157,6 +157,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--quantTranscriptomeUnspliced` | `None` | rustar-aligner extension. `Intron` / `PreMRNA`: add one unspliced target per gene (`<gene_id>-I`: merged introns plus flanks, or the gene body) to the transcriptome BAM. `None` is STAR's behaviour. See [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/). |
 | `--quantTranscriptomeUnsplicedFlank` | `-1` | rustar-aligner extension. Flank around each merged intron for `Intron`; `-1` uses the index's `sjdbOverhang`. |
 | `--quantTranscriptomeUnsplicedFasta` | `No` | rustar-aligner extension. `Yes` writes the unspliced target sequences to `Aligned.toTranscriptome.unspliced.fa`. |
+| `--quantTranscriptomeRAD` | `No` | rustar-aligner extension. `Yes` writes the transcriptome alignments to `Aligned.toTranscriptome.out.rad` for `salmon quant --rad`, see [Quantification](/rustar-aligner/guides/quantification/). |
 | `--quantGeneSplicing` | `No` | rustar-aligner extension. `Yes` writes bulk spliced / unspliced / ambiguous gene counts (`ReadsPerGeneSplicing.out.tab`), see [Bulk total RNA-seq](/rustar-aligner/guides/bulk-total-rna/). |
 | `--outSAMsplicingStatus` | `No` | rustar-aligner extension. `Yes` adds an `sp:A` splicing-status tag (S / U / A) to genomic SAM/BAM records. |
 | `--quantGeneCoverage` | `No` | rustar-aligner extension. `Yes` writes per-gene exonic coverage to `GeneCoverage.out.bin` for DegNorm. See [DegNorm](/rustar-aligner/guides/degnorm/). |

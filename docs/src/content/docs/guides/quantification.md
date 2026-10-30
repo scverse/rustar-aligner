@@ -69,6 +69,17 @@ rustar-aligner \
 
 Pick the variant that matches your downstream tool's expectations. RSEM defaults to `BanSingleEnd_BanIndels_ExtendSoftclip`.
 
+## Transcriptome RAD for salmon (`--quantTranscriptomeRAD`)
+
+A rustar-aligner extension. `--quantTranscriptomeRAD Yes` writes the same transcriptome alignments to `Aligned.toTranscriptome.out.rad`, for `salmon quant --rad` (salmon 2.x; tested with 2.8.0). The file has no read names, sequences or qualities: about 8 times smaller than the BAM on paired yeast reads. The BAM is written only if `--quantMode TranscriptomeSAM` is given as well.
+
+```bash
+rustar-aligner --genomeDir index --readFilesIn r1.fq.gz r2.fq.gz --quantTranscriptomeRAD Yes
+salmon quant --rad Aligned.toTranscriptome.out.rad -l A -o quant
+```
+
+`--quantTranscriptomeSAMoutput` and `--quantTranscriptomeUnspliced` apply as they do to the BAM. Each placement carries its alignment score, which the BAM does not, and salmon weights placements by it; `--scoreExp 0` turns that off and gives the same `quant.sf` as `salmon quant -a` on the BAM. For single-end reads give the library type (`-l U`, `-l SF` or `-l SR`), and bias correction needs `-t transcripts.fa`. `--errorModel` has no effect, as the file has no read bases. salmon cannot read this file from a pipe. It is not available with `--soloType`. See [DIVERGENCE.md §1.9](https://github.com/scverse/rustar-aligner/blob/main/DIVERGENCE.md).
+
 ## Combining both
 
 You can request both modes in the same run:

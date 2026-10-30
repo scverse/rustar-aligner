@@ -1880,6 +1880,17 @@ pub(crate) fn apply_pe_transcriptome_mate_fields(
     Ok(())
 }
 
+/// The `@PG` line of the run, as in the genomic BAM header (`--quantTranscriptomeRAD`
+/// records it in place of a SAM header).
+pub(crate) fn program_line(params: &Parameters) -> String {
+    let cl = params.command_line.as_deref().unwrap_or("rustar-aligner");
+    format!(
+        "@PG\tID:rustar-aligner\tPN:rustar-aligner\tVN:{}\tCL:{}",
+        env!("CARGO_PKG_VERSION"),
+        cl.replace(['\n', '\t'], " ")
+    )
+}
+
 /// Build a SAM record for one mate of a paired-end read
 #[allow(clippy::too_many_arguments)]
 fn build_paired_mate_record(

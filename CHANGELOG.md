@@ -11,6 +11,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- `--quantTranscriptomeRAD Yes` writes the transcriptome alignments to
+  `Aligned.toTranscriptome.out.rad`, which `salmon quant --rad` (salmon 2.x)
+  quantifies without an intermediate BAM: 8 times smaller on 5M yeast pairs
+  (63 MB against 500 MB), and read by salmon in half the time. Same projection
+  and filters as `--quantMode TranscriptomeSAM`, whose BAM is unchanged and is
+  only written if asked for. `--scoreExp 0` reproduces the `quant.sf` of
+  `salmon quant -a` on the BAM exactly; by default salmon also uses the alignment
+  scores, which the BAM does not carry. See
+  [DIVERGENCE.md §1.9](DIVERGENCE.md#19---quanttranscriptomerad-transcriptome-alignments-as-a-rad-file-for-salmon).
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

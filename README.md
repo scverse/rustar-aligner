@@ -204,6 +204,7 @@ The yeast reads are `seqtk sample -s100` 1,000,000-pair subsamples of ERR1238969
 - Chimeric alignment detection — SE and PE, 4-tier pipeline: transcript-pair search, multi-cluster, soft-clip re-seeding, residual outer re-seeding for multi-junction fusions (`--chimSegmentMin`)
 - Gene-level read counting (`--quantMode GeneCounts` → `ReadsPerGene.out.tab`)
 - Transcriptome-coordinate SAM output (`--quantMode TranscriptomeSAM`)
+- Transcriptome alignments as a RAD file for `salmon quant --rad`, without an intermediate BAM (`--quantTranscriptomeRAD Yes`); not a STAR feature
 - Transcript-degradation normalization, DegNorm-style (`--quantGeneCoverage Yes` during alignment, then `--degNormCoverageFiles` across samples) — per-gene Degradation Index scores and degradation-adjusted counts; not a STAR feature
 - Bulk total RNA-seq: unspliced `<gene_id>-I` targets in the transcriptome BAM (`--quantTranscriptomeUnspliced`), an `sp:A` splicing-status tag (`--outSAMsplicingStatus`) and spliced / unspliced gene counts (`--quantGeneSplicing`); not STAR features
 - **Single-cell quantification (STARsolo)** — `--soloType CB_UMI_Simple`, `CB_UMI_Complex` (multi-segment barcodes), and `SmartSeq` (plate-based, SE + PE); features `Gene`, `GeneFull` (pre-mRNA), `SJ`, and `Velocyto` (spliced/unspliced/ambiguous); barcode correction (`--soloCBmatchWLtype` Exact/1MM/1MM_multi/…), UMI dedup (`--soloUMIdedup` 1MM_All/1MM_CR/1MM_Directional/…), multi-gene UMI filtering, multi-mapper resolution (`--soloMultiMappers` Uniform/PropUnique/EM/Rescue), cell calling (`--soloCellFilter` CellRanger2.2/TopCells/EmptyDrops_CR), gzip output, and `Summary.csv` — writes STARsolo-compatible `Solo.out/<feature>/{raw,filtered}/{matrix.mtx, barcodes.tsv, features.tsv}`
@@ -259,6 +260,7 @@ The majority of rustar-aligner's code was written by [Claude Code](https://claud
 
 MIT (matching the original STAR license). Code ported from STAR, STAR-rs, DegNorm and
 David Elworthy's `sgt.h` stays under its own licence, and libc++ is credited for the
-random-number behaviour STARsolo's EmptyDrops_CR depends on; all of these notices are in
+random-number behaviour STARsolo's EmptyDrops_CR depends on, and salmon and libradicl for the
+RAD format; all of these notices are in
 [`LICENSES/`](LICENSES/). The licences of the crates linked into the binaries ship with
 them as `THIRD_PARTY_LICENSES.md` (`scripts/third-party-licenses.sh`).

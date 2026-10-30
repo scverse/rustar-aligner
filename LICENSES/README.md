@@ -23,6 +23,10 @@ Other third-party code ported into rustar-aligner, each under a licence compatib
   libc++'s `std::mt19937`, `std::generate_canonical` and `std::discrete_distribution`, which
   STAR's EmptyDrops_CR draws from, so that the Monte-Carlo draws match STAR's bit for bit.
   Included for attribution.
+- `SALMON_LICENSE`: [salmon](https://github.com/COMBINE-lab/salmon) and
+  [libradicl](https://github.com/COMBINE-lab/libradicl) (BSD 3-clause, Copyright (c) COMBINE
+  lab). `src/io/rad.rs` writes the RAD layout of salmon's `crates/salmon-rad`, so that
+  `salmon quant --rad` can read it; no code is linked. Included for attribution.
 
 
 These cover code ported into rustar-aligner's own source. The licences of the Rust crates

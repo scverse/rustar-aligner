@@ -5,4 +5,5 @@ pub mod bgzf_writer;
 pub mod compression;
 pub mod fastq;
 pub mod log;
+pub mod rad;
 pub mod sam;
