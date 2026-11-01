@@ -48,7 +48,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # ratchet:dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # ratchet:Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # ratchet:Swatinem/rust-cache@v2.9.3
 
       - name: Detect host triple
         if: matrix.target_cpu
@@ -92,7 +92,7 @@ jobs:
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # ratchet:Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # ratchet:Swatinem/rust-cache@v2.9.3
 
       - run: cargo clippy --all-targets -- -D warnings
 
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: "1.89"
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # ratchet:Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # ratchet:Swatinem/rust-cache@v2.9.3
 
       - name: Check MSRV compiles
         run: cargo check
