@@ -1318,6 +1318,28 @@ struct Stage2 {
     read_idx: Vec<u64>,
 }
 
+/// Count a mapped pair: by its number of alignments, as half-mapped when the primary
+/// has one mate, and with its transcripts' statistics when it is unique.
+fn record_pair_alignment_stats(
+    stats: &crate::stats::AlignmentStats,
+    results: &[crate::align::read_align::PairedAlignmentResult],
+    max_multimaps: usize,
+) {
+    use crate::align::read_align::PairedAlignmentResult;
+    stats.record_alignment(results.len(), max_multimaps);
+    if matches!(
+        results.first(),
+        Some(PairedAlignmentResult::HalfMapped { .. })
+    ) {
+        stats.record_half_mapped();
+    }
+    if results.len() == 1 {
+        for t in pair_result_transcripts(results) {
+            stats.record_transcript_stats(t);
+        }
+    }
+}
+
 /// Every transcript (one per mate) of the alignments of a pair, in order.
 fn pair_result_transcripts(
     results: &[crate::align::read_align::PairedAlignmentResult],
@@ -2918,7 +2940,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
     solo_ctx: &std::sync::Arc<crate::solo::SoloContext>,
 ) -> anyhow::Result<()> {
-    use crate::align::read_align::{PairedAlignment, PairedAlignmentResult, align_paired_read};
+    use crate::align::read_align::{PairedAlignmentResult, align_paired_read};
     use crate::io::fastq::clip_read;
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::solo::{SoloCountRecord, SoloMultiRecord};
@@ -3137,49 +3159,19 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 stats.record_unmapped_reason(
                                     unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                                 );
-                            } else if has_half_mapped {
-                                stats.record_alignment(1, max_multimaps);
-                                stats.record_half_mapped();
-                                if let Some(PairedAlignmentResult::HalfMapped {
-                                    mapped_transcript,
-                                    ..
-                                }) = results.first()
-                                {
-                                    stats.record_transcript_stats(mapped_transcript);
-                                }
                             } else {
-                                let n = both_mapped.len();
-                                stats.record_alignment(n, max_multimaps);
-                                if n == 1 {
-                                    stats.record_transcript_stats(&both_mapped[0].mate1_transcript);
-                                    stats.record_transcript_stats(&both_mapped[0].mate2_transcript);
-                                }
+                                record_pair_alignment_stats(&stats, &results, max_multimaps);
                             }
 
-                            let is_unique =
-                                both_mapped.len() == 1 || (has_half_mapped && results.len() == 1);
+                            let is_unique = results.len() == 1;
                             // Per-read junction dedup (fix A): a junction crossed by
                             // both mates / several loci counts once.
-                            let mut read_trs: Vec<&crate::align::transcript::Transcript> =
-                                Vec::new();
-                            for result in &results {
-                                match result {
-                                    PairedAlignmentResult::BothMapped(pair) => {
-                                        read_trs.push(&pair.mate1_transcript);
-                                        read_trs.push(&pair.mate2_transcript);
-                                    }
-                                    PairedAlignmentResult::HalfMapped {
-                                        mapped_transcript, ..
-                                    } => {
-                                        read_trs.push(mapped_transcript);
-                                    }
-                                }
-                            }
+                            let read_trs = pair_result_transcripts(&results);
                             record_read_junctions(read_trs, &index, &sj_stats, is_unique);
 
                             // SJ feature: junctions crossed by the unique pair (both mates).
                             let junctions: Vec<(u64, u64)> =
-                                if solo.sj_enabled && both_mapped.len() == 1 {
+                                if solo.sj_enabled && both_mapped.len() == 1 && is_unique {
                                     let pair = both_mapped[0];
                                     let mut js = Vec::new();
                                     for tr in [&pair.mate1_transcript, &pair.mate2_transcript] {
@@ -3197,8 +3189,8 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 };
 
                             // Solo quantification: union both mates (strand from mate 1)
-                            // for a both-mapped pair; fall back to the mapped mate for
-                            // half-mapped.
+                            // for a both-mapped pair; the mapped mate for a single-mate
+                            // alignment.
                             // `CB_samTagOut` corrects the barcode for the CB tag and
                             // counts nothing, exactly as in the single-end loop.
                             let (mut outcome, cb_corrected) = if tag_out_only {
@@ -3214,28 +3206,10 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                         corrected
                                     });
                                 (outcome, corrected)
-                            } else if !both_mapped.is_empty() {
-                                let pairs: Vec<_> = both_mapped
-                                    .iter()
-                                    .map(|pa| (&pa.mate1_transcript, &pa.mate2_transcript))
-                                    .collect();
+                            } else if !results.is_empty() {
                                 (
                                     solo.process_read_pe(
-                                        &pairs,
-                                        pread.barcode.as_ref().map_err(|m| *m),
-                                        &junctions,
-                                    ),
-                                    None,
-                                )
-                            } else if let Some(PairedAlignmentResult::HalfMapped {
-                                mapped_transcript,
-                                ..
-                            }) = results.first()
-                            {
-                                (
-                                    solo.process_read(
-                                        std::slice::from_ref(mapped_transcript),
-                                        1,
+                                        &results,
                                         pread.barcode.as_ref().map_err(|m| *m),
                                         &junctions,
                                     ),
@@ -3276,37 +3250,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                         buffer.push(record);
                                     }
                                 }
-                            } else if has_half_mapped {
-                                if let Some(PairedAlignmentResult::HalfMapped {
-                                    mapped_transcript,
-                                    mate1_is_mapped,
-                                }) = results.first()
-                                {
-                                    let records = SamWriter::build_half_mapped_records(
-                                        &out_read_name,
-                                        &pread.mate1.sequence,
-                                        &pread.mate1.quality,
-                                        &pread.mate2.sequence,
-                                        &pread.mate2.quality,
-                                        clip5p_m1,
-                                        clip3p_m1,
-                                        clip5p_m2,
-                                        clip3p_m2,
-                                        mapped_transcript,
-                                        *mate1_is_mapped,
-                                        &index.genome,
-                                        params,
-                                        n_for_mapq,
-                                    )?;
-                                    for record in records {
-                                        buffer.push(record);
-                                    }
-                                }
-                            } else if both_mapped.len() <= max_multimaps {
-                                let paired_alns: Vec<PairedAlignment> = both_mapped
-                                    .iter()
-                                    .map(|pa| PairedAlignment::clone(pa))
-                                    .collect();
+                            } else {
                                 // Soft-clip the fixed per-mate clips against the original
                                 // mate reads (matching SE/PE non-solo). Inert at default 10x.
                                 let mut records = SamWriter::build_paired_records(
@@ -3319,7 +3263,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                     clip3p_m1,
                                     clip5p_m2,
                                     clip3p_m2,
-                                    &paired_alns,
+                                    &results,
                                     &index.genome,
                                     params,
                                     n_for_mapq,
@@ -3327,8 +3271,11 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 // STARsolo gene tags: a pair is one alignment, so
                                 // both mates carry the pair's tags; pairs in output
                                 // order, as `build_paired_records` writes them.
-                                if solo_tags
-                                    .intersects(crate::params::SamAttributes::SOLO_GENE_TAGS)
+                                // shortcut: a read with a single-mate alignment gets no
+                                // gene tags, upgrade when these tags take such a read.
+                                if !has_half_mapped
+                                    && solo_tags
+                                        .intersects(crate::params::SamAttributes::SOLO_GENE_TAGS)
                                 {
                                     let alns: Vec<_> = both_mapped
                                         .iter()
@@ -3624,7 +3571,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         stats.record_alignment(0, max_multimaps);
                         stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                         if let Some(ref q) = quant {
-                            q.count_pe_read(&[], true, false);
+                            q.count_pe_read(&[], 0);
                         }
                         if output_unmapped {
                             // Full original mates for unmapped pairs (STAR convention).
@@ -3755,8 +3702,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     // towards the novel junction list, and a read with an
                     // unannotated junction is held (STAR `outFilterBySJout`).
                     if by_sjout && stage2.is_none() {
-                        let is_unique =
-                            both_mapped.len() == 1 || (has_half_mapped && results.len() == 1);
+                        let is_unique = results.len() == 1;
                         record_read_junctions(
                             pair_result_transcripts(&results),
                             &index,
@@ -3785,25 +3731,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         stats.record_unmapped_reason(
                             unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
                         );
-                    } else if has_half_mapped {
-                        // Half-mapped: count as mapped for the mapped mate
-                        stats.record_alignment(1, max_multimaps);
-                        stats.record_half_mapped();
-                        // Record transcript stats from the mapped mate only
-                        if let Some(PairedAlignmentResult::HalfMapped {
-                            mapped_transcript, ..
-                        }) = results.first()
-                        {
-                            stats.record_transcript_stats(mapped_transcript);
-                        }
                     } else {
-                        // Both-mapped pairs
-                        let n = both_mapped.len();
-                        stats.record_alignment(n, max_multimaps);
-                        if n == 1 {
-                            stats.record_transcript_stats(&both_mapped[0].mate1_transcript);
-                            stats.record_transcript_stats(&both_mapped[0].mate2_transcript);
-                        }
+                        record_pair_alignment_stats(&stats, &results, max_multimaps);
                     }
 
                     // Chimeric stats
@@ -3816,12 +3745,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         // Dereference Box<PairedAlignment> to get &PairedAlignment slice.
                         let bm_deref: Vec<&crate::align::read_align::PairedAlignment> =
                             both_mapped.iter().map(AsRef::as_ref).collect();
-                        q.count_pe_read(&bm_deref, results.is_empty(), has_half_mapped);
+                        q.count_pe_read(&bm_deref, results.len());
                     }
 
                     // Record junction statistics
-                    let is_unique =
-                        both_mapped.len() == 1 || (has_half_mapped && results.len() == 1);
+                    let is_unique = results.len() == 1;
                     // Per-read junction dedup (fix A): a junction crossed by
                     // both mates / several loci counts once.
                     let read_trs = pair_result_transcripts(&results);
@@ -3830,7 +3758,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     // --outWigType bedGraph: both-mapped pairs' reported alignments,
                     // both mates per pair (mate1 sense, mate2 flipped). signal_n_tr is
                     // the pair NH; each mate record is counted in the writer thread.
-                    let signal_n_tr = both_mapped.len();
+                    let signal_n_tr = results.len();
                     let signal_contrib: Vec<(crate::align::transcript::Transcript, bool)> =
                         if params.out_wig_bedgraph()
                             && !both_mapped.is_empty()
@@ -3871,40 +3799,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                                 buffer.push(record);
                             }
                         }
-                    } else if has_half_mapped {
-                        // Half-mapped pair
-                        if let Some(PairedAlignmentResult::HalfMapped {
-                            mapped_transcript,
-                            mate1_is_mapped,
-                        }) = results.first()
-                        {
-                            let records = SamWriter::build_half_mapped_records(
-                                &out_read_name,
-                                &paired_read.mate1.sequence,
-                                &paired_read.mate1.quality,
-                                &paired_read.mate2.sequence,
-                                &paired_read.mate2.quality,
-                                m1_clip5p,
-                                m1_clip3p,
-                                m2_clip5p,
-                                m2_clip3p,
-                                mapped_transcript,
-                                *mate1_is_mapped,
-                                &index.genome,
-                                params,
-                                n_for_mapq,
-                            )?;
-                            for record in records {
-                                buffer.push(record);
-                            }
-                        }
-                    } else if both_mapped.len() <= max_multimaps {
-                        // Both-mapped pairs (within multimap limit)
-                        // Extract PairedAlignments for the existing build_paired_records
-                        let paired_alns: Vec<PairedAlignment> = both_mapped
-                            .iter()
-                            .map(|pa| PairedAlignment::clone(pa))
-                            .collect();
+                    } else {
                         let mut records = SamWriter::build_paired_records(
                             &out_read_name,
                             &paired_read.mate1.sequence,
@@ -3915,38 +3810,45 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             m1_clip3p,
                             m2_clip5p,
                             m2_clip3p,
-                            &paired_alns,
+                            &results,
                             &index.genome,
                             params,
                             n_for_mapq,
                         )?;
-                        // WASP allele-specific filtering: stamp vW/vA/vG by
-                        // re-mapping the allele-swapped pair (STAR waspMap).
-                        if let Some(ctx) = &*wasp_ctx {
-                            crate::wasp::annotate_records_pe(
-                                &mut records,
-                                &paired_alns,
-                                &m1_seq,
-                                &m2_seq,
-                                &paired_read.name,
-                                &index,
-                                ctx,
-                                params.out_sam_attributes,
-                            )?;
-                        }
-                        // --outSAMsplicingStatus Yes: splicing status tag.
-                        if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref()) {
-                            crate::quant::splice_status::tag_records_pe(
-                                &mut records,
-                                &paired_alns,
-                                tx,
-                            );
+                        // shortcut: a read with a single-mate alignment gets neither of
+                        // these tags, upgrade when they take such a read.
+                        if !has_half_mapped {
+                            let paired_alns: Vec<PairedAlignment> = both_mapped
+                                .iter()
+                                .map(|pa| PairedAlignment::clone(pa))
+                                .collect();
+                            // WASP allele-specific filtering: stamp vW/vA/vG by
+                            // re-mapping the allele-swapped pair (STAR waspMap).
+                            if let Some(ctx) = &*wasp_ctx {
+                                crate::wasp::annotate_records_pe(
+                                    &mut records,
+                                    &paired_alns,
+                                    &m1_seq,
+                                    &m2_seq,
+                                    &paired_read.name,
+                                    &index,
+                                    ctx,
+                                    params.out_sam_attributes,
+                                )?;
+                            }
+                            // --outSAMsplicingStatus Yes: splicing status tag.
+                            if let Some(tx) = quant.as_ref().and_then(|q| q.splice_tag.as_ref()) {
+                                crate::quant::splice_status::tag_records_pe(
+                                    &mut records,
+                                    &paired_alns,
+                                    tx,
+                                );
+                            }
                         }
                         for record in records {
                             buffer.push(record);
                         }
                     }
-                    // else: too many loci, skip output
 
                     // Transcriptome SAM projection (both-mapped pairs only)
                     let transcriptome_records: TrRecords = if let Some(ref tidx) = tr_local {
@@ -3966,10 +3868,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         TrRecords::default()
                     };
                     // Collect unmapped mates for --outReadsUnmapped Fastx.
-                    // Write both mates if: pair is fully unmapped OR half-mapped.
+                    // Write both mates if: pair is fully unmapped OR the primary has one mate.
                     // STAR writes both mates of half-mapped pairs to the unmapped files.
                     let (unmapped_mate1, unmapped_mate2) = if write_unmapped_fastq {
-                        let pair_unmapped = results.is_empty() || has_half_mapped;
+                        let pair_unmapped =
+                            !matches!(results.first(), Some(PairedAlignmentResult::BothMapped(_)));
                         if pair_unmapped {
                             (
                                 vec![(fastx_name1.clone(), m1_seq.clone(), m1_qual.clone())],

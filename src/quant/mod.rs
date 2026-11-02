@@ -470,24 +470,19 @@ impl GeneCounts {
         self.count_unique_hit(&transcripts[0], transcripts[0].is_reverse, gene_ann);
     }
 
-    /// Count a paired-end fragment (both mates uniquely mapped).
+    /// Count a paired-end fragment. `n_alignments` counts single-mate alignments too.
     ///
-    /// - `unmapped` or empty with no half-mapped → N_unmapped
-    /// - `both_mapped.len() > 1` → N_multimapping
-    /// - `both_mapped.len() == 1` → unique; union of exon overlaps from both mates,
+    /// - `n_alignments > 1` → N_multimapping
+    /// - no pair among them → N_unmapped
+    /// - one pair → unique; union of exon overlaps from both mates,
     ///   strand determined by mate1
     pub fn count_pe_read(
         &self,
         both_mapped: &[&PairedAlignment],
-        unmapped: bool,
-        half_mapped: bool,
+        n_alignments: usize,
         gene_ann: &GeneAnnotation,
     ) {
-        if unmapped || (both_mapped.is_empty() && half_mapped) {
-            self.n_unmapped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if both_mapped.len() > 1 {
+        if n_alignments > 1 {
             self.n_multimapping.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -740,23 +735,18 @@ impl QuantContext {
     }
 
     /// Count a read pair in every enabled quantification.
-    pub fn count_pe_read(
-        &self,
-        both_mapped: &[&PairedAlignment],
-        unmapped: bool,
-        half_mapped: bool,
-    ) {
+    pub fn count_pe_read(&self, both_mapped: &[&PairedAlignment], n_alignments: usize) {
         if let Some(g) = &self.gene {
             if let Some(c) = &g.counts {
-                c.count_pe_read(both_mapped, unmapped, half_mapped, &g.gene_ann);
+                c.count_pe_read(both_mapped, n_alignments, &g.gene_ann);
             }
-            if let Some(c) = &g.coverage {
+            if let Some(c) = g.coverage.as_ref().filter(|_| n_alignments == 1) {
                 c.coverage.count_pe_read(both_mapped, &g.gene_ann);
             }
         }
         if let Some(v) = &self.splicing {
             v.counts
-                .count_pe_read(both_mapped, unmapped, &v.transcriptome);
+                .count_pe_read(both_mapped, n_alignments, &v.transcriptome);
         }
     }
 

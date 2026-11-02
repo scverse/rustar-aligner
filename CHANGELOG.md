@@ -13,6 +13,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- A pair with one aligned mate is no longer reported as one unique location. Single-mate
+  alignments now compete with pairs for the score range, the primary and `NH`, and pass the
+  same `mappedFilter` and `--outFilterMultimapNmax` checks: a mate in a 3-copy repeat gets
+  `NH:3 MAPQ:1` on all 3 copies. The unmapped mate's record is written only under
+  `--outSAMunmapped Within`, after the read's alignments; `Within KeepPairs` writes one after
+  each single-mate alignment. `NH` of a pair also counts alignments past `--outSAMmultNmax`.
 - The residual differences in DIVERGENCE.md §5 are fixed. On the parity
   suite's yeast (10k and 100k, SE and PE, chimeric, `--outSAMunmapped
   Within`), human chr21 (SE, PE) and fusion runs, alignments, `SJ.out.tab`

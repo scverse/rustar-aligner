@@ -594,13 +594,13 @@ impl SplicingCounts {
     pub fn count_pe_read(
         &self,
         both_mapped: &[&PairedAlignment],
-        unmapped: bool,
+        n_alignments: usize,
         idx: &TranscriptomeIndex,
     ) {
-        if unmapped || both_mapped.is_empty() {
-            self.n_unmapped.fetch_add(1, Ordering::Relaxed);
-        } else if both_mapped.len() > 1 {
+        if n_alignments > 1 {
             self.n_multimapping.fetch_add(1, Ordering::Relaxed);
+        } else if both_mapped.is_empty() {
+            self.n_unmapped.fetch_add(1, Ordering::Relaxed);
         } else {
             self.record(&classify_read(&AlignBlocks::from_pair(both_mapped[0]), idx));
         }
