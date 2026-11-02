@@ -11,6 +11,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- `SJ.out.tab` is written even with no junction, as STAR writes it empty. Before, a run without junctions left no file, which fails pipelines that expect it.
+- SAM output now reports a failed final write. The last buffer was flushed when the writer was dropped, which discards errors, so a full disk could cut `Aligned.out.sam` with exit code 0. The `Log.out`, genome `Log.out` and `Log.progress.out` writers flush the same way now.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
