@@ -13,6 +13,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- FASTA reads are accepted, in one or several lines, mixed with FASTQ, as in STAR. Their records have `*` for quality, and they go to `Unmapped.out.mate*` as FASTA.
+- A blank line at the end of a read file no longer stops the run. A blank line with reads after it is an error. See `DIVERGENCE.md` §4.8.
+- Mates named `SRR1.5.1` / `SRR1.5.2` are accepted as a pair. `SRR1.1` / `SRR1.2` are still refused, since there the number is the read's.
+- Both records of a pair carry mate 1's full name as QNAME, as STAR does. A `_1`, `.R1` or `.1` suffix was removed from it.
+- Sort spill files stay in the output folder when `--outFileNamePrefix` ends in `/`. They went to the folder above it.
+- `--outBAMcompression -1` compresses like level 1, as STAR does. It wrote uncompressed BAM.
+
+### Bug fixes
+
 - Streamed FASTQ input (FIFOs, `<(...)`, `/dev/stdin`) fails instead of passing
   for complete. A compressed stream cut in a way the FASTQ parser took for a
   clean end of file (gzip trailer, member header, or decoded text ending on a

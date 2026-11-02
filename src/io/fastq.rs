@@ -25,7 +25,9 @@ impl UnmappedFastqWriter {
     /// Write one FASTQ record. `seq` is in genome encoding (0=A,1=C,2=G,3=T,4=N).
     /// `qual` is raw FASTQ quality bytes.
     pub fn write_record(&mut self, name: &str, seq: &[u8], qual: &[u8]) -> Result<(), Error> {
-        self.writer.write_all(b"@").map_err(Error::from)?;
+        // A FASTA input read (no quality) stays FASTA, as STAR writes it.
+        let marker: &[u8] = if qual.is_empty() { b">" } else { b"@" };
+        self.writer.write_all(marker).map_err(Error::from)?;
         self.writer
             .write_all(name.as_bytes())
             .map_err(Error::from)?;
@@ -34,6 +36,9 @@ impl UnmappedFastqWriter {
             self.writer
                 .write_all(&[decode_base(b)])
                 .map_err(Error::from)?;
+        }
+        if qual.is_empty() {
+            return self.writer.write_all(b"\n").map_err(Error::from);
         }
         self.writer.write_all(b"\n+\n").map_err(Error::from)?;
         self.writer.write_all(qual).map_err(Error::from)?;
@@ -63,7 +68,7 @@ pub struct EncodedRead {
 /// A paired-end read from two FASTQ files
 #[derive(Debug, Clone)]
 pub struct PairedRead {
-    /// Base read name (without /1 or /2 suffix)
+    /// Mate 1's read name, which both mates' records carry
     pub name: String,
     /// First mate in pair
     pub mate1: EncodedRead,
@@ -253,6 +258,15 @@ impl FastqReader {
     }
 
     fn next_in_current_file(&mut self) -> Result<Option<EncodedRead>, Error> {
+        match self.peek_first_byte()? {
+            None => return Ok(None),
+            Some(b'>') => return self.next_fasta().map(Some),
+            Some(b'\n' | b'\r' | b' ') => {
+                self.expect_only_blank_lines()?;
+                return Ok(None);
+            }
+            Some(_) => {}
+        }
         match self.inner.records().next() {
             Some(Ok(record)) => {
                 // STAR's check (`readLoad.cpp`). It is also what catches plain
@@ -271,26 +285,8 @@ impl FastqReader {
                     ));
                 }
 
-                let name = std::str::from_utf8(record.name())
-                    .map_err(|e| {
-                        Error::from(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("invalid UTF-8 in read name: {e}"),
-                        ))
-                    })?
-                    .to_string();
-
+                let name = self.read_name(record.name())?;
                 let sequence = record.sequence().iter().map(|&b| encode_base(b)).collect();
-
-                let name = match self
-                    .name_separators
-                    .iter()
-                    .filter_map(|&sep| name.as_bytes().iter().position(|&b| b == sep))
-                    .min()
-                {
-                    Some(cut) => name[..cut].to_string(),
-                    None => name,
-                };
 
                 let quality = if self.qual_shift == 0 {
                     record.quality_scores().to_vec()
@@ -311,6 +307,93 @@ impl FastqReader {
             }
             Some(Err(e)) => Err(Error::io(e, &self.path)),
             None => Ok(None),
+        }
+    }
+
+    /// The next byte of the current file, not consumed; `None` at its end.
+    fn peek_first_byte(&mut self) -> Result<Option<u8>, Error> {
+        let buf = self
+            .inner
+            .get_mut()
+            .fill_buf()
+            .map_err(|e| Error::io(e, &self.path))?;
+        Ok(buf.first().copied())
+    }
+
+    /// A read name as the rest of the run sees it, cut at `--readNameSeparator`.
+    fn read_name(&self, raw: &[u8]) -> Result<String, Error> {
+        let name = std::str::from_utf8(raw).map_err(|e| {
+            Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid UTF-8 in read name: {e}"),
+            ))
+        })?;
+        let cut = self
+            .name_separators
+            .iter()
+            .filter_map(|&sep| name.as_bytes().iter().position(|&b| b == sep))
+            .min()
+            .unwrap_or(name.len());
+        Ok(name[..cut].to_string())
+    }
+
+    /// One FASTA read: a `>name` line, then its sequence over any number of lines.
+    /// Quality stays empty, which the SAM and BAM writers output as `*`, as STAR does.
+    fn next_fasta(&mut self) -> Result<EncodedRead, Error> {
+        let mut line = Vec::new();
+        self.inner
+            .get_mut()
+            .read_until(b'\n', &mut line)
+            .map_err(|e| Error::io(e, &self.path))?;
+        let header = line[1..].trim_ascii_end();
+        let raw_name = header.split(u8::is_ascii_whitespace).next().unwrap_or(&[]);
+        let name = self.read_name(raw_name)?;
+
+        let mut sequence = Vec::new();
+        while let Some(first) = self.peek_first_byte()? {
+            if matches!(first, b'>' | b'@' | b'\n' | b'\r' | b' ') {
+                break;
+            }
+            line.clear();
+            self.inner
+                .get_mut()
+                .read_until(b'\n', &mut line)
+                .map_err(|e| Error::io(e, &self.path))?;
+            sequence.extend(line.trim_ascii_end().iter().map(|&b| encode_base(b)));
+        }
+        Ok(EncodedRead {
+            name,
+            sequence,
+            quality: Vec::new(),
+            file_index: self.file_index,
+        })
+    }
+
+    /// Blank lines are fine at the end of a file. STAR stops at the first one and
+    /// exits 0 even with reads after it; those would be lost, so that is an error
+    /// here (`DIVERGENCE.md` 4.8).
+    fn expect_only_blank_lines(&mut self) -> Result<(), Error> {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = self
+                .inner
+                .get_mut()
+                .read_until(b'\n', &mut line)
+                .map_err(|e| Error::io(e, &self.path))?;
+            if n == 0 {
+                return Ok(());
+            }
+            if !line.trim_ascii().is_empty() {
+                return Err(Error::io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "data after a blank line; remove the blank line, or reads after \
+                         it would be lost",
+                    ),
+                    &self.path,
+                ));
+            }
         }
     }
 
@@ -404,7 +487,8 @@ impl PairedFastqReader {
                 }
 
                 Ok(Some(PairedRead {
-                    name: name1_base,
+                    // STAR's QNAME is mate 1's name; the suffix only matters above.
+                    name: read1.name.clone(),
                     mate1: read1,
                     mate2: read2,
                 }))
@@ -446,6 +530,7 @@ impl PairedFastqReader {
 /// - /1 or /2 (Illumina convention)
 /// - .R1 or .R2 (alternative convention)
 /// - _1 or _2 (another convention)
+/// - .1 or .2 after a read number (`SRR1.5.1`)
 /// - space and everything after (e.g., "READ_NAME 1:N:0:0" -> "READ_NAME")
 ///
 /// # Arguments
@@ -468,6 +553,11 @@ pub fn strip_mate_suffix(name: &str) -> String {
     } else if name.ends_with(".R1") || name.ends_with(".R2") {
         name[..name.len() - 3].to_string()
     } else if name.ends_with("_1") || name.ends_with("_2") {
+        name[..name.len() - 2].to_string()
+    } else if (name.ends_with(".1") || name.ends_with(".2")) && name[..name.len() - 2].contains('.')
+    {
+        // `SRR1.5.1`. Not `SRR1.1`: there `.1` is the spot number, and stripping it
+        // would hide mates that are out of step.
         name[..name.len() - 2].to_string()
     } else {
         name.to_string()
@@ -541,7 +631,9 @@ pub fn clip_read(seq: &[u8], qual: &[u8], clip5p: usize, clip3p: usize) -> (Vec<
     let start = clip5p;
     let end = len - clip3p;
 
-    (seq[start..end].to_vec(), qual[start..end].to_vec())
+    // FASTA reads have no quality.
+    let clipped_qual = qual.get(start..end).unwrap_or_default().to_vec();
+    (seq[start..end].to_vec(), clipped_qual)
 }
 
 #[cfg(test)]
@@ -795,6 +887,63 @@ mod tests {
         assert_eq!(read2.sequence, vec![3, 2, 1, 0]); // TGCA
 
         assert!(reader.next_encoded().unwrap().is_none());
+    }
+
+    fn reader_over(contents: &str) -> FastqReader {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        FastqReader::open(f.path(), None).unwrap()
+    }
+
+    #[test]
+    fn fasta_reads_have_empty_quality_and_may_span_lines() {
+        let mut r = reader_over(">f1 desc\nAC\nGT\n>f2/1\nTT\n@q3\nAA\n+\nII\n>f4\nCC");
+        let f1 = r.next_encoded().unwrap().unwrap();
+        assert_eq!(
+            (f1.name.as_str(), f1.sequence, f1.quality),
+            ("f1", vec![0, 1, 2, 3], vec![])
+        );
+        assert_eq!(r.next_encoded().unwrap().unwrap().name, "f2");
+        assert_eq!(r.next_encoded().unwrap().unwrap().quality, b"II");
+        assert_eq!(r.next_encoded().unwrap().unwrap().sequence, vec![1, 1]);
+        assert!(r.next_encoded().unwrap().is_none());
+    }
+
+    #[test]
+    fn blank_lines_end_a_file_but_not_before_more_reads() {
+        let mut r = reader_over("@a\nAC\n+\nII\n\n \n\r\n");
+        assert!(r.next_encoded().unwrap().is_some());
+        assert!(r.next_encoded().unwrap().is_none());
+
+        let mut r = reader_over("@a\nAC\n+\nII\n\n@b\nAC\n+\nII\n");
+        assert!(r.next_encoded().unwrap().is_some());
+        let err = r.next_encoded().unwrap_err().to_string();
+        assert!(err.contains("blank line"), "{err}");
+    }
+
+    #[test]
+    fn clip_read_of_a_fasta_read_has_no_quality() {
+        let (seq, qual) = clip_read(&[0, 1, 2, 3], &[], 1, 1);
+        assert_eq!((seq, qual), (vec![1, 2], vec![]));
+    }
+
+    #[test]
+    fn dotted_mate_suffix_needs_a_read_number_before_it() {
+        assert_eq!(strip_mate_suffix("SRR1.5.1"), "SRR1.5");
+        assert_eq!(strip_mate_suffix("SRR1.5.2"), "SRR1.5");
+        // Here `.1` and `.2` are spot numbers: mates out of step must still differ.
+        assert_eq!(strip_mate_suffix("SRR1.1"), "SRR1.1");
+        assert_ne!(strip_mate_suffix("SRR1.1"), strip_mate_suffix("SRR1.2"));
+    }
+
+    #[test]
+    fn pair_is_named_after_mate1_as_star_does() {
+        let mut f1 = NamedTempFile::new().unwrap();
+        let mut f2 = NamedTempFile::new().unwrap();
+        f1.write_all(b"@p_1\nAC\n+\nII\n").unwrap();
+        f2.write_all(b"@p_2\nAC\n+\nII\n").unwrap();
+        let mut r = PairedFastqReader::open(f1.path(), f2.path(), None).unwrap();
+        assert_eq!(r.next_paired().unwrap().unwrap().name, "p_1");
     }
 
     #[test]

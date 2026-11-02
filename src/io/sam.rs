@@ -132,6 +132,15 @@ pub(crate) fn insert_mate_cigar_tags(rec1: &mut RecordBuf, rec2: &mut RecordBuf)
         .insert(tag, Value::String(BString::from(c1)));
 }
 
+/// The aligned part of a read's quality. A FASTA read has none, whatever its clips.
+fn aligned_quality(qual: &[u8], clip5p: usize, clip3p: usize) -> &[u8] {
+    if qual.is_empty() {
+        qual
+    } else {
+        &qual[clip5p..qual.len() - clip3p]
+    }
+}
+
 /// SAM file writer
 pub struct SamWriter {
     writer: sam::io::Writer<BufWriter<File>>,
@@ -330,7 +339,7 @@ impl SamWriter {
         // (CIGAR core, MD, NM) is built from that aligned slice, then apply_read_clips
         // restores the full read + soft-clips. clip5p/clip3p == 0 => aligned == full.
         let aligned_seq = &read_seq[clip5p..read_seq.len() - clip3p];
-        let aligned_qual = &read_qual[clip5p..read_qual.len() - clip3p];
+        let aligned_qual = aligned_quality(read_qual, clip5p, clip3p);
 
         let n_alignments = transcripts.len();
         let max_output = if params.out_sam_mult_nmax < 0 {
@@ -588,7 +597,7 @@ impl SamWriter {
             };
         // Aligned slice of the mapped mate (core SEQ/CIGAR/MD built from this).
         let aligned_mapped_seq = &mapped_seq[mapped_clip5p..mapped_seq.len() - mapped_clip3p];
-        let aligned_mapped_qual = &mapped_qual[mapped_clip5p..mapped_qual.len() - mapped_clip3p];
+        let aligned_mapped_qual = aligned_quality(mapped_qual, mapped_clip5p, mapped_clip3p);
 
         // --- Build mapped mate record ---
         let mut mapped_rec = RecordBuf::default();
@@ -1977,7 +1986,7 @@ fn build_paired_mate_record(
     // Core SEQ/QUAL/MD are built from the aligned (clipped) slice; apply_read_clips
     // below restores the full mate read + soft-clips (clip==0 => aligned == mate_seq).
     let aligned_seq = &mate_seq[clip5p..mate_seq.len() - clip3p];
-    let aligned_qual = &mate_qual[clip5p..mate_qual.len() - clip3p];
+    let aligned_qual = aligned_quality(mate_qual, clip5p, clip3p);
 
     // Sequence and quality scores (reverse complement for reverse strand)
     if transcript.is_reverse {
