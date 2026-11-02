@@ -141,19 +141,71 @@ impl FromStr for UmiFiltering {
     }
 }
 
-/// True if packed UMIs `a` and `b` (length `len`) differ at exactly one base.
+/// True if packed UMIs `a` and `b` differ at exactly one of their last `len` bases.
 fn hamming1(a: u64, b: u64, len: usize) -> bool {
-    let x = a ^ b;
-    let mut diff = 0u32;
-    for i in 0..len {
-        if (x >> (2 * i)) & 0b11 != 0 {
-            diff += 1;
-            if diff > 1 {
-                return false;
-            }
+    let mask = if len >= 32 {
+        u64::MAX
+    } else {
+        (1 << (2 * len)) - 1
+    };
+    let x = (a ^ b) & mask;
+    // One bit per differing base.
+    ((x | (x >> 1)) & 0x5555_5555_5555_5555).is_power_of_two()
+}
+
+/// Sets of at most this many UMIs are compared pair by pair: most `(cell, gene)`
+/// sets are this small, and there a comparison per pair costs less than
+/// `3 * umi_len` hash lookups per UMI, nearly all of them misses in a map at up
+/// to 7/8 load, which is what 224 keys are (`umi_dedup_timing` in the tests).
+const UMI_PAIRWISE_MAX: usize = 224;
+
+/// Finds the UMIs of a set that are one mismatch from a given UMI.
+#[derive(Clone, Copy)]
+struct OneMmFinder<'a> {
+    umis: &'a HashMap<u64, u32>,
+    umi_len: usize,
+    pairwise: bool,
+}
+
+impl<'a> OneMmFinder<'a> {
+    /// A UMI longer than `umi_len` (`--soloUMIposition` does not have to agree
+    /// with `--soloUMIlen`) is only compared on its last `umi_len` bases, so its
+    /// neighbours can have other high bits, which a lookup would miss.
+    fn new(umis: &'a HashMap<u64, u32>, umi_len: usize) -> Self {
+        let pairwise = umis.len() <= UMI_PAIRWISE_MAX
+            || umi_len >= 32
+            || umis.keys().any(|&u| u >> (2 * umi_len) != 0);
+        Self {
+            umis,
+            umi_len,
+            pairwise,
         }
     }
-    diff == 1
+
+    /// `(UMI, count)` of each neighbour of `umi`, in no particular order.
+    fn neighbours(self, umi: u64) -> impl Iterator<Item = (u64, u32)> + 'a {
+        let Self {
+            umis,
+            umi_len,
+            pairwise,
+        } = self;
+        let scan = pairwise.then(|| {
+            umis.iter()
+                .filter(move |&(&v, _)| hamming1(umi, v, umi_len))
+                .map(|(&v, &c)| (v, c))
+        });
+        let lookup = (!pairwise).then(|| {
+            (0..umi_len).flat_map(move |base| {
+                (1..4u64).filter_map(move |change| {
+                    let v = umi ^ (change << (2 * base));
+                    umis.get(&v).map(|&c| (v, c))
+                })
+            })
+        });
+        scan.into_iter()
+            .flatten()
+            .chain(lookup.into_iter().flatten())
+    }
 }
 
 /// Deduplicate the UMIs observed for one `(cell, gene)` pair into a molecule
@@ -171,13 +223,13 @@ pub fn dedup_count(umis: &HashMap<u64, u32>, method: UmiDedup, umi_len: usize) -
 }
 
 /// 1MM_CR: CellRanger's 1-mismatch UMI collapse (STAR `umiArrayCorrect_CR`).
-/// UMIs are sorted ascending by `(count, umi)`; each UMI is corrected to the
-/// LAST (highest-count) 1MM neighbor with a strictly later sort position — i.e.
-/// its highest-count 1MM neighbor. Correction is non-transitive (it points to
-/// the neighbor's raw UMI, not its corrected value); the molecule count is the
-/// number of distinct corrected UMIs.
+/// With UMIs ordered ascending by `(count, umi)`, each UMI is corrected to its
+/// LAST 1MM neighbor with a strictly later position, i.e. its highest-count 1MM
+/// neighbor. Correction is non-transitive (it points to the neighbor's raw UMI,
+/// not its corrected value); the molecule count is the number of distinct
+/// corrected UMIs.
 fn cellranger_1mm(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
-    let distinct: std::collections::HashSet<u64> =
+    let distinct: rustc_hash::FxHashSet<u64> =
         cellranger_1mm_map(umis, umi_len).into_values().collect();
     distinct.len() as u64
 }
@@ -189,60 +241,52 @@ fn cellranger_1mm(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
 /// read totals by the corrected value
 /// (`SoloFeature_collapseUMIall.cpp:134-148`).
 fn cellranger_1mm_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
-    let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
-    // Ascending by count, then by UMI value (mirrors funCompareSolo1 ordering,
-    // so the inner scan from the end meets higher-count neighbors first).
-    items.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    let n = items.len();
-    let mut corrected: Vec<u64> = Vec::with_capacity(n);
-    for iu in 0..n {
-        let mut corr = items[iu].0;
-        let mut iuu = n;
-        while iuu > iu + 1 {
-            iuu -= 1;
-            if hamming1(items[iu].0, items[iuu].0, umi_len) {
-                corr = items[iuu].0;
-                break;
-            }
-        }
-        corrected.push(corr);
-    }
-    items.iter().map(|&(u, _)| u).zip(corrected).collect()
+    let finder = OneMmFinder::new(umis, umi_len);
+    umis.iter()
+        .map(|(&u, &c)| {
+            let last = finder
+                .neighbours(u)
+                .map(|(v, cv)| (cv, v))
+                .filter(|&later| later > (c, u))
+                .max();
+            (u, last.map_or(u, |(_, v)| v))
+        })
+        .collect()
 }
 
-/// 1MM_All: number of connected components when UMIs within Hamming-1 are
-/// merged transitively (union-find).
-fn connected_components(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
-    let keys: Vec<u64> = umis.keys().copied().collect();
-    let n = keys.len();
-    if n <= 1 {
-        return n as u64;
-    }
-    let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
+/// Calls `f` with the UMIs of each connected component of the 1-mismatch graph.
+fn for_each_1mm_component(umis: &HashMap<u64, u32>, umi_len: usize, mut f: impl FnMut(&[u64])) {
+    let finder = OneMmFinder::new(umis, umi_len);
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut component = Vec::new();
+    for &start in umis.keys() {
+        if !seen.insert(start) {
+            continue;
         }
-        x
-    }
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if hamming1(keys[i], keys[j], umi_len) {
-                let ri = find(&mut parent, i);
-                let rj = find(&mut parent, j);
-                if ri != rj {
-                    parent[ri] = rj;
+        component.clear();
+        component.push(start);
+        let mut next = 0;
+        while let Some(&u) = component.get(next) {
+            next += 1;
+            for (v, _) in finder.neighbours(u) {
+                if seen.insert(v) {
+                    component.push(v);
                 }
             }
         }
+        f(&component);
     }
-    let mut roots = std::collections::HashSet::new();
-    for i in 0..n {
-        let r = find(&mut parent, i);
-        roots.insert(r);
+}
+
+/// 1MM_All: number of connected components when UMIs within Hamming-1 are
+/// merged transitively.
+fn connected_components(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
+    if umis.len() <= 1 {
+        return umis.len() as u64;
     }
-    roots.len() as u64
+    let mut components = 0;
+    for_each_1mm_component(umis, umi_len, |_| components += 1);
+    components
 }
 
 /// 1MM_Directional: a lower-count UMI within Hamming-1 of a hub whose count
@@ -254,7 +298,7 @@ fn directional(umis: &HashMap<u64, u32>, umi_len: usize, dir_count_add: i64) -> 
     let corrections = directional_correction_map(umis, umi_len, dir_count_add);
     umis.keys()
         .map(|u| corrections.get(u).copied().unwrap_or(*u))
-        .collect::<std::collections::HashSet<u64>>()
+        .collect::<rustc_hash::FxHashSet<u64>>()
         .len() as u64
 }
 
@@ -298,57 +342,20 @@ pub fn umi_correction_map(
 /// highest-count UMI, ties going to the one STAR meets first, the smallest
 /// half-swapped value (`umiArrayCorrect_Graph`'s `umiBest` scan).
 fn graph_correction_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
-    let keys: Vec<u64> = umis.keys().copied().collect();
-    let n = keys.len();
     let mut map = HashMap::default();
-    if n <= 1 {
+    if umis.len() <= 1 {
         return map;
     }
-    let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
-    }
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if hamming1(keys[i], keys[j], umi_len) {
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                if ri != rj {
-                    parent[ri] = rj;
-                }
-            }
-        }
-    }
-    // Best (count, then smallest swapped value) UMI per component.
-    let mut best: HashMap<usize, (u32, u64, u64)> = HashMap::default();
-    for (i, &umi) in keys.iter().enumerate() {
-        let root = find(&mut parent, i);
-        let count = umis[&umi];
-        let swapped = swap_halves(umi, umi_len);
-        match best.get(&root) {
-            Some(&(bc, bs, _)) if bc > count || (bc == count && bs <= swapped) => {}
-            _ => {
-                best.insert(root, (count, swapped, umi));
-            }
-        }
-    }
-    // A component of one is never coloured by STAR, so it is never recorded.
-    let mut comp_size: HashMap<usize, usize> = HashMap::default();
-    for i in 0..n {
-        let root = find(&mut parent, i);
-        *comp_size.entry(root).or_insert(0) += 1;
-    }
-    for (i, &umi) in keys.iter().enumerate() {
-        let root = find(&mut parent, i);
-        if comp_size[&root] > 1
-            && let Some(&(_, _, rep)) = best.get(&root)
+    for_each_1mm_component(umis, umi_len, |component| {
+        // A component of one is never coloured by STAR, so it is never recorded.
+        if component.len() > 1
+            && let Some(&rep) = component
+                .iter()
+                .max_by_key(|&&u| (umis[&u], std::cmp::Reverse(swap_halves(u, umi_len))))
         {
-            map.insert(umi, rep);
+            map.extend(component.iter().map(|&u| (u, rep)));
         }
-    }
+    });
     map
 }
 
@@ -361,25 +368,25 @@ fn directional_correction_map(
     umi_len: usize,
     dir_count_add: i64,
 ) -> HashMap<u64, u64> {
-    let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let mut corrected: Vec<u64> = items.iter().map(|&(u, _)| u).collect();
-    for iu in 1..items.len() {
-        for iuu in 0..iu {
-            if i64::from(items[iuu].1) >= 2 * i64::from(items[iu].1) + dir_count_add
-                && hamming1(items[iu].0, items[iuu].0, umi_len)
-            {
-                corrected[iu] = corrected[iuu];
-                break;
-            }
+    use std::cmp::Reverse;
+    let finder = OneMmFinder::new(umis, umi_len);
+    let mut items: Vec<(Reverse<u32>, u64)> = umis.iter().map(|(&u, &c)| (Reverse(c), u)).collect();
+    items.sort_unstable();
+    let mut corrected = HashMap::default();
+    for &rank @ (Reverse(c), u) in &items {
+        let first_hub = finder
+            .neighbours(u)
+            .map(|(v, cv)| (Reverse(cv), v))
+            .filter(|&(Reverse(cv), _)| i64::from(cv) >= 2 * i64::from(c) + dir_count_add)
+            .filter(|&earlier| earlier < rank)
+            .min();
+        if let Some((_, hub)) = first_hub {
+            // `hub` comes earlier in `items`, so its own correction is known.
+            let head = corrected.get(&hub).copied().unwrap_or(hub);
+            corrected.insert(u, head);
         }
     }
-    items
-        .iter()
-        .map(|&(u, _)| u)
-        .zip(corrected)
-        .filter(|(raw, corr)| raw != corr)
-        .collect()
+    corrected
 }
 
 // ---------------------------------------------------------------------------
@@ -3180,6 +3187,373 @@ mod tests {
         let c = counts(&[("AAAA", 1), ("AAAC", 2), ("AACC", 4)]);
         assert_eq!(dedup_count(&c, UmiDedup::OneMmCr, 4), 2);
         assert_eq!(dedup_count(&c, UmiDedup::OneMmAll, 4), 1);
+    }
+
+    // The all-pairs dedup these functions had before the neighbour lookup, kept
+    // as the reference that `umi_dedup_matches_all_pairs_reference` compares with.
+    mod all_pairs {
+        use super::*;
+
+        pub fn hamming1(a: u64, b: u64, len: usize) -> bool {
+            let x = a ^ b;
+            let mut diff = 0u32;
+            for i in 0..len {
+                if (x >> (2 * i)) & 0b11 != 0 {
+                    diff += 1;
+                    if diff > 1 {
+                        return false;
+                    }
+                }
+            }
+            diff == 1
+        }
+
+        fn cellranger_1mm_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
+            let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
+            items.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            let n = items.len();
+            let mut corrected: Vec<u64> = Vec::with_capacity(n);
+            for iu in 0..n {
+                let mut corr = items[iu].0;
+                let mut iuu = n;
+                while iuu > iu + 1 {
+                    iuu -= 1;
+                    if hamming1(items[iu].0, items[iuu].0, umi_len) {
+                        corr = items[iuu].0;
+                        break;
+                    }
+                }
+                corrected.push(corr);
+            }
+            items.iter().map(|&(u, _)| u).zip(corrected).collect()
+        }
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        fn connected_components(umis: &HashMap<u64, u32>, umi_len: usize) -> u64 {
+            let keys: Vec<u64> = umis.keys().copied().collect();
+            let n = keys.len();
+            if n <= 1 {
+                return n as u64;
+            }
+            let mut parent: Vec<usize> = (0..n).collect();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if hamming1(keys[i], keys[j], umi_len) {
+                        let ri = find(&mut parent, i);
+                        let rj = find(&mut parent, j);
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
+                }
+            }
+            let mut roots = std::collections::HashSet::new();
+            for i in 0..n {
+                let r = find(&mut parent, i);
+                roots.insert(r);
+            }
+            roots.len() as u64
+        }
+
+        fn graph_correction_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
+            let keys: Vec<u64> = umis.keys().copied().collect();
+            let n = keys.len();
+            let mut map = HashMap::default();
+            if n <= 1 {
+                return map;
+            }
+            let mut parent: Vec<usize> = (0..n).collect();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if hamming1(keys[i], keys[j], umi_len) {
+                        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                        if ri != rj {
+                            parent[ri] = rj;
+                        }
+                    }
+                }
+            }
+            let mut best: HashMap<usize, (u32, u64, u64)> = HashMap::default();
+            for (i, &umi) in keys.iter().enumerate() {
+                let root = find(&mut parent, i);
+                let count = umis[&umi];
+                let swapped = swap_halves(umi, umi_len);
+                match best.get(&root) {
+                    Some(&(bc, bs, _)) if bc > count || (bc == count && bs <= swapped) => {}
+                    _ => {
+                        best.insert(root, (count, swapped, umi));
+                    }
+                }
+            }
+            let mut comp_size: HashMap<usize, usize> = HashMap::default();
+            for i in 0..n {
+                let root = find(&mut parent, i);
+                *comp_size.entry(root).or_insert(0) += 1;
+            }
+            for (i, &umi) in keys.iter().enumerate() {
+                let root = find(&mut parent, i);
+                if comp_size[&root] > 1
+                    && let Some(&(_, _, rep)) = best.get(&root)
+                {
+                    map.insert(umi, rep);
+                }
+            }
+            map
+        }
+
+        fn directional_correction_map(
+            umis: &HashMap<u64, u32>,
+            umi_len: usize,
+            dir_count_add: i64,
+        ) -> HashMap<u64, u64> {
+            let mut items: Vec<(u64, u32)> = umis.iter().map(|(&u, &c)| (u, c)).collect();
+            items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let mut corrected: Vec<u64> = items.iter().map(|&(u, _)| u).collect();
+            for iu in 1..items.len() {
+                for iuu in 0..iu {
+                    if i64::from(items[iuu].1) >= 2 * i64::from(items[iu].1) + dir_count_add
+                        && hamming1(items[iu].0, items[iuu].0, umi_len)
+                    {
+                        corrected[iu] = corrected[iuu];
+                        break;
+                    }
+                }
+            }
+            items
+                .iter()
+                .map(|&(u, _)| u)
+                .zip(corrected)
+                .filter(|(raw, corr)| raw != corr)
+                .collect()
+        }
+
+        fn directional(umis: &HashMap<u64, u32>, umi_len: usize, dir_count_add: i64) -> u64 {
+            let corrections = directional_correction_map(umis, umi_len, dir_count_add);
+            umis.keys()
+                .map(|u| corrections.get(u).copied().unwrap_or(*u))
+                .collect::<std::collections::HashSet<u64>>()
+                .len() as u64
+        }
+
+        pub fn dedup_count(umis: &HashMap<u64, u32>, method: UmiDedup, umi_len: usize) -> u64 {
+            match method {
+                UmiDedup::Exact => umis.len() as u64,
+                UmiDedup::NoDedup => umis.values().map(|&c| u64::from(c)).sum(),
+                UmiDedup::OneMmAll => connected_components(umis, umi_len),
+                UmiDedup::OneMmDirectional => directional(umis, umi_len, 0),
+                UmiDedup::OneMmDirectionalUmiTools => directional(umis, umi_len, -1),
+                UmiDedup::OneMmCr => {
+                    let distinct: std::collections::HashSet<u64> =
+                        cellranger_1mm_map(umis, umi_len).into_values().collect();
+                    distinct.len() as u64
+                }
+            }
+        }
+
+        pub fn umi_correction_map(
+            umis: &HashMap<u64, u32>,
+            method: UmiDedup,
+            umi_len: usize,
+        ) -> HashMap<u64, u64> {
+            let mut map = match method {
+                UmiDedup::Exact | UmiDedup::NoDedup => HashMap::default(),
+                UmiDedup::OneMmCr => cellranger_1mm_map(umis, umi_len),
+                UmiDedup::OneMmAll => graph_correction_map(umis, umi_len),
+                UmiDedup::OneMmDirectional => directional_correction_map(umis, umi_len, 0),
+                UmiDedup::OneMmDirectionalUmiTools => directional_correction_map(umis, umi_len, -1),
+            };
+            map.retain(|raw, corrected| raw != corrected);
+            map
+        }
+
+        /// CR's full map, which `multi_gene_umi_cr_counts` reads, identities included.
+        pub fn cr_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
+            cellranger_1mm_map(umis, umi_len)
+        }
+    }
+
+    const ALL_DEDUP: [UmiDedup; 6] = [
+        UmiDedup::Exact,
+        UmiDedup::NoDedup,
+        UmiDedup::OneMmAll,
+        UmiDedup::OneMmDirectional,
+        UmiDedup::OneMmDirectionalUmiTools,
+        UmiDedup::OneMmCr,
+    ];
+
+    /// Up to `n` random UMIs of `bits` bits (duplicates fall together), with
+    /// counts in `1..=max_count`.
+    fn random_umis(
+        rng: &mut crate::solo::libcxx_rng::Mt19937,
+        n: usize,
+        bits: u32,
+        max_count: u32,
+    ) -> HashMap<u64, u32> {
+        (0..n)
+            .map(|_| {
+                let umi = ((u64::from(rng.next_u32()) << 32) | u64::from(rng.next_u32()))
+                    & ((1u64 << bits) - 1);
+                (umi, rng.next_u32() % max_count + 1)
+            })
+            .collect()
+    }
+
+    fn assert_dedup_matches_reference(umis: &HashMap<u64, u32>, umi_len: usize) {
+        for method in ALL_DEDUP {
+            assert_eq!(
+                dedup_count(umis, method, umi_len),
+                all_pairs::dedup_count(umis, method, umi_len),
+                "{method:?} count, length {umi_len}: {umis:?}"
+            );
+            assert_eq!(
+                umi_correction_map(umis, method, umi_len),
+                all_pairs::umi_correction_map(umis, method, umi_len),
+                "{method:?} map, length {umi_len}: {umis:?}"
+            );
+        }
+        assert_eq!(
+            cellranger_1mm_map(umis, umi_len),
+            all_pairs::cr_map(umis, umi_len),
+            "CR full map, length {umi_len}: {umis:?}"
+        );
+    }
+
+    /// Every method, on sets from empty to twice the pairwise limit, sparse and
+    /// dense (so chains and ties), with few and many reads per UMI.
+    #[test]
+    fn umi_dedup_matches_all_pairs_reference() {
+        let mut rng = crate::solo::libcxx_rng::Mt19937::new(20_261_102);
+        let mut sets_with_corrections = 0u32;
+        let mut sets_over_limit = 0u32;
+        for round in 0..3000 {
+            let (umi_len, n) = if round % 20 == 0 {
+                // Large enough for the lookup, in as few as 4^5 possible UMIs.
+                (
+                    5 + (rng.next_u32() % 8) as usize,
+                    UMI_PAIRWISE_MAX + 1 + (rng.next_u32() as usize) % UMI_PAIRWISE_MAX,
+                )
+            } else {
+                (
+                    1 + (rng.next_u32() % 12) as usize,
+                    (rng.next_u32() % 64) as usize,
+                )
+            };
+            let max_count = [1, 2, 3, 10, 1000][round % 5];
+            let umis = random_umis(&mut rng, n, 2 * umi_len as u32, max_count);
+            assert_dedup_matches_reference(&umis, umi_len);
+            if !umi_correction_map(&umis, UmiDedup::OneMmDirectional, umi_len).is_empty() {
+                sets_with_corrections += 1;
+            }
+            if !OneMmFinder::new(&umis, umi_len).pairwise {
+                sets_over_limit += 1;
+            }
+        }
+        // The sets did collide and did reach the lookup, or this compared
+        // nothing of interest.
+        assert!(sets_with_corrections > 500, "{sets_with_corrections}");
+        assert!(sets_over_limit > 100, "{sets_over_limit}");
+    }
+
+    /// Bases past `len` do not count, up to UMIs that fill the `u64`.
+    #[test]
+    fn hamming1_matches_the_base_by_base_reference() {
+        let mut rng = crate::solo::libcxx_rng::Mt19937::new(3);
+        for round in 0..100_000 {
+            let len = 1 + round % 32;
+            let a = (u64::from(rng.next_u32()) << 32) | u64::from(rng.next_u32());
+            // Up to three changed bits, to reach zero, one and two changed bases.
+            let mut b = a;
+            for _ in 0..round % 4 {
+                b ^= 1 << (rng.next_u32() % 64);
+            }
+            assert_eq!(
+                hamming1(a, b, len),
+                all_pairs::hamming1(a, b, len),
+                "{a:x} {b:x} {len}"
+            );
+        }
+    }
+
+    /// Lookup and pair-by-pair comparison agree on the same set, at every size.
+    #[test]
+    fn one_mm_finder_paths_agree() {
+        let mut rng = crate::solo::libcxx_rng::Mt19937::new(7);
+        for n in [1, 2, 5, 40, 300] {
+            let umis = random_umis(&mut rng, n, 12, 3);
+            let sorted = |u, pairwise| {
+                let finder = OneMmFinder {
+                    umis: &umis,
+                    umi_len: 6,
+                    pairwise,
+                };
+                let mut found: Vec<_> = finder.neighbours(u).collect();
+                found.sort_unstable();
+                found
+            };
+            for &u in umis.keys() {
+                assert_eq!(sorted(u, true), sorted(u, false));
+            }
+        }
+    }
+
+    /// A UMI longer than `umi_len` is compared on its last `umi_len` bases, as
+    /// it was before the lookup, however large the set.
+    #[test]
+    fn umis_longer_than_umi_len_match_reference() {
+        let mut rng = crate::solo::libcxx_rng::Mt19937::new(11);
+        let umis = random_umis(&mut rng, 4 * UMI_PAIRWISE_MAX, 16, 4);
+        assert!(OneMmFinder::new(&umis, 5).pairwise);
+        assert_dedup_matches_reference(&umis, 5);
+    }
+
+    /// Before and after on the same machine and sets, in one binary:
+    /// `cargo test --release --lib umi_dedup_timing -- --ignored --nocapture`.
+    /// The 200k row takes minutes, all of it in the reference.
+    #[test]
+    #[ignore = "timing table for the PR, not a check"]
+    fn umi_dedup_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut rng = crate::solo::libcxx_rng::Mt19937::new(1);
+        println!("UMIs, method, reference ns/call, new ns/call, calls");
+        for n in [
+            1usize, 2, 3, 5, 10, 20, 50, 100, 128, 129, 200, 500, 1000, 10_000, 200_000,
+        ] {
+            // Many calls on the small sizes, one on the large; the best of five
+            // rounds, or a single round of the large ones, which take minutes.
+            let calls = (4_000_000 / (n * n)).max(1);
+            let rounds = if n > 1000 { 1 } else { 5 };
+            let sets: Vec<_> = (0..calls.min(1000))
+                .map(|_| random_umis(&mut rng, n, 24, 3))
+                .collect();
+            for method in [
+                UmiDedup::OneMmAll,
+                UmiDedup::OneMmDirectional,
+                UmiDedup::OneMmDirectionalUmiTools,
+                UmiDedup::OneMmCr,
+            ] {
+                let time = |f: &dyn Fn(&HashMap<u64, u32>) -> u64| {
+                    let start = Instant::now();
+                    for i in 0..calls {
+                        black_box(f(&sets[i % sets.len()]));
+                    }
+                    start.elapsed().as_nanos() / calls as u128
+                };
+                let (mut old, mut new) = (u128::MAX, u128::MAX);
+                for _ in 0..rounds {
+                    old = old.min(time(&|s| all_pairs::dedup_count(s, method, 12)));
+                    new = new.min(time(&|s| dedup_count(s, method, 12)));
+                }
+                println!("{n}, {method:?}, {old}, {new}, {calls}");
+            }
+        }
     }
 
     #[test]
