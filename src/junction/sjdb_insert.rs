@@ -527,21 +527,21 @@ pub fn build_gsj(
     let mut gsj = vec![GSJ_SPACING; junctions.len() * sjdb_length];
 
     for (i, pj) in junctions.iter().enumerate() {
-        let donor_start = pj
-            .original_start()
-            .checked_sub(overhang as u64)
-            .ok_or_else(|| sjdb_bounds_err(pj, overhang, "donor underflows"))?;
-        let acceptor_start = pj.original_end() + 1;
-
-        let d0 = donor_start as usize;
-        let a0 = acceptor_start as usize;
-        if d0 + overhang > forward.len() || a0 + overhang > forward.len() {
-            return Err(sjdb_bounds_err(pj, overhang, "flank overruns genome"));
+        let start = pj.original_start() as usize;
+        let a0 = pj.original_end() as usize + 1;
+        if a0 > forward.len() {
+            return Err(sjdb_bounds_err(pj, overhang, "intron overruns genome"));
         }
 
+        // A flank running past either end of the genome keeps its spacer bytes
+        // for the missing part, what STAR reads from the padding around G.
         let base = i * sjdb_length;
-        gsj[base..base + overhang].copy_from_slice(&forward[d0..d0 + overhang]);
-        gsj[base + overhang..base + 2 * overhang].copy_from_slice(&forward[a0..a0 + overhang]);
+        let donor_len = overhang.min(start);
+        gsj[base + overhang - donor_len..base + overhang]
+            .copy_from_slice(&forward[start - donor_len..start]);
+        let acceptor_len = overhang.min(forward.len() - a0);
+        gsj[base + overhang..base + overhang + acceptor_len]
+            .copy_from_slice(&forward[a0..a0 + acceptor_len]);
         // base + 2*overhang = trailing spacer, already initialized.
     }
 
@@ -961,20 +961,27 @@ mod tests {
     }
 
     #[test]
-    fn build_gsj_errors_when_flank_underflows() {
-        // Junction too close to the left edge → donor_start underflows.
-        let g = make_test_genome(vec![0u8; 300]);
-        let bad = pj(0, 3, 200, 1, 0, 1); // original_start=3; overhang 10 underflows
-        let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
-        assert!(format!("{err}").contains("underflows"));
+    fn build_gsj_pads_a_donor_flank_before_the_genome_start() {
+        let g = make_test_genome((0..300).map(|i| (i % 4) as u8).collect());
+        let near = pj(0, 3, 200, 1, 0, 1); // original_start=3, overhang 10
+        let gsj = build_gsj(&[near], &g, g.n_genome, 10).unwrap();
+        // Seven spacers, then bases 0..3, then the acceptor from original_end+1.
+        assert_eq!(&gsj[..10], &[5, 5, 5, 5, 5, 5, 5, 0, 1, 2]);
+        assert_eq!(gsj[10], (201 % 4) as u8);
     }
 
     #[test]
-    fn build_gsj_errors_when_flank_overruns_genome() {
-        // Acceptor overruns the right edge.
+    fn build_gsj_pads_an_acceptor_flank_past_the_genome_end() {
         let g = make_test_genome(vec![0u8; 300]);
-        // original_end = 295, overhang = 10 → acceptor region [296..306), exceeds n_genome=300.
-        let bad = pj(0, 100, 295, 1, 0, 1);
+        let near = pj(0, 50, 294, 1, 0, 1); // acceptor starts at 295: five real bases
+        let gsj = build_gsj(&[near], &g, g.n_genome, 10).unwrap();
+        assert_eq!(&gsj[10..20], &[0, 0, 0, 0, 0, 5, 5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn build_gsj_errors_when_the_intron_overruns_the_genome() {
+        let g = make_test_genome(vec![0u8; 300]);
+        let bad = pj(0, 50, 400, 1, 0, 1);
         let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
         assert!(format!("{err}").contains("overruns"));
     }

@@ -449,24 +449,34 @@ pub fn insert_junctions(
 
     let mut new_genome = real_genome;
     new_genome.append_sjdb(&gsj);
-    let mut new_sai = std::mem::replace(
-        &mut index.sa_index,
-        SaIndex {
-            nbases: 0,
-            genome_sa_index_start: Vec::new(),
-            data: PackedArray::new(1, 0),
-            word_length: 1,
-            gstrand_bit,
-            sparse_d: 1,
-        },
-    );
-    // A loaded SAindex is memory-mapped: take an owned copy to update.
-    new_sai.data = PackedArray::from_bytes(
-        new_sai.data.word_length(),
-        new_sai.data.len(),
-        new_sai.data.data().to_vec(),
-    );
-    update_sa_index(&mut new_sai, &inserts, &gsj2);
+    let new_sai = if dropped_old {
+        // `update_sa_index` only ever moves entries up. Removed suffixes move
+        // them down too, which it has no way to express, so build the table anew.
+        let mut sai = SaIndex::build(&new_genome, &new_sa, index.sa_index.nbases)?;
+        sai.sparse_d = index.sa_index.sparse_d;
+        sai
+    } else {
+        let mut new_sai = std::mem::replace(
+            &mut index.sa_index,
+            SaIndex {
+                nbases: 0,
+                genome_sa_index_start: Vec::new(),
+                data: PackedArray::new(1, 0),
+                word_length: 1,
+                gstrand_bit,
+                sparse_d: 1,
+            },
+        );
+        // A loaded SAindex is memory-mapped: take an owned copy to update.
+        new_sai.data = PackedArray::from_bytes(
+            new_sai.data.word_length(),
+            new_sai.data.len(),
+            new_sai.data.data().to_vec(),
+        );
+        update_sa_index(&mut new_sai, &inserts, &gsj2);
+
+        new_sai
+    };
 
     log::info!(
         "Inserted {} new junctions on the fly ({} total, {} SA entries)",

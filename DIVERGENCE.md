@@ -267,6 +267,18 @@ There are none at present. The four yeast PE reads once listed here now match ST
 
 ---
 
+### 3.5 `Genome` file: one byte of a flank past the genome end
+
+**What STAR does.** A junction's acceptor flank that runs past the end of the genome reads STAR's padding after `G`. With a last chromosome ending at the bin boundary minus 2, `--sjdbOverhang 100` and an acceptor 97 bases from the end, the flank's last three bases lie past the end, and STAR's `Genome` holds `5 5 0` for them.
+
+**What rustar-aligner does.** It writes spacers for the whole missing part: `5 5 5`.
+
+**Why.** The `0` is not explained by STAR's output, and its source was not read for this. The padding is spacers everywhere else, and a donor flank past the genome's start matches STAR byte for byte.
+
+**Impact.** Only a junction whose acceptor flank overruns the genome's end by at least three bases, which used to stop the run. That byte also moves `SA` and `SAindex` entries for the suffixes crossing it. A read would have to span the end of that flank to notice.
+
+**Source.** `src/junction/sjdb_insert.rs` (`build_gsj`), locked by `build_gsj_pads_an_acceptor_flank_past_the_genome_end`.
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.
