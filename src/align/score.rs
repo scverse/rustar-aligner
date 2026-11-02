@@ -248,23 +248,6 @@ impl AlignmentScorer {
         genome_pos: u64,
         genome: &Genome,
     ) -> (i32, GapType) {
-        self.score_gap_with_strand(genome_gap, read_gap, genome_pos, genome, false, 0)
-    }
-
-    /// Score a gap between consecutive seeds, with strand-aware motif detection.
-    ///
-    /// For reverse-strand reads, `genome_pos` is a raw SA position in the RC genome.
-    /// The donor position must be converted to forward genome coordinates for motif
-    /// detection: `forward_donor = n_genome - rc_donor - intron_len`.
-    pub fn score_gap_with_strand(
-        &self,
-        genome_gap: i64,
-        read_gap: i64,
-        genome_pos: u64,
-        genome: &Genome,
-        is_reverse: bool,
-        n_genome: u64,
-    ) -> (i32, GapType) {
         match (genome_gap, read_gap) {
             // Insertion: read advances but genome doesn't
             (0, rg) if rg > 0 => {
@@ -277,12 +260,7 @@ impl AlignmentScorer {
                 let len = gg as u32;
                 if len >= self.align_intron_min && len <= self.align_intron_max {
                     // Splice junction — detect motif on forward genome
-                    let donor = if is_reverse {
-                        n_genome - genome_pos - len as u64
-                    } else {
-                        genome_pos
-                    };
-                    let motif = self.detect_splice_motif(donor, len, genome);
+                    let motif = self.detect_splice_motif(genome_pos, len, genome);
                     let score = self.score_splice_junction(motif);
                     (
                         score,
@@ -305,12 +283,7 @@ impl AlignmentScorer {
                     1.. => {
                         let del_len = excess as u32;
                         if del_len >= self.align_intron_min && del_len <= self.align_intron_max {
-                            let rc_donor = genome_pos + rg as u64;
-                            let donor = if is_reverse {
-                                n_genome - rc_donor - del_len as u64
-                            } else {
-                                rc_donor
-                            };
+                            let donor = genome_pos + rg as u64;
                             let motif = self.detect_splice_motif(donor, del_len, genome);
                             let score = self.score_splice_junction(motif);
                             (
@@ -344,8 +317,7 @@ impl AlignmentScorer {
     /// Memoized wrapper around [`AlignmentScorer::find_best_junction_position`].
     ///
     /// The scan is a pure function of its arguments. Within one window's stitch
-    /// recursion, `read_seq`, the genome, `is_reverse` and `n_genome` are fixed,
-    /// so the six remaining coordinates identify a scan completely.
+    /// recursion, `read_seq` and the genome are fixed, so the six remaining coordinates identify a scan completely.
     /// `stitchWindowAligns`' include/exclude recursion reaches the same
     /// (exon A end, seed B) pair through many different branch paths, so without
     /// a memo the identical scan is repeated thousands of times per window.
@@ -360,8 +332,6 @@ impl AlignmentScorer {
         r_gap: i64,
         g_gap: i64,
         genome: &Genome,
-        is_reverse: bool,
-        n_genome: u64,
         prev_exon_len: usize,
         next_seed_len: usize,
     ) -> (i32, SpliceMotif, i32, u32, u32) {
@@ -383,8 +353,6 @@ impl AlignmentScorer {
             r_gap,
             g_gap,
             genome,
-            is_reverse,
-            n_genome,
             prev_exon_len,
             next_seed_len,
         );
@@ -399,7 +367,8 @@ impl AlignmentScorer {
     /// score how well the read matches the upstream vs downstream genome, plus
     /// the splice motif quality. Return the shift that maximizes the combined score.
     ///
-    /// All coordinates are in SA coordinate space (forward for fwd reads, RC genome for rev).
+    /// Coordinates are forward-genome: `stitch_seeds_core` reverse-complements
+    /// the read of a reverse-strand window before stitching.
     ///
     /// Returns: (jr_shift, best_motif, best_motif_score)
     /// - jr_shift: how many bases to shift the junction boundary (positive = rightward)
@@ -414,8 +383,6 @@ impl AlignmentScorer {
         r_gap: i64,     // read gap between seeds
         g_gap: i64,     // genome gap between seeds
         genome: &Genome,
-        is_reverse: bool,
-        n_genome: u64,
         prev_exon_len: usize,
         next_seed_len: usize, // length of the B seed (for scan range)
     ) -> (i32, SpliceMotif, i32, u32, u32) {
@@ -433,7 +400,6 @@ impl AlignmentScorer {
         // With inclusive coords: gBstart1 = g_a_end_inc + del
         let g_b_start1 = g_a_end_inc as i64 + del;
 
-        let genome_offset: u64 = if is_reverse { n_genome } else { 0 };
         // Resolve the genome storage once: the three scans below read a base per
         // iteration, and `Genome::get_base` re-checks the `GenomeSeq` variant on
         // every one of them.
@@ -457,8 +423,8 @@ impl AlignmentScorer {
                 break;
             }
 
-            let g_up = seq.base((g_up_pos as u64 + genome_offset) as usize);
-            let g_dn = seq.base((g_dn_pos as u64 + genome_offset) as usize);
+            let g_up = seq.base(g_up_pos as usize);
+            let g_dn = seq.base(g_dn_pos as usize);
 
             if g_up >= 4 || g_dn >= 4 {
                 break;
@@ -491,9 +457,6 @@ impl AlignmentScorer {
             scan_end: r_gap as i32 + next_seed_len as i32,
             del,
             motif_in_range,
-            is_reverse,
-            n_genome,
-            genome_offset,
             seq,
         };
         let (mut best_jr, mut best_motif, mut best_motif_score) = self
@@ -510,8 +473,8 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
-            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            let gl = seq.base(left_pos as usize);
+            let gr = seq.base(right_pos as usize);
             if gl < 4 && gl == gr {
                 jj_l += 1;
             } else {
@@ -530,8 +493,8 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
-            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            let gl = seq.base(left_pos as usize);
+            let gr = seq.base(right_pos as usize);
             if gl < 4 && gl == gr {
                 jj_r += 1;
             } else {
@@ -544,33 +507,17 @@ impl AlignmentScorer {
 
         // Non-canonical or deletion: flush to be deterministic in repeat regions.
         // STAR operates in forward-genome space, so flush-left = leftmost in forward coords.
-        // Our function operates in SA space (RC genome for reverse reads), so:
-        //   - Forward reads: flush LEFT in SA space = LEFT in forward space ✓
-        //   - Reverse reads: flush RIGHT in SA space = LEFT in forward space ✓
         if best_motif == SpliceMotif::NonCanonical || del < self.align_intron_min as i64 {
-            if is_reverse {
-                // Reverse strand: flush RIGHT in RC space = LEFT in forward space
-                best_jr += jj_r;
-                jj_l += jj_r;
-                jj_r = 0;
-            } else {
-                // Forward strand: flush LEFT (STAR default)
-                best_jr -= jj_l;
-                jj_r += jj_l;
-                jj_l = 0;
-            }
+            best_jr -= jj_l;
+            jj_r += jj_l;
+            jj_l = 0;
             // STAR: `if (int(EX_L)+jR<1) return -1000005;` The caller rejects the
             // stitch when the flush leaves no base in the exon that shrinks
             // (clamping here would build a junction STAR never considers).
             // Re-check motif at flushed position
             if del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64 {
                 let donor_sa = (g_a_end_inc as i64 + best_jr as i64 + 1) as u64;
-                let donor_fwd = if is_reverse {
-                    n_genome - donor_sa - del as u64
-                } else {
-                    donor_sa
-                };
-                best_motif = self.detect_splice_motif(donor_fwd, del as u32, genome);
+                best_motif = self.detect_splice_motif(donor_sa, del as u32, genome);
                 best_motif_score = self.score_splice_junction(best_motif);
             }
         }
@@ -621,10 +568,8 @@ impl AlignmentScorer {
         }
         let mut up = [OUT_OF_RANGE; SCAN_BUF];
         let mut dn = [OUT_OF_RANGE; SCAN_BUF];
-        scan.seq
-            .bases_into(up0 as usize + scan.genome_offset as usize, &mut up[..n]);
-        scan.seq
-            .bases_into(dn0 as usize + scan.genome_offset as usize, &mut dn[..n]);
+        scan.seq.bases_into(up0 as usize, &mut up[..n]);
+        scan.seq.bases_into(dn0 as usize, &mut dn[..n]);
         // score1 change at each position: +1 where the read matches upstream
         // only, -1 where it matches downstream only, 0 otherwise or where
         // either genome base is not A/C/G/T (the sentinel included).
@@ -637,22 +582,12 @@ impl AlignmentScorer {
             delta[k] = plus as i8 - minus as i8;
         }
 
-        // Donor and acceptor runs, forward strand. Forward reads move the
-        // donor right one base a position; reverse reads move it left, so
-        // their run starts at the last position's donor and is read backwards.
+        // Donor and acceptor runs: the donor moves right one base a position.
         let mut don = [OUT_OF_RANGE; SCAN_BUF];
         let mut acc = [OUT_OF_RANGE; SCAN_BUF];
         let del = scan.del as u64;
         if scan.motif_in_range {
-            let lo = if scan.is_reverse {
-                let last = donor_sa0 as u64 + (n as u64 - 1) + del;
-                if last > scan.n_genome {
-                    return None;
-                }
-                scan.n_genome - last
-            } else {
-                donor_sa0 as u64
-            };
+            let lo = donor_sa0 as u64;
             scan.seq.bases_into(lo as usize, &mut don[..=n]);
             scan.seq.bases_into((lo + del - 2) as usize, &mut acc[..=n]);
         }
@@ -667,13 +602,12 @@ impl AlignmentScorer {
             let jr1 = scan.jr_start + k as i32;
             score1 += i32::from(step);
             if scan.motif_in_range {
-                let i = if scan.is_reverse { n - 1 - k } else { k };
                 let motif = MotifWindow {
                     donor: 0,
-                    d1: don[i],
-                    d2: don[i + 1],
-                    a1: acc[i],
-                    a2: acc[i + 1],
+                    d1: don[k],
+                    d2: don[k + 1],
+                    a1: acc[k],
+                    a2: acc[k + 1],
                 }
                 .motif();
                 let motif_score = self.score_splice_junction(motif);
@@ -684,7 +618,7 @@ impl AlignmentScorer {
                     best_motif = motif;
                     best_motif_score = motif_score;
                 }
-            } else if score1 > max_score2 || (scan.is_reverse && score1 == max_score2) {
+            } else if score1 > max_score2 {
                 max_score2 = score1;
                 best_jr = jr1;
                 best_motif = SpliceMotif::NonCanonical;
@@ -693,8 +627,7 @@ impl AlignmentScorer {
             let bound = score1
                 + (scan.scan_end - 1 - jr1)
                 + if scan.motif_in_range { max_motif } else { 0 };
-            let tie_wins = !scan.motif_in_range && scan.is_reverse;
-            if bound < max_score2 || (bound == max_score2 && !tie_wins) {
+            if bound <= max_score2 {
                 break;
             }
         }
@@ -727,12 +660,8 @@ impl AlignmentScorer {
                 let g_dn_pos = scan.g_b_start1 + jr1 as i64;
 
                 if g_up_pos >= 0 && g_dn_pos >= 0 {
-                    let gu = scan
-                        .seq
-                        .base((g_up_pos as u64 + scan.genome_offset) as usize);
-                    let gd = scan
-                        .seq
-                        .base((g_dn_pos as u64 + scan.genome_offset) as usize);
+                    let gu = scan.seq.base(g_up_pos as usize);
+                    let gd = scan.seq.base(g_dn_pos as usize);
 
                     if gu < 4 && gd < 4 {
                         if read_base == gu && read_base != gd {
@@ -748,18 +677,12 @@ impl AlignmentScorer {
             if scan.motif_in_range {
                 // Donor position in SA space: one past the last donor-exon base
                 let donor_sa = (scan.g_a_end_inc + jr1 as i64 + 1) as u64;
-                // Convert to forward genome coordinates for motif detection
-                let donor_fwd = if scan.is_reverse {
-                    scan.n_genome - donor_sa - scan.del as u64
-                } else {
-                    donor_sa
-                };
                 let w = match window.as_mut() {
                     Some(w) => {
-                        w.slide_to(donor_fwd, scan.del as u64, scan.seq);
+                        w.slide_to(donor_sa, scan.del as u64, scan.seq);
                         &*w
                     }
-                    None => window.insert(MotifWindow::at(donor_fwd, scan.del as u64, scan.seq)),
+                    None => window.insert(MotifWindow::at(donor_sa, scan.del as u64, scan.seq)),
                 };
                 let motif = w.motif();
                 let motif_score = self.score_splice_junction(motif);
@@ -774,8 +697,7 @@ impl AlignmentScorer {
             } else {
                 // Deletion (Del < alignIntronMin) or out-of-range gap — no motif,
                 // pure positional score. STAR: jCan1=-1, jPen1=0, Score2=Score1.
-                // For reverse strand, rightmost-in-RC wins ties (= leftmost in forward).
-                if score1 > max_score2 || (scan.is_reverse && score1 == max_score2) {
+                if score1 > max_score2 {
                     max_score2 = score1;
                     best_jr = jr1;
                     best_motif = SpliceMotif::NonCanonical;
@@ -785,12 +707,11 @@ impl AlignmentScorer {
 
             // `score1` rises by at most 1 a position, so once even that cannot
             // lift a later position past the best one the rest of the scan is
-            // settled. Ties win only in the reverse-strand deletion case.
+            // settled: a tie does not move the best position.
             let scan_end = scan.scan_end;
             let bound =
                 score1 + (scan_end - 1 - jr1) + if scan.motif_in_range { max_motif } else { 0 };
-            let tie_wins = !scan.motif_in_range && scan.is_reverse;
-            if bound < max_score2 || (bound == max_score2 && !tie_wins) {
+            if bound <= max_score2 {
                 break;
             }
 
@@ -854,9 +775,6 @@ struct ScanArgs<'a> {
     scan_end: i32,
     del: i64,
     motif_in_range: bool,
-    is_reverse: bool,
-    n_genome: u64,
-    genome_offset: u64,
     seq: SeqView<'a>,
 }
 
@@ -954,9 +872,8 @@ const fn build_motif_table() -> [SpliceMotif; 256] {
 
 /// Key for [`JunctionScanCache`]: the arguments of
 /// `find_best_junction_position` that vary within a single window's stitch
-/// recursion. Everything else (`read_seq`, the genome, `is_reverse`,
-/// `n_genome`) is loop-invariant there, so these six fields identify a scan
-/// exactly.
+/// recursion. Everything else (`read_seq`, the genome) is loop-invariant
+/// there, so these six fields identify a scan exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct JunctionScanKey {
     r_a_end: usize,
@@ -1172,7 +1089,6 @@ mod tests {
         let scorer = AlignmentScorer::from_params_minimal();
         let mut compared = 0;
         for _ in 0..20_000 {
-            let is_reverse = next(2) == 1;
             let read: Vec<u8> = (0..150)
                 .map(|_| if next(40) == 0 { 4 } else { next(4) as u8 })
                 .collect();
@@ -1192,9 +1108,6 @@ mod tests {
                 del,
                 motif_in_range: del >= scorer.align_intron_min as i64
                     && del <= scorer.align_intron_max as i64,
-                is_reverse,
-                n_genome: genome.n_genome,
-                genome_offset: if is_reverse { genome.n_genome } else { 0 },
                 seq,
             };
             let a = ScanArgs {
@@ -1911,15 +1824,11 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3, 0, 0, 0, 1]; // ACGTAACG...
 
         let (jr_shift, motif, _motif_score, _, _) = scorer.find_best_junction_position(
-            &read_seq,
-            5,  // r_a_end (exclusive)
+            &read_seq, 5,  // r_a_end (exclusive)
             5,  // g_a_end (exclusive)
             1,  // read_gap
             25, // genome_gap
-            &genome,
-            false, // forward strand
-            genome.n_genome,
-            5, // prev_exon_len
+            &genome, 5, // prev_exon_len
             3, // next_seed_len
         );
 
@@ -1955,16 +1864,11 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3, 0, 0, 1]; // ACGTAAC
 
         let (jr_shift, motif, _motif_score, _, _) = scorer.find_best_junction_position(
-            &read_seq,
-            5,  // r_a_end (exclusive)
+            &read_seq, 5,  // r_a_end (exclusive)
             5,  // g_a_end (exclusive)
             0,  // read_gap = 0 (pure splice)
             24, // genome_gap = intron length
-            &genome,
-            false,
-            genome.n_genome,
-            5,
-            2, // next_seed_len
+            &genome, 5, 2, // next_seed_len
         );
 
         assert_eq!(motif, SpliceMotif::GtAg);
@@ -2006,16 +1910,11 @@ mod tests {
         let read_seq = vec![0, 1, 2, 3, 1, 1, 1]; // the gap base
 
         let (jr_shift, motif, _, _, _) = scorer.find_best_junction_position(
-            &read_seq,
-            5,  // r_a_end
+            &read_seq, 5,  // r_a_end
             5,  // g_a_end
             0,  // read_gap
             24, // genome_gap
-            &genome,
-            false,
-            genome.n_genome,
-            5,
-            2, // next_seed_len
+            &genome, 5, 2, // next_seed_len
         );
 
         // Non-canonical junction should be flushed left

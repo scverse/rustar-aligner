@@ -97,12 +97,6 @@ pub fn parse_gtf_configured(
     Ok(exons)
 }
 
-/// Parse GTF file and extract exon features (default: feature `"exon"`, no chr prefix).
-#[allow(dead_code)]
-pub fn parse_gtf(path: &Path) -> Result<Vec<GtfRecord>, Error> {
-    parse_gtf_configured(path, "exon", "")
-}
-
 /// Parse a single GTF line
 fn parse_gtf_line(line: &str) -> Result<GtfRecord, Error> {
     let fields: Vec<&str> = line.split('\t').collect();
@@ -264,15 +258,6 @@ pub fn extract_junctions_configured(
     Ok(junctions)
 }
 
-/// Extract junctions grouping by `"transcript_id"` (default, backward-compatible wrapper).
-#[allow(dead_code)]
-pub fn extract_junctions_from_exons(
-    exons: Vec<GtfRecord>,
-    genome: &Genome,
-) -> Result<Vec<(usize, u64, u64, u8)>, Error> {
-    extract_junctions_configured(exons, genome, "transcript_id")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,8 +292,16 @@ mod tests {
         std::fs::write(&gz, bytes).unwrap();
 
         let key = |r: &GtfRecord| (r.seqname.clone(), r.start, r.end, r.strand);
-        let want: Vec<_> = parse_gtf(&plain).unwrap().iter().map(key).collect();
-        let got: Vec<_> = parse_gtf(&gz).unwrap().iter().map(key).collect();
+        let want: Vec<_> = parse_gtf_configured(&plain, "exon", "")
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect();
+        let got: Vec<_> = parse_gtf_configured(&gz, "exon", "")
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect();
         assert_eq!(want.len(), 2);
         assert_eq!(got, want);
         assert_eq!(read_annotation_to_string(&gz).unwrap(), gtf);
@@ -361,7 +354,7 @@ mod tests {
         )
         .unwrap();
 
-        let exons = parse_gtf(file.path()).unwrap();
+        let exons = parse_gtf_configured(file.path(), "exon", "").unwrap();
         assert_eq!(exons.len(), 1);
     }
 
@@ -375,7 +368,7 @@ mod tests {
         )
         .unwrap();
 
-        let exons = parse_gtf(file.path()).unwrap();
+        let exons = parse_gtf_configured(file.path(), "exon", "").unwrap();
         assert_eq!(exons.len(), 1); // Only exon, not gene
         assert_eq!(exons[0].feature, "exon");
     }
@@ -424,7 +417,7 @@ mod tests {
             },
         ];
 
-        let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
+        let junctions = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
 
         assert_eq!(junctions.len(), 1);
         let (chr_idx, start, end, strand) = junctions[0];
@@ -505,7 +498,7 @@ mod tests {
             },
         ];
 
-        let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
+        let junctions = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
 
         assert_eq!(junctions.len(), 1);
         assert_eq!(junctions[0], (0, 200, 298, 1));
@@ -539,7 +532,7 @@ mod tests {
             .collect(),
         }];
 
-        let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
+        let junctions = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
 
         assert_eq!(junctions.len(), 0); // No junctions
     }
@@ -587,7 +580,7 @@ mod tests {
             },
         ];
 
-        let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
+        let junctions = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
 
         assert_eq!(junctions.len(), 0); // Skipped due to unknown chr
     }
@@ -636,7 +629,7 @@ mod tests {
             },
         ];
 
-        let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
+        let junctions = extract_junctions_configured(exons, &genome, "transcript_id").unwrap();
 
         assert_eq!(junctions.len(), 1);
         let (_chr_idx, start, end, _strand) = junctions[0];

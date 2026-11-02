@@ -24,7 +24,7 @@ use noodles::sam::header::record::value::{
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufWriter, Write as _};
+use std::io::BufWriter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -133,101 +133,27 @@ pub(crate) fn insert_mate_cigar_tags(rec1: &mut RecordBuf, rec2: &mut RecordBuf)
 }
 
 /// SAM file writer
-pub struct SamWriter {
-    writer: sam::io::Writer<BufWriter<File>>,
+pub struct SamWriter<W: std::io::Write = BufWriter<File>> {
+    writer: sam::io::Writer<W>,
     header: sam::Header,
 }
 
-impl SamWriter {
-    /// Create a new SAM writer with header from genome index
+impl<W: std::io::Write> SamWriter<W> {
+    /// Create a SAM writer on `out`, with header from genome index
     ///
     /// # Arguments
-    /// * `output_path` - Path to output SAM file
+    /// * `out` - Output (a buffered file or stdout)
     /// * `genome` - Genome index with chromosome information
     /// * `params` - Parameters (for @PG header)
-    pub fn create(output_path: &Path, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
-        let file = File::create(output_path)?;
-        let buf_writer = BufWriter::new(file);
-
+    pub fn with_output(out: W, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
         let header = build_sam_header(genome, params)?;
-        let mut writer = sam::io::Writer::new(buf_writer);
+        let mut writer = sam::io::Writer::new(out);
 
         writer
             .get_mut()
             .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
 
         Ok(Self { writer, header })
-    }
-
-    /// Write alignment record(s) for a read
-    ///
-    /// # Arguments
-    /// * `read_name` - Read identifier
-    /// * `read_seq` - Read sequence (encoded)
-    /// * `read_qual` - Quality scores
-    /// * `transcripts` - Alignment transcripts (1 or more for multi-mappers)
-    /// * `genome` - Genome index
-    /// * `params` - Parameters
-    #[allow(clippy::too_many_arguments)]
-    pub fn write_alignment(
-        &mut self,
-        read_name: &str,
-        read_seq: &[u8],
-        read_qual: &[u8],
-        transcripts: &[Transcript],
-        genome: &Genome,
-        params: &Parameters,
-        n_for_mapq: usize,
-    ) -> Result<(), Error> {
-        if transcripts.is_empty() {
-            return Ok(());
-        }
-
-        let n_alignments = transcripts.len();
-        let max_output = if params.out_sam_mult_nmax < 0 {
-            n_alignments
-        } else {
-            (params.out_sam_mult_nmax as usize).min(n_alignments)
-        };
-        let effective_n = n_alignments.max(n_for_mapq);
-        let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
-        let attrs = params.out_sam_attributes;
-        let rg_id_owned = params.primary_rg_id()?;
-        let rg_id = rg_id_owned.as_deref();
-
-        let best_score = transcripts
-            .iter()
-            .map(|t| t.score)
-            .max()
-            .unwrap_or(i32::MIN);
-        // STAR writes the alignments in its output order (`output_rank`); the primary
-        // (`transcripts[0]`) is not necessarily the first.
-        for (hit_index, (is_primary, transcript)) in output_order(transcripts, |t| t.output_rank)
-            .take(max_output)
-            .enumerate()
-        {
-            let mut record = transcript_to_record(
-                transcript,
-                read_name,
-                read_seq,
-                read_qual,
-                genome,
-                mapq,
-                max_output,    // NH = number of reported alignments
-                hit_index + 1, // 1-based
-                params.out_sam_attr_ih_start,
-                attrs,
-            )?;
-            set_secondary(&mut record, !is_primary);
-            maybe_insert_rg_tag(&mut record, rg_id);
-            order_record_tags(&mut record, &attrs);
-            apply_sam_flag_or_and(&mut record, params);
-            apply_primary_flag(&mut record, transcript.score, best_score, params);
-
-            self.writer.write_alignment_record(&self.header, &record)?;
-        }
-
-        Ok(())
     }
 
     /// Write batch of buffered records (for parallel processing)
@@ -261,6 +187,13 @@ impl SamWriter {
             self.writer.write_alignment_record(&self.header, record)?;
         }
         Ok(())
+    }
+}
+
+impl SamWriter {
+    /// Create a new SAM file writer.
+    pub fn create(output_path: &Path, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
+        Self::with_output(BufWriter::new(File::create(output_path)?), genome, params)
     }
 
     /// Build unmapped record (without writing)
@@ -930,30 +863,6 @@ impl SamWriter {
         records.push(rec2);
 
         Ok(records)
-    }
-}
-
-/// SAM writer that streams to stdout.
-pub struct SamStdoutWriter {
-    writer: sam::io::Writer<BufWriter<std::io::Stdout>>,
-    header: sam::Header,
-}
-
-impl SamStdoutWriter {
-    pub fn create(genome: &Genome, params: &Parameters) -> Result<Self, Error> {
-        let header = build_sam_header(genome, params)?;
-        let mut writer = sam::io::Writer::new(BufWriter::new(std::io::stdout()));
-        writer
-            .get_mut()
-            .write_all(&render_header_text(&header, params, HeaderKind::Main)?)?;
-        Ok(Self { writer, header })
-    }
-
-    pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        for record in batch {
-            self.writer.write_alignment_record(&self.header, record)?;
-        }
-        Ok(())
     }
 }
 
@@ -2304,8 +2213,6 @@ mod tests {
 
     #[test]
     fn test_sam_output_includes_rg_header_and_tag() {
-        use crate::align::transcript::Exon;
-        use cigar::op::{Kind, Op};
         use std::io::Read;
 
         let genome = make_test_genome();
@@ -2321,40 +2228,16 @@ mod tests {
         let tmpfile = NamedTempFile::new().unwrap();
         let mut writer = SamWriter::create(tmpfile.path(), &genome, &params).unwrap();
 
-        let transcript = Transcript {
-            output_rank: 0,
-            chr_idx: 0,
-            genome_start: 0,
-            genome_end: 4,
-            is_reverse: false,
-            exons: vec![Exon {
-                genome_start: 0,
-                genome_end: 4,
-                read_start: 0,
-                read_end: 4,
-                i_frag: 0,
-            }],
-            cigar: vec![Op::new(Kind::Match, 4)],
-            score: 100,
-            n_mismatch: 0,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            junction_strand: vec![],
-        };
-
-        writer
-            .write_alignment(
-                "read1",
-                &[0, 1, 2, 3],
-                &[30, 30, 30, 30],
-                &[transcript],
-                &genome,
-                &params,
-                1,
-            )
-            .unwrap();
+        let record = SamWriter::build_unmapped_record(
+            "read1",
+            &[0, 1, 2, 3],
+            &[30, 30, 30, 30],
+            &params,
+            UnmappedReason::Other,
+            BestTr::default(),
+        )
+        .unwrap();
+        writer.write_batch(&[record]).unwrap();
         drop(writer);
 
         let mut contents = String::new();

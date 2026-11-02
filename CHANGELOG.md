@@ -48,6 +48,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- Dead code removed: the per-seed pre-extension scoring block in the stitcher,
+  which ran for every window and whose result was discarded; the reverse-strand
+  branches of the stitcher and junction scan, unreachable since windows are
+  stitched in forward coordinates; and `BufferedBamRecords`,
+  `SamWriter::write_alignment`, `Seed::find_paired_seeds`,
+  `Seed::get_genome_positions`, `combined_transcript_for_projection`,
+  `parse_gtf`, `extract_junctions_from_exons`,
+  `AlignmentScorer::score_gap_with_strand`. **API removal.** The stdout writers
+  are now the file writers on another output (`SamWriter<W>`, `BamWriter<W>`,
+  `SortedBamWriter::create_stdout`), so `--outStd SAM` gets the file writer's
+  `[SAM-MISMATCH]` check. Output is unchanged.
+
 - Third-party notices completed. `LICENSES/` gains the licences of code
   ported from DegNorm (MIT) and David Elworthy's `sgt.h` via STAR (BSD
   2-clause), and of libc++ (Apache 2.0 with LLVM Exceptions), whose random

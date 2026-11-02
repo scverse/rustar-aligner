@@ -43,10 +43,6 @@ pub struct PackedArray {
     /// Number of bits per element
     word_length: u32,
 
-    /// Complement bits (64 - word_length) — kept for STAR compatibility
-    #[allow(dead_code)]
-    word_comp_length: u32,
-
     /// Mask for extracting an element (word_length bits set)
     bit_rec_mask: u64,
 
@@ -66,7 +62,6 @@ impl PackedArray {
     pub fn new(word_length: u32, length: usize) -> Self {
         assert!(word_length > 0 && word_length <= 64);
 
-        let word_comp_length = 64 - word_length;
         let bit_rec_mask = if word_length == 64 {
             u64::MAX
         } else {
@@ -84,7 +79,6 @@ impl PackedArray {
 
         Self {
             word_length,
-            word_comp_length,
             bit_rec_mask,
             length,
             data,
@@ -245,7 +239,6 @@ impl PackedArray {
     fn from_store(word_length: u32, length: usize, data: PackedBytes) -> Self {
         assert!(word_length > 0 && word_length <= 64);
 
-        let word_comp_length = 64 - word_length;
         let bit_rec_mask = if word_length == 64 {
             u64::MAX
         } else {
@@ -254,7 +247,6 @@ impl PackedArray {
 
         Self {
             word_length,
-            word_comp_length,
             bit_rec_mask,
             length,
             data,
