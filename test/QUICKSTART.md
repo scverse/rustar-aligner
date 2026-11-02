@@ -279,7 +279,6 @@ python3 --version  # Should be 3.8+
 
 - **Full documentation:** `README.md`
 - **STAR source reference:** `STAR_REFERENCE.md`
-- **Implementation details:** `IMPLEMENTATION_SUMMARY.md`
 
 ---
 

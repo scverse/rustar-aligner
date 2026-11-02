@@ -1,6 +1,6 @@
 # rustar-aligner Implementation Roadmap
 
-Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. Detailed notes for later phases are in `docs-old/` (the published Astro Starlight docs site lives in `docs/`).
+Tracks implementation progress across sessions. Each phase lists its deliverables, files touched, and completion status. The per-phase working notes that used to live in `docs-old/` were removed as stale (they are in git history); the published Astro Starlight docs site lives in `docs/`.
 
 ## Release plan
 
@@ -64,11 +64,11 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 | 10 | BAM Output | ✅ | 136 | BGZF streaming, `--outSAMtype BAM Unsorted` |
 | 11 | Two-Pass Mode | ✅ | 138 | Novel junction discovery, pass1→pass2 |
 | 12 | Chimeric Detection | ✅ | 170 | SE chimeric, Chimeric.out.junction |
-| [13](docs-old/phase13_accuracy.md) | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
-| [15](docs-old/phase15_sam_tags.md) | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
-| [16](docs-old/phase16_algorithm.md) | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
-| [17](docs-old/phase17_features.md) | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
-| [14](docs-old/phase14_starsolo.md) | STARsolo (single-cell) | ✅* | 516 | **Gene matrix byte-identical to STARsolo.** CB_UMI_Simple/Complex/SmartSeq; Gene/GeneFull/SJ/Velocyto features; CB correction, UMI dedup (1MM_All/CR/Directional), multi-mapper resolution, EmptyDrops_CR + CellRanger2.2 cell calling, Summary.csv, gzip. Native 3-way benchmark vs STARsolo/CellRanger |
+| 13 | Performance + Accuracy | ✅ | 205 | 94.5% pos, 97.8% CIGAR, 2.1% splice |
+| 15 | SAM Tags + PE Fix | ✅ | 235 | NH/HI/AS/NM/nM/XS/jM/jI/MD, PE fix |
+| 16 | Algorithm Parity | ✅* | 268 | SE: **8613/8926 (0 STAR-only, 99.815% tie-adj)**, 2.2% splice; PE: **8390/8390 exact**, **99.883% tie-adj PE faithfulness**, 0 MAPQ inflate/deflate, 0 NH diffs (Phase G2) |
+| 17 | Features + Polish | ✅* | 396 | Log.final.out, GeneCounts, TranscriptomeSAM, SJDB insertion, --outSAMattrRGline, --runRNGseed, combined-read PE seeding (Phase E2), scoreSeedBest (17.A), sorted BAM (17.2), outReadsUnmapped (17.4), outStd (17.6), PE chimeric (17.3), WithinBAM (17.11), GTF tag params (17.7), outBAMcompression+limitBAMsortRAM (17.9), chimeric Tier 1b soft-clip re-seed (12.2), chimeric Tier 3 residual re-seed (17.10) |
+| 14 | STARsolo (single-cell) | ✅* | 516 | **Gene matrix byte-identical to STARsolo.** CB_UMI_Simple/Complex/SmartSeq; Gene/GeneFull/SJ/Velocyto features; CB correction, UMI dedup (1MM_All/CR/Directional), multi-mapper resolution, EmptyDrops_CR + CellRanger2.2 cell calling, Summary.csv, gzip. Native 3-way benchmark vs STARsolo/CellRanger |
 
 *Partially complete — see linked docs for sub-phase status.
 
@@ -179,7 +179,6 @@ Paired-end (Phase 8) builds on threaded infrastructure. GTF/junctions (Phase 7) 
 
 ## Phase 13: Performance + Accuracy ✅
 
-See [docs-old/phase13_accuracy.md](docs-old/phase13_accuracy.md) for detailed sub-phase notes (13.1-13.14).
 
 **Summary**: From 42% to 94.5% position agreement through SA position encoding fix, CIGAR reversal, splice motif fix, extendAlign, bidirectional seeding, BySJout filtering, and scoring fixes.
 
@@ -187,7 +186,6 @@ See [docs-old/phase13_accuracy.md](docs-old/phase13_accuracy.md) for detailed su
 
 ## Phase 15: SAM Tags + Output Correctness ✅
 
-See [docs-old/phase15_sam_tags.md](docs-old/phase15_sam_tags.md) for detailed sub-phase notes (15.1-15.6 + PE fix).
 
 **Summary**: NH/HI/AS/NM/nM/XS/jM/jI/MD tags, SECONDARY flag, outSAMmultNmax, outSAMattributes enforcement, PE FLAG/PNEXT fixes, independent mate alignment.
 
@@ -195,7 +193,6 @@ See [docs-old/phase15_sam_tags.md](docs-old/phase15_sam_tags.md) for detailed su
 
 ## Phase 16: Algorithm Parity ✅ (partial)
 
-See [docs-old/phase16_algorithm.md](docs-old/phase16_algorithm.md) for sub-phase notes (16.1-16.13), [docs-old/phase16_14_nstart_fix.md](docs-old/phase16_14_nstart_fix.md) for the Nstart fix.
 
 **Summary**: Bin-based windowing, pre-DP seed extension, MMP SA range narrowing, multi-transcript DP, recursive combinatorial stitcher, STAR-faithful scoring (scoreStitchSJshift removed), sparse bidirectional seed search with Nstart +1 fix, WALrec persistent threshold, post-jR shared base scoring, hierarchical SAindex lookup, nWA reset + overlap detection, coverage filter removal, Lread-1 filter fix, too-many-loci filter, mate rescue, SA range narrowing fix (find_mult_range + max_mappable_length), reverse-strand stitcher coordinate fix (RC read + forward genome coords), PE joint DP stitching via combined-read path, STAR-faithful PE architecture (no cross-product), combined-read score threshold fix (pre-split check prevents double-counting), extendAlign EXTEND_ORDER fix (5' of read first; reverse-strand reads extend right before left) + float comparison fix.
 
@@ -295,7 +292,6 @@ Instrumented locations (all gated on read name match, no performance impact on n
 
 ## Phase 17: Features + Polish ✅ (partial)
 
-See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase table and 17.1 details.
 
 **Completed sub-phases:**
 - 17.1: Log.final.out (STAR-compatible, MultiQC-parseable)
@@ -326,7 +322,7 @@ See [docs-old/phase17_features.md](docs-old/phase17_features.md) for sub-phase t
 
 **Status**: A STARsolo-faithful single-cell pipeline, Gene count matrix **byte-identical to STARsolo's**, with GeneFull/SJ/Velocyto features, CB_UMI_Simple/Complex/SmartSeq chemistries, EmptyDrops_CR + CellRanger2.2 cell calling, multi-mapper resolution, `Summary.csv`, and the per-read STARsolo SAM tags. Validated in a native three-way benchmark against STARsolo and CellRanger (see below).
 
-Single-cell quantification layered around the existing aligner: the cDNA read aligns through the normal SE path; a paired **barcode read** (R1 = cell barcode + UMI) is parsed, corrected against a whitelist, assigned to a gene, UMI-deduplicated, and emitted as a sparse per-cell count matrix. Target: faithful port of STARsolo (all features). See [docs-old/phase14_starsolo.md](docs-old/phase14_starsolo.md) for the full design and sub-phase tracking.
+Single-cell quantification layered around the existing aligner: the cDNA read aligns through the normal SE path; a paired **barcode read** (R1 = cell barcode + UMI) is parsed, corrected against a whitelist, assigned to a gene, UMI-deduplicated, and emitted as a sparse per-cell count matrix. Target: faithful port of STARsolo (all features).
 
 | Sub-phase | Description | Status |
 |-----------|-------------|--------|
@@ -351,7 +347,7 @@ Single-cell quantification layered around the existing aligner: the cDNA read al
 
 **Phase 14.CR — CellRanger 4.x/5.x matching** (2026-06-12): implemented the STARsolo.md CellRanger-matching flag set faithfully from STAR source. `--soloUMIdedup 1MM_CR` (`umiArrayCorrect_CR`: each UMI corrected to its highest-count 1MM neighbor, non-transitive, count = distinct corrected). `--soloUMIfiltering MultiGeneUMI_CR` (keep the top-read-count gene of a multi-gene UMI) + `MultiGeneUMI`; `build_matrix` restructured to per-cell `umi → gene → readcount`. `--soloCBmatchWLtype 1MM_multi_Nbase_pseudocounts` adds a +1 pseudocount to the CB posterior prior. `--clipAdapterType CellRanger4` (TSO 5' clip + polyA 3' trim, conservative no-op on adapter-free reads). All validated in params. Differential harness `test/solo_cellranger_diff.py` runs the full CellRanger flag set on both rustar-aligner and real STAR and compares decoded `{(barcode, gene_id): count}` matrices; committed cargo test `test_starsolo_cellranger_style_matrix` asserts the matrix (incl. 1MM_CR collapse) always.
 
-**Three-way benchmark** (see [docs-old/phase14_benchmark.md](docs-old/phase14_benchmark.md)): CellRanger 10.0.0 vs STARsolo 2.7.10b vs rustar-aligner on 10M reads of a real 5′ mouse 10x dataset (GRCm39-2024-A), all x86_64 in Docker. rustar produces a correct matrix (4.22M UMIs, exonic Gene, ~4% above STARsolo's 4.07M; CellRanger's 4.84M includes introns). After a buffered-I/O fix (raw-matrix write 1306s → 3s; barcodes.tsv was unbuffered), rustar's count is 670s vs STARsolo 152s / CellRanger 356s; index build 2801s (faster than STAR's 3626s under emulation). Peak RSS 37GB (index-dominated). `build_matrix` Step 1 (per-cell processing) bounds matrix-build memory.
+**Three-way benchmark** (an early measurement; the current speed figures are in the README): CellRanger 10.0.0 vs STARsolo 2.7.10b vs rustar-aligner on 10M reads of a real 5′ mouse 10x dataset (GRCm39-2024-A), all x86_64 in Docker. rustar produces a correct matrix (4.22M UMIs, exonic Gene, ~4% above STARsolo's 4.07M; CellRanger's 4.84M includes introns). After a buffered-I/O fix (raw-matrix write 1306s → 3s; barcodes.tsv was unbuffered), rustar's count is 670s vs STARsolo 152s / CellRanger 356s; index build 2801s (faster than STAR's 3626s under emulation). Peak RSS 37GB (index-dominated). `build_matrix` Step 1 (per-cell processing) bounds matrix-build memory.
 
 **Live verification — PASS:** rustar-aligner's `Gene/raw` matrix is **byte-identical to real STARsolo's** for the CellRanger-style run, confirmed deterministically (3/3 runs). The reference STAR (2.7.10b) and a Linux build of rustar-aligner run in a consistent Linux container (`test/Dockerfile.solodiff` + `test/solo_diff_docker.sh`, via colima — no Docker Desktop). This was necessary because STAR 2.7.11b reads 0 input reads on Apple-Silicon macOS (a known STAR/macOS bug, `nextChar=-1`). 479 lib + 11 integration tests, 0 clippy warnings.
 

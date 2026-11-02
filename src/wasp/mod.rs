@@ -2,7 +2,7 @@
 //!
 //! Ported from STAR-rs `crates/star-align/src/star_wasp.rs`, which itself ports
 //! STAR's `ReadAlign_waspMap.cpp`, `Transcript::variationAdjust` and
-//! `Variation::loadVCF`. See `docs-old/dev/porting-from-star-rs.md`.
+//! `Variation::loadVCF`.
 //!
 //! A read overlapping heterozygous SNP(s) is re-mapped with every alternative
 //! allele combination; if all re-maps land on the identical locus the read passes

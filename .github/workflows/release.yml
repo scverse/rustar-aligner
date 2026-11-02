@@ -112,7 +112,7 @@ jobs:
           # true`): a fresh synthetic genome+reads fixture (scripts/../
           # src/bin/gen_pgo_fixture.rs) trains an instrumented build, which is
           # then rebuilt using that profile. ~10-20% faster alignment in
-          # practice (see docs-old perf notes), output-identical to a plain
+          # practice, output-identical to a plain
           # build. Restricted to Linux because these are the only matrix
           # entries that run NATIVELY on their own build runner — PGO needs to
           # execute the instrumented binary to collect a profile, which is not
