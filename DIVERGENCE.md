@@ -173,6 +173,18 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 ---
 
+### 1.9 The same transcript ID on two chromosomes
+
+**What STAR does.** `GTF_transcriptGeneSJ.cpp` sorts a transcript's exons by absolute position and joins neighbours, so an ID used on two chromosomes also yields one junction joining them. With `T` on `c1` (1000-1200, 2000-2200) and `c2` (1500-1700, 2500-2700), `sjdbList.out.tab` holds the real `c1 1201-1999` and `c2 1701-2499`, plus `c1 2201 263643`, which runs off the end of `c1`.
+
+**What rustar-aligner does.** It treats each chromosome's exons as their own chain: the two real junctions, without the third.
+
+**Why.** The third junction is an artefact of the sort, not annotation, and a junction crossing chromosomes cannot be aligned to.
+
+**Impact.** Only GTFs that reuse a transcript ID across chromosomes (the PAR genes of refGene-style files), and only by one junction per such ID. Coordinates elsewhere in the sjdb are unaffected.
+
+**Source.** `src/junction/gtf.rs` (`extract_junctions_configured`), locked by `same_transcript_id_on_two_chromosomes_is_two_chains`.
+
 ## 2. Cases where rustar-aligner outperforms STAR
 
 These are not chosen divergences and not bugs: rustar-aligner reports a **higher-scoring, correct** alignment that STAR misses.

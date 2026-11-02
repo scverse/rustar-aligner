@@ -152,14 +152,13 @@ fn parse_attributes(attr_str: &str) -> HashMap<String, String> {
             continue;
         }
 
-        // Split on first space to separate key and value
-        let parts: Vec<&str> = pair.splitn(2, ' ').collect();
-        if parts.len() != 2 {
+        // Split on the first space, or `=` for GFF3 (`Parent=T1`).
+        let Some((key, value)) = pair.split_once([' ', '=']) else {
             continue; // Skip malformed attributes
-        }
+        };
 
-        let key = parts[0].trim().to_string();
-        let value = parts[1]
+        let key = key.trim().to_string();
+        let value = value
             .trim()
             .trim_matches('"') // Remove quotes
             .to_string();
@@ -184,16 +183,39 @@ pub fn extract_junctions_configured(
     genome: &Genome,
     transcript_tag: &str,
 ) -> Result<Vec<(usize, u64, u64, u8)>, Error> {
-    let mut transcripts: HashMap<String, Vec<GtfRecord>> = HashMap::new();
+    // Keyed by chromosome too: the same ID on two chromosomes (PAR genes in
+    // refGene-style GTFs) is two exon chains, and one list would mix their
+    // chromosome-local coordinates into false introns.
+    let mut transcripts: HashMap<(String, String), Vec<GtfRecord>> = HashMap::new();
+    let mut n_valid = 0usize;
 
     for exon in exons {
-        let transcript_id = exon
-            .attributes
-            .get(transcript_tag)
-            .ok_or_else(|| Error::Gtf(format!("Exon missing {transcript_tag} attribute")))?
-            .clone();
+        // As STAR: an exon without a parent transcript is skipped, not fatal.
+        let Some(transcript_id) = exon.attributes.get(transcript_tag).cloned() else {
+            log::warn!(
+                "Skipping exon at {}:{} without a {transcript_tag} attribute",
+                exon.seqname,
+                exon.start
+            );
+            continue;
+        };
+        if genome.chr_name.contains(&exon.seqname) {
+            n_valid += 1;
+        }
+        transcripts
+            .entry((exon.seqname.clone(), transcript_id))
+            .or_default()
+            .push(exon);
+    }
 
-        transcripts.entry(transcript_id).or_default().push(exon);
+    // STAR's fatal error (exit 104): an annotation that matches nothing is a
+    // mistake, nearly always `X` vs `chrX`, not an unannotated genome.
+    if n_valid == 0 {
+        return Err(Error::Gtf(
+            "no valid exon lines in the GTF file. Check its formatting. One likely cause \
+             is the difference in chromosome naming between GTF and FASTA file."
+                .to_string(),
+        ));
     }
 
     // Extract junctions from each transcript
@@ -585,6 +607,17 @@ mod tests {
                 .into_iter()
                 .collect(),
             },
+            // One exon on a known chromosome, or the whole GTF would be refused.
+            GtfRecord {
+                seqname: "chr1".to_string(),
+                feature: "exon".to_string(),
+                start: 100,
+                end: 200,
+                strand: '+',
+                attributes: vec![("transcript_id".to_string(), "T2".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
         ];
 
         let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
@@ -722,5 +755,56 @@ mod tests {
         let junctions = extract_junctions_configured(exons, &genome, "Parent").unwrap();
         assert_eq!(junctions.len(), 1);
         assert_eq!(junctions[0], (0, 200, 298, 1));
+    }
+
+    fn two_chr_genome() -> Genome {
+        Genome {
+            transform_blocks: None,
+            sequence: vec![0; 8000].into(),
+            n_genome: 8000,
+            n_genome_real: 8000,
+            n_chr_real: 2,
+            chr_start: vec![0, 4000, 8000],
+            chr_length: vec![4000, 4000],
+            chr_name: vec!["c1".to_string(), "c2".to_string()],
+        }
+    }
+
+    fn exon(line: &str) -> GtfRecord {
+        parse_gtf_line(line).unwrap()
+    }
+
+    #[test]
+    fn same_transcript_id_on_two_chromosomes_is_two_chains() {
+        let a = |c: &str, s, e| format!("{c}\tt\texon\t{s}\t{e}\t.\t+\t.\ttranscript_id \"T\";");
+        let exons = vec![
+            exon(&a("c1", 1000, 1200)),
+            exon(&a("c1", 2000, 2200)),
+            exon(&a("c2", 1500, 1700)),
+            exon(&a("c2", 2500, 2700)),
+        ];
+        let got = extract_junctions_configured(exons, &two_chr_genome(), "transcript_id").unwrap();
+        assert_eq!(got, vec![(0, 1200, 1998, 1), (1, 5700, 6498, 1)]);
+    }
+
+    #[test]
+    fn no_exon_on_a_known_chromosome_is_fatal() {
+        let exons = vec![exon(
+            "X\tt\texon\t1000\t1200\t.\t+\t.\ttranscript_id \"T\";",
+        )];
+        let err = extract_junctions_configured(exons, &two_chr_genome(), "transcript_id");
+        assert!(err.unwrap_err().to_string().contains("chromosome naming"));
+        assert!(extract_junctions_configured(vec![], &two_chr_genome(), "transcript_id").is_err());
+    }
+
+    #[test]
+    fn exon_without_parent_is_skipped_and_gff3_attributes_parse() {
+        let exons = vec![
+            exon("c1\tt\texon\t1000\t1200\t.\t+\t.\tParent=T;Name=x"),
+            exon("c1\tt\texon\t2000\t2200\t.\t+\t.\tParent=T"),
+            exon("c1\tt\texon\t3000\t3200\t.\t+\t.\tID=orphan"),
+        ];
+        let got = extract_junctions_configured(exons, &two_chr_genome(), "Parent").unwrap();
+        assert_eq!(got, vec![(0, 1200, 1998, 1)]);
     }
 }
