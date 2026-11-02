@@ -45,6 +45,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
   - `--soloUMIfiltering` applies to the STARsolo `SJ` feature as it does to
     genes: a read that crosses two junctions is one UMI on two features, a
     tie `MultiGeneUMI_CR` drops.
+- `--alignEndsType EndToEnd`, `Extend5pOfRead1`, `Extend5pOfReads12` and
+  `Extend3pOfRead1` on paired-end reads: both ends of a mate are extended while
+  the pair's transcript is stitched, so the extension's mismatches count in the
+  pair's score and limits, as in STAR. The inner ends of the mates were left
+  soft-clipped (`96M4S`, `AS:190` where STAR has `100M`, `AS:182`), and a mate
+  that cannot reach its end could be clipped into a pair. A single-end read that
+  runs past a chromosome end now counts as unmapped "other", as in STAR.
 
 ### Other changes
 

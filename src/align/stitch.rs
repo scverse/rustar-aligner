@@ -1271,6 +1271,12 @@ impl WorkingTranscript {
     }
 }
 
+/// A seed's fragment in `--alignEndsType`'s table. Single-end seeds carry mate_id 2;
+/// STAR's iFrag is 0 there.
+fn ext_frag(mate_id: u8) -> usize {
+    usize::from(mate_id == 1)
+}
+
 /// Fill the gap between the last exon in a WorkingTranscript and the next WA entry.
 /// Returns None if stitching fails (mismatch limit, overhang too short, etc.).
 /// Matches STAR's stitchAlignToTranscript.cpp logic.
@@ -1350,7 +1356,8 @@ fn stitch_align_in_place(
 
         // STAR stitchAlignToTranscript.cpp:374-381: right-extend mate A to fragment boundary.
         // extendAlign(R, G, rAend+1, gAend+1, 1, 1, DEF_readSeqLengthMax, nMatch, nMM, ...)
-        // extendToEnd=false (local mode); spacer at position 150 naturally stops the extension.
+        // The spacer at the mate's end stops the extension, also an end-to-end one. These
+        // are the mates' inner ends, their 3' ends.
         // nMatch approximated as score + n_mismatch (exact for seeds-only paths, approx otherwise).
         let n_match_m1 = (new_wt.score + new_wt.n_mismatch as i32).max(0) as usize;
         let right_ext = extend_alignment_cached(
@@ -1366,8 +1373,11 @@ fn stitch_align_in_place(
             scorer.p_mm_max,
             index,
             cluster.is_reverse,
-            false, // internal stitch extension: alignEndsType applied at finalize
+            scorer.align_ends_type.ext[ext_frag(last_mate)][1],
         );
+        if right_ext.max_score == EXTEND_TO_END_KILL {
+            return false;
+        }
         if right_ext.extend_len > 0 {
             let last = new_wt.exons.last_mut().unwrap();
             last.read_end += right_ext.extend_len;
@@ -1427,8 +1437,11 @@ fn stitch_align_in_place(
             scorer.p_mm_max,
             index,
             cluster.is_reverse,
-            false, // internal stitch extension: alignEndsType applied at finalize
+            scorer.align_ends_type.ext[ext_frag(wa.mate_id)][1],
         );
+        if left_ext.max_score == EXTEND_TO_END_KILL {
+            return false;
+        }
         if left_ext.extend_len > 0 {
             let last = new_wt.exons.last_mut().unwrap();
             last.read_start -= left_ext.extend_len;
@@ -2047,23 +2060,11 @@ pub(crate) fn finalize_transcript(
     original_is_reverse: bool,
     no_left_ext: bool,
     no_right_ext: bool,
-    imate: u8,
 ) -> Option<Transcript> {
     use crate::align::transcript::Exon;
 
     let alignment_start = wt.read_start;
     let alignment_end = wt.read_end;
-
-    // --alignEndsType: decide whether each end is force-extended (no soft-clip).
-    // `read_seq` is a single mate's slice, so `original_is_reverse` here equals
-    // STAR's `(Str != imate)`: when the slice is reverse-complemented, the read's
-    // 5' end sits on the right. STAR indexes ext[imate][iEnd] with iEnd 0 = 5',
-    // 1 = 3', so the left/start end maps to `original_is_reverse` and the
-    // right/end to its complement.
-    let ext = scorer.align_ends_type.ext;
-    let mi = (imate as usize).min(1);
-    let extend_left_to_end = ext[mi][original_is_reverse as usize];
-    let extend_right_to_end = ext[mi][(!original_is_reverse) as usize];
 
     // Guard: exon positions must be within read bounds. Out-of-bounds positions can
     // arise when a combined PE read's WorkingTranscript has junction shifts that extend
@@ -2102,7 +2103,7 @@ pub(crate) fn finalize_transcript(
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
-                extend_left_to_end,
+                false, // --alignEndsType was applied in the stitcher
             )
         } else {
             zero_extend.clone()
@@ -2121,7 +2122,7 @@ pub(crate) fn finalize_transcript(
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
-                extend_right_to_end,
+                false, // --alignEndsType was applied in the stitcher
             )
         } else {
             zero_extend.clone()
@@ -2142,7 +2143,7 @@ pub(crate) fn finalize_transcript(
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
-                extend_right_to_end,
+                false, // --alignEndsType was applied in the stitcher
             )
         } else {
             zero_extend.clone()
@@ -2161,19 +2162,13 @@ pub(crate) fn finalize_transcript(
                 scorer.p_mm_max,
                 index,
                 cluster.is_reverse,
-                extend_left_to_end,
+                false, // --alignEndsType was applied in the stitcher
             )
         } else {
             zero_extend
         };
         (left, right)
     };
-
-    // End-to-end extension that ran into a chromosome boundary kills the
-    // transcript (STAR: no soft-clipping past the read end in EndToEnd mode).
-    if left_extend.max_score == EXTEND_TO_END_KILL || right_extend.max_score == EXTEND_TO_END_KILL {
-        return None;
-    }
 
     // STAR finalization check (`stitchWindowAligns.cpp:96-108`): exon lengths
     // including repeat lengths (shiftSJ). An unannotated junction needs
@@ -2509,7 +2504,9 @@ fn wt_final_score(wt: &WorkingTranscript, scorer: &AlignmentScorer) -> i32 {
     match (wt.exons.first(), wt.exons.last()) {
         (Some(first), Some(last)) => {
             let span = last.genome_end - first.genome_start;
-            (wt.score + scorer.genomic_length_penalty(span)).max(0)
+            // Not floored: an end-to-end extension can take a transcript below zero,
+            // and then the window's score gate must reject it.
+            wt.score + scorer.genomic_length_penalty(span)
         }
         _ => wt.score,
     }
@@ -2764,6 +2761,15 @@ fn stitch_recurse(
                 };
 
                 let do_left_first = !original_is_reverse;
+                // --alignEndsType, as STAR's `ext[iFrag][iEnd]` with iEnd 0 = 5': the
+                // left end is a 5' end where the mate is on its own strand.
+                let ends = scorer.align_ends_type.ext;
+                let frag_first = ext_frag(wt.exons[0].mate_id);
+                let frag_last = ext_frag(wt.exons[wt.exons.len() - 1].mate_id);
+                let extend_left_to_end =
+                    ends[frag_first][usize::from(usize::from(original_is_reverse) != frag_first)];
+                let extend_right_to_end =
+                    ends[frag_last][usize::from(usize::from(original_is_reverse) == frag_last)];
                 let first_ext = if do_left_first {
                     // Left extension (5' of forward read)
                     if wt.read_start > 0 {
@@ -2780,7 +2786,7 @@ fn stitch_recurse(
                             scorer.p_mm_max,
                             index,
                             cluster.is_reverse,
-                            false, // internal stitch extension: alignEndsType applied at finalize
+                            extend_left_to_end,
                         )
                     } else {
                         zero_ext.clone()
@@ -2801,7 +2807,7 @@ fn stitch_recurse(
                             scorer.p_mm_max,
                             index,
                             cluster.is_reverse,
-                            false, // internal stitch extension: alignEndsType applied at finalize
+                            extend_right_to_end,
                         )
                     } else {
                         zero_ext.clone()
@@ -2828,7 +2834,7 @@ fn stitch_recurse(
                             scorer.p_mm_max,
                             index,
                             cluster.is_reverse,
-                            false, // internal stitch extension: alignEndsType applied at finalize
+                            extend_right_to_end,
                         )
                     } else {
                         zero_ext
@@ -2850,12 +2856,20 @@ fn stitch_recurse(
                             scorer.p_mm_max,
                             index,
                             cluster.is_reverse,
-                            false, // internal stitch extension: alignEndsType applied at finalize
+                            extend_left_to_end,
                         )
                     } else {
                         zero_ext
                     }
                 };
+
+                // An end-to-end extension that ran into a chromosome boundary kills the
+                // transcript: it cannot reach the read's end, and it may not be clipped.
+                if first_ext.max_score == EXTEND_TO_END_KILL
+                    || second_ext.max_score == EXTEND_TO_END_KILL
+                {
+                    break 'leaf;
+                }
 
                 // Apply the extensions to wt
                 if first_ext.extend_len > 0 || second_ext.extend_len > 0 {
@@ -3369,7 +3383,6 @@ pub(crate) fn stitch_seeds_with_jdb_debug(
             stitch_is_reverse,
             false,
             false,
-            0, // single-end read is mate 0
         ) {
             // Restore original reverse-strand flag and read sequence for SAM output.
             if stitch_is_reverse {
@@ -4534,10 +4547,8 @@ mod tests {
         wt.genome_end = 8;
         wt.score = 6;
         wt.n_mismatch = 1;
-        let t = finalize_transcript(
-            &wt, &read, &index, &scorer, &cluster, false, false, false, 0,
-        )
-        .expect("finalizes");
+        let t = finalize_transcript(&wt, &read, &index, &scorer, &cluster, false, false, false)
+            .expect("finalizes");
         assert_eq!(t.cigar_string(), "8M");
         assert_eq!(t.n_mismatch, 1);
     }
