@@ -263,6 +263,13 @@ impl SamWriter {
         Ok(())
     }
 
+    /// Flush the buffered tail. Dropping the writer would flush too, but a drop
+    /// cannot report an error, so a full disk would lose the last records silently.
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.writer.get_mut().flush()?;
+        Ok(())
+    }
+
     /// Build unmapped record (without writing)
     ///
     /// # Arguments
@@ -944,6 +951,12 @@ impl SamStdoutWriter {
         for record in batch {
             self.writer.write_alignment_record(&self.header, record)?;
         }
+        Ok(())
+    }
+
+    /// See [`SamWriter::finish`].
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.writer.get_mut().flush()?;
         Ok(())
     }
 }

@@ -132,7 +132,7 @@ pub fn write_log_out(
     )?;
     writeln!(out, "ALL DONE!")?;
 
-    Ok(())
+    out.flush()
 }
 
 /// Write a STAR-shaped `Log.out` for `genomeGenerate`.
@@ -202,7 +202,7 @@ pub fn write_genome_generate_log(
     )?;
     writeln!(out, "DONE: Genome generation, EXITING")?;
 
-    Ok(())
+    out.flush()
 }
 
 /// Write STAR-compatible `Log.progress.out`.
@@ -269,5 +269,5 @@ pub fn write_log_progress_out(
 
     writeln!(out, "ALL DONE!")?;
 
-    Ok(())
+    out.flush()
 }

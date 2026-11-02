@@ -298,6 +298,9 @@ impl AlignmentWriter for crate::io::sam::SamWriter {
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
     }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
+    }
 }
 
 impl AlignmentWriter for crate::io::bam::BamWriter {
@@ -339,6 +342,9 @@ impl AlignmentWriter for crate::io::sam::SamStdoutWriter {
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
     ) -> Result<(), error::Error> {
         self.write_batch(batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        self.finish()
     }
 }
 
@@ -1032,7 +1038,7 @@ fn run_single_pass(
         }
         let sj_output_path = params.output_path("SJ.out.tab");
         // `--outSJtype None` suppresses SJ.out.tab entirely.
-        if params.out_sj_type != "None" && !sj_stats.is_empty() {
+        if params.out_sj_type != "None" {
             sj_stats.write_output(&sj_output_path, &index.genome, params)?;
         }
         // Per-cell count matrices (raw + filtered), Summary.csv, and the SJ
@@ -1100,7 +1106,7 @@ fn run_single_pass(
     // 5. Write SJ.out.tab file
     let sj_output_path = params.output_path("SJ.out.tab");
     // `--outSJtype None` suppresses SJ.out.tab entirely.
-    if params.out_sj_type != "None" && !sj_stats.is_empty() {
+    if params.out_sj_type != "None" {
         info!(
             "Writing splice junction statistics to {}",
             sj_output_path.display()
