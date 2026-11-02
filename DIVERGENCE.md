@@ -317,6 +317,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **Source.** `src/io/compression.rs`, called from `FastqReader::open` in `src/io/fastq.rs`.
 
+### 4.6 Failures of streamed reads are errors
+
+**What STAR does.** STAR does not look at the exit status of `--readFilesCommand`: the process is only started in `Parameters_openReadsFiles.cpp` and killed in `Parameters_closeReadsFiles.cpp`, and STAR 2.7.11b with `--readFilesCommand false` exits 0 having mapped 0 reads. `--twopassMode Basic` closes and reopens the inputs after pass 1 (`twoPassRunPass1.cpp:95-96`), which a stream cannot honour: measured with 2.7.11b, a FIFO blocks forever on the second open, and `<(...)` exits 0 with 0 input reads in `Log.final.out`.
+
+**What rustar-aligner does.** A `--readFilesCommand` that exits non-zero fails the run, unless the run stopped reading first (`--readMapNumber`), in which case the command is killed, as in STAR. `--twopassMode Basic` refuses, before reading anything, any file that pass 1 would read and that is not a regular file, or that lies under `/dev/`. A solo run's barcode file is exempt, since pass 1 does not read it. On Linux this also refuses `/dev/stdin` redirected from a regular file, which that platform could reopen; macOS cannot.
+
+**Why.** Exit code 0 with partial or empty results is the worst way a long run on a download can end. A temporary copy of the input would make two-pass work on a stream, but it would write the data to disk, which is what reading a stream is meant to avoid, so the error says to save the file instead.
+
+**Impact.** Runs that hung or gave an empty result now fail with a message, as do runs whose command failed after a complete-looking output. No alignment output changes for a run that succeeds in both.
+
+**Source.** `CommandOutput` in `src/io/fastq.rs`; `is_read_once` in `src/params/mod.rs`.
+
 ## 5. Known residual single-read differences
 
 These are **not** deliberate divergences. They are the differences `test/parity_suite.sh` finds, kept here so that each one is fixed or explained before v0.2.0 (README, *Comparison with STAR 2.7.11b*). Read names are from that suite's datasets.

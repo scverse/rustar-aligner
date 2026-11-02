@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -1488,6 +1488,15 @@ pub struct Parameters {
     pub read_files_names: Vec<Vec<PathBuf>>,
 }
 
+/// Whether a read file cannot be opened a second time from its start: a FIFO,
+/// a pipe or a socket, or anything under `/dev/`. `/dev/stdin` and `/dev/fd/N`
+/// can stat as a regular file when redirected from one, and on macOS opening
+/// them again keeps the current offset. Only stats the path, which neither
+/// blocks on a FIFO nor consumes any of the stream.
+fn is_read_once(path: &Path) -> bool {
+    path.starts_with("/dev/") || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
+}
+
 impl Parameters {
     /// The run mode. Validation guarantees it parses, so this cannot fail
     /// after `validate()`; before it, an unknown mode reads as `alignReads`
@@ -1620,6 +1629,17 @@ impl Parameters {
             );
         }
         Ok(names)
+    }
+
+    /// The files pass 1 of `--twopassMode Basic` reads, and pass 2 reads again.
+    /// A solo run aligns only the cDNA read in pass 1 (`run_pass1`).
+    fn pass1_read_files(&self) -> impl Iterator<Item = &PathBuf> {
+        let mates = if self.solo_enabled() {
+            1
+        } else {
+            self.read_files_names.len()
+        };
+        self.read_files_names.iter().take(mates).flatten()
     }
 
     /// Number of read files per mate (STAR `readFilesN`); 0 when none given.
@@ -2071,6 +2091,22 @@ impl Parameters {
         match params.build_read_files_names() {
             Ok(names) => params.read_files_names = names,
             Err(e) => return Err(command.error(ErrorKind::InvalidValue, e)),
+        }
+
+        // Pass 1 would consume a stream and pass 2 would find it empty or block
+        // on it forever, so refuse before anything is read (DIVERGENCE.md 4.6).
+        if params.twopass_mode == TwopassMode::Basic
+            && let Some(stream) = params.pass1_read_files().find(|p| is_read_once(p))
+        {
+            return Err(command.error(
+                ErrorKind::InvalidValue,
+                format!(
+                    "EXITING because of fatal PARAMETER error: --twopassMode Basic reads the \
+                     input twice, but {} is a stream, which can only be read once\n\
+                     SOLUTION: save the reads to a regular file first, or use --twopassMode None",
+                    stream.display()
+                ),
+            ));
         }
 
         // --clipAdapterType, as `ParametersClip_initialize.cpp:11-30`.

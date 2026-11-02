@@ -53,6 +53,7 @@ export default defineConfig({
             { label: 'Single-end alignment', slug: 'guides/single-end' },
             { label: 'Paired-end alignment', slug: 'guides/paired-end' },
             { label: 'Two-pass mode', slug: 'guides/two-pass' },
+            { label: 'Streaming input', slug: 'guides/streaming-input' },
             { label: 'Chimeric detection', slug: 'guides/chimeric' },
             { label: 'Gene quantification', slug: 'guides/quantification' },
             { label: 'Bulk total RNA-seq', slug: 'guides/bulk-total-rna' },
