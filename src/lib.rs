@@ -1051,7 +1051,7 @@ fn run_single_pass(
         }
         if let Some(info) = sctx.tag_read_info() {
             let info = info.lock().unwrap();
-            let umi_len = params.solo_umi_len as usize;
+            let umi_len = sctx.umi_len;
             writer.finish_with(&mut |record| {
                 crate::io::sam::apply_solo_read_info(record, &info, &sctx.whitelist, umi_len);
             })?;

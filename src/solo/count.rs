@@ -1534,7 +1534,7 @@ pub fn write_gene_matrix(
     } else {
         0.0
     };
-    let umi_len = params.solo_umi_len as usize;
+    let umi_len = ctx.umi_len;
 
     let solo_dir = params
         .solo_out_file_names
@@ -1654,7 +1654,7 @@ pub fn write_gene_matrix(
 
         // `--soloCellReadStats CB`: the per-cell read summary, alongside the
         // raw matrix because its UMI and gene columns are the raw totals.
-        if let Some(cell_stats) = &ctx.cell_read_stats {
+        if let Some(cell_stats) = ctx.cell_read_stats.as_ref().map(|s| &s[fi]) {
             let umi_gene: std::collections::BTreeMap<u32, (u32, u32)> = mstats
                 .cells
                 .iter()
@@ -1875,7 +1875,7 @@ pub fn write_gene_matrix(
             sorted.len(),
             gzip,
         )?;
-        let umi_len = params.solo_umi_len as usize;
+        let umi_len = ctx.umi_len;
         // STAR's per-line filters (`SoloReadFeature_inputRecords.cpp:23-104`),
         // counted only for a junction with a row: STAR skips the others first.
         let has_row = |start: u64, end: u64| row.contains_key(&(start, end));
@@ -2799,7 +2799,13 @@ pub fn run_cell_filtering(params: &crate::params::Parameters) -> anyhow::Result<
     std::fs::write(&bc_path, bc).map_err(|e| Error::io(e, &bc_path))?;
 
     let feat_path = dir.join(format!("{prefix}features.tsv"));
-    std::fs::copy(&features_path, &feat_path).map_err(|e| Error::io(e, &feat_path))?;
+    // The filtered matrix is written plain, whatever the raw one was.
+    let mut feat_out = std::fs::File::create(&feat_path).map_err(|e| Error::io(e, &feat_path))?;
+    std::io::copy(
+        &mut crate::solo::whitelist::open_maybe_gzip(&features_path)?,
+        &mut feat_out,
+    )
+    .map_err(|e| Error::io(e, &feat_path))?;
 
     let mtx_path = dir.join(format!("{prefix}matrix.mtx"));
     let nnz = finalize_matrix(

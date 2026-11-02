@@ -69,7 +69,12 @@ impl GeneAnnotation {
     /// Build from GTF exon records using `gene_tag` as the gene grouping attribute.
     ///
     /// `gene_tag` is STAR's `sjdbGTFtagExonParentGene` (default `"gene_id"`).
-    pub fn from_gtf_exons_configured(exons: &[GtfRecord], genome: &Genome, gene_tag: &str) -> Self {
+    pub fn from_gtf_exons_configured(
+        exons: &[GtfRecord],
+        genome: &Genome,
+        gene_tag: &str,
+        gene_name_tags: &[String],
+    ) -> Self {
         let n_chrs = genome.n_chr_real;
         let mut gene_ids: Vec<String> = Vec::new();
         let mut gene_names: Vec<String> = Vec::new();
@@ -96,11 +101,9 @@ impl GeneAnnotation {
                 gene_is_reverse.push(is_rev);
                 // gene_name (symbol) for features.tsv col 2; STAR falls back to
                 // the gene_id when the GTF record omits gene_name.
-                let gene_name = exon
-                    .attributes
-                    .get("gene_name")
-                    .cloned()
-                    .unwrap_or_else(|| gene_id.clone());
+                let gene_name =
+                    crate::quant::transcriptome::find_attr_list(&exon.attributes, gene_name_tags)
+                        .unwrap_or_else(|| gene_id.clone());
                 gene_names.push(gene_name);
                 gene_ids.push(gene_id);
                 gene_span.push(None);
@@ -290,7 +293,7 @@ impl GeneAnnotation {
 
     /// Build from GTF exon records using default `"gene_id"` attribute (backward-compatible).
     pub fn from_gtf_exons(exons: &[GtfRecord], genome: &Genome) -> Self {
-        Self::from_gtf_exons_configured(exons, genome, "gene_id")
+        Self::from_gtf_exons_configured(exons, genome, "gene_id", &["gene_name".to_string()])
     }
 
     pub fn n_genes(&self) -> usize {
@@ -629,6 +632,7 @@ pub fn resolve_gene_annotation(
             &exons,
             genome,
             &params.sjdb_gtf_tag_exon_parent_gene,
+            &params.sjdb_gtf_tag_exon_parent_gene_name,
         ));
     }
     match transcriptome {

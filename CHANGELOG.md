@@ -11,6 +11,22 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- Solo runs refuse options their read loops do not implement (`--quantMode
+  GeneCounts`/`TranscriptomeSAM`, `--quantGeneCoverage`, `--quantGeneSplicing`,
+  `--outReadsUnmapped Fastx`, `--outFilterType BySJout`, `--chimSegmentMin`,
+  `--waspOutputMode`, and more than one `--soloUMIdedup`) instead of writing
+  empty or zero output with exit 0.
+- A whitelist whose barcodes are not as long as the barcode read gives is now
+  fatal, as in STAR. It used to give an empty matrix, or false matches.
+- `CB_UMI_Complex`: a missing or bad position is fatal, and the UMI width comes
+  from `--soloUMIposition` rather than `--soloUMIlen`.
+- `--soloUMIlen` above 32 is refused rather than corrupting UMIs.
+- `--runMode soloCellFiltering` no longer writes gzip bytes into `features.tsv`.
+- `--sjdbGTFtagExonParentGeneName` applies when the GTF is given at mapping.
+- `CellReads.stats` counts each feature's reads in that feature's file.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
