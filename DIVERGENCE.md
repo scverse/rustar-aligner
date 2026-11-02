@@ -171,6 +171,18 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
+### 1.9 A chimeric candidate with no junction to place is rejected
+
+**Needs maintainer sign-off.**
+
+**What STAR does.** Observed output, source not read: STAR 2.7.11b stops with a bus error (exit 138) on a read pair with `--chimMultimapNmax 20 --chimJunctionOverhangMin 1`, where rustar-aligner on `main` stalled in `place()` because the trailing segment's new length was not positive.
+
+**What rustar-aligner does.** It rejects that candidate, reports no chimera for it, and carries on with exit 0.
+
+**Why.** A run should not die on one read, and there is no STAR output to match. Stopping with an error instead would be a one-line change.
+
+**Source.** `src/chimeric/detect.rs` (`place`).
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

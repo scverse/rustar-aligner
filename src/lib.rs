@@ -411,6 +411,7 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 
     // Redefine window parameters based on genome size (STAR's Genome_genomeLoad.cpp)
     let mut params = params.clone();
+    params.genome_chr_bin_nbits = crate::index::loaded_genome_params(&params).genome_chr_bin_nbits;
     params.redefine_window_params(index.genome.n_genome);
 
     // Use the transcriptome index loaded alongside the genome (populated

@@ -11,6 +11,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- **Window bins are capped by the index's `genomeChrBinNbits`, as STAR.** The cap
+  was skipped when `--alignIntronMax` and `--alignMatesGapMax` were both 0, and
+  read the command-line value rather than the index's, so genomes of many small
+  contigs lost reads as "too short" and reported repeats as unique. The bin size
+  now also uses STAR's integer divisions (`--alignIntronMax 1450` gives 8, not 9).
+- **Chimeric detection no longer hangs on one read.** `place()` turned a negative
+  block length into a huge one when the trailing segment ended before the leading
+  segment's last block (seen with `--chimJunctionOverhangMin 1`). Such a candidate
+  is now rejected. STAR crashes on the same read (`DIVERGENCE.md` §1.9).
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

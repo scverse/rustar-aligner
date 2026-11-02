@@ -508,7 +508,7 @@ impl GenomeIndex {
 /// `genomeSAindexNbases`, `genomeChrBinNbits` and `genomeSAsparseD` are taken
 /// from its `genomeParameters.txt` (`Genome_genomeLoad.cpp:104-107`), and
 /// `genomeFastaFiles` keeps its mapping-time default `-`.
-fn loaded_genome_params(params: &Parameters) -> Parameters {
+pub(crate) fn loaded_genome_params(params: &Parameters) -> Parameters {
     let mut p = params.clone();
     p.genome_fasta_files = vec![std::path::PathBuf::from("-")];
     let path = params.genome_dir.join("genomeParameters.txt");

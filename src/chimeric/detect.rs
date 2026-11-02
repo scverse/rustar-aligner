@@ -666,6 +666,11 @@ fn place(
         let m = ro_start1 + l1;
         if m > ro_start0 { m - ro_start0 - 1 } else { 0 }
     };
+    // The trailing segment ends before the leading one's last block: no junction
+    // to scan for, and a length below would go negative.
+    if jr_max == 0 {
+        return None;
+    }
     let (mut motif, mut jr_best) = (0i32, 0i64);
     let (mut j_score, mut j_score_best) = (0i32, -999_999i32);
     let mut jr = 0i64;
@@ -713,6 +718,13 @@ fn place(
         jr += 1;
     }
 
+    // The mate-spacer skip above can leave `jr_best` at `jr_max`, with nothing left
+    // of the trailing segment.
+    let new_l1 = jr_max - jr_best;
+    if new_l1 <= 0 {
+        return None;
+    }
+
     // Shift the junction.
     let jr_best = jr_best as usize;
     let (j0, j1);
@@ -731,15 +743,14 @@ fn place(
     }
     {
         let x = &mut t1.exons[e1];
-        let new_l = (ro_start1 + x.l as i64 - ro_start0 - jr_best as i64 - 1) as usize;
         if t1.str_ == 0 {
             let d = (ro_start0 + jr_best as i64 + 1 - ro_start1) as usize;
             x.r += d;
             x.g += d as u64;
-            x.l = new_l;
+            x.l = new_l1 as usize;
             j1 = x.g.wrapping_sub(1);
         } else {
-            x.l = new_l;
+            x.l = new_l1 as usize;
             j1 = x.g + x.l as u64;
         }
     }
@@ -1470,6 +1481,44 @@ mod tests {
         assert_eq!(win.tr.len(), 1);
         let capped = Windows::new(win.tr, 2);
         assert_eq!(capped.tr[0].len(), 2);
+    }
+
+    /// The trailing segment's first block ends before the leading segment's last
+    /// block starts. The junction shift used to make its length negative, cast to
+    /// a huge `usize`, and the loops over that length never ended.
+    #[test]
+    fn place_rejects_a_trailing_block_ending_before_the_last_leading_block() {
+        let gn = genome();
+        let fwd = slice(&gn, 100, 100);
+        let read = ChimRead::new(&fwd, [100, 0], "r", [&fwd, &[]]);
+        let t0 = wintr(vec![exon(100, 0, 25, 0), exon(200, 25, 35, 0)], vec![1], 10);
+        let t1 = wintr(
+            vec![
+                exon(CHR_PAD + 100, 15, 5, 0),
+                exon(CHR_PAD + 200, 25, 75, 0),
+            ],
+            vec![1],
+            10,
+        );
+        assert!(place(t0, t1, 0, &read, &gn, &params(&[])).is_none());
+    }
+
+    /// The scan skips offset 30 (mate 1's length) and so can settle on
+    /// `jr_best == jr_max`, leaving a trailing block of length 0.
+    #[test]
+    fn place_rejects_a_junction_leaving_no_trailing_bases() {
+        let gn = genome();
+        let mut fwd = slice(&gn, 100, 61);
+        fwd[30] = 5;
+        let read = ChimRead::new(&fwd, [30, 30], "r", [&fwd[..30], &fwd[31..]]);
+        // The last scanned base (offset 31) must favour the leading segment.
+        let g1 = (CHR_PAD + 100..CHR_PAD + 200)
+            .find(|&g| gn.get_base(g + 11).unwrap() != fwd[31])
+            .unwrap();
+        let t0 = wintr(vec![exon(100, 0, 40, 0)], vec![], 10);
+        let t1 = wintr(vec![exon(g1, 20, 12, 0)], vec![], 10);
+        let prm = params(&["--chimScoreJunctionNonGTAG", "0"]);
+        assert!(place(t0, t1, 0, &read, &gn, &prm).is_none());
     }
 
     /// A single-end read, half chr0 and half chr1: the old detector pins the

@@ -1713,59 +1713,51 @@ impl Parameters {
         }
     }
 
-    /// Compute the default window distance: 2^winBinNbits * winAnchorDistNbins.
-    /// Used for max_cluster_dist and as default alignIntronMax (when 0).
+    /// The window distance: 2^winBinNbits * winAnchorDistNbins.
     pub fn win_bin_window_dist(&self) -> u64 {
         (1u64 << self.win_bin_nbits) * self.win_anchor_dist_nbins as u64
     }
 
-    /// Redefine window parameters based on genome size and intron/gap limits.
-    /// Ports STAR's Genome_genomeLoad.cpp logic that recomputes winBinNbits,
-    /// winFlankNbins, and winAnchorDistNbins after loading the genome.
+    /// Redefine window parameters based on genome size and intron/gap limits,
+    /// as STAR reports doing after loading the genome (its `Log.out`).
     ///
-    /// IMPORTANT: winBinNbits is only redefined when alignIntronMax > 0 OR
-    /// alignMatesGapMax > 0. When both are 0, winBinNbits stays at its default (16).
+    /// `genome_chr_bin_nbits` must already hold the index's value. Windows are not
+    /// widened beyond it, including with alignIntronMax = alignMatesGapMax = 0: bins
+    /// wider than the padding between contigs would mix contigs in one window.
     pub fn redefine_window_params(&mut self, n_genome: u64) {
         let intron_max = self.align_intron_max as u64;
         let gap_max = self.align_mates_gap_max as u64;
+        let redefine = intron_max > 0 || gap_max > 0;
 
-        if intron_max == 0 && gap_max == 0 {
-            // STAR: no redefinition when both are 0. Log effective max intron.
-            let max_intron = (1u64 << self.win_bin_nbits) * self.win_anchor_dist_nbins as u64;
-            log::info!(
-                "alignIntronMax=alignMatesGapMax=0, max intron ~= (2^winBinNbits)*winAnchorDistNbins={max_intron}"
+        if redefine {
+            // STAR: max(max(4, alignIntronMax), alignMatesGapMax==0 ? 1000 : alignMatesGapMax)
+            let max_span = std::cmp::max(
+                std::cmp::max(4u64, intron_max),
+                if gap_max == 0 { 1000 } else { gap_max },
             );
-            return;
+
+            // Integer divisions: --alignIntronMax 1450 gives winBinNbits=8 in STAR's
+            // Log.out, where 1450/4 = 362.5 would round to 9.
+            self.win_bin_nbits = (((max_span / 4) as f64).log2() + 0.5).floor() as u32;
+            let genome_based = (((n_genome / 40000 + 1) as f64).log2() + 0.5).floor() as u32;
+            self.win_bin_nbits = self.win_bin_nbits.max(genome_based);
         }
 
-        // STAR: max(max(4, alignIntronMax), alignMatesGapMax==0 ? 1000 : alignMatesGapMax)
-        let max_span = std::cmp::max(
-            std::cmp::max(4u64, intron_max),
-            if gap_max == 0 { 1000 } else { gap_max },
-        );
+        self.win_bin_nbits = self.win_bin_nbits.min(self.genome_chr_bin_nbits);
 
-        // winBinNbits = floor(log2(max_span / 4) + 0.5)
-        self.win_bin_nbits = ((max_span as f64 / 4.0).log2() + 0.5).floor() as u32;
-
-        // max with genome-based value: floor(log2(nGenome/40000 + 1) + 0.5)
-        let genome_based = ((n_genome as f64 / 40000.0 + 1.0).log2() + 0.5).floor() as u32;
-        self.win_bin_nbits = self.win_bin_nbits.max(genome_based);
-
-        // Cap at genomeChrBinNbits
-        if self.win_bin_nbits > self.genome_chr_bin_nbits {
-            self.win_bin_nbits = self.genome_chr_bin_nbits;
+        if redefine {
+            let max_gap = std::cmp::max(intron_max, gap_max);
+            self.win_flank_nbins = (max_gap / (1u64 << self.win_bin_nbits) + 1) as u32;
+            self.win_anchor_dist_nbins = 2 * self.win_flank_nbins;
         }
-
-        // Redefine winFlankNbins and winAnchorDistNbins
-        let max_gap = std::cmp::max(intron_max, gap_max);
-        self.win_flank_nbins = (max_gap / (1u64 << self.win_bin_nbits) + 1) as u32;
-        self.win_anchor_dist_nbins = 2 * self.win_flank_nbins;
 
         log::info!(
-            "Redefined window params: winBinNbits={}, winFlankNbins={}, winAnchorDistNbins={}",
+            "Window params: winBinNbits={}, winFlankNbins={}, winAnchorDistNbins={}, \
+             max window span (2^winBinNbits)*winAnchorDistNbins={}",
             self.win_bin_nbits,
             self.win_flank_nbins,
-            self.win_anchor_dist_nbins
+            self.win_anchor_dist_nbins,
+            self.win_bin_window_dist()
         );
     }
 
@@ -3472,6 +3464,34 @@ mod tests {
                 "Bogus"
             ])
             .is_err()
+        );
+    }
+
+    /// Expected values are those in STAR 2.7.11b's `Log.out` for the same options.
+    #[test]
+    fn window_params_follow_star_log() {
+        let run = |chr_bin: u32, n_genome: u64, extra: &[&str]| {
+            let mut args = vec!["rustar-aligner", "--readFilesIn", "r.fq"];
+            args.extend_from_slice(extra);
+            let mut p = Parameters::parse_from(args);
+            p.genome_chr_bin_nbits = chr_bin;
+            p.redefine_window_params(n_genome);
+            (p.win_bin_nbits, p.win_flank_nbins, p.win_anchor_dist_nbins)
+        };
+        let n = 1_619_968;
+        // No intron or gap limit: only the cap applies.
+        assert_eq!(run(11, n, &[]), (11, 4, 9));
+        assert_eq!(run(18, n, &[]), (16, 4, 9));
+        assert_eq!(run(11, n, &["--winBinNbits", "5"]), (5, 4, 9));
+        // Capped before the flanks are derived.
+        assert_eq!(run(11, n, &["--alignIntronMax", "100000"]), (11, 49, 98));
+        // 1450 / 4 is 362, not 362.5.
+        assert_eq!(run(11, n, &["--alignIntronMax", "1450"]), (8, 6, 12));
+        assert_eq!(run(11, n, &["--alignMatesGapMax", "1450"]), (8, 6, 12));
+        // 14450688 / 40000 is 361, not 361.27.
+        assert_eq!(
+            run(12, 14_450_688, &["--alignIntronMax", "1000"]),
+            (8, 4, 8)
         );
     }
 
