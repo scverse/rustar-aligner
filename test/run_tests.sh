@@ -60,7 +60,7 @@ TEST_CASES=(
 # PE SAM gap: compare_sam.py does per-record mate-field comparison; rustar-aligner
 #   differs from STAR on soft-clip placement and strand for ~52% of mate records.
 #   Summary statistics (mapped, unique, MAPQ) match exactly.
-#   Tracked: fix_specs_round2.md §9 (PE transcriptome), docs-old/.
+#   Tracked: fix_specs_round2.md §9 (PE transcriptome).
 
 XFAIL_JUNCTION=(
     "yeast_1k"

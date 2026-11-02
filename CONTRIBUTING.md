@@ -210,7 +210,7 @@ Report the harness used and the raw before/after counts in the PR. "Tests pass" 
 
 ## Project history
 
-rustar-aligner was written as a faithful port of [STAR](https://github.com/alexdobin/STAR) by Alexander Dobin. Up to the parity release (v0.5.0, see the release plan in [`ROADMAP.md`](ROADMAP.md)), the goal is behavioural parity with STAR 2.7.11b: matching its algorithms, thresholds, and output formats as closely as possible. Notes from the early development phase are in `docs-old/` (`docs-old/dev/` and the `phase*.md` files).
+rustar-aligner was written as a faithful port of [STAR](https://github.com/alexdobin/STAR) by Alexander Dobin. Up to the parity release (v0.5.0, see the release plan in [`ROADMAP.md`](ROADMAP.md)), the goal is behavioural parity with STAR 2.7.11b: matching its algorithms, thresholds, and output formats as closely as possible.
 
 Before v0.5.0, additions that don't change default output are welcome behind their own flag or cargo feature, with a [`DIVERGENCE.md`](DIVERGENCE.md) entry. After v0.5.0, development is no longer bound by parity: new features and deliberate divergence from STAR follow a normal development cycle with scverse and contributors.
 
