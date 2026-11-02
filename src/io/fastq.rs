@@ -2,9 +2,9 @@
 use crate::error::Error;
 use noodles::fastq;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 /// Writer for unmapped reads in FASTQ format (`--outReadsUnmapped Fastx`).
 pub struct UnmappedFastqWriter {
@@ -71,6 +71,41 @@ pub struct PairedRead {
     pub mate2: EncodedRead,
 }
 
+/// Output of a `--readFilesCommand` process.
+///
+/// The end of the output only means the process stopped writing, so its exit
+/// status decides whether that was the end of the reads. A reader dropped
+/// before the end (`--readMapNumber`) kills the process, as STAR does in
+/// `Parameters::closeReadsFiles`.
+struct CommandOutput {
+    child: Child,
+    stdout: ChildStdout,
+    command: String,
+}
+
+impl Read for CommandOutput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.stdout.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            let status = self.child.wait()?;
+            if !status.success() {
+                return Err(std::io::Error::other(format!(
+                    "--readFilesCommand '{}' failed ({status}), its output may be incomplete",
+                    self.command
+                )));
+            }
+        }
+        Ok(n)
+    }
+}
+
+impl Drop for CommandOutput {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// FASTQ reader that handles decompression and base encoding
 pub struct FastqReader {
     inner: fastq::io::Reader<Box<dyn BufRead + Send>>,
@@ -92,6 +127,8 @@ pub struct FastqReader {
     decompress_cmd: Option<String>,
     /// Index of the file `inner` is reading.
     file_index: u32,
+    /// Path of the file `inner` is reading, for error messages.
+    path: PathBuf,
 }
 
 impl FastqReader {
@@ -113,7 +150,7 @@ impl FastqReader {
     ///
     /// # Arguments
     /// * `path` - Path to FASTQ file
-    /// * `decompress_cmd` - Optional decompression command (e.g., "zcat" for .gz files)
+    /// * `decompress_cmd` - Optional shell command (e.g., "zcat" for .gz files)
     ///
     /// # Returns
     /// A FastqReader that iterates over encoded reads
@@ -141,6 +178,7 @@ impl FastqReader {
             pending: std::collections::VecDeque::new(),
             decompress_cmd: decompress_cmd.map(str::to_owned),
             file_index: 0,
+            path: path.to_path_buf(),
         })
     }
 
@@ -163,13 +201,23 @@ impl FastqReader {
         self
     }
 
-    /// Open FASTQ file using external decompression command
+    /// Open FASTQ file through `--readFilesCommand`, run by the shell with the
+    /// file name after it, as the script `Parameters_openReadsFiles.cpp` writes.
+    /// That script has the name inside double quotes, so a `$` in it would expand;
+    /// here it stays literal, whatever the name holds (`DIVERGENCE.md` 4.7).
     fn open_with_command(path: &Path, cmd: &str) -> Result<Box<dyn BufRead + Send>, Error> {
-        let mut child = Command::new(cmd)
-            .arg(path)
+        let shell = if cfg!(windows) { "sh" } else { "/bin/sh" };
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(format!("{cmd}   \"$RUSTAR_READ_FILE\""))
+            .env("RUSTAR_READ_FILE", path)
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::io(e, path))?;
+            .map_err(|e| {
+                Error::from(std::io::Error::other(format!(
+                    "could not start {shell} for --readFilesCommand '{cmd}': {e}"
+                )))
+            })?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             Error::from(std::io::Error::other(
@@ -177,7 +225,14 @@ impl FastqReader {
             ))
         })?;
 
-        Ok(Box::new(BufReader::with_capacity(1 << 19, stdout)))
+        Ok(Box::new(BufReader::with_capacity(
+            1 << 19,
+            CommandOutput {
+                child,
+                stdout,
+                command: cmd.to_owned(),
+            },
+        )))
     }
 
     /// Get next read with encoded bases
@@ -192,6 +247,7 @@ impl FastqReader {
             };
             let next_reader = Self::open(&next, self.decompress_cmd.as_deref())?;
             self.inner = next_reader.inner;
+            self.path = next_reader.path;
             self.file_index += 1;
         }
     }
@@ -199,6 +255,22 @@ impl FastqReader {
     fn next_in_current_file(&mut self) -> Result<Option<EncodedRead>, Error> {
         match self.inner.records().next() {
             Some(Ok(record)) => {
+                // STAR's check (`readLoad.cpp`). It is also what catches plain
+                // text cut in the quality line, which the parser accepts.
+                if record.sequence().len() != record.quality_scores().len() {
+                    return Err(Error::io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "read {}: quality string length is not equal to sequence \
+                                 length; the input is corrupt or was cut short",
+                                String::from_utf8_lossy(record.name())
+                            ),
+                        ),
+                        &self.path,
+                    ));
+                }
+
                 let name = std::str::from_utf8(record.name())
                     .map_err(|e| {
                         Error::from(std::io::Error::new(
@@ -237,7 +309,7 @@ impl FastqReader {
                     file_index: self.file_index,
                 }))
             }
-            Some(Err(e)) => Err(Error::from(e)),
+            Some(Err(e)) => Err(Error::io(e, &self.path)),
             None => Ok(None),
         }
     }
@@ -933,6 +1005,18 @@ mod tests {
         // EOF batch
         let batch3 = reader.read_paired_batch(3).unwrap();
         assert_eq!(batch3.len(), 0);
+    }
+
+    #[test]
+    fn test_cut_in_quality_line_is_an_error_naming_file_and_read() {
+        let mut f = NamedTempFile::new().unwrap();
+        write!(f, "@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nII").unwrap();
+        f.flush().unwrap();
+        let mut reader = FastqReader::open(f.path(), None).unwrap();
+        assert!(reader.next_encoded().unwrap().is_some());
+        let err = reader.next_encoded().unwrap_err().to_string();
+        assert!(err.contains("read r2"), "{err}");
+        assert!(err.contains(&*f.path().to_string_lossy()), "{err}");
     }
 
     #[test]

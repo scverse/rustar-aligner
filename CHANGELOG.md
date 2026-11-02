@@ -11,6 +11,23 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- Streamed FASTQ input (FIFOs, `<(...)`, `/dev/stdin`) fails instead of passing
+  for complete. A compressed stream cut in a way the FASTQ parser took for a
+  clean end of file (gzip trailer, member header, or decoded text ending on a
+  record boundary) is an error, and so is a `--readFilesCommand` that exits
+  non-zero. A read whose quality line is shorter than its sequence, what plain
+  text cut in the quality line looks like, gets STAR's error rather than a
+  panic. `--twopassMode Basic` on a stream now stops at once with a message; it
+  used to block forever or exit 0 with a second pass of 0 reads, as STAR 2.7.11b
+  does (`DIVERGENCE.md` 4.6). FASTQ read errors name the file.
+- `--readFilesCommand` takes what STAR takes. The value used to be a program
+  name, so `'gzip -dc'`, `gunzip -c` and `-` all failed with `No such file or
+  directory`. It is now a shell command line, in one value or several, run by
+  `/bin/sh` on each read file, and a first value of `-` means no command
+  (`DIVERGENCE.md` 4.7).
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

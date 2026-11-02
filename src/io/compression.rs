@@ -13,6 +13,10 @@
 //! naming the feature and the `--readFilesCommand` alternative, instead of
 //! handing compressed bytes to the FASTQ parser.
 //!
+//! A decoder that runs out of input reports `UnexpectedEof`, and the FASTQ
+//! parser reads that kind of error at the start of a record as a clean end of
+//! file. [`TruncationCheck`] keeps a cut stream from passing for a complete one.
+//!
 //! STAR itself does no detection and relies on `--readFilesCommand`; that
 //! option still takes precedence over everything here (see `DIVERGENCE.md`).
 
@@ -112,30 +116,58 @@ where
 
     let reader: Box<dyn BufRead + Send> = match format {
         Format::Plain => Box::new(compressed),
-        Format::Gzip => Box::new(BufReader::with_capacity(
-            DECODE_BUF,
-            MultiGzDecoder::new(compressed),
-        )),
+        Format::Gzip => decoded(MultiGzDecoder::new(compressed), format),
         #[cfg(feature = "bz2")]
-        Format::Bzip2 => Box::new(BufReader::with_capacity(
-            DECODE_BUF,
-            bzip2::read::MultiBzDecoder::new(compressed),
-        )),
+        Format::Bzip2 => decoded(bzip2::read::MultiBzDecoder::new(compressed), format),
         #[cfg(feature = "zstd")]
-        Format::Zstd => Box::new(BufReader::with_capacity(
-            DECODE_BUF,
-            zstd_frames::ZstdFrames::new(compressed),
-        )),
+        Format::Zstd => decoded(zstd_frames::ZstdFrames::new(compressed), format),
         #[cfg(feature = "xz")]
-        Format::Xz => Box::new(BufReader::with_capacity(
-            DECODE_BUF,
-            // `true`: keep going across concatenated XZ streams.
-            lzma_rust2::XzReader::new(compressed, true),
-        )),
+        // `true`: keep going across concatenated XZ streams.
+        Format::Xz => decoded(lzma_rust2::XzReader::new(compressed, true), format),
         #[allow(unreachable_patterns)]
         other => return Err(unsupported(other)),
     };
     Ok((reader, format))
+}
+
+/// Buffer a decoder's output, with truncation reported as such.
+fn decoded<R>(decoder: R, format: Format) -> Box<dyn BufRead + Send>
+where
+    R: Read + Send + 'static,
+{
+    Box::new(BufReader::with_capacity(
+        DECODE_BUF,
+        TruncationCheck {
+            inner: decoder,
+            format,
+        },
+    ))
+}
+
+/// Turns a decoder's `UnexpectedEof` into `InvalidData`.
+///
+/// noodles' FASTQ reader returns "no more records" when reading the first byte
+/// of a record fails with `UnexpectedEof`. Without this adapter, a compressed
+/// stream cut where the decoded text ends on a record boundary, in the gzip
+/// trailer or in a member header would end the run with exit code 0.
+struct TruncationCheck<R> {
+    inner: R,
+    format: Format,
+}
+
+impl<R: Read> Read for TruncationCheck<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("truncated {} input: {e}", self.format),
+                )
+            } else {
+                e
+            }
+        })
+    }
 }
 
 /// Error for a format whose decoder was not compiled in.
@@ -341,6 +373,57 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!((out.as_slice(), f), (FASTQ, Format::Gzip));
+    }
+
+    /// Every strict prefix of a compressed stream, from the magic bytes on, is
+    /// an error and never reads as a clean end of input. `compress` makes one
+    /// self-contained stream, so no cut falls on a member boundary.
+    fn assert_every_cut_fails(compress: impl Fn(&[u8]) -> Vec<u8>, min_cut: usize) {
+        let bytes = compress(FASTQ);
+        for cut in min_cut..bytes.len() {
+            let (mut r, _) = open_decoded(Cursor::new(bytes[..cut].to_vec())).unwrap();
+            let mut out = Vec::new();
+            let err = r
+                .read_to_end(&mut out)
+                .expect_err(&format!("cut at {cut}/{} must fail", bytes.len()));
+            assert_ne!(err.kind(), io::ErrorKind::UnexpectedEof, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn gzip_cut_anywhere_is_an_error() {
+        assert_every_cut_fails(gzip, 2);
+    }
+
+    /// A cut on a member boundary leaves a valid gzip file: undetectable.
+    #[test]
+    fn gzip_cut_on_member_boundary_reads_as_complete() {
+        let (a, b) = FASTQ.split_at(16);
+        let mut bytes = gzip(a);
+        let boundary = bytes.len();
+        bytes.extend(gzip(b));
+        let (out, _) = decode(bytes[..boundary].to_vec()).unwrap();
+        assert_eq!(out, a);
+        // One byte more, in the next member's header, is detected.
+        assert!(decode(bytes[..=boundary].to_vec()).is_err());
+    }
+
+    #[cfg(feature = "bz2")]
+    #[test]
+    fn bzip2_cut_anywhere_is_an_error() {
+        assert_every_cut_fails(bzip2, 3);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_cut_anywhere_is_an_error() {
+        assert_every_cut_fails(zstd, 4);
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_cut_anywhere_is_an_error() {
+        assert_every_cut_fails(xz, 6);
     }
 
     #[cfg(feature = "bz2")]

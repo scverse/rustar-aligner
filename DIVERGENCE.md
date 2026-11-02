@@ -309,13 +309,37 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **What STAR does.** Reads `--readFilesIn` as plain text unless `--readFilesCommand` names a decompressor (`zcat`, `bunzip2 -c`, ...), which STAR runs per file (`Parameters_openReadsFiles.cpp:21-70`). It does no detection of its own.
 
-**What rustar-aligner does.** Without `--readFilesCommand`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
+**What rustar-aligner does.** Without `--readFilesCommand`, or with `-`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
 
 **Why.** Extension-based gzip detection was already a local convenience; content detection makes it independent of file names and covers stdin and pipes.
 
 **Impact.** Input STAR would reject (compressed data without `--readFilesCommand`) is accepted. No alignment output changes for input both accept.
 
 **Source.** `src/io/compression.rs`, called from `FastqReader::open` in `src/io/fastq.rs`.
+
+### 4.6 Failures of streamed reads are errors
+
+**What STAR does.** STAR does not look at the exit status of `--readFilesCommand`: the process is only started in `Parameters_openReadsFiles.cpp` and killed in `Parameters_closeReadsFiles.cpp`, and STAR 2.7.11b with `--readFilesCommand false` exits 0 having mapped 0 reads. `--twopassMode Basic` closes and reopens the inputs after pass 1 (`twoPassRunPass1.cpp:95-96`), which a stream cannot honour: measured with 2.7.11b, a FIFO blocks forever on the second open, and `<(...)` exits 0 with 0 input reads in `Log.final.out`.
+
+**What rustar-aligner does.** A `--readFilesCommand` that exits non-zero fails the run, unless the run stopped reading first (`--readMapNumber`), in which case the command is killed, as in STAR. `--twopassMode Basic` refuses, before reading anything, any file that pass 1 would read and that is not a regular file, or that lies under `/dev/`. A solo run's barcode file is exempt, since pass 1 does not read it. On Linux this also refuses `/dev/stdin` redirected from a regular file, which that platform could reopen; macOS cannot.
+
+**Why.** Exit code 0 with partial or empty results is the worst way a long run on a download can end. A temporary copy of the input would make two-pass work on a stream, but it would write the data to disk, which is what reading a stream is meant to avoid, so the error says to save the file instead.
+
+**Impact.** Runs that hung or gave an empty result now fail with a message, as do runs whose command failed after a complete-looking output. No alignment output changes for a run that succeeds in both.
+
+**Source.** `CommandOutput` in `src/io/fastq.rs`; `is_read_once` in `src/params/mod.rs`.
+
+### 4.7 Details of running `--readFilesCommand`
+
+**What STAR does.** Joins the values with three spaces (`Parameters_readFilesInit.cpp`) and writes, for each mate, one script holding the command line and the file name in double quotes, once per file, which the default shell runs (`Parameters_openReadsFiles.cpp`). It first refuses a read file it cannot open, even if the command would not read it. So the shell expands a `$`, a backtick or a `\` in the name, and a `"` ends the quotes. `--sysShell` chooses the shell.
+
+**What rustar-aligner does.** Same command line and same shell, with these differences. The file name reaches the command through the environment variable `RUSTAR_READ_FILE`, so it stays literal. Each file gets its own shell, so a variable or a `cd` in the command does not carry over to the next file. A read file that cannot be opened is left for the command to report: `gzip -dc` on a missing file fails the run (4.6), while a command that ignores its file name still runs. `--sysShell` is not accepted, as `tests/parameter_surface.rs` records. On Windows, which STAR does not support, the shell is `sh` from `PATH`, and is required: without one, the run stops with a message.
+
+**Why.** A file name is data, and a literal one needs no quoting rules. Leaving out the check keeps a FIFO readable through a command: measured with 2.7.11b, `--readFilesCommand cat` on a FIFO was still blocked when stopped after 12 s, where rustar-aligner maps all reads.
+
+**Impact.** Names that STAR expands or breaks on work here: measured with 2.7.11b, `--readFilesCommand 'gzip -dc'` on a file named `cost$HOME.gz` exits 0 with no records, where rustar-aligner maps all reads. A command that relies on state from the previous file's run, or a run on a missing file with a command that ignores its argument, behaves differently; neither is a use STAR documents. Alignment output for a run that succeeds in both does not change.
+
+**Source.** `FastqReader::open_with_command` in `src/io/fastq.rs`; `join_read_files_command` in `src/params/mod.rs`.
 
 ## 5. Known residual single-read differences
 

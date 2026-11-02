@@ -23,6 +23,8 @@ rustar-aligner \
   --outFileNamePrefix sample_
 ```
 
+Both passes read the input from the start, so the reads must be regular files. A [stream](/rustar-aligner/guides/streaming-input/) is refused with an error.
+
 ## Combining with a GTF
 
 You can use two-pass mode together with `--sjdbGTFfile`. The GTF's junctions are inserted before pass 1; the pass-1 junctions are then added to them. When the same junction comes from both, the genome's and the GTF's version is kept, as STAR does.
