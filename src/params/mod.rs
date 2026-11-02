@@ -2311,8 +2311,57 @@ impl Parameters {
 
         // ── STARsolo validation ─────────────────────────────────────────
         if params.run_mode() == RunMode::AlignReads && params.solo_enabled() {
+            // The solo read loops have no code for these, so they would write
+            // empty or all-zero files and exit 0 (DIVERGENCE §1.10).
+            let unsupported = [
+                (params.quant_gene_counts(), "--quantMode GeneCounts"),
+                (
+                    params.quant_transcriptome_sam(),
+                    "--quantMode TranscriptomeSAM",
+                ),
+                (params.quant_gene_coverage(), "--quantGeneCoverage"),
+                (params.quant_gene_splicing(), "--quantGeneSplicing"),
+                (
+                    params.out_reads_unmapped == OutReadsUnmapped::Fastx,
+                    "--outReadsUnmapped Fastx",
+                ),
+                (
+                    params.out_filter_type == OutFilterType::BySJout,
+                    "--outFilterType BySJout",
+                ),
+                (params.chim_segment_min > 0, "--chimSegmentMin"),
+                (
+                    params.wasp_output_mode != WaspOutputMode::None,
+                    "--waspOutputMode",
+                ),
+            ];
+            if let Some((_, flag)) = unsupported.iter().find(|(on, _)| *on) {
+                return Err(command.error(
+                    ErrorKind::ArgumentConflict,
+                    format!("{flag} is not implemented with --soloType, so it cannot be used here"),
+                ));
+            }
+            // Only the first method reaches the matrix (DIVERGENCE §1.10).
+            if params.solo_umi_dedup.len() > 1 {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--soloUMIdedup takes one method here, got {}",
+                        params.solo_umi_dedup.len()
+                    ),
+                ));
+            }
             // CB_UMI_Complex needs one CB position + whitelist per segment.
             if params.solo_type == SoloType::CbUmiComplex {
+                if params.solo_umi_position.is_empty() {
+                    return Err(command.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "--soloType CB_UMI_Complex requires --soloUMIposition",
+                    ));
+                }
+                if let Err(e) = crate::solo::check_positions(&params) {
+                    return Err(command.error(ErrorKind::InvalidValue, e.to_string()));
+                }
                 if params.solo_cb_position.is_empty() {
                     return Err(command.error(
                         ErrorKind::MissingRequiredArgument,
@@ -2535,6 +2584,20 @@ impl Parameters {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     "--soloCBlen and --soloUMIlen must be > 0 for soloType CB_UMI_Simple",
+                ));
+            }
+            // UMIs are packed in a u64 too. CB_UMI_Complex takes its width from
+            // --soloUMIposition, checked above.
+            if params.solo_type != SoloType::CbUmiComplex
+                && params.solo_umi_len as usize > crate::solo::whitelist::CB_LEN_MAX
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "--soloUMIlen {} exceeds the maximum of {}",
+                        params.solo_umi_len,
+                        crate::solo::whitelist::CB_LEN_MAX
+                    ),
                 ));
             }
             // Cell barcode cannot exceed a u64 packing (32 bases).

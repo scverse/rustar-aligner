@@ -171,6 +171,16 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
+### 1.10 Solo options that are refused rather than implemented
+
+**What STAR does.** STARsolo runs accept `--quantMode GeneCounts TranscriptomeSAM`, `--outReadsUnmapped Fastx`, `--outFilterType BySJout`, `--chimSegmentMin`, `--waspOutputMode`, and several `--soloUMIdedup` methods (one matrix per method). These descriptions come from STAR's documentation; solo runs of the Homebrew binary could not be compared on macOS, where it stops at `geneInfo.tab`.
+
+**What rustar-aligner does.** With `--soloType` it exits with an error naming the option. The same goes for this tool's own `--quantGeneCoverage` and `--quantGeneSplicing`.
+
+**Why.** The solo read loops have no code for these. They were accepted and wrote empty or all-zero files with exit 0, or dropped all methods but the first. An error is better than a result that looks real. Each one can be lifted when the loop implements it.
+
+**Source.** `src/params/mod.rs` (STARsolo validation).
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

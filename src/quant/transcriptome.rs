@@ -31,7 +31,7 @@ const MISSING_GENE_TYPE: &str = "MissingGeneType";
 /// STAR's `find_attr_list` (`GTF.cpp`): the last of `tags`, in list order, that has an entry in
 /// `attrs`. `--sjdbGTFtagExonParentGeneName`/`GeneType` accept several candidate keys; when more
 /// than one matches, the last one in the list wins.
-fn find_attr_list(attrs: &HashMap<String, String>, tags: &[String]) -> Option<String> {
+pub(crate) fn find_attr_list(attrs: &HashMap<String, String>, tags: &[String]) -> Option<String> {
     tags.iter()
         .filter_map(|t| attrs.get(t))
         .next_back()

@@ -356,11 +356,19 @@ impl CbWhitelist {
     /// Matching the assembled CB against this is equivalent to STARsolo's
     /// per-segment matching for both Exact and 1MM (a 1MM in the concatenation is
     /// a 1MM in exactly one segment). Errors if the combined length exceeds 32.
-    pub fn load_complex(paths: &[std::path::PathBuf]) -> Result<Self, Error> {
+    pub fn load_complex(
+        paths: &[std::path::PathBuf],
+        segment_lens: &[Option<usize>],
+    ) -> Result<Self, Error> {
         let segs: Vec<(Vec<u64>, usize)> = paths
             .iter()
             .map(|p| Self::load_packed(p))
             .collect::<Result<_, _>>()?;
+        for ((path, (_, len)), want) in paths.iter().zip(&segs).zip(segment_lens) {
+            if want.is_some_and(|w| w != *len) {
+                return Err(wrong_length(path, *len, want.unwrap_or(0)));
+            }
+        }
         let total_len: usize = segs.iter().map(|(_, l)| l).sum();
         if total_len == 0 || total_len > CB_LEN_MAX {
             return Err(Error::from(std::io::Error::new(
@@ -497,6 +505,11 @@ impl CbWhitelist {
     /// `cb_seq`). On an exact hit the whitelist's exact-count is incremented.
     pub fn match_cb(&self, cb_seq: &[u8], cb_qual: &[u8], match_type: CbMatchType) -> CbMatch {
         let len = cb_seq.len();
+        // Packing drops the length, so a shorter barcode would equal a longer
+        // entry that starts with `A`s.
+        if matches!(self, Self::List { len: want, .. } if *want != len) {
+            return CbMatch::NoMatch;
+        }
         match self {
             Self::NoWhitelist { .. } => match pack_barcode(cb_seq) {
                 // No whitelist: every N-free barcode is its own "cell". We
@@ -580,7 +593,17 @@ fn qual_at(qual: &[u8], pos: usize) -> u8 {
 }
 
 /// Open a file, transparently decompressing `.gz`.
-fn open_maybe_gzip(path: &Path) -> Result<Box<dyn BufRead>, Error> {
+pub(crate) fn wrong_length(path: &Path, found: usize, want: usize) -> Error {
+    Error::from(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{}: whitelist barcodes have length {found}, but the barcode read gives {want}",
+            path.display()
+        ),
+    ))
+}
+
+pub(crate) fn open_maybe_gzip(path: &Path) -> Result<Box<dyn BufRead>, Error> {
     let file = File::open(path).map_err(|e| Error::io(e, path))?;
     let is_gz = path
         .extension()
@@ -709,6 +732,17 @@ mod tests {
         }
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn barcode_of_another_length_never_matches() {
+        // Packed, `AACCC` and the 3-base entry `CCC` are the same number.
+        let PackResult::NoN(packed) = pack_barcode(&[1, 1, 1]) else {
+            unreachable!()
+        };
+        let wl = CbWhitelist::from_packed_list(vec![packed], 3);
+        let matched = wl.match_cb(&[0, 0, 1, 1, 1], &[b'I'; 5], "Exact".parse().unwrap());
+        assert!(matches!(matched, CbMatch::NoMatch));
     }
 
     #[test]

@@ -203,7 +203,51 @@ fn parse_position_anchored(spec: &str) -> Result<(Anchored, Anchored), Error> {
     }
 }
 
+/// Refuse a `CB_UMI_Complex` position that cannot be parsed, or a UMI too wide to
+/// pack. [`SoloBarcodeLayout::from_params`] assumes this has passed.
+pub fn check_positions(params: &Parameters) -> Result<(), Error> {
+    let anchored = params.solo_adapter_sequence != "-";
+    for spec in params
+        .solo_cb_position
+        .iter()
+        .chain(std::iter::once(&params.solo_umi_position))
+    {
+        if anchored {
+            parse_position_anchored(spec)?;
+        } else {
+            parse_position(spec)?;
+        }
+    }
+    match SoloBarcodeLayout::from_params(params).umi_len() {
+        Some(len) if len > whitelist::CB_LEN_MAX => Err(invalid_pos(
+            &params.solo_umi_position,
+            "the UMI is longer than 32 bases",
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl SoloBarcodeLayout {
+    /// UMI width, or `None` when two different anchors make it vary by read.
+    pub fn umi_len(&self) -> Option<usize> {
+        match self {
+            Self::Simple { umi_len, .. } => Some(*umi_len),
+            Self::Complex { umi, .. } => Some(umi.1),
+            Self::Anchored { umi, .. } => anchored_len(umi),
+        }
+    }
+
+    /// Cell barcode width of each segment, `None` where it varies by read.
+    pub fn cb_segment_lens(&self) -> Vec<Option<usize>> {
+        match self {
+            Self::Simple { cb_len, .. } => vec![Some(*cb_len)],
+            Self::Complex { cb_segments, .. } => {
+                cb_segments.iter().map(|&(_, l)| Some(l)).collect()
+            }
+            Self::Anchored { cb_segments, .. } => cb_segments.iter().map(anchored_len).collect(),
+        }
+    }
+
     /// Build the layout from CLI parameters. `CB_UMI_Complex` parses
     /// `--soloCBposition`/`--soloUMIposition`; otherwise fixed Simple geometry.
     pub fn from_params(params: &Parameters) -> Self {
@@ -391,6 +435,13 @@ pub fn barcode_q30(
             q30(&read.quality[..n])
         }
     }
+}
+
+fn anchored_len(field: &(Anchored, Anchored)) -> Option<usize> {
+    let (start, end) = field;
+    (start.anchor == end.anchor)
+        .then(|| usize::try_from(end.dist - start.dist + 1).ok())
+        .flatten()
 }
 
 fn slice_or_empty(data: &[u8], start: usize, len: usize) -> Vec<u8> {
@@ -1291,7 +1342,9 @@ pub struct SoloContext {
     /// `--soloCellReadStats CB`: the per-cell read summary, or `None` when the
     /// flag is off. Behind a mutex like the other per-read collections; the
     /// lock is only taken when the flag asks for the file.
-    pub cell_read_stats: Option<Mutex<crate::solo::cell_reads::CellReadStats>>,
+    pub cell_read_stats: Option<Vec<Mutex<crate::solo::cell_reads::CellReadStats>>>,
+    /// UMI width: `--soloUMIposition`'s for `CB_UMI_Complex`, else `--soloUMIlen`.
+    pub umi_len: usize,
     /// Chromosome indices named by `--genomeChrSetMitochondrial`, for the
     /// `mito` column.
     pub mito_chr: std::collections::HashSet<usize>,
@@ -1528,6 +1581,8 @@ impl SoloContext {
         genome: &crate::genome::Genome,
         transcriptome: Option<&crate::quant::transcriptome::TranscriptomeIndex>,
     ) -> Result<Self, Error> {
+        let layout = SoloBarcodeLayout::from_params(params);
+        let cb_lens = layout.cb_segment_lens();
         let whitelist = if params.solo_type == SoloType::CbUmiComplex {
             // One whitelist per CB segment → combined cartesian-product whitelist.
             let paths: Vec<std::path::PathBuf> = params
@@ -1539,7 +1594,7 @@ impl SoloContext {
                 "STARsolo CB_UMI_Complex: combining {} segment whitelists",
                 paths.len()
             );
-            let wl = CbWhitelist::load_complex(&paths)?;
+            let wl = CbWhitelist::load_complex(&paths, &cb_lens)?;
             log::info!("STARsolo: {} combined whitelist barcodes", wl.len());
             wl
         } else {
@@ -1550,6 +1605,13 @@ impl SoloContext {
                         path.display()
                     );
                     let wl = CbWhitelist::load(&path)?;
+                    if cb_lens[0].is_some_and(|want| want != wl.barcode_len()) {
+                        return Err(whitelist::wrong_length(
+                            &path,
+                            wl.barcode_len(),
+                            cb_lens[0].unwrap_or(0),
+                        ));
+                    }
                     log::info!("STARsolo: {} whitelist barcodes loaded", wl.len());
                     wl
                 }
@@ -1621,8 +1683,10 @@ impl SoloContext {
                 (tags || velocyto).then(|| Mutex::new(Vec::new()))
             })
             .collect();
+        let n_features = features.len();
         Ok(Self {
-            layout: SoloBarcodeLayout::from_params(params),
+            umi_len: layout.umi_len().unwrap_or(params.solo_umi_len as usize),
+            layout,
             whitelist,
             match_type: params.solo_cb_match_type(),
             strand,
@@ -1641,8 +1705,11 @@ impl SoloContext {
             velocyto_enabled,
             velocyto_records: Mutex::new(VelocytoRecords::default()),
             want_multi,
-            cell_read_stats: (params.solo_cell_read_stats == "CB")
-                .then(|| Mutex::new(crate::solo::cell_reads::CellReadStats::new())),
+            cell_read_stats: (params.solo_cell_read_stats == "CB").then(|| {
+                (0..n_features)
+                    .map(|_| Mutex::new(crate::solo::cell_reads::CellReadStats::new()))
+                    .collect()
+            }),
             mito_chr: params
                 .genome_chr_set_mitochondrial
                 .iter()
@@ -2183,34 +2250,37 @@ impl SoloContext {
         let Some(stats) = &self.cell_read_stats else {
             return;
         };
-        let counted_u = out.per_feature.iter().any(|f| f.record.is_some());
-        let counted_m = out.per_feature.iter().any(|f| f.multi_gene.is_some());
-        let feature_u = counted_u || out.per_feature.iter().any(|f| f.multi.is_some());
-        let flag = crate::solo::cell_reads::CellReadFlag {
-            cb_perfect: matches!(cb_match, CbMatch::Exact(_)),
-            cb_mm_unique: matches!(cb_match, CbMatch::Corrected(_)),
-            cb_mm_multiple: matches!(cb_match, CbMatch::Multi(_)),
-            genome_u: n_loci == 1,
-            genome_m: n_loci > 1,
-            feature_u,
-            feature_m: counted_m,
-            // The region columns split by strand: STAR reports an antisense
-            // read under `exonicAS`/`intronicAS`, not under `exonic`/`intronic`.
-            exonic: !class.antisense && class.region == Some(Region::Exonic),
-            intronic: !class.antisense && class.region == Some(Region::Intronic),
-            exonic_as: class.antisense && class.region == Some(Region::Exonic),
-            intronic_as: class.antisense && class.region == Some(Region::Intronic),
-            mito: !self.mito_chr.is_empty()
-                && transcripts
-                    .iter()
-                    .any(|t| self.mito_chr.contains(&t.chr_idx)),
-            counted_u,
-            counted_m,
-        };
-        let mut stats = stats.lock().unwrap();
-        match cb_resolved {
-            Some(cb) => stats.add_cell(cb, &flag),
-            None => stats.add_no_cb(&flag),
+        // STAR keeps one file per feature, so what a read counted to stays there.
+        for (stats, f) in stats.iter().zip(&out.per_feature) {
+            let counted_u = f.record.is_some();
+            let counted_m = f.multi_gene.is_some();
+            let feature_u = counted_u || f.multi.is_some();
+            let flag = crate::solo::cell_reads::CellReadFlag {
+                cb_perfect: matches!(cb_match, CbMatch::Exact(_)),
+                cb_mm_unique: matches!(cb_match, CbMatch::Corrected(_)),
+                cb_mm_multiple: matches!(cb_match, CbMatch::Multi(_)),
+                genome_u: n_loci == 1,
+                genome_m: n_loci > 1,
+                feature_u,
+                feature_m: counted_m,
+                // The region columns split by strand: STAR reports an antisense
+                // read under `exonicAS`/`intronicAS`, not under `exonic`/`intronic`.
+                exonic: !class.antisense && class.region == Some(Region::Exonic),
+                intronic: !class.antisense && class.region == Some(Region::Intronic),
+                exonic_as: class.antisense && class.region == Some(Region::Exonic),
+                intronic_as: class.antisense && class.region == Some(Region::Intronic),
+                mito: !self.mito_chr.is_empty()
+                    && transcripts
+                        .iter()
+                        .any(|t| self.mito_chr.contains(&t.chr_idx)),
+                counted_u,
+                counted_m,
+            };
+            let mut stats = stats.lock().unwrap();
+            match cb_resolved {
+                Some(cb) => stats.add_cell(cb, &flag),
+                None => stats.add_no_cb(&flag),
+            }
         }
     }
 
