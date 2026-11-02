@@ -34,7 +34,7 @@ five supported platforms, without a C toolchain unless the row says otherwise.
 | `dashmap` | 6 | MIT | `junction/sj_output.rs` | The concurrent junction-count map. Its iteration order is not stable, which is why every path that emits an order sorts on a total key first (see [#210](https://github.com/scverse/rustar-aligner/issues/210), and the determinism test that locks it). |
 | `chrono` | 0.4 | MIT OR Apache-2.0 | `lib.rs`, `stats.rs`, `io/log.rs` | Timestamps in `Log.out` / `Log.final.out`, whose format STAR fixes. |
 | `tempfile` | 3 | MIT OR Apache-2.0 | `io/bam.rs`, `solo/count.rs` | The sorted-BAM spill runs and the solo matrix body, plus test fixtures. |
-| `shlex` | 2 | MIT OR Apache-2.0 | `params/mod.rs` | Quoting the command line for the `@PG` header, and splitting `--readFilesCommand`. |
+| `shlex` | 2 | MIT OR Apache-2.0 | `params/mod.rs` | Quoting the command line for the `@PG` header. |
 | `caps-sa` | 0.7 | MIT | `index/sa_build.rs` | Suffix-array construction at `genomeGenerate`. Alternatives are in section 4. |
 | `mimalloc` + `libmimalloc-sys` | 0.1 | MIT | `main.rs`, `lib.rs` | The global allocator. glibc malloc keeps one arena per worker thread and caches freed allocations in them indefinitely, which added 10-20 GB of slack to peak RSS on genome-scale runs; mimalloc's per-thread heaps release whole segments back to the OS. It is also cheaper per allocation, which matters for the millions of small allocations SA construction makes. |
 | `hyalite` | =0.4.0 | MIT | `solo/mod.rs` | The Smith-Waterman alignment behind `--clipAdapterType CellRanger4`'s TSO clip ([#197](https://github.com/scverse/rustar-aligner/issues/197)). Pinned to an exact version because its output is checked against a committed fixture. |

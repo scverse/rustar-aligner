@@ -22,6 +22,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
   panic. `--twopassMode Basic` on a stream now stops at once with a message; it
   used to block forever or exit 0 with a second pass of 0 reads, as STAR 2.7.11b
   does (`DIVERGENCE.md` 4.6). FASTQ read errors name the file.
+- `--readFilesCommand` takes what STAR takes. The value used to be a program
+  name, so `'gzip -dc'`, `gunzip -c` and `-` all failed with `No such file or
+  directory`. It is now a shell command line, in one value or several, run by
+  `/bin/sh` on each read file, and a first value of `-` means no command
+  (`DIVERGENCE.md` 4.7).
 
 ### Other changes
 

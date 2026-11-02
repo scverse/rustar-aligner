@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -533,7 +534,9 @@ pub struct Parameters {
     #[arg(long = "readFilesIn", num_args = 1..=3)]
     pub read_files_in: Vec<PathBuf>,
 
-    /// Command to decompress input files (e.g. "zcat" for .gz)
+    /// Shell command run on each read file, which writes FASTQ to stdout: `zcat`,
+    /// `gunzip -c` or `'gzip -dc'`. `-` (or nothing) means no command. Several
+    /// values are joined into one command, see `join_read_files_command`.
     #[arg(long = "readFilesCommand")]
     pub read_files_command: Option<String>,
 
@@ -1488,6 +1491,31 @@ pub struct Parameters {
     pub read_files_names: Vec<Vec<PathBuf>>,
 }
 
+/// Join the values of `--readFilesCommand` into one argument for clap, as
+/// `Parameters_readFilesInit.cpp` joins them with three spaces. As in STAR
+/// (`Parameters::inputParameters`), only a word starting with `--` ends the
+/// values, so `--readFilesCommand gunzip -c --readFilesIn r.fq.gz` has two.
+/// clap cannot say that: `allow_hyphen_values` on an open-ended option would
+/// take `--readFilesIn` as a value too.
+fn join_read_files_command(args: &[OsString]) -> Vec<OsString> {
+    let mut joined = Vec::with_capacity(args.len());
+    let mut rest = args.iter().peekable();
+    while let Some(arg) = rest.next() {
+        let mut arg = arg.clone();
+        let bare = arg == "--readFilesCommand";
+        if bare || arg.as_encoded_bytes().starts_with(b"--readFilesCommand=") {
+            let mut separator = if bare { "=" } else { "   " };
+            while let Some(value) = rest.next_if(|a| !a.as_encoded_bytes().starts_with(b"--")) {
+                arg.push(separator);
+                arg.push(value);
+                separator = "   ";
+            }
+        }
+        joined.push(arg);
+    }
+    joined
+}
+
 /// Whether a read file cannot be opened a second time from its start: a FIFO,
 /// a pipe or a socket, or anything under `/dev/`. `/dev/stdin` and `/dev/fd/N`
 /// can stat as a regular file when redirected from one, and on macOS opening
@@ -1822,8 +1850,16 @@ impl Parameters {
         let args: Vec<_> = args.into_iter().map(Into::into).collect();
 
         let mut command = <Self as clap::CommandFactory>::command();
-        let matches = command.clone().get_matches_from(args.iter());
+        let matches = command
+            .clone()
+            .get_matches_from(join_read_files_command(&args));
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
+
+        // A first value of `-` means no command, whatever follows it
+        // (`Parameters_readFilesInit.cpp`).
+        params
+            .read_files_command
+            .take_if(|c| c == "-" || c.starts_with("-   "));
 
         params.star_command_line = Some(
             args.iter()
@@ -2962,6 +2998,34 @@ mod tests {
         let mut full = vec!["rustar-aligner"];
         full.extend_from_slice(args);
         Parameters::try_parse_from(&full)
+    }
+
+    #[test]
+    fn read_files_command_forms_as_star() {
+        let parse = |args: &[&str]| {
+            let mut full = vec!["--genomeDir", "/idx", "--readFilesCommand"];
+            full.extend_from_slice(args);
+            full.extend_from_slice(&["--readFilesIn", "r.fq"]);
+            let p = try_parse(&full).unwrap();
+            assert_eq!(p.read_files_in, vec![PathBuf::from("r.fq")]);
+            p.read_files_command
+        };
+        assert_eq!(parse(&["zcat"]).as_deref(), Some("zcat"));
+        assert_eq!(parse(&["gzip -dc"]).as_deref(), Some("gzip -dc"));
+        assert_eq!(parse(&["gunzip", "-c"]).as_deref(), Some("gunzip   -c"));
+        assert_eq!(parse(&["-c", "cat"]).as_deref(), Some("-c   cat"));
+        assert_eq!(parse(&["cat", "-"]).as_deref(), Some("cat   -"));
+        assert_eq!(parse(&["-"]), None);
+        assert_eq!(parse(&["-", "zcat"]), None);
+
+        let p = try_parse(&[
+            "--genomeDir=/idx",
+            "--readFilesIn=r.fq",
+            "--readFilesCommand=gunzip",
+            "-c",
+        ]);
+        let command = p.unwrap().read_files_command;
+        assert_eq!(command.as_deref(), Some("gunzip   -c"));
     }
 
     #[test]

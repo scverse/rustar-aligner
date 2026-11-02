@@ -150,7 +150,7 @@ impl FastqReader {
     ///
     /// # Arguments
     /// * `path` - Path to FASTQ file
-    /// * `decompress_cmd` - Optional decompression command (e.g., "zcat" for .gz files)
+    /// * `decompress_cmd` - Optional shell command (e.g., "zcat" for .gz files)
     ///
     /// # Returns
     /// A FastqReader that iterates over encoded reads
@@ -201,13 +201,23 @@ impl FastqReader {
         self
     }
 
-    /// Open FASTQ file using external decompression command
+    /// Open FASTQ file through `--readFilesCommand`, run by the shell with the
+    /// file name after it, as the script `Parameters_openReadsFiles.cpp` writes.
+    /// That script has the name inside double quotes, so a `$` in it would expand;
+    /// here it stays literal, whatever the name holds (`DIVERGENCE.md` 4.7).
     fn open_with_command(path: &Path, cmd: &str) -> Result<Box<dyn BufRead + Send>, Error> {
-        let mut child = Command::new(cmd)
-            .arg(path)
+        let shell = if cfg!(windows) { "sh" } else { "/bin/sh" };
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(format!("{cmd}   \"$RUSTAR_READ_FILE\""))
+            .env("RUSTAR_READ_FILE", path)
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::io(e, path))?;
+            .map_err(|e| {
+                Error::from(std::io::Error::other(format!(
+                    "could not start {shell} for --readFilesCommand '{cmd}': {e}"
+                )))
+            })?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             Error::from(std::io::Error::other(

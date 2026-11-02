@@ -309,7 +309,7 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **What STAR does.** Reads `--readFilesIn` as plain text unless `--readFilesCommand` names a decompressor (`zcat`, `bunzip2 -c`, ...), which STAR runs per file (`Parameters_openReadsFiles.cpp:21-70`). It does no detection of its own.
 
-**What rustar-aligner does.** Without `--readFilesCommand`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
+**What rustar-aligner does.** Without `--readFilesCommand`, or with `-`, it peeks each input's first bytes and decodes gzip (always), and bzip2, Zstandard and XZ when built with the `bz2`, `zstd` and `xz` Cargo features. Anything else is read as plain text, whatever the file name. A recognised format whose feature is not compiled in is an error, not garbage fed to the parser. With `--readFilesCommand`, no detection happens, exactly as in STAR.
 
 **Why.** Extension-based gzip detection was already a local convenience; content detection makes it independent of file names and covers stdin and pipes.
 
@@ -328,6 +328,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 **Impact.** Runs that hung or gave an empty result now fail with a message, as do runs whose command failed after a complete-looking output. No alignment output changes for a run that succeeds in both.
 
 **Source.** `CommandOutput` in `src/io/fastq.rs`; `is_read_once` in `src/params/mod.rs`.
+
+### 4.7 Details of running `--readFilesCommand`
+
+**What STAR does.** Joins the values with three spaces (`Parameters_readFilesInit.cpp`) and writes, for each mate, one script holding the command line and the file name in double quotes, once per file, which the default shell runs (`Parameters_openReadsFiles.cpp`). It first refuses a read file it cannot open, even if the command would not read it. So the shell expands a `$`, a backtick or a `\` in the name, and a `"` ends the quotes. `--sysShell` chooses the shell.
+
+**What rustar-aligner does.** Same command line and same shell, with these differences. The file name reaches the command through the environment variable `RUSTAR_READ_FILE`, so it stays literal. Each file gets its own shell, so a variable or a `cd` in the command does not carry over to the next file. A read file that cannot be opened is left for the command to report: `gzip -dc` on a missing file fails the run (4.6), while a command that ignores its file name still runs. `--sysShell` is not accepted, as `tests/parameter_surface.rs` records. On Windows, which STAR does not support, the shell is `sh` from `PATH`, and is required: without one, the run stops with a message.
+
+**Why.** A file name is data, and a literal one needs no quoting rules. Leaving out the check keeps a FIFO readable through a command: measured with 2.7.11b, `--readFilesCommand cat` on a FIFO was still blocked when stopped after 12 s, where rustar-aligner maps all reads.
+
+**Impact.** Names that STAR expands or breaks on work here: measured with 2.7.11b, `--readFilesCommand 'gzip -dc'` on a file named `cost$HOME.gz` exits 0 with no records, where rustar-aligner maps all reads. A command that relies on state from the previous file's run, or a run on a missing file with a command that ignores its argument, behaves differently; neither is a use STAR documents. Alignment output for a run that succeeds in both does not change.
+
+**Source.** `FastqReader::open_with_command` in `src/io/fastq.rs`; `join_read_files_command` in `src/params/mod.rs`.
 
 ## 5. Known residual single-read differences
 

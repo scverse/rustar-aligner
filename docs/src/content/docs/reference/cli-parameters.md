@@ -30,7 +30,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--readFilesIn` | — | Input FASTQ file(s); second file is mate 2 for paired-end (required for `alignReads`). Several files per mate are comma-separated (`a_1.fq,b_1.fq a_2.fq,b_2.fq`) and read in order; each mate must list the same number. Compression is detected from the file contents (gzip; bzip2/zstd/xz with the matching build features) unless `--readFilesCommand` is given. A `--soloType` run appends the barcode read as the last file: `cDNA_read barcode_read`, or `cDNA_read1 cDNA_read2 barcode_read` for paired-end cDNA. |
-| `--readFilesCommand` | — | Decompression command, e.g. `zcat` for `.gz`. |
+| `--readFilesCommand` | `-` | Shell command line run on each read file, with the file name after it, writing FASTQ to stdout: `zcat`, `gunzip -c` or `'gzip -dc'`. Several values are joined; an option starting with `--` has to be inside a quoted value, or it starts a new parameter. `-` means no command. |
 | `--readMapNumber` | `-1` | Number of reads to map (`-1` = all). |
 | `--clip5pNbases` | `0` | Bases to clip from the 5' end of each mate. |
 | `--clip3pNbases` | `0` | Bases to clip from the 3' end of each mate. |
