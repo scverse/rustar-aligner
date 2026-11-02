@@ -13,6 +13,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- `--bamRemoveDuplicatesType` writes each cluster of overlapping reads as it
+  ends, rather than reading the whole BAM first, so memory follows the largest
+  cluster. Output is unchanged. A run that stops on a missing `NH` or `AS` tag
+  now leaves the earlier clusters in `Processed.out.bam`.
+
 - Third-party notices completed. `LICENSES/` gains the licences of code
   ported from DegNorm (MIT) and David Elworthy's `sgt.h` via STAR (BSD
   2-clause), and of libc++ (Apache 2.0 with LLVM Exceptions), whose random
