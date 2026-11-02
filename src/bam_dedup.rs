@@ -5,7 +5,10 @@
 //! reads are grouped into maximal overlapping clusters; within a cluster the unique mappers are
 //! paired by name and, per run of pairs with an identical (start, flag, S-extended CIGAR) key, the
 //! highest-`AS` pair is un-marked (kept). All records are re-emitted in the input order with the
-//! flag adjusted. `NH`/`AS` are required (a missing tag is a fatal error).
+//! flag adjusted, a cluster at a time, so memory follows the largest cluster, not the BAM. A cluster
+//! only ends past a mate on a later coordinate, so with no such mate (single-end reads) it runs to the
+//! end of the reference. `NH`/`AS` are required (a missing tag is a fatal error, and the output then
+//! holds the clusters before it).
 //!
 //! Near-verbatim port of the sister project STAR-rs's `crates/star-io/src/bam.rs`
 //! (`bam_remove_duplicates` and its helpers), which cites the exact upstream STAR routines
@@ -17,19 +20,17 @@ use std::path::Path;
 use noodles::bam;
 use noodles::sam::alignment::io::Write as SamWrite;
 use noodles::sam::alignment::record::Flags;
+use noodles::sam::alignment::record_buf::RecordBuf;
 use noodles::sam::alignment::record_buf::data::field::Value;
 
 use crate::params::Parameters;
 
-/// Per-record fields for dedup (STAR's dedup key + grouping coordinates).
+/// Per-record fields for dedup (STAR's dedup key).
 struct DedupRec {
     tid: i64,
-    pos: i64,
     flag: u16, // pre-marked/un-marked in place
-    nh: u32,
     as_score: Option<i64>,
     name: Vec<u8>,
-    mate_pos: i64,
     /// `funStartExtendS`: alignment start with a leading soft-clip unclipped.
     unclip: i64,
     /// `funCigarExtendS`: CIGAR with leading/trailing `S` folded into the adjacent op, packed
@@ -182,9 +183,14 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
 
     let mut reader = bam::io::Reader::new(input);
     let header = reader.read_header()?;
+    let mut writer = bam::io::Writer::new(output);
+    writer.write_header(&header)?;
 
+    // The current cluster: every record since it began, and the unique mappers among them.
     let mut records = Vec::new();
-    let mut recs = Vec::new();
+    let mut recs: Vec<DedupRec> = Vec::new();
+    let mut group: Vec<usize> = Vec::new();
+    let mut right_max: i64 = 0;
     for result in reader.record_bufs(&header) {
         let rec = result?;
         let tid = rec.reference_sequence_id().map_or(-1, |i| i as i64);
@@ -244,14 +250,32 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
         } else {
             (Vec::new(), 0)
         };
+        // Group into maximal overlapping clusters.
+        if recs
+            .first()
+            .is_some_and(|first| tid != first.tid || (right_max > 0 && pos > right_max))
+        {
+            write_cluster(
+                &mut writer,
+                &header,
+                &mut records,
+                &mut recs,
+                &mut group,
+                mate2_bases_n,
+            )?;
+            right_max = 0;
+        }
+        if nh == 1 {
+            group.push(recs.len());
+            if mate_pos > pos {
+                right_max = right_max.max(mate_pos);
+            }
+        }
         recs.push(DedupRec {
             tid,
-            pos,
             flag,
-            nh,
             as_score,
             name: rec.name().unwrap_or_default().to_vec(),
-            mate_pos,
             unclip,
             s_cigar: s_ext_cigar(&cigar),
             seq_packed,
@@ -259,43 +283,35 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
         });
         records.push(rec);
     }
-
-    // Group into maximal overlapping clusters; collapse each (unique mappers only).
-    let n = recs.len();
-    let mut group_start = 0usize;
-    let mut right_max: i64 = 0;
-    let mut group: Vec<usize> = Vec::new();
-    let mut e = 0usize;
-    while e <= n {
-        let boundary = e == n
-            || recs[e].tid != recs[group_start].tid
-            || (right_max > 0 && recs[e].pos > right_max);
-        if boundary {
-            collapse_group(&mut recs, &group, mate2_bases_n)?;
-            if e == n {
-                break;
-            }
-            right_max = 0;
-            group_start = e;
-            group.clear();
-        }
-        if recs[e].nh == 1 {
-            group.push(e);
-            if recs[e].mate_pos > recs[e].pos {
-                right_max = right_max.max(recs[e].mate_pos);
-            }
-        }
-        e += 1;
-    }
-
-    // Re-emit every record with its (possibly adjusted) flag.
-    let mut writer = bam::io::Writer::new(output);
-    writer.write_header(&header)?;
-    for (rec, d) in records.iter_mut().zip(&recs) {
-        *rec.flags_mut() = Flags::from(d.flag);
-        writer.write_alignment_record(&header, rec)?;
-    }
+    write_cluster(
+        &mut writer,
+        &header,
+        &mut records,
+        &mut recs,
+        &mut group,
+        mate2_bases_n,
+    )?;
     writer.try_finish()?;
+    Ok(())
+}
+
+/// Collapse one cluster (unique mappers only) and write all its records, with their adjusted flags.
+fn write_cluster<W: Write>(
+    writer: &mut bam::io::Writer<noodles::bgzf::io::Writer<W>>,
+    header: &noodles::sam::Header,
+    records: &mut Vec<RecordBuf>,
+    recs: &mut Vec<DedupRec>,
+    group: &mut Vec<usize>,
+    mate2_bases_n: u32,
+) -> io::Result<()> {
+    collapse_group(recs, group, mate2_bases_n)?;
+    for (rec, d) in records.iter_mut().zip(recs.iter()) {
+        *rec.flags_mut() = Flags::from(d.flag);
+        writer.write_alignment_record(header, rec)?;
+    }
+    records.clear();
+    recs.clear();
+    group.clear();
     Ok(())
 }
 
@@ -389,17 +405,111 @@ mod tests {
     fn mate2(seq: &[u8], flag: u16) -> DedupRec {
         DedupRec {
             tid: 0,
-            pos: 0,
             flag,
-            nh: 1,
             as_score: Some(0),
             name: Vec::new(),
-            mate_pos: -1,
             unclip: 0,
             s_cigar: Vec::new(),
             seq_packed: pack_seq(seq),
             seq_len: seq.len() as u32,
         }
+    }
+
+    const SAM_HEADER: &str = "@SQ\tSN:chr1\tLN:10000\n@SQ\tSN:chr2\tLN:10000\n";
+
+    /// One SAM line of a 10M alignment.
+    fn sam_line(name: &str, flag: u16, chr: &str, pos: u32, mate: u32, tags: &str) -> String {
+        format!("{name}\t{flag}\t{chr}\t{pos}\t255\t10M\t=\t{mate}\t0\tACGTACGTAC\t*\t{tags}\n")
+    }
+
+    /// A proper pair, as its two SAM lines, on `pos` and `mate`.
+    fn sam_pair(name: &str, chr: &str, pos: u32, mate: u32, score: u32) -> [String; 2] {
+        let tags = format!("NH:i:1\tAS:i:{score}");
+        [
+            sam_line(name, 99, chr, pos, mate, &tags),
+            sam_line(name, 147, chr, mate, pos, &tags),
+        ]
+    }
+
+    fn bam_from_sam(lines: &[String]) -> Vec<u8> {
+        let sam = format!("{SAM_HEADER}{}", lines.concat());
+        let mut reader = noodles::sam::io::Reader::new(sam.as_bytes());
+        let header = reader.read_header().unwrap();
+        let mut writer = bam::io::Writer::new(Vec::new());
+        writer.write_header(&header).unwrap();
+        for record in reader.record_bufs(&header) {
+            writer
+                .write_alignment_record(&header, &record.unwrap())
+                .unwrap();
+        }
+        writer.into_inner().finish().unwrap()
+    }
+
+    /// `(name, flag)` of each record of a BAM, in file order.
+    fn names_and_flags(bam_bytes: &[u8]) -> Vec<(String, u16)> {
+        let mut reader = bam::io::Reader::new(bam_bytes);
+        let header = reader.read_header().unwrap();
+        reader
+            .record_bufs(&header)
+            .map(|r| {
+                let r = r.unwrap();
+                (r.name().unwrap().to_string(), u16::from(r.flags()))
+            })
+            .collect()
+    }
+
+    /// Duplicates are found within a cluster only, each cluster keeps its best pair, multimappers
+    /// are marked on request only, and every record comes back in the input order.
+    #[test]
+    fn clusters_are_collapsed_and_written_in_input_order() {
+        let [a1, a2] = sam_pair("low", "chr1", 100, 200, 10);
+        let [b1, b2] = sam_pair("high", "chr1", 100, 200, 20);
+        // Past the first cluster's last mate, so a cluster of its own.
+        let [c1, c2] = sam_pair("next", "chr1", 1000, 1100, 5);
+        // The same key as the first two on another reference: not their duplicate.
+        let [d1, d2] = sam_pair("other", "chr2", 100, 200, 5);
+        let multi = sam_line("multi", 0, "chr1", 150, 0, "NH:i:2\tAS:i:30");
+        let input = bam_from_sam(&[a1, b1, multi, a2, b2, c1, c2, d1, d2]);
+
+        let run = |mark_multi| {
+            let mut out = Vec::new();
+            bam_remove_duplicates(input.as_slice(), &mut out, mark_multi, 0).unwrap();
+            names_and_flags(&out)
+        };
+        let expected = |multi_flag| {
+            [
+                ("low", 99 + 0x400),
+                ("high", 99),
+                ("multi", multi_flag),
+                ("low", 147 + 0x400),
+                ("high", 147),
+                ("next", 99),
+                ("next", 147),
+                ("other", 99),
+                ("other", 147),
+            ]
+            .map(|(name, flag)| (name.to_string(), flag))
+            .to_vec()
+        };
+        assert_eq!(run(true), expected(0x400));
+        assert_eq!(run(false), expected(0));
+    }
+
+    /// Clusters are written as they end: those that ended before a bad record are in the output.
+    #[test]
+    fn a_missing_tag_leaves_the_earlier_clusters_written() {
+        let [a1, a2] = sam_pair("first", "chr1", 100, 200, 10);
+        let [b1, _] = sam_pair("second", "chr1", 1000, 1100, 10);
+        let bad = sam_line("bad", 99, "chr1", 1000, 1100, "AS:i:1");
+        let input = bam_from_sam(&[a1, a2, b1, bad]);
+
+        let mut out = Vec::new();
+        let err = bam_remove_duplicates(input.as_slice(), &mut out, true, 0).unwrap_err();
+        assert!(err.to_string().contains("NH is required"), "{err}");
+        assert_eq!(
+            names_and_flags(&out),
+            [("first".to_string(), 99), ("first".to_string(), 147)]
+        );
     }
 
     #[test]
