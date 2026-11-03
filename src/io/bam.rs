@@ -36,11 +36,13 @@ impl BufferedBamRecords {
 
 /// Convert STAR's `--outBAMcompression` integer (-1..9) to a noodles level.
 ///
-/// STAR mapping: -1 or 0 = uncompressed, 1-9 = deflate levels, default 1.
+/// 0 = uncompressed, 1-9 = deflate levels. STAR's -1 compresses like level 1
+/// (measured: 59,925 bytes against 59,924 at level 1 and 635,969 at level 0).
 fn bgzf_compression(level: i32) -> bgzf::io::writer::CompressionLevel {
     use bgzf::io::writer::CompressionLevel;
     match level {
-        n if n <= 0 => CompressionLevel::NONE,
+        0 => CompressionLevel::NONE,
+        n if n < 0 => CompressionLevel::try_from(1).unwrap_or_default(),
         n if n >= 9 => CompressionLevel::BEST,
         n => CompressionLevel::try_from(n as u8).unwrap_or_default(),
     }
@@ -166,6 +168,13 @@ fn sort_temp_dir(params: &Parameters) -> std::path::PathBuf {
         return std::path::PathBuf::from(&params.out_tmp_dir);
     }
     let prefix = params.output_path("");
+    // `Path::parent` of `out/sub/` is `out`, one level above the output.
+    if params
+        .out_file_name_prefix
+        .ends_with(['/', std::path::MAIN_SEPARATOR])
+    {
+        return prefix;
+    }
     match prefix.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => std::path::PathBuf::from("."),
@@ -713,6 +722,22 @@ mod tests {
     use crate::align::transcript::{Exon, Transcript};
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn minus_one_compresses_like_level_one_and_zero_does_not() {
+        assert_eq!(bgzf_compression(-1), bgzf_compression(1));
+        assert_ne!(bgzf_compression(0), bgzf_compression(1));
+    }
+
+    #[test]
+    fn spill_files_stay_inside_a_directory_prefix() {
+        let args =
+            |prefix: &'static str| ["x", "--readFilesIn", "r.fq", "--outFileNamePrefix", prefix];
+        let dir = |prefix| sort_temp_dir(&Parameters::parse_from(args(prefix)));
+        assert_eq!(dir("/data/run1/"), std::path::Path::new("/data/run1/"));
+        assert_eq!(dir("/data/run1/s_"), std::path::Path::new("/data/run1"));
+        assert_eq!(dir("s_"), std::path::Path::new("."));
+    }
 
     fn create_test_genome() -> Genome {
         Genome {

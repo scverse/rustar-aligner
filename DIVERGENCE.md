@@ -341,6 +341,18 @@ rustar-aligner uses an in-tree splitmix64 (`src/rng.rs`) rather than the `rand` 
 
 **Source.** `FastqReader::open_with_command` in `src/io/fastq.rs`; `join_read_files_command` in `src/params/mod.rs`.
 
+### 4.8 A blank line before more reads is an error
+
+**What STAR does.** Its read loop stops at the first line starting with a space or a newline (observed: `@q1 ... \n\n@q2 ...` maps `q1`, ignores `q2`, exit 0).
+
+**What rustar-aligner does.** Blank lines at the end of a file are fine, as in STAR. Data after a blank line stops the run with an error naming the file.
+
+**Why.** Reads after the blank line would be lost with exit code 0.
+
+**Impact.** Only input with a blank line in the middle. Those runs now fail rather than align part of the file.
+
+**Source.** `src/io/fastq.rs` (`expect_only_blank_lines`), locked by `blank_lines_end_a_file_but_not_before_more_reads`.
+
 ## 5. Known residual single-read differences
 
 These are **not** deliberate divergences. They are the differences `test/parity_suite.sh` finds, kept here so that each one is fixed or explained before v0.2.0 (README, *Comparison with STAR 2.7.11b*). Read names are from that suite's datasets.
