@@ -182,6 +182,25 @@ fn a_mate_past_the_chromosome_start_cannot_be_clipped_into_a_pair() {
     assert_eq!(records, [record(153, 301, "100M", 98, 0)]);
 }
 
+/// STAR checks the chromosome edge before the mate spacer (`extendAlign.cpp`),
+/// so a mate whose 3' end sits on the edge cannot be extended into a pair.
+#[test]
+fn a_mate_ending_on_the_chromosome_end_cannot_be_extended_into_a_pair() {
+    let g = genome();
+    let at_end = &g[g.len() - 100..];
+    let low = [
+        "--outFilterScoreMinOverLread",
+        "0.3",
+        "--outFilterMatchNminOverLread",
+        "0.3",
+    ];
+    for mode in ["EndToEnd", "Extend3pOfRead1"] {
+        let options = [&["--alignEndsType", mode][..], &low[..]].concat();
+        let (records, _) = run(&[at_end, &reverse_complement(at_end)], &options);
+        assert_eq!(records, [record(153, 19_901, "100M", 98, 0)], "{mode}");
+    }
+}
+
 #[test]
 fn one_sided_modes_extend_only_their_inner_end() {
     let (m1, m2) = pair(&LAST_FOUR, &FIRST_FOUR);

@@ -306,10 +306,6 @@ fn extend_alignment(
                 break;
             }
             let read_base = read_seq[read_pos];
-            // No extension through the inter-mate spacer.
-            if read_base == PE_SPACER_BASE {
-                break;
-            }
             let genome_pos = if direction > 0 {
                 genome_start + i as u64
             } else {
@@ -338,6 +334,12 @@ fn extend_alignment(
                     max_score: EXTEND_TO_END_KILL,
                     n_mismatch: n_mm_max + 1,
                 };
+            }
+            // No extension through the inter-mate spacer. Checked after the
+            // boundary, as STAR does (`extendAlign.cpp:24-31`): a mate ending on a
+            // chromosome edge is killed, not stopped at the spacer.
+            if read_base == PE_SPACER_BASE {
+                break;
             }
             ext_len = i + 1;
             // Ns (read or genome) carry no score.
