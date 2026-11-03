@@ -857,7 +857,6 @@ pub fn align_paired_read(
                     m1_orig_rev,
                     m1_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
                     !m1_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    0,            // mate1
                 ) else {
                     continue;
                 };
@@ -870,7 +869,6 @@ pub fn align_paired_read(
                     m2_orig_rev,
                     m2_orig_rev,  // no_left_ext = inner for reverse (orig_is_rev=true)
                     !m2_orig_rev, // no_right_ext = inner for forward (orig_is_rev=false)
-                    1,            // mate2
                 ) else {
                     continue;
                 };
@@ -981,7 +979,6 @@ pub fn align_paired_read(
                         orig_rev,
                         false,
                         false,
-                        0, // mate1
                     ) {
                         t.is_reverse = stitch_is_reverse;
                         any_transcript = true;
@@ -1021,7 +1018,6 @@ pub fn align_paired_read(
                         orig_rev,
                         false,
                         false,
-                        1, // mate2
                     ) {
                         t.is_reverse = !stitch_is_reverse;
                         any_transcript = true;
