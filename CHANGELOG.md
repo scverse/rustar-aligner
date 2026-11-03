@@ -46,6 +46,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
     genes: a read that crosses two junctions is one UMI on two features, a
     tie `MultiGeneUMI_CR` drops.
 
+- `--alignMatesGapMax` limits the gap between the mates, as in STAR, not the
+  fragment span. A pair with mates at 33713 and 33997 (gap 184) was reported
+  unmapped "too short" under `--alignMatesGapMax 300`; STAR maps it. A pair
+  is also flagged proper (0x2) whatever its span.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
