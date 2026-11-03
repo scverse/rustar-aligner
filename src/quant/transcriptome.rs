@@ -343,8 +343,9 @@ impl TranscriptomeIndex {
             let total_len = ex_len_cum;
 
             let strand_u8 = match strand_char {
+                '+' => 1u8,
                 '-' => 2u8,
-                _ => 1u8, // forward or unknown → treat as forward (STAR default)
+                _ => 0u8, // STAR GTF.cpp:138-144: neither strand
             };
 
             let gene_id = first.attributes.get(gene_tag).cloned().unwrap_or_default();

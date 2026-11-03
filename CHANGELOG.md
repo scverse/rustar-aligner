@@ -232,6 +232,16 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`ReadsPerGene.out.tab` stranded columns use each exon's strand.**
+  Columns 3 and 4 took one strand per gene, from its first exon, so a gene
+  ID with transcripts on both strands put every read in one column. Like
+  STAR (`exG.str`, `Transcriptome_geneCountsAddAlign.cpp`), a read now
+  counts for a gene in a stranded column when an exon it overlaps is on that
+  strand. A transcript with strand `.` is strand 0 in `transcriptInfo.tab`
+  and `exonGeTrInfo.tab` (it was 1), and its exons count in both stranded
+  columns, as in STAR. STARsolo's `tr_strand == 1` test now treats such a
+  transcript as reverse, also as STAR does.
+
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
   written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull

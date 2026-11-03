@@ -42,9 +42,13 @@ pub struct GeneAnnotation {
     pub gene_names: Vec<String>,
     /// Strand per gene: true = reverse/minus strand.
     pub gene_is_reverse: Vec<bool>,
-    /// Per-chromosome exon interval list, sorted by (start, end).
+    /// Per-chromosome exon interval list, sorted by (start, end, gene).
     /// Each entry: (start_0based_incl, end_0based_excl, gene_idx).
     pub chr_exons: Vec<Vec<(u64, u64, usize)>>,
+    /// Strands of each `chr_exons` entry, parallel to it: [`STRAND_PLUS`] and/or
+    /// [`STRAND_MINUS`], both for a strand-less (`.`) transcript. GeneCounts keys
+    /// strand per exon like STAR's `exG.str`, not per gene.
+    pub chr_exons_strand: Vec<Vec<u8>>,
     /// Per-chromosome **gene-body** interval list (one entry per gene: its full
     /// `[min exon start, max exon end)` span, covering introns), sorted by
     /// (start, end). Used by the STARsolo `GeneFull` feature, which counts a
@@ -65,6 +69,20 @@ pub struct GeneAnnotation {
     chr_gene_body_seg: Vec<Vec<u64>>,
 }
 
+/// Exon strand mask bits of [`GeneAnnotation::chr_exons_strand`].
+pub const STRAND_PLUS: u8 = 1;
+pub const STRAND_MINUS: u8 = 2;
+
+/// Mask for STAR's transcript strand code (1 `+`, 2 `-`, 0 neither): a strand-0
+/// exon accepts reads of both strands (`Transcriptome_geneCountsAddAlign.cpp:34`).
+fn strand_mask(star_strand: u8) -> u8 {
+    match star_strand {
+        1 => STRAND_PLUS,
+        2 => STRAND_MINUS,
+        _ => STRAND_PLUS | STRAND_MINUS,
+    }
+}
+
 impl GeneAnnotation {
     /// Build from GTF exon records using `gene_tag` as the gene grouping attribute.
     ///
@@ -76,7 +94,7 @@ impl GeneAnnotation {
         let mut gene_is_reverse: Vec<bool> = Vec::new();
         let mut gene_id_to_idx: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
+        let mut chr_exons: Vec<Vec<(u64, u64, usize, u8)>> = vec![Vec::new(); n_chrs];
         // Per-gene full span: (chr_idx, min_start, max_end). Accumulated over all
         // of a gene's exons to build the GeneFull gene-body intervals.
         let mut gene_span: Vec<Option<(usize, u64, u64)>> = Vec::new();
@@ -120,7 +138,14 @@ impl GeneAnnotation {
             let start = chr_offset + exon.start.saturating_sub(1);
             let end = chr_offset + exon.end;
 
-            chr_exons[chr_idx].push((start, end, gene_idx));
+            // shortcut: the exon's own strand, where STAR uses its transcript's
+            // (first exon's) strand; they differ only in a malformed GTF.
+            let star_strand = match exon.strand {
+                '+' => 1,
+                '-' => 2,
+                _ => 0,
+            };
+            chr_exons[chr_idx].push((start, end, gene_idx, strand_mask(star_strand)));
 
             // Extend this gene's full span. (A gene's exons share one chr.)
             match &mut gene_span[gene_idx] {
@@ -146,7 +171,7 @@ impl GeneAnnotation {
         let n_genes = tr.gene_ids.len();
         let mut gene_is_reverse = vec![false; n_genes];
         let mut gene_seen = vec![false; n_genes];
-        let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
+        let mut chr_exons: Vec<Vec<(u64, u64, usize, u8)>> = vec![Vec::new(); n_chrs];
         let mut gene_span: Vec<Option<(usize, u64, u64)>> = vec![None; n_genes];
 
         for t in 0..tr.n_transcripts() {
@@ -163,7 +188,8 @@ impl GeneAnnotation {
                 continue;
             }
             for ex in &tr.tr_exons[t] {
-                chr_exons[chr_idx].push((ex.genome_start, ex.genome_end, g));
+                let mask = strand_mask(tr.tr_strand[t]);
+                chr_exons[chr_idx].push((ex.genome_start, ex.genome_end, g, mask));
                 match &mut gene_span[g] {
                     Some((_, s, e)) => {
                         *s = (*s).min(ex.genome_start);
@@ -189,13 +215,28 @@ impl GeneAnnotation {
         gene_ids: Vec<String>,
         gene_names: Vec<String>,
         gene_is_reverse: Vec<bool>,
-        mut chr_exons: Vec<Vec<(u64, u64, usize)>>,
+        stranded_exons: Vec<Vec<(u64, u64, usize, u8)>>,
         gene_span: &[Option<(usize, u64, u64)>],
     ) -> Self {
-        let n_chrs = chr_exons.len();
-        for exons in &mut chr_exons {
-            exons.sort_unstable_by_key(|&(s, e, _)| (s, e));
-            exons.dedup();
+        let n_chrs = stranded_exons.len();
+        let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = Vec::with_capacity(n_chrs);
+        let mut chr_exons_strand: Vec<Vec<u8>> = Vec::with_capacity(n_chrs);
+        for mut exons in stranded_exons {
+            exons.sort_unstable();
+            let mut iv: Vec<(u64, u64, usize)> = Vec::with_capacity(exons.len());
+            let mut strands: Vec<u8> = Vec::with_capacity(exons.len());
+            // One entry per (start, end, gene); its strands OR-ed, which counts
+            // like STAR's separate exG entries per strand.
+            for (s, e, g, m) in exons {
+                if iv.last() == Some(&(s, e, g)) {
+                    *strands.last_mut().unwrap() |= m;
+                } else {
+                    iv.push((s, e, g));
+                    strands.push(m);
+                }
+            }
+            chr_exons.push(iv);
+            chr_exons_strand.push(strands);
         }
 
         // Build the per-chromosome gene-body interval list.
@@ -248,6 +289,7 @@ impl GeneAnnotation {
             gene_names,
             gene_is_reverse,
             chr_exons,
+            chr_exons_strand,
             chr_gene_body,
             gene_exons,
             chr_exons_seg,
@@ -320,6 +362,31 @@ impl GeneAnnotation {
         Self::overlapping_in_into(&self.chr_exons, &self.chr_exons_seg, transcript, out);
     }
 
+    /// Genes whose exons overlap any of `transcripts` (the mates of one read),
+    /// each with the OR of the strand masks of its overlapping exons. Sorted by
+    /// gene, one entry per gene. Drives `ReadsPerGene.out.tab`.
+    pub fn overlapping_gene_strands(&self, transcripts: &[&Transcript]) -> Vec<(usize, u8)> {
+        let mut hits: Vec<(usize, u8)> = Vec::new();
+        for t in transcripts {
+            let Some(strands) = self.chr_exons_strand.get(t.chr_idx) else {
+                continue;
+            };
+            let chr = &self.chr_exons[t.chr_idx];
+            Self::for_each_overlap(chr, &self.chr_exons_seg[t.chr_idx], t, |i| {
+                hits.push((chr[i].2, strands[i]));
+            });
+        }
+        hits.sort_unstable();
+        let mut out: Vec<(usize, u8)> = Vec::with_capacity(hits.len());
+        for (g, m) in hits {
+            match out.last_mut() {
+                Some((lg, lm)) if *lg == g => *lm |= m,
+                _ => out.push((g, m)),
+            }
+        }
+        out
+    }
+
     /// `overlapping_genes_full` into a caller-provided buffer.
     pub fn overlapping_genes_full_into(&self, transcript: &Transcript, out: &mut Vec<usize>) {
         Self::overlapping_in_into(
@@ -353,10 +420,24 @@ impl GeneAnnotation {
             return;
         }
         let chr = &chr_intervals[transcript.chr_idx];
+        Self::for_each_overlap(chr, &chr_segs[transcript.chr_idx], transcript, |i| {
+            out.push(chr[i].2);
+        });
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// Call `f` with the index in `chr` of every interval overlapping an exon
+    /// of `transcript` (an interval overlapping several exons comes once per exon).
+    fn for_each_overlap(
+        chr: &[(u64, u64, usize)],
+        seg: &[u64],
+        transcript: &Transcript,
+        mut f: impl FnMut(usize),
+    ) {
         if chr.is_empty() {
             return;
         }
-        let seg = &chr_segs[transcript.chr_idx];
         let sz = seg.len() / 2; // number of leaves (power of two)
 
         for exon in &transcript.exons {
@@ -385,7 +466,7 @@ impl GeneAnnotation {
                 }
                 if nhi - nlo == 1 {
                     // Leaf: nlo < upper (start < re) and its end > rs → overlap.
-                    out.push(chr[nlo].2);
+                    f(nlo);
                     continue;
                 }
                 let mid = usize::midpoint(nlo, nhi);
@@ -395,9 +476,6 @@ impl GeneAnnotation {
                 sp += 1;
             }
         }
-
-        out.sort_unstable();
-        out.dedup();
     }
 }
 
@@ -498,15 +576,11 @@ impl GeneCounts {
 
         let pair: &PairedAlignment = both_mapped[0];
         // Union of all genes overlapping either mate.
-        let mut all_genes = gene_ann.overlapping_genes(&pair.mate1_transcript);
-        let genes2 = gene_ann.overlapping_genes(&pair.mate2_transcript);
-        all_genes.extend_from_slice(&genes2);
-        all_genes.sort_unstable();
-        all_genes.dedup();
+        let genes =
+            gene_ann.overlapping_gene_strands(&[&pair.mate1_transcript, &pair.mate2_transcript]);
 
         // Strand is determined by mate1.
-        let read_is_rev = pair.mate1_transcript.is_reverse;
-        self.apply_three_columns(&all_genes, read_is_rev, gene_ann);
+        self.apply_three_columns(&genes, pair.mate1_transcript.is_reverse);
     }
 
     /// Write `ReadsPerGene.out.tab` in STAR's format.
@@ -551,32 +625,28 @@ impl GeneCounts {
 
     /// Run 3 independent counting passes on a pre-computed set of overlapping genes.
     ///
-    /// `all_genes`: sorted+deduplicated gene indices overlapping the read (any strand).
+    /// `genes`: overlapping genes with the strand mask of their overlapping
+    /// exons (from [`GeneAnnotation::overlapping_gene_strands`]).
     /// `read_is_rev`: strand of the read (mate1 for PE).
-    fn apply_three_columns(
-        &self,
-        all_genes: &[usize],
-        read_is_rev: bool,
-        gene_ann: &GeneAnnotation,
-    ) {
-        // Col 1 — unstranded: use all_genes directly.
-        self.apply_column(all_genes, 0, &self.unstranded);
-
-        // Col 2 — strand1: genes whose strand matches the read.
-        let same: Vec<usize> = all_genes
-            .iter()
-            .copied()
-            .filter(|&g| gene_ann.gene_is_reverse[g] == read_is_rev)
-            .collect();
-        self.apply_column(&same, 1, &self.strand1);
-
-        // Col 3 — strand2: genes whose strand is opposite to the read.
-        let opp: Vec<usize> = all_genes
-            .iter()
-            .copied()
-            .filter(|&g| gene_ann.gene_is_reverse[g] != read_is_rev)
-            .collect();
-        self.apply_column(&opp, 2, &self.strand2);
+    /// A gene counts in a stranded column when one of its overlapping exons is
+    /// on that strand (STAR `Transcriptome_geneCountsAddAlign.cpp:30-45`).
+    fn apply_three_columns(&self, genes: &[(usize, u8)], read_is_rev: bool) {
+        let (same_bit, opp_bit) = if read_is_rev {
+            (STRAND_MINUS, STRAND_PLUS)
+        } else {
+            (STRAND_PLUS, STRAND_MINUS)
+        };
+        let pick = |bit: u8| -> Vec<usize> {
+            genes
+                .iter()
+                .filter(|&&(_, m)| m & bit != 0)
+                .map(|&(g, _)| g)
+                .collect()
+        };
+        let all: Vec<usize> = genes.iter().map(|&(g, _)| g).collect();
+        self.apply_column(&all, 0, &self.unstranded);
+        self.apply_column(&pick(same_bit), 1, &self.strand1);
+        self.apply_column(&pick(opp_bit), 2, &self.strand2);
     }
 
     fn apply_column(&self, genes: &[usize], col: usize, per_gene: &[AtomicU64]) {
@@ -600,8 +670,8 @@ impl GeneCounts {
         read_is_reverse: bool,
         gene_ann: &GeneAnnotation,
     ) {
-        let all_genes = gene_ann.overlapping_genes(transcript);
-        self.apply_three_columns(&all_genes, read_is_reverse, gene_ann);
+        let genes = gene_ann.overlapping_gene_strands(&[transcript]);
+        self.apply_three_columns(&genes, read_is_reverse);
     }
 }
 
@@ -1144,6 +1214,29 @@ mod tests {
         assert_eq!(counts.strand2[0].load(Ordering::Relaxed), 1);
     }
 
+    /// STAR keys the stranded columns on each exon's strand, not on the gene's:
+    /// a gene with a + and a - transcript counts a forward read on either as
+    /// same-strand only on the + exon. A `.` exon counts in both columns.
+    #[test]
+    fn test_gene_counts_strand_per_exon() {
+        let genome = make_genome();
+        let exons = vec![
+            make_gtf_exon("chr1", 101, 200, '+', "G1"),
+            make_gtf_exon("chr1", 501, 600, '-', "G1"),
+            make_gtf_exon("chr1", 701, 800, '.', "G2"),
+        ];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &genome);
+        let counts = GeneCounts::new(ann.n_genes());
+        for (s, e) in [(110, 150), (510, 550), (710, 750)] {
+            counts.count_se_read(&[make_transcript(0, s, e, false)], 1, &ann);
+        }
+        let col =
+            |c: &[AtomicU64]| -> Vec<u64> { c.iter().map(|x| x.load(Ordering::Relaxed)).collect() };
+        assert_eq!(col(&counts.unstranded), [2, 1]);
+        assert_eq!(col(&counts.strand1), [1, 1]);
+        assert_eq!(col(&counts.strand2), [1, 1]);
+    }
+
     #[test]
     fn from_transcriptome_matches_from_gtf() {
         // The index-table gene model must count like the GTF-built one.
@@ -1152,7 +1245,7 @@ mod tests {
             make_gtf_exon("chr1", 101, 200, '+', "G1"),
             make_gtf_exon("chr1", 301, 400, '+', "G1"),
             make_gtf_exon("chr1", 351, 450, '-', "G2"),
-            make_gtf_exon("chr2", 51, 150, '-', "G3"),
+            make_gtf_exon("chr2", 51, 150, '.', "G3"),
         ];
         for (e, t) in exons.iter_mut().zip(["T1", "T1", "T2", "T3"]) {
             e.attributes
@@ -1165,6 +1258,7 @@ mod tests {
         assert_eq!(from_tr.gene_ids, from_gtf.gene_ids);
         assert_eq!(from_tr.gene_is_reverse, from_gtf.gene_is_reverse);
         assert_eq!(from_tr.chr_exons, from_gtf.chr_exons);
+        assert_eq!(from_tr.chr_exons_strand, from_gtf.chr_exons_strand);
         assert_eq!(from_tr.chr_gene_body, from_gtf.chr_gene_body);
         assert_eq!(from_tr.gene_exons, from_gtf.gene_exons);
     }
