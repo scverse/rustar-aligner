@@ -14,7 +14,7 @@ Sections commonly used: Features, Bug fixes, Other changes.
 ### Bug fixes
 
 - A GTF with no exon on a known chromosome is now fatal, as in STAR, with STAR's hint about chromosome naming. An Ensembl GTF on a UCSC FASTA used to exit 0 with an unannotated index and every read in `N_noFeature`.
-- GTF attributes accept GFF3's `key=value`, so `--sjdbGTFtagExonParentTranscript Parent` works on GFF3 as in STAR's manual. An exon with no parent transcript is skipped with a warning rather than stopping the build.
+- GTF attributes are read as STAR reads them: GFF3's `key=value` works, so `--sjdbGTFtagExonParentTranscript Parent` works on GFF3 as in STAR's manual, and a value is its first word (`Parent = rna-1` gives `rna-1`, `"T=1"` gives `T`). An exon with no parent transcript becomes a transcript of its own named as STAR names it (`tr_<chr>_<start>_<end>_<n>`) rather than stopping the build, and one with no gene ID belongs to `MissingGeneID`, so `transcriptInfo.tab`, `geneInfo.tab` and `ReadsPerGene.out.tab` match STAR's.
 - A transcript ID used on two chromosomes no longer produces false junctions and loses the real ones. See `DIVERGENCE.md` §1.9.
 
 ### Other changes
