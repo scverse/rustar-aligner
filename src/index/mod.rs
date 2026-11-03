@@ -231,35 +231,9 @@ impl GenomeIndex {
         // path; factored into a helper.
         update_genome_params_sa_size(&dir.join("genomeParameters.txt"), genome.n_genome, sa_size)?;
 
-        // Transcriptome + sjdb files. Matches the tail of
-        // `GenomeIndex::write` byte-for-byte.
-        if let Some(tr) = &transcriptome {
-            tr.write_transcript_info(dir)?;
-            tr.write_exon_info(dir)?;
-            tr.write_gene_info(dir)?;
-            tr.write_exon_ge_tr_info(dir)?;
-            tr.write_sjdb_list_from_gtf(dir, &genome)?;
-            log::info!(
-                "Wrote transcriptome index files: {} transcripts, {} genes",
-                tr.n_transcripts(),
-                tr.gene_ids.len()
-            );
-        }
-        if !prepared_junctions.is_empty() {
-            sjdb_insert::write_sjdb_info_tab(
-                &dir.join("sjdbInfo.txt"),
-                &prepared_junctions,
-                params.sjdb_overhang,
-            )?;
-            sjdb_insert::write_sjdb_list_out_tab(
-                &dir.join("sjdbList.out.tab"),
-                &prepared_junctions,
-                &genome,
-            )?;
-            log::info!("Wrote sjdb files: {} junctions", prepared_junctions.len());
-        }
-
-        Ok(())
+        // Same tail as `GenomeIndex::write`.
+        write_transcript_tables(dir, transcriptome.as_ref(), &genome)?;
+        write_sjdb_files(dir, &prepared_junctions, &genome, params.sjdb_overhang)
     }
 
     /// Shared setup: load FASTA, parse GTF, build junctions, append
@@ -413,8 +387,13 @@ impl GenomeIndex {
     /// Write index files to directory.
     pub fn write(&self, dir: &Path, params: &Parameters) -> Result<(), Error> {
         self.write_genome_files(dir, params)?;
-        self.write_transcript_tables(dir)?;
-        self.write_sjdb_files(dir, params.sjdb_overhang)
+        write_transcript_tables(dir, self.transcriptome.as_ref(), &self.genome)?;
+        write_sjdb_files(
+            dir,
+            &self.prepared_junctions,
+            &self.genome,
+            params.sjdb_overhang,
+        )
     }
 
     /// Genome, SA, SAindex, the chromosome tables and `genomeParameters.txt`.
@@ -440,46 +419,6 @@ impl GenomeIndex {
         )
     }
 
-    /// Write transcriptome index files (STAR-compatible) when the GTF
-    /// was supplied. Matches STAR's `GTF_transcriptGeneSJ.cpp` outputs.
-    fn write_transcript_tables(&self, dir: &Path) -> Result<(), Error> {
-        if let Some(tr) = &self.transcriptome {
-            tr.write_transcript_info(dir)?;
-            tr.write_exon_info(dir)?;
-            tr.write_gene_info(dir)?;
-            tr.write_exon_ge_tr_info(dir)?;
-            tr.write_sjdb_list_from_gtf(dir, &self.genome)?;
-            log::info!(
-                "Wrote transcriptome index files: {} transcripts, {} genes",
-                tr.n_transcripts(),
-                tr.gene_ids.len()
-            );
-        }
-        Ok(())
-    }
-
-    /// Write sjdbInfo.txt + sjdbList.out.tab, the files `sjdbPrepare` writes
-    /// whenever junctions are inserted into the genome.
-    fn write_sjdb_files(&self, dir: &Path, sjdb_overhang: u32) -> Result<(), Error> {
-        if !self.prepared_junctions.is_empty() {
-            sjdb_insert::write_sjdb_info_tab(
-                &dir.join("sjdbInfo.txt"),
-                &self.prepared_junctions,
-                sjdb_overhang,
-            )?;
-            sjdb_insert::write_sjdb_list_out_tab(
-                &dir.join("sjdbList.out.tab"),
-                &self.prepared_junctions,
-                &self.genome,
-            )?;
-            log::info!(
-                "Wrote sjdb files: {} junctions",
-                self.prepared_junctions.len()
-            );
-        }
-        Ok(())
-    }
-
     /// STAR's run-time genome directory `<prefix>_STARgenome/`
     /// (`Parameters.cpp:1019-1034`) after junctions were inserted at mapping:
     /// `sjdbPrepare` writes `sjdbInfo.txt` and `sjdbList.out.tab`, a GTF given
@@ -494,14 +433,65 @@ impl GenomeIndex {
         let dir = params.output_path("_STARgenome");
         fs::create_dir_all(&dir).map_err(|e| Error::io(e, &dir))?;
         if gtf_tables {
-            self.write_transcript_tables(&dir)?;
+            write_transcript_tables(&dir, self.transcriptome.as_ref(), &self.genome)?;
         }
-        self.write_sjdb_files(&dir, self.sjdb_overhang)?;
+        write_sjdb_files(
+            &dir,
+            &self.prepared_junctions,
+            &self.genome,
+            self.sjdb_overhang,
+        )?;
         if params.sjdb_insert_save == "All" {
             self.write_genome_files(&dir, &loaded_genome_params(params))?;
         }
         Ok(())
     }
+}
+
+/// Write transcriptome index files (STAR-compatible) when the GTF was supplied.
+/// Matches STAR's `GTF_transcriptGeneSJ.cpp` outputs.
+fn write_transcript_tables(
+    dir: &Path,
+    transcriptome: Option<&TranscriptomeIndex>,
+    genome: &Genome,
+) -> Result<(), Error> {
+    if let Some(tr) = transcriptome {
+        tr.write_transcript_info(dir)?;
+        tr.write_exon_info(dir)?;
+        tr.write_gene_info(dir)?;
+        tr.write_exon_ge_tr_info(dir)?;
+        tr.write_sjdb_list_from_gtf(dir, genome)?;
+        log::info!(
+            "Wrote transcriptome index files: {} transcripts, {} genes",
+            tr.n_transcripts(),
+            tr.gene_ids.len()
+        );
+    }
+    Ok(())
+}
+
+/// Write sjdbInfo.txt + sjdbList.out.tab, the files `sjdbPrepare` writes
+/// whenever junctions are inserted into the genome.
+fn write_sjdb_files(
+    dir: &Path,
+    prepared_junctions: &[PreparedJunction],
+    genome: &Genome,
+    sjdb_overhang: u32,
+) -> Result<(), Error> {
+    if !prepared_junctions.is_empty() {
+        sjdb_insert::write_sjdb_info_tab(
+            &dir.join("sjdbInfo.txt"),
+            prepared_junctions,
+            sjdb_overhang,
+        )?;
+        sjdb_insert::write_sjdb_list_out_tab(
+            &dir.join("sjdbList.out.tab"),
+            prepared_junctions,
+            genome,
+        )?;
+        log::info!("Wrote sjdb files: {} junctions", prepared_junctions.len());
+    }
+    Ok(())
 }
 
 /// `params` as STAR holds them after loading the genome in `--genomeDir`:

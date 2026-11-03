@@ -5,7 +5,7 @@ use crate::align::stitch::{
     PE_SPACER_BASE, cluster_seeds, finalize_transcript, split_combined_wt, stitch_seeds_core,
     stitch_seeds_with_jdb_debug,
 };
-use crate::align::transcript::{Exon, Transcript};
+use crate::align::transcript::Transcript;
 use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::{MultimapperOrder, Parameters};
@@ -177,51 +177,6 @@ impl PairedAlignment {
         let (m1, m2) = (&self.mate1_transcript, &self.mate2_transcript);
         let (first, last) = if m1.is_reverse { (m2, m1) } else { (m1, m2) };
         last.genome_end.saturating_sub(first.genome_start)
-    }
-
-    /// Build a STAR-style combined two-mate `Transcript` for transcriptome
-    /// projection.
-    ///
-    /// Matches STAR's single-`Transcript`-per-pair model: mate1 exons with
-    /// `i_frag = 0`, then mate2 exons rewritten to `i_frag = 1`. Only
-    /// meaningful for pairs on the same chromosome and strand — both are
-    /// invariants of a `PairedAlignment` (checked in `try_pair_transcripts`).
-    ///
-    /// The returned transcript's `cigar` is empty: transcriptome BAM
-    /// emission generates per-mate CIGARs from the split exon list rather
-    /// than consuming a combined one.
-    pub fn combined_transcript_for_projection(&self) -> Transcript {
-        let m1 = &self.mate1_transcript;
-        let m2 = &self.mate2_transcript;
-
-        let mut exons: Vec<Exon> = Vec::with_capacity(m1.exons.len() + m2.exons.len());
-        for e in &m1.exons {
-            let mut ee = e.clone();
-            ee.i_frag = 0;
-            exons.push(ee);
-        }
-        for e in &m2.exons {
-            let mut ee = e.clone();
-            ee.i_frag = 1;
-            exons.push(ee);
-        }
-
-        Transcript {
-            output_rank: 0,
-            chr_idx: m1.chr_idx,
-            genome_start: m1.genome_start.min(m2.genome_start),
-            genome_end: m1.genome_end.max(m2.genome_end),
-            is_reverse: m1.is_reverse,
-            exons,
-            cigar: Vec::new(),
-            score: m1.score + m2.score,
-            n_mismatch: m1.n_mismatch + m2.n_mismatch,
-            n_gap: m1.n_gap + m2.n_gap,
-            n_junction: m1.n_junction + m2.n_junction,
-            junction_motifs: Vec::new(),
-            junction_annotated: Vec::new(),
-            junction_strand: vec![],
-        }
     }
 }
 
@@ -493,16 +448,26 @@ fn align_read_inner(
     // to the earliest-discovered alignment, so we must not reorder here (the
     // old code sorted by coordinate, destroying that order).
     {
-        let mut seen = std::collections::HashSet::new();
-        transcripts.retain(|t| {
-            seen.insert((
-                t.chr_idx,
-                t.genome_start,
-                t.genome_end,
-                t.is_reverse,
-                t.cigar_string(),
-            ))
-        });
+        // Keyed on the position, with the CIGARs of one position compared
+        // directly: no CIGAR string is built per transcript.
+        let mut firsts: rustc_hash::FxHashMap<(usize, u64, u64, bool), Vec<usize>> =
+            rustc_hash::FxHashMap::default();
+        let keep: Vec<bool> = transcripts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let same = firsts
+                    .entry((t.chr_idx, t.genome_start, t.genome_end, t.is_reverse))
+                    .or_default();
+                let dup = same.iter().any(|&j| transcripts[j].cigar == t.cigar);
+                if !dup {
+                    same.push(i);
+                }
+                !dup
+            })
+            .collect();
+        let mut keep = keep.into_iter();
+        transcripts.retain(|_| keep.next().unwrap_or(true));
     }
 
     // STAR's `trBest` (ReadAlign_stitchPieces.cpp), over the transcripts in window
@@ -864,6 +829,10 @@ pub fn align_paired_read(
                 ) else {
                     continue;
                 };
+                // Both halves carry the pair's stitched mismatch count (STAR's trA.nMM,
+                // which also bounds each extension); keep it once, on mate1, so that
+                // the mates sum to STAR's nMM for the pair.
+                t2.n_mismatch -= m2_wt.n_mismatch;
 
                 any_transcript = true;
                 if stitch_is_reverse {
@@ -1133,84 +1102,36 @@ pub fn align_paired_read(
     // earliest-discovered pair, so discovery order has to survive to the
     // primary-selection sort below.
     {
-        let mut seen = std::collections::HashSet::new();
-        joint_pairs.retain(|p| {
-            seen.insert((
-                p.mate1_transcript.chr_idx,
-                p.mate1_transcript.genome_start,
-                p.mate1_transcript.is_reverse,
-                p.mate1_transcript.cigar_string(),
-                p.mate2_transcript.genome_start,
-                p.mate2_transcript.is_reverse,
-                p.mate2_transcript.cigar_string(),
-            ))
-        });
-    }
-
-    // Post-finalization mate2-exon-subset dedup.
-    {
-        use crate::align::transcript::Exon;
-        let exons_subset = |b: &[Exon], a: &[Exon]| -> bool {
-            let total_b: u32 = b.iter().map(|e| (e.read_end - e.read_start) as u32).sum();
-            if total_b == 0 {
-                return false;
-            }
-            let mut covered = 0u32;
-            for be in b {
-                let b_diag = be.genome_start as i64 - be.read_start as i64;
-                for ae in a {
-                    let a_diag = ae.genome_start as i64 - ae.read_start as i64;
-                    if a_diag == b_diag {
-                        let r_start = be.read_start.max(ae.read_start);
-                        let r_end = be.read_end.min(ae.read_end);
-                        if r_start < r_end {
-                            covered += (r_end - r_start) as u32;
-                        }
-                    }
-                }
-            }
-            covered == total_b
-        };
-        let n = joint_pairs.len();
-        let mut keep = vec![true; n];
-        for i in 0..n {
-            if !keep[i] {
-                continue;
-            }
-            for j in 0..n {
-                if i == j || !keep[j] {
-                    continue;
-                }
-                let same_pos = joint_pairs[i].mate1_transcript.chr_idx
-                    == joint_pairs[j].mate1_transcript.chr_idx
-                    && joint_pairs[i].mate1_transcript.genome_start
-                        == joint_pairs[j].mate1_transcript.genome_start
-                    && joint_pairs[i].mate1_transcript.genome_end
-                        == joint_pairs[j].mate1_transcript.genome_end
-                    && joint_pairs[i].mate1_transcript.is_reverse
-                        == joint_pairs[j].mate1_transcript.is_reverse
-                    && joint_pairs[i].mate2_transcript.genome_start
-                        == joint_pairs[j].mate2_transcript.genome_start
-                    && joint_pairs[i].mate2_transcript.is_reverse
-                        == joint_pairs[j].mate2_transcript.is_reverse;
-                if same_pos
-                    && joint_pairs[i].combined_wt_score < joint_pairs[j].combined_wt_score
-                    && exons_subset(
-                        &joint_pairs[i].mate2_transcript.exons,
-                        &joint_pairs[j].mate2_transcript.exons,
-                    )
-                {
-                    keep[i] = false;
-                    break;
-                }
-            }
-        }
-        joint_pairs = joint_pairs
-            .into_iter()
+        // Keyed on the mate positions, with the CIGARs of one key compared
+        // directly: no CIGAR string is built per pair.
+        let mut firsts: rustc_hash::FxHashMap<(usize, u64, bool, u64, bool), Vec<usize>> =
+            rustc_hash::FxHashMap::default();
+        let keep: Vec<bool> = joint_pairs
+            .iter()
             .enumerate()
-            .filter(|(i, _)| keep[*i])
-            .map(|(_, p)| p)
+            .map(|(i, p)| {
+                let (m1, m2) = (&p.mate1_transcript, &p.mate2_transcript);
+                let same = firsts
+                    .entry((
+                        m1.chr_idx,
+                        m1.genome_start,
+                        m1.is_reverse,
+                        m2.genome_start,
+                        m2.is_reverse,
+                    ))
+                    .or_default();
+                let dup = same.iter().any(|&j| {
+                    let q = &joint_pairs[j];
+                    q.mate1_transcript.cigar == m1.cigar && q.mate2_transcript.cigar == m2.cigar
+                });
+                if !dup {
+                    same.push(i);
+                }
+                !dup
+            })
             .collect();
+        let mut keep = keep.into_iter();
+        joint_pairs.retain(|_| keep.next().unwrap_or(true));
     }
 
     // Step 2: score-range filter (STAR's multMapSelect).
@@ -1669,6 +1590,7 @@ pub(crate) fn pe_junctions_consistent(first: &Transcript, second: &Transcript) -
 mod tests {
     use super::*;
     use crate::align::score::SpliceMotif;
+    use crate::align::transcript::Exon;
     use crate::params::IntronMotifFilter;
 
     use crate::genome::Genome;
@@ -1734,51 +1656,6 @@ mod tests {
             prepared_junctions: Vec::new(),
             sjdb_overhang: 0,
         }
-    }
-
-    #[test]
-    fn combined_transcript_for_projection_rewrites_mate2_ifrag() {
-        use cigar::op::{Kind, Op};
-        let make_tr = |gs: u64, ge: u64, rs: usize, re: usize| Transcript {
-            output_rank: 0,
-            chr_idx: 0,
-            genome_start: gs,
-            genome_end: ge,
-            is_reverse: false,
-            exons: vec![Exon {
-                genome_start: gs,
-                genome_end: ge,
-                read_start: rs,
-                read_end: re,
-                i_frag: 0,
-            }],
-            cigar: vec![Op::new(Kind::Match, (ge - gs) as usize)],
-            score: 100,
-            n_mismatch: 0,
-            n_gap: 0,
-            n_junction: 0,
-            junction_motifs: vec![],
-            junction_annotated: vec![],
-            junction_strand: vec![],
-        };
-        let pair = PairedAlignment {
-            output_rank: 0,
-            mate1_transcript: make_tr(1000, 1100, 0, 100),
-            mate2_transcript: make_tr(1300, 1400, 0, 100),
-            mate1_region: (0, 100),
-            mate2_region: (0, 100),
-            is_proper_pair: true,
-            insert_size: 400,
-            combined_wt_score: 200,
-        };
-        assert_eq!(pair.star_g_length(), 400);
-        let combined = pair.combined_transcript_for_projection();
-        assert_eq!(combined.exons.len(), 2);
-        assert_eq!(combined.exons[0].i_frag, 0);
-        assert_eq!(combined.exons[1].i_frag, 1);
-        assert_eq!(combined.genome_start, 1000);
-        assert_eq!(combined.genome_end, 1400);
-        assert_eq!(combined.score, 200);
     }
 
     /// Overlapping mates: STAR's `gLength` runs from the first mate's start to

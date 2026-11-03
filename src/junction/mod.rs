@@ -13,7 +13,7 @@ pub mod sjdb_insert;
 pub use sj_output::SpliceJunctionStats;
 pub(crate) use sj_output::{SjKey, encode_motif};
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Key for junction lookup: (chr_idx, intron_start, intron_end, strand).
 ///
@@ -40,14 +40,14 @@ pub struct JunctionInfo {
 #[derive(Clone)]
 pub struct SpliceJunctionDb {
     /// Map: (chr_idx, intron_start, intron_end, strand) → annotated
-    junctions: HashMap<JunctionKey, JunctionInfo>,
+    junctions: FxHashMap<JunctionKey, JunctionInfo>,
 }
 
 impl SpliceJunctionDb {
     /// Create empty database (for no-GTF mode)
     pub fn empty() -> Self {
         Self {
-            junctions: HashMap::new(),
+            junctions: FxHashMap::default(),
         }
     }
 
@@ -57,7 +57,8 @@ impl SpliceJunctionDb {
     /// `TranscriptomeIndex` and the `sjdb_insert` pipeline without
     /// re-parsing the file.
     pub fn from_raw_junctions(raw: &[(usize, u64, u64, u8)]) -> Self {
-        let mut junctions = HashMap::with_capacity(raw.len());
+        let mut junctions =
+            FxHashMap::with_capacity_and_hasher(raw.len(), rustc_hash::FxBuildHasher);
         for &(chr_idx, intron_start, intron_end, strand) in raw {
             let key = JunctionKey {
                 chr_idx,

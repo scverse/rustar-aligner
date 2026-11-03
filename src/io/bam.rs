@@ -14,26 +14,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
-/// Buffer for BAM records built by parallel threads
-#[derive(Default)]
-pub struct BufferedBamRecords {
-    pub records: Vec<RecordBuf>,
-}
-
-impl BufferedBamRecords {
-    /// Create new buffer with capacity
-    pub fn new() -> Self {
-        Self {
-            records: Vec::with_capacity(10000),
-        }
-    }
-
-    /// Add a record to the buffer
-    pub fn push(&mut self, record: RecordBuf) {
-        self.records.push(record);
-    }
-}
-
 /// Convert STAR's `--outBAMcompression` integer (-1..9) to a noodles level.
 ///
 /// STAR mapping: -1 or 0 = uncompressed, 1-9 = deflate levels, default 1.
@@ -69,16 +49,13 @@ fn bgzf_threads(params: &Parameters) -> usize {
     params.run_thread_n.get()
 }
 
-type BgzfFile = BgzfWriter<BufWriter<File>>;
-type BgzfStdout = BgzfWriter<BufWriter<std::io::Stdout>>;
-
 /// BAM file writer (streaming, unsorted)
 ///
 /// This writer streams BAM records directly to disk as they're generated,
 /// without buffering or sorting. The output is BGZF-compressed but unsorted.
 /// Users can sort the output with `samtools sort` if needed.
-pub struct BamWriter {
-    writer: bam::io::Writer<BgzfFile>,
+pub struct BamWriter<W: Write + Send + 'static = BufWriter<File>> {
+    writer: bam::io::Writer<BgzfWriter<W>>,
     header: sam::Header,
 }
 
@@ -454,11 +431,12 @@ fn read_run_record<R: std::io::Read>(
 /// The header emits `SO:coordinate`. Unmapped records sort to the end.
 pub struct SortedBamWriter {
     sorter: CoordinateSorter,
-    output_path: std::path::PathBuf,
+    /// `None`: stdout. A file is only created by `finish`.
+    output_path: Option<std::path::PathBuf>,
 }
 
-impl BamWriter {
-    /// Create a BAM writer at `output_path` with the given prepared header.
+impl<W: Write + Send + 'static> BamWriter<W> {
+    /// Create a BAM writer on `out` with the given prepared header.
     ///
     /// Uses a lenient header writer that bypasses noodles' SAM-spec
     /// reference-name validator. STAR accepts `(` / `)` in reference names
@@ -466,49 +444,24 @@ impl BamWriter {
     /// validator rejects. Writing the SAM text portion of the BAM header
     /// manually sidesteps that validation while preserving every other byte.
     fn with_header(
-        output_path: &Path,
+        out: W,
         header: sam::Header,
         header_text: &[u8],
         compression: i32,
         threads: usize,
     ) -> Result<Self, Error> {
-        let buf_writer = BufWriter::new(File::create(output_path)?);
-        let mut bgzf = make_bgzf_writer(buf_writer, compression, threads)?;
+        let mut bgzf = make_bgzf_writer(out, compression, threads)?;
         write_bam_header_lenient(&mut bgzf, &header, header_text)?;
         let writer = bam::io::Writer::from(bgzf);
         Ok(Self { writer, header })
     }
 
-    /// Create a new BAM writer with header from genome index.
-    pub fn create(output_path: &Path, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
+    /// Create a BAM writer on `out`, with header from genome index.
+    pub fn with_output(out: W, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
         let text = crate::io::sam::render_header_text(&header, params, HeaderKind::Main)?;
         Self::with_header(
-            output_path,
-            header,
-            &text,
-            params.out_bam_compression,
-            bgzf_threads(params),
-        )
-    }
-
-    /// Create a BAM writer whose @SQ header lists the transcripts (not
-    /// chromosomes) from `tr_idx`.  Used for
-    /// `Aligned.toTranscriptome.out.bam`.
-    pub fn create_transcriptome(
-        output_path: &Path,
-        tr_idx: &TranscriptomeIndex,
-        params: &Parameters,
-    ) -> Result<Self, Error> {
-        let refs = tr_idx
-            .tr_ids
-            .iter()
-            .zip(tr_idx.tr_length.iter())
-            .map(|(id, len)| (id.as_str(), *len as usize));
-        let header = crate::io::sam::build_sam_header_from_refs(refs, params)?;
-        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::Transcriptome)?;
-        Self::with_header(
-            output_path,
+            out,
             header,
             &text,
             params.out_bam_compression,
@@ -535,6 +488,37 @@ impl BamWriter {
     }
 }
 
+impl BamWriter {
+    /// Create a new BAM file writer with header from genome index.
+    pub fn create(output_path: &Path, genome: &Genome, params: &Parameters) -> Result<Self, Error> {
+        Self::with_output(BufWriter::new(File::create(output_path)?), genome, params)
+    }
+
+    /// Create a BAM writer whose @SQ header lists the transcripts (not
+    /// chromosomes) from `tr_idx`.  Used for
+    /// `Aligned.toTranscriptome.out.bam`.
+    pub fn create_transcriptome(
+        output_path: &Path,
+        tr_idx: &TranscriptomeIndex,
+        params: &Parameters,
+    ) -> Result<Self, Error> {
+        let refs = tr_idx
+            .tr_ids
+            .iter()
+            .zip(tr_idx.tr_length.iter())
+            .map(|(id, len)| (id.as_str(), *len as usize));
+        let header = crate::io::sam::build_sam_header_from_refs(refs, params)?;
+        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::Transcriptome)?;
+        Self::with_header(
+            BufWriter::new(File::create(output_path)?),
+            header,
+            &text,
+            params.out_bam_compression,
+            bgzf_threads(params),
+        )
+    }
+}
+
 impl SortedBamWriter {
     /// Create a sorted BAM writer. Records are buffered up to the
     /// `--limitBAMsortRAM` budget and spilled to sorted runs beyond it.
@@ -543,11 +527,27 @@ impl SortedBamWriter {
         genome: &crate::genome::Genome,
         params: &Parameters,
     ) -> Result<Self, Error> {
+        Self::with_output(Some(output_path.to_path_buf()), genome, params)
+    }
+
+    /// [`create`](Self::create) writing to stdout on `finish`.
+    pub fn create_stdout(
+        genome: &crate::genome::Genome,
+        params: &Parameters,
+    ) -> Result<Self, Error> {
+        Self::with_output(None, genome, params)
+    }
+
+    fn with_output(
+        output_path: Option<std::path::PathBuf>,
+        genome: &crate::genome::Genome,
+        params: &Parameters,
+    ) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
         let text = crate::io::sam::render_header_text(&header, params, HeaderKind::MainSorted)?;
         Ok(Self {
             sorter: CoordinateSorter::new(header, text, params),
-            output_path: output_path.to_path_buf(),
+            output_path,
         })
     }
 
@@ -573,13 +573,14 @@ impl SortedBamWriter {
         &mut self,
         finalize: Option<&mut dyn FnMut(&mut RecordBuf)>,
     ) -> Result<(), Error> {
-        let file = File::create(&self.output_path)
-            .map_err(|source| Error::io(source, &self.output_path))?;
-        self.sorter.write_sorted(
-            BufWriter::new(file),
-            &self.output_path.display().to_string(),
-            finalize,
-        )
+        let Some(path) = &self.output_path else {
+            return self
+                .sorter
+                .write_sorted(BufWriter::new(std::io::stdout()), "stdout", finalize);
+        };
+        let file = File::create(path).map_err(|source| Error::io(source, path))?;
+        self.sorter
+            .write_sorted(BufWriter::new(file), &path.display().to_string(), finalize)
     }
 }
 
@@ -640,71 +641,6 @@ fn write_bam_header_lenient<W: Write>(
     }
 
     Ok(())
-}
-
-/// Streaming unsorted BAM writer that writes to stdout.
-pub struct BamStdoutWriter {
-    writer: bam::io::Writer<BgzfStdout>,
-    header: sam::Header,
-}
-
-impl BamStdoutWriter {
-    pub fn create(genome: &crate::genome::Genome, params: &Parameters) -> Result<Self, Error> {
-        let header = crate::io::sam::build_sam_header(genome, params)?;
-        let header_text = crate::io::sam::render_header_text(&header, params, HeaderKind::Main)?;
-        let mut bgzf = make_bgzf_writer(
-            BufWriter::new(std::io::stdout()),
-            params.out_bam_compression,
-            bgzf_threads(params),
-        )?;
-        write_bam_header_lenient(&mut bgzf, &header, &header_text)?;
-        let writer = bam::io::Writer::from(bgzf);
-        Ok(Self { writer, header })
-    }
-
-    pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        for record in batch {
-            self.writer.write_alignment_record(&self.header, record)?;
-        }
-        Ok(())
-    }
-
-    pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.get_mut().finish()?;
-        Ok(())
-    }
-}
-
-/// Coordinate-sorted BAM writer that writes to stdout on `finish()`, with the
-/// same bounded-memory spill/merge behavior as [`SortedBamWriter`].
-pub struct SortedBamStdoutWriter {
-    sorter: CoordinateSorter,
-}
-
-impl SortedBamStdoutWriter {
-    pub fn create(genome: &crate::genome::Genome, params: &Parameters) -> Result<Self, Error> {
-        let header = crate::io::sam::build_sam_header(genome, params)?;
-        let text = crate::io::sam::render_header_text(&header, params, HeaderKind::MainSorted)?;
-        Ok(Self {
-            sorter: CoordinateSorter::new(header, text, params),
-        })
-    }
-
-    pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        self.sorter.push_batch(batch)
-    }
-
-    pub fn finish(&mut self) -> Result<(), Error> {
-        self.sorter
-            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", None)
-    }
-
-    /// [`finish`](Self::finish), passing each record through `finalize` as it
-    /// is written (see [`SortedBamWriter::finish_with`]).
-    pub fn finish_with(&mut self, finalize: &mut dyn FnMut(&mut RecordBuf)) -> Result<(), Error> {
-        self.sorter
-            .write_sorted(BufWriter::new(std::io::stdout()), "stdout", Some(finalize))
-    }
 }
 
 #[cfg(test)]

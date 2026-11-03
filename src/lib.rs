@@ -291,7 +291,7 @@ impl AlignmentWriter for NullWriter {
     }
 }
 
-impl AlignmentWriter for crate::io::sam::SamWriter {
+impl<W: std::io::Write + Send> AlignmentWriter for crate::io::sam::SamWriter<W> {
     fn write_batch(
         &mut self,
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
@@ -300,7 +300,7 @@ impl AlignmentWriter for crate::io::sam::SamWriter {
     }
 }
 
-impl AlignmentWriter for crate::io::bam::BamWriter {
+impl<W: std::io::Write + Send + 'static> AlignmentWriter for crate::io::bam::BamWriter<W> {
     fn write_batch(
         &mut self,
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
@@ -313,48 +313,6 @@ impl AlignmentWriter for crate::io::bam::BamWriter {
 }
 
 impl AlignmentWriter for crate::io::bam::SortedBamWriter {
-    fn write_batch(
-        &mut self,
-        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
-    ) -> Result<(), error::Error> {
-        self.write_batch(batch)
-    }
-    fn finish(&mut self) -> Result<(), error::Error> {
-        self.finish()
-    }
-    fn finish_with(
-        &mut self,
-        finalize: &mut dyn FnMut(&mut noodles::sam::alignment::record_buf::RecordBuf),
-    ) -> Result<(), error::Error> {
-        self.finish_with(finalize)
-    }
-    fn holds_records(&self) -> bool {
-        true
-    }
-}
-
-impl AlignmentWriter for crate::io::sam::SamStdoutWriter {
-    fn write_batch(
-        &mut self,
-        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
-    ) -> Result<(), error::Error> {
-        self.write_batch(batch)
-    }
-}
-
-impl AlignmentWriter for crate::io::bam::BamStdoutWriter {
-    fn write_batch(
-        &mut self,
-        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
-    ) -> Result<(), error::Error> {
-        self.write_batch(batch)
-    }
-    fn finish(&mut self) -> Result<(), error::Error> {
-        self.finish()
-    }
-}
-
-impl AlignmentWriter for crate::io::bam::SortedBamStdoutWriter {
     fn write_batch(
         &mut self,
         batch: &[noodles::sam::alignment::record_buf::RecordBuf],
@@ -941,7 +899,8 @@ fn run_single_pass(
             OutSamFormat::Sam => {
                 if params.out_std == OutStd::Sam {
                     info!("Writing SAM to stdout (--outStd SAM)");
-                    Box::new(crate::io::sam::SamStdoutWriter::create(
+                    Box::new(SamWriter::with_output(
+                        std::io::BufWriter::new(std::io::stdout()),
                         &index.genome,
                         params,
                     )?)
@@ -959,7 +918,8 @@ fn run_single_pass(
                 if out_type.bam_unsorted {
                     outputs.push(if params.out_std == OutStd::BamUnsorted {
                         info!("Writing unsorted BAM to stdout (--outStd BAM_Unsorted)");
-                        Box::new(crate::io::bam::BamStdoutWriter::create(
+                        Box::new(BamWriter::with_output(
+                            std::io::BufWriter::new(std::io::stdout()),
                             &index.genome,
                             params,
                         )?)
@@ -977,10 +937,7 @@ fn run_single_pass(
                         info!(
                             "Writing coordinate-sorted BAM to stdout (--outStd BAM_SortedByCoordinate)"
                         );
-                        Box::new(crate::io::bam::SortedBamStdoutWriter::create(
-                            &index.genome,
-                            params,
-                        )?)
+                        Box::new(SortedBamWriter::create_stdout(&index.genome, params)?)
                     } else {
                         let output_path = params.output_path("Aligned.sortedByCoord.out.bam");
                         info!("Writing BAM to {}", output_path.display());

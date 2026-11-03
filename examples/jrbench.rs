@@ -77,8 +77,6 @@ fn main() {
                 0,
                 del as i64,
                 &genome,
-                false,
-                N as u64,
                 75,
                 iters_per_scan,
             );

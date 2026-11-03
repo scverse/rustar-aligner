@@ -11,7 +11,54 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- The residual differences in DIVERGENCE.md §5 are fixed. On the parity
+  suite's yeast (10k and 100k, SE and PE, chimeric, `--outSAMunmapped
+  Within`), human chr21 (SE, PE) and fusion runs, alignments, `SJ.out.tab`
+  and `Log.final.out` now match STAR 2.7.11b, mate order included; on the
+  mouse chr19 STARsolo runs every `Solo.out` file does.
+  - `nM` is STAR's mismatch count as accumulated while stitching, not a
+    recount of the final alignment. The two differ when a junction scan moves
+    a junction back over bases already counted as mismatches against the
+    intron: STAR counts them again and keeps both counts.
+  - The two mates of a pair are written in STAR's order: the one on the
+    forward strand first, so mate 2 leads when mate 1 is reverse. Every
+    paired alignment was mate 1 first before, about half of STAR's.
+  - A pair whose two alignments share their mate positions but place an
+    indel or junction differently inside one mate is no longer collapsed to
+    one alignment. The extra mate-2 dedup that did it is gone; STAR's window
+    dedup compares the whole pair.
+  - A read is dropped as "other" when a window full of anchors receives one
+    more align, whatever that align is (STAR's
+    `MARKER_TOO_MANY_ANCHORS_PER_WINDOW`). A non-anchor arriving there was
+    skipped instead, so the read could map or count as "too short".
+  - STARsolo `--soloMultiMappers EM` is STAR's EM: it starts from the unique
+    counts plus the uniform spread, zeroes values below 0.01 at the start of
+    each round, and stops once no gene moves by 0.01 (or after 101 rounds),
+    so a gene can keep a value below 0.01. Every gene of a cell's unique or
+    multi-gene counts is written to `UniqueAndMult-*.mtx`, a zero included.
+  - A gene-ambiguous read whose barcode has several 1MM whitelist matches is
+    kept for `--soloMultiMappers` and its barcode resolved at counting time,
+    as for a unique-gene read; one it cannot resolve counts as
+    `noTooManyWLmatches`. It was dropped before.
+  - `--soloUMIfiltering` applies to the STARsolo `SJ` feature as it does to
+    genes: a read that crosses two junctions is one UMI on two features, a
+    tie `MultiGeneUMI_CR` drops.
+
 ### Other changes
+
+- Dead code removed: the per-seed pre-extension scoring block in the stitcher,
+  which ran for every window and whose result was discarded; the reverse-strand
+  branches of the stitcher and junction scan, unreachable since windows are
+  stitched in forward coordinates; and `BufferedBamRecords`,
+  `SamWriter::write_alignment`, `Seed::find_paired_seeds`,
+  `Seed::get_genome_positions`, `combined_transcript_for_projection`,
+  `parse_gtf`, `extract_junctions_from_exons`,
+  `AlignmentScorer::score_gap_with_strand`. **API removal.** The stdout writers
+  are now the file writers on another output (`SamWriter<W>`, `BamWriter<W>`,
+  `SortedBamWriter::create_stdout`), so `--outStd SAM` gets the file writer's
+  `[SAM-MISMATCH]` check. Output is unchanged.
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
   ported from DegNorm (MIT) and David Elworthy's `sgt.h` via STAR (BSD
