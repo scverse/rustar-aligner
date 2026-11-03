@@ -50,6 +50,27 @@ impl UnmappedFastqWriter {
     }
 }
 
+/// The name of an `Unmapped.out.mate*` record, without its `@` or `>`: the read
+/// name, the 0-based mate, the filter flag, an empty barcode field, then `status`.
+/// That is `""` for single-end reads, and for pairs a space and whether each mate
+/// mapped (` 10`). Layout observed in STAR 2.7.11b's output, source not read.
+pub fn unmapped_name(name: &str, mate: u8, filter_flag: u8, status: &str) -> String {
+    format!("{name} {mate}:{}: {status}", filter_flag as char)
+}
+
+/// `Y` when the first word of a FASTQ description has `:Y:` from its second byte.
+fn filter_flag(description: &[u8]) -> u8 {
+    let field = description
+        .split(u8::is_ascii_whitespace)
+        .next()
+        .unwrap_or(&[]);
+    if field.get(1..4) == Some(b":Y:") {
+        b'Y'
+    } else {
+        b'N'
+    }
+}
+
 /// A read from a FASTQ file with encoded bases
 #[derive(Debug, Clone)]
 pub struct EncodedRead {
@@ -63,6 +84,8 @@ pub struct EncodedRead {
     /// Index of the `--readFilesIn` file this read came from (STAR
     /// `readFilesIndex`); selects the read group.
     pub file_index: u32,
+    /// `Y` when the second field of a FASTQ name line reads `n:Y:...`, else `N`.
+    pub filter_flag: u8,
 }
 
 /// A paired-end read from two FASTQ files
@@ -303,6 +326,7 @@ impl FastqReader {
                     sequence,
                     quality,
                     file_index: self.file_index,
+                    filter_flag: filter_flag(record.description()),
                 }))
             }
             Some(Err(e)) => Err(Error::io(e, &self.path)),
@@ -366,6 +390,7 @@ impl FastqReader {
             sequence,
             quality: Vec::new(),
             file_index: self.file_index,
+            filter_flag: b'N',
         })
     }
 
@@ -893,6 +918,26 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(contents.as_bytes()).unwrap();
         FastqReader::open(f.path(), None).unwrap()
+    }
+
+    /// Expected flags are STAR's on the same name lines.
+    #[test]
+    fn filter_flag_needs_y_as_the_second_colon_field_of_a_one_byte_first_field() {
+        for (description, flag) in [
+            (&b"1:Y:0:ACGT"[..], b'Y'),
+            (b"2:Y:18:GG", b'Y'),
+            (b"1:Y:0 2:N:0", b'Y'),
+            (b"1:N:0:ACGT", b'N'),
+            (b"Y", b'N'),
+            (b":Y:", b'N'),
+            (b"1:Y", b'N'),
+            (b"ab:Y:", b'N'),
+            (b"1:y:0", b'N'),
+            (b"x\ty:Y:z", b'N'),
+            (b"", b'N'),
+        ] {
+            assert_eq!(filter_flag(description), flag, "{description:?}");
+        }
     }
 
     #[test]

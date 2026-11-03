@@ -2016,7 +2016,12 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         }
                         let unmapped_m1 = if write_unmapped_fastq {
                             vec![(
-                                out_read_name.clone(),
+                                crate::io::fastq::unmapped_name(
+                                    &out_read_name,
+                                    0,
+                                    read.filter_flag,
+                                    "",
+                                ),
                                 read.sequence.clone(),
                                 read.quality.clone(),
                             )]
@@ -2232,7 +2237,12 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     };
                     let unmapped_m1 = if write_unmapped_fastq && is_unmapped_se {
                         vec![(
-                            out_read_name.clone(),
+                            crate::io::fastq::unmapped_name(
+                                &out_read_name,
+                                0,
+                                read.filter_flag,
+                                "",
+                            ),
                             read.sequence.clone(),
                             read.quality.clone(),
                         )]
@@ -3583,12 +3593,18 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     } else {
                         paired_read.name.clone()
                     };
-                    let (fastx_name1, fastx_name2) = if out_read_id_number {
-                        (out_read_name.clone(), out_read_name.clone())
-                    } else {
+                    // STAR's mate 2 record carries mate 1's name and flag, except that a
+                    // FASTA mate 2 keeps its own name.
+                    let fastx_names = |status: &str| {
+                        let name2 = if !out_read_id_number && paired_read.mate2.quality.is_empty() {
+                            &paired_read.mate2.name
+                        } else {
+                            &out_read_name
+                        };
+                        let flag = paired_read.mate1.filter_flag;
                         (
-                            paired_read.mate1.name.clone(),
-                            paired_read.mate2.name.clone(),
+                            crate::io::fastq::unmapped_name(&out_read_name, 0, flag, status),
+                            crate::io::fastq::unmapped_name(name2, 1, flag, status),
                         )
                     };
 
@@ -3643,14 +3659,15 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             }
                         }
                         let (um1, um2) = if write_unmapped_fastq {
+                            let (fastx_name1, fastx_name2) = fastx_names(" 00");
                             (
                                 vec![(
-                                    fastx_name1.clone(),
+                                    fastx_name1,
                                     paired_read.mate1.sequence.clone(),
                                     paired_read.mate1.quality.clone(),
                                 )],
                                 vec![(
-                                    fastx_name2.clone(),
+                                    fastx_name2,
                                     paired_read.mate2.sequence.clone(),
                                     paired_read.mate2.quality.clone(),
                                 )],
@@ -3971,9 +3988,26 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     let (unmapped_mate1, unmapped_mate2) = if write_unmapped_fastq {
                         let pair_unmapped = results.is_empty() || has_half_mapped;
                         if pair_unmapped {
+                            let status = match results.first() {
+                                Some(PairedAlignmentResult::HalfMapped {
+                                    mate1_is_mapped: true,
+                                    ..
+                                }) => " 10",
+                                Some(PairedAlignmentResult::HalfMapped { .. }) => " 01",
+                                _ => " 00",
+                            };
+                            let (fastx_name1, fastx_name2) = fastx_names(status);
                             (
-                                vec![(fastx_name1.clone(), m1_seq.clone(), m1_qual.clone())],
-                                vec![(fastx_name2.clone(), m2_seq.clone(), m2_qual.clone())],
+                                vec![(
+                                    fastx_name1,
+                                    paired_read.mate1.sequence.clone(),
+                                    paired_read.mate1.quality.clone(),
+                                )],
+                                vec![(
+                                    fastx_name2,
+                                    paired_read.mate2.sequence.clone(),
+                                    paired_read.mate2.quality.clone(),
+                                )],
                             )
                         } else {
                             (Vec::new(), Vec::new())
