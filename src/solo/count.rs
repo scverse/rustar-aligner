@@ -340,7 +340,9 @@ pub fn umi_correction_map(
 
 /// 1MM_All: every UMI of a connected component is corrected to the component's
 /// highest-count UMI, ties going to the one STAR meets first, the smallest
-/// half-swapped value (`umiArrayCorrect_Graph`'s `umiBest` scan).
+/// half-swapped value (`umiArrayCorrect_Graph`'s `umiBest` scan). A UMI longer
+/// than `umi_len` can share its half-swapped value with another; the smaller raw
+/// UMI wins then, so the choice never depends on hash or walk order.
 fn graph_correction_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64, u64> {
     let mut map = HashMap::default();
     if umis.len() <= 1 {
@@ -349,9 +351,10 @@ fn graph_correction_map(umis: &HashMap<u64, u32>, umi_len: usize) -> HashMap<u64
     for_each_1mm_component(umis, umi_len, |component| {
         // A component of one is never coloured by STAR, so it is never recorded.
         if component.len() > 1
-            && let Some(&rep) = component
-                .iter()
-                .max_by_key(|&&u| (umis[&u], std::cmp::Reverse(swap_halves(u, umi_len))))
+            && let Some(&rep) = component.iter().max_by_key(|&&u| {
+                use std::cmp::Reverse;
+                (umis[&u], Reverse(swap_halves(u, umi_len)), Reverse(u))
+            })
         {
             map.extend(component.iter().map(|&u| (u, rep)));
         }
@@ -3286,7 +3289,8 @@ mod tests {
                 let count = umis[&umi];
                 let swapped = swap_halves(umi, umi_len);
                 match best.get(&root) {
-                    Some(&(bc, bs, _)) if bc > count || (bc == count && bs <= swapped) => {}
+                    Some(&(bc, bs, bu))
+                        if bc > count || (bc == count && (bs, bu) <= (swapped, umi)) => {}
                     _ => {
                         best.insert(root, (count, swapped, umi));
                     }
@@ -3507,6 +3511,13 @@ mod tests {
     /// it was before the lookup, however large the set.
     #[test]
     fn umis_longer_than_umi_len_match_reference() {
+        // 3019 and 4042 are 1MM on their last 5 bases and half-swap to the same
+        // value; the smaller raw UMI wins, whatever order the component is walked in.
+        let tie: HashMap<u64, u32> = [(3019, 1), (4042, 1), (976, 1)].into_iter().collect();
+        let expected: HashMap<u64, u64> = [(4042, 3019)].into_iter().collect();
+        assert_eq!(umi_correction_map(&tie, UmiDedup::OneMmAll, 5), expected);
+        assert_dedup_matches_reference(&tie, 5);
+
         let mut rng = crate::solo::libcxx_rng::Mt19937::new(11);
         let umis = random_umis(&mut rng, 4 * UMI_PAIRWISE_MAX, 16, 4);
         assert!(OneMmFinder::new(&umis, 5).pairwise);
