@@ -149,26 +149,48 @@ impl GenomeIndex {
     }
 }
 
-/// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt
-/// and return the first field (total genome byte count, including Gsj if
-/// sjdb was baked in). Returns `Ok(None)` if the file or line is absent,
-/// leaving the caller to fall back to the chr_start boundary.
-fn read_genome_file_size(genome_dir: &Path) -> Result<Option<u64>, Error> {
+/// Read `genomeFileSizes\t<n_genome> <sa_size>` from genomeParameters.txt.
+/// Either value is `None` when absent; a recorded SA size of 0 means unknown.
+fn read_genome_file_sizes(genome_dir: &Path) -> Result<(Option<u64>, Option<u64>), Error> {
     let path = genome_dir.join("genomeParameters.txt");
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
         Err(e) => return Err(Error::io(e, &path)),
     };
     for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("genomeFileSizes\t")
-            && let Some(first) = rest.split_whitespace().next()
-            && let Ok(v) = first.parse::<u64>()
-        {
-            return Ok(Some(v));
+        if let Some(rest) = line.strip_prefix("genomeFileSizes\t") {
+            let mut values = rest.split_whitespace().map(|v| v.parse::<u64>().ok());
+            let n_genome = values.next().flatten();
+            let sa_size = values.next().flatten().filter(|&v| v != 0);
+            return Ok((n_genome, sa_size));
         }
     }
-    Ok(None)
+    Ok((None, None))
+}
+
+/// One integer per line, as `chrLength.txt` and `chrStart.txt` hold.
+fn parse_u64_lines(contents: &str, path: &Path) -> Result<Vec<u64>, Error> {
+    contents
+        .lines()
+        .map(|s| {
+            s.parse().map_err(|_| {
+                Error::Index(format!(
+                    "{}: '{s}' is not a number; regenerate the index",
+                    path.display()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// A short index file reads as zeros or panics mid-run, so refuse it at load.
+fn index_file_size_err(path: &Path, actual: u64, expected: u64) -> Error {
+    Error::Index(format!(
+        "{} is {actual} bytes, expected {expected}: the index is damaged or was not fully \
+         copied; copy it again or regenerate it",
+        path.display()
+    ))
 }
 
 /// The `versionGenome` an index has to carry (STAR 2.7.11b's `versionGenome`
@@ -260,20 +282,24 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     let chr_length_path = genome_dir.join("chrLength.txt");
     let chr_length_contents =
         std::fs::read_to_string(&chr_length_path).map_err(|e| Error::io(e, &chr_length_path))?;
-    let chr_length: Vec<u64> = chr_length_contents
-        .lines()
-        .map(|s| s.parse().unwrap())
-        .collect();
+    let chr_length = parse_u64_lines(&chr_length_contents, &chr_length_path)?;
 
     let chr_start_path = genome_dir.join("chrStart.txt");
     let chr_start_contents =
         std::fs::read_to_string(&chr_start_path).map_err(|e| Error::io(e, &chr_start_path))?;
-    let chr_start: Vec<u64> = chr_start_contents
-        .lines()
-        .map(|s| s.parse().unwrap())
-        .collect();
+    let chr_start = parse_u64_lines(&chr_start_contents, &chr_start_path)?;
 
     let n_chr_real = chr_name.len();
+    if chr_length.len() != n_chr_real || chr_start.len() != n_chr_real + 1 {
+        return Err(Error::Index(format!(
+            "{}: {n_chr_real} chromosomes but {} lengths and {} starts (expected {}); \
+             regenerate the index",
+            genome_dir.display(),
+            chr_length.len(),
+            chr_start.len(),
+            n_chr_real + 1
+        )));
+    }
 
     // `chr_start[n_chr_real]` is the forward boundary of REAL chromosomes
     // only — it stays pinned at the pre-sjdb value in STAR (`chrStart.txt`).
@@ -282,7 +308,9 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     // Prefer that value; fall back to the chr_start boundary for indices
     // built without a GTF.
     let n_genome_real = chr_start[n_chr_real];
-    let n_genome = read_genome_file_size(genome_dir)?.unwrap_or(n_genome_real);
+    let n_genome = read_genome_file_sizes(genome_dir)?
+        .0
+        .unwrap_or(n_genome_real);
 
     // Memory-map the Genome sequence file (forward strand only, `n_genome`
     // bytes). The reverse-complement half is computed on access by
@@ -351,6 +379,12 @@ fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, 
     let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| Error::io(e, &sa_path))? };
     advise_random(&mmap);
 
+    if let (_, Some(expected)) = read_genome_file_sizes(genome_dir)?
+        && mmap.len() as u64 != expected
+    {
+        return Err(index_file_size_err(&sa_path, mmap.len() as u64, expected));
+    }
+
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
     let word_length = gstrand_bit + 1;
     let gstrand_mask = (1u64 << gstrand_bit) - 1;
@@ -418,6 +452,15 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
 
     let word_length = gstrand_bit + 3;
     let num_indices = SaIndex::calculate_num_indices(nbases);
+
+    let expected = PackedArray::data_byte_len_for(word_length, num_indices as usize);
+    if mmap.len() < expected {
+        return Err(index_file_size_err(
+            &sai_path,
+            header_len + mmap.len() as u64,
+            header_len + expected as u64,
+        ));
+    }
 
     let data = PackedArray::from_mmap(word_length, num_indices as usize, mmap);
 

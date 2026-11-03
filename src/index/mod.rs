@@ -355,8 +355,13 @@ impl GenomeIndex {
                 .collect();
             let prepared = sjdb_insert::sort_and_dedup(prepared);
 
-            let gsj =
-                sjdb_insert::build_gsj(&prepared, &genome, n_genome_real, params.sjdb_overhang)?;
+            let gsj = sjdb_insert::build_gsj(
+                &prepared,
+                &genome,
+                n_genome_real,
+                params.sjdb_overhang,
+                true,
+            )?;
             log::info!(
                 "Built Gsj buffer: {} junctions × {} bytes = {} bytes",
                 prepared.len(),
