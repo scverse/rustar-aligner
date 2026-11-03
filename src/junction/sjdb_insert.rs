@@ -37,7 +37,7 @@ pub struct SjdbInfoTab {
 /// `genome.chr_start[..n_chr_real]`. Positions falling in chromosome
 /// padding return an `Error::Index`.
 pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, Error> {
-    let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let contents = crate::index::io::read_index_table(path)?;
     let mut lines = contents.lines();
 
     let header = lines
@@ -52,6 +52,19 @@ pub fn read_sjdb_info_tab(path: &Path, genome: &Genome) -> Result<SjdbInfoTab, E
         .next()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Error::Index(format!("{}: bad header overhang", path.display())))?;
+    // Each junction takes 2*overhang+1 bytes after the chromosomes. STAR does
+    // not check (`Genome_genomeLoad.cpp:487`) and maps reads wrongly when they
+    // disagree.
+    let gsj_bytes = genome
+        .n_genome
+        .saturating_sub(genome.chr_start[genome.n_chr_real]);
+    if gsj_bytes != n_expected as u64 * (2 * sjdb_overhang as u64 + 1) {
+        return Err(Error::Index(format!(
+            "{}: {n_expected} junctions of overhang {sjdb_overhang} do not fill the {gsj_bytes} \
+             junction bytes of the Genome; regenerate the index",
+            path.display()
+        )));
+    }
 
     let mut junctions = Vec::with_capacity(n_expected);
     for (i, line) in lines.enumerate() {
@@ -1261,8 +1274,8 @@ mod tests {
         let genome = Genome {
             transform_blocks: None,
             sequence: seq.into(),
-            n_genome: 2000,
-            n_genome_real: 2000,
+            n_genome: 1000 + 2 * 201,
+            n_genome_real: 1000,
             n_chr_real: 1,
             chr_name: vec!["I".to_string()],
             chr_length: vec![1000],

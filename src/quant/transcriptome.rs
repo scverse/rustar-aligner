@@ -706,6 +706,7 @@ impl TranscriptomeIndex {
         let (ex_start_rel, ex_end_rel_incl, ex_len_cum_flat) =
             read_exon_info(&dir.join("exonInfo.tab"))?;
         let (gene_ids, gene_names, gene_biotypes) = read_gene_info(&dir.join("geneInfo.tab"))?;
+        check_exon_ge_tr_info(&dir.join("exonGeTrInfo.tab"))?;
 
         let n_tr = tr_ids.len();
         let n_exons_total = ex_start_rel.len();
@@ -1073,7 +1074,7 @@ type TrInfoColumns = (
 /// 0-based-inclusive `trEnd` to rustar-aligner's 0-based-exclusive convention.
 /// Ignores the `trEmax` column (reconstructed from `tr_end` + sort order).
 fn read_transcript_info(path: &Path) -> Result<TrInfoColumns, Error> {
-    let body = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let body = crate::index::io::read_index_table(path)?;
     let mut lines = body.lines();
 
     let header = lines
@@ -1146,7 +1147,7 @@ fn read_transcript_info(path: &Path) -> Result<TrInfoColumns, Error> {
 /// Read `exonInfo.tab` into flat arrays. Start/end are transcript-relative,
 /// 0-based; exEnd is INCLUSIVE (STAR's convention).
 fn read_exon_info(path: &Path) -> Result<ExonInfoColumns, Error> {
-    let body = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let body = crate::index::io::read_index_table(path)?;
     let mut lines = body.lines();
 
     let header = lines
@@ -1199,9 +1200,30 @@ fn read_exon_info(path: &Path) -> Result<ExonInfoColumns, Error> {
     Ok((starts, ends, len_cums))
 }
 
+/// rustar-aligner rebuilds the exon-gene table from the others, but STAR reads
+/// `exonGeTrInfo.tab` for gene counts (`Transcriptome.cpp:78-122`) and counts
+/// nothing for the exons a short one lacks. Refuse it, as STAR would give other
+/// numbers on the same index.
+fn check_exon_ge_tr_info(path: &Path) -> Result<(), Error> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let body = crate::index::io::read_index_table(path)?;
+    let mut lines = body.lines();
+    let header = lines.next().unwrap_or("");
+    let rows = lines.count();
+    if header.trim().parse::<usize>().ok() != Some(rows) {
+        return Err(Error::Index(format!(
+            "{}: header says '{header}' exons but found {rows}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Read `geneInfo.tab`. Each record: geneID \t geneName \t geneBiotype.
 fn read_gene_info(path: &Path) -> Result<GeneInfoColumns, Error> {
-    let body = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    let body = crate::index::io::read_index_table(path)?;
     let mut lines = body.lines();
 
     let header = lines

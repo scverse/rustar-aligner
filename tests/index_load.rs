@@ -184,3 +184,88 @@ fn insertion_that_drops_an_old_junction_keeps_a_valid_saindex() {
         );
     }
 }
+
+/// An index built with a GTF of one three-exon transcript: two junctions and
+/// the transcript tables.
+fn annotated_index() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let seq = lcg_seq(11, 5000);
+    write_genome(dir.path(), &seq);
+    write_reads(dir.path(), &seq);
+    let gtf: String = [(1001, 1200), (2001, 2200), (3001, 3200)]
+        .iter()
+        .map(|(s, e)| {
+            format!("c1\tt\texon\t{s}\t{e}\t.\t+\t.\tgene_id \"G\"; transcript_id \"T\";\n")
+        })
+        .collect();
+    fs::write(dir.path().join("a.gtf"), gtf).unwrap();
+    let gtf = dir.path().join("a.gtf");
+    generate(
+        dir.path(),
+        &[
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--sjdbOverhang",
+            "50",
+        ],
+    )
+    .success();
+    dir
+}
+
+/// A table cut mid-line still parses, with a wrong last value; STAR reads it
+/// silently, except `transcriptInfo.tab`, so every one is refused.
+#[test]
+fn table_with_a_cut_last_line_is_refused() {
+    let dir = annotated_index();
+    let new = dir.path().join("new.tab");
+    fs::write(&new, "c1\t4001\t4100\t+\n").unwrap();
+    for name in [
+        "sjdbInfo.txt",
+        "sjdbList.out.tab",
+        "transcriptInfo.tab",
+        "exonInfo.tab",
+        "geneInfo.tab",
+        "exonGeTrInfo.tab",
+    ] {
+        let path = dir.path().join("idx").join(name);
+        let intact = fs::read(&path).unwrap();
+        truncate(&path, 2);
+        // sjdbList.out.tab is read only when junctions are inserted.
+        align(
+            dir.path(),
+            &["--sjdbFileChrStartEnd", new.to_str().unwrap()],
+        )
+        .failure()
+        .stderr(contains(format!("{name} is empty or its last line is cut")));
+        fs::write(&path, intact).unwrap();
+    }
+    align(dir.path(), &[]).success();
+}
+
+/// STAR reloads the index's junctions from sjdbList.out.tab to insert new ones
+/// and hangs when one is missing; without insertion it never reads the file.
+#[test]
+fn short_sjdb_list_is_refused_when_junctions_are_inserted() {
+    let dir = annotated_index();
+    let path = dir.path().join("idx/sjdbList.out.tab");
+    let list = fs::read_to_string(&path).unwrap();
+    fs::write(&path, list.lines().next().unwrap().to_string() + "\n").unwrap();
+    align(dir.path(), &[]).success();
+    align(dir.path(), &["--twopassMode", "Basic"])
+        .failure()
+        .stderr(contains("has 1 junctions but sjdbInfo.txt has 2"));
+}
+
+/// The junction count must fill the junction part of the Genome; STAR maps
+/// reads wrongly when it does not.
+#[test]
+fn sjdb_info_that_disagrees_with_the_genome_is_refused() {
+    let dir = annotated_index();
+    let path = dir.path().join("idx/sjdbInfo.txt");
+    let info = fs::read_to_string(&path).unwrap();
+    fs::write(&path, info.replacen("\t50\n", "\t49\n", 1)).unwrap();
+    align(dir.path(), &[])
+        .failure()
+        .stderr(contains("do not fill"));
+}

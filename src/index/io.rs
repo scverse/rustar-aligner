@@ -57,6 +57,9 @@ impl GenomeIndex {
                 tab.junctions.len(),
                 tab.sjdb_overhang,
             );
+            if sjdb_insert(params) {
+                check_sjdb_list(genome_dir, tab.junctions.len())?;
+            }
             (tab.junctions, tab.sjdb_overhang)
         } else {
             (Vec::new(), 0)
@@ -236,11 +239,9 @@ fn check_genome_version(genome_dir: &Path, params: &Parameters) -> Result<(), Er
         }
         Some(_) => log::info!("Genome version is compatible with current STAR"),
     }
-    // `sjdbInsert.yes` (`Parameters.cpp:1002-1010`).
-    let sjdb_insert = params.sjdb_gtf_file.is_some()
-        || !params.sjdb_file_chr_start_end.is_empty()
-        || params.twopass_mode == crate::params::TwopassMode::Basic;
-    if sjdb_insert && genome_dir.join("sjdbInfo.txt").exists() && value("sjdbInsertSave").is_none()
+    if sjdb_insert(params)
+        && genome_dir.join("sjdbInfo.txt").exists()
+        && value("sjdbInsertSave").is_none()
     {
         return Err(Error::Index(
             "EXITING because of FATAL ERROR: old Genome is INCOMPATIBLE with on the fly junction \
@@ -248,6 +249,47 @@ fn check_genome_version(genome_dir: &Path, params: &Parameters) -> Result<(), Er
              SOLUTION: please re-generate genome from scratch with the latest version of STAR"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// `sjdbInsert.yes` (`Parameters.cpp:1002-1010`).
+fn sjdb_insert(params: &Parameters) -> bool {
+    params.sjdb_gtf_file.is_some()
+        || !params.sjdb_file_chr_start_end.is_empty()
+        || params.twopass_mode == crate::params::TwopassMode::Basic
+}
+
+/// Read a text table of the index. Each one ends with a newline, so a missing
+/// one means its last line was cut, which can change a value without any
+/// parse error.
+pub(crate) fn read_index_table(path: &Path) -> Result<String, Error> {
+    let contents = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
+    if !contents.ends_with('\n') {
+        return Err(Error::Index(format!(
+            "{} is empty or its last line is cut: the index is damaged or was not fully \
+             copied; copy it again or regenerate it",
+            path.display()
+        )));
+    }
+    Ok(contents)
+}
+
+/// Junction insertion reloads the index's junctions from `sjdbList.out.tab`
+/// (`sjdbInsertJunctions.cpp:15-18`). STAR hangs on a short list, so refuse
+/// one that disagrees with `sjdbInfo.txt`.
+fn check_sjdb_list(genome_dir: &Path, n_junctions: usize) -> Result<(), Error> {
+    let path = genome_dir.join("sjdbList.out.tab");
+    let n = read_index_table(&path)?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    if n != n_junctions {
+        return Err(Error::Index(format!(
+            "{} has {n} junctions but sjdbInfo.txt has {n_junctions}: the index is damaged \
+             or was not fully copied; copy it again or regenerate it",
+            path.display()
+        )));
     }
     Ok(())
 }
