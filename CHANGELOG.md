@@ -13,6 +13,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- STARsolo UMI collapsing (`1MM_All`, `1MM_Directional`,
+  `1MM_Directional_UMItools`, `1MM_CR`) no longer compares all pairs of a large
+  `(cell, gene)` UMI set: above 224 UMIs it looks up each UMI's `3 * umi_len`
+  single-base variants instead. Results are unchanged.
+
 - Third-party notices completed. `LICENSES/` gains the licences of code
   ported from DegNorm (MIT) and David Elworthy's `sgt.h` via STAR (BSD
   2-clause), and of libc++ (Apache 2.0 with LLVM Exceptions), whose random
