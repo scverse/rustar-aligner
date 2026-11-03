@@ -286,6 +286,7 @@ impl FastqReader {
                 }
 
                 let name = self.read_name(record.name())?;
+                self.check_not_empty(record.sequence(), &name)?;
                 let sequence = record.sequence().iter().map(|&b| encode_base(b)).collect();
 
                 let quality = if self.qual_shift == 0 {
@@ -337,6 +338,20 @@ impl FastqReader {
         Ok(name[..cut].to_string())
     }
 
+    /// STAR stops on a read with no bases (`readLoad.cpp`, exit 104).
+    fn check_not_empty(&self, sequence: &[u8], name: &str) -> Result<(), Error> {
+        if !sequence.is_empty() {
+            return Ok(());
+        }
+        Err(Error::io(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("read {name}: short read sequence line: 0"),
+            ),
+            &self.path,
+        ))
+    }
+
     /// One FASTA read: a `>name` line, then its sequence over any number of lines.
     /// Quality stays empty, which the SAM and BAM writers output as `*`, as STAR does.
     fn next_fasta(&mut self) -> Result<EncodedRead, Error> {
@@ -361,6 +376,7 @@ impl FastqReader {
                 .map_err(|e| Error::io(e, &self.path))?;
             sequence.extend(line.trim_ascii_end().iter().map(|&b| encode_base(b)));
         }
+        self.check_not_empty(&sequence, &name)?;
         Ok(EncodedRead {
             name,
             sequence,
@@ -907,6 +923,20 @@ mod tests {
         assert_eq!(r.next_encoded().unwrap().unwrap().quality, b"II");
         assert_eq!(r.next_encoded().unwrap().unwrap().sequence, vec![1, 1]);
         assert!(r.next_encoded().unwrap().is_none());
+    }
+
+    /// STAR exits 104 on a read with no bases, FASTA or FASTQ.
+    #[test]
+    fn a_read_with_no_bases_is_an_error() {
+        let mut r = reader_over(">e0\nACGT\n>e1\n>e2\nAC\n");
+        assert_eq!(r.next_encoded().unwrap().unwrap().name, "e0");
+        let err = r.next_encoded().unwrap_err().to_string();
+        assert!(err.contains("e1: short read sequence line: 0"), "{err}");
+        let err = reader_over("@q\n\n+\n\n")
+            .next_encoded()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("short read sequence line: 0"), "{err}");
     }
 
     #[test]
