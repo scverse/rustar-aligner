@@ -232,6 +232,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- SEQ keeps the read's own letters, as STAR does: lowercase bases and IUPAC
+  codes other than N (`R`, `y`, ...) were written as uppercase `ACGTN`. On
+  the reverse strand they are reverse complemented with their case, as
+  STAR's `revComplementNucleotides`. BAM keeps the IUPAC codes (its 4-bit
+  code has no case). `Unmapped.out.mate*` has the read's letters too, and
+  for pairs now the whole mate, as STAR writes it: under `--clip3pNbases` or
+  `--clip5pNbases` it had the clipped mate. Reads in plain `ACGTN`, the usual
+  case, take no extra work.
+
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
   written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull

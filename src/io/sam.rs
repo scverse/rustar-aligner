@@ -1399,6 +1399,47 @@ pub fn apply_solo_read_info(
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
 /// `(FLAG & flagAND) | flagOR`. Matches STAR/STAR-rs, which apply this only to
 /// mapped-mate records; unmapped and transcriptome-BAM records are untouched.
+/// Put a read's own letters (lowercase, IUPAC codes) back in SEQ, which the
+/// builders write from the ACGTN encoding. STAR writes its `Read0` text, reverse
+/// complemented by `revComplementNucleotides` on the reverse strand
+/// (`ReadAlign_outputTranscriptSAM.cpp:194-204`, `ReadAlign_alignBAM.cpp:489-506`).
+/// `mate1`/`mate2` are [`crate::io::fastq::EncodedRead::raw_letters`]; a record
+/// whose SEQ is not that read's bases is left as it is.
+pub fn restore_read_letters(records: &mut [RecordBuf], mate1: Option<&[u8]>, mate2: Option<&[u8]>) {
+    use crate::io::fastq::{encode_base, revcomp_letters};
+    for rec in records {
+        let flags = rec.flags();
+        let Some(letters) = (if flags.is_last_segment() {
+            mate2
+        } else {
+            mate1
+        }) else {
+            continue;
+        };
+        let full = if flags.is_reverse_complemented() && !flags.is_unmapped() {
+            revcomp_letters(letters)
+        } else {
+            letters.to_vec()
+        };
+        let hard5 = rec
+            .cigar()
+            .as_ref()
+            .first()
+            .filter(|op| op.kind() == cigar::op::Kind::HardClip)
+            .map_or(0, |op| op.len());
+        let Some(seq) = full.get(hard5..hard5 + rec.sequence().len()) else {
+            continue;
+        };
+        let same_bases = seq
+            .iter()
+            .zip(rec.sequence().as_ref())
+            .all(|(&a, &b)| decode_base(encode_base(a)) == b);
+        if same_bases {
+            *rec.sequence_mut() = Sequence::from(seq.to_vec());
+        }
+    }
+}
+
 pub(crate) fn apply_sam_flag_or_and(record: &mut RecordBuf, params: &Parameters) {
     let or_bits = params.out_sam_flag_or as u16;
     let and_bits = params.out_sam_flag_and.min(u16::MAX as u32) as u16;
@@ -2071,6 +2112,33 @@ mod tests {
     use crate::params::SamAttr;
     use noodles::sam::alignment::record::cigar;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn restore_read_letters_after_hard_clip_and_not_on_other_bases() {
+        use cigar::op::{Kind, Op};
+        use noodles::sam::alignment::record::Flags;
+        let rec = |flags: Flags, ops: Vec<Op>, seq: &[u8]| {
+            let mut r = RecordBuf::default();
+            *r.flags_mut() = flags;
+            *r.cigar_mut() = ops.into_iter().collect();
+            *r.sequence_mut() = Sequence::from(seq.to_vec());
+            r
+        };
+        let mut records = vec![
+            // Reverse strand, 3 bases hard-clipped: SEQ is that slice of the
+            // reverse complement `ttRacgt`.
+            rec(
+                Flags::REVERSE_COMPLEMENTED,
+                vec![Op::new(Kind::HardClip, 3), Op::new(Kind::Match, 4)],
+                b"ACGT",
+            ),
+            // Not this read's bases: left alone.
+            rec(Flags::empty(), vec![Op::new(Kind::Match, 7)], b"AAAAAAA"),
+        ];
+        restore_read_letters(&mut records, Some(b"acgtYaa"), None);
+        assert_eq!(records[0].sequence().as_ref(), b"acgt");
+        assert_eq!(records[1].sequence().as_ref(), b"AAAAAAA");
+    }
 
     fn make_test_genome() -> Genome {
         Genome {

@@ -833,6 +833,23 @@ fn apply_rg_per_file(
     }
 }
 
+/// [`crate::io::sam::restore_read_letters`] over a batch's genomic and
+/// transcriptome records; `letters(i)` are the `i`-th read's mates' raw letters.
+fn restore_letters_batch<'a>(
+    out: &mut BatchOut<AlignmentBatchResults>,
+    letters: impl Fn(usize) -> (Option<&'a [u8]>, Option<&'a [u8]>),
+) {
+    for (i, res) in out.iter_mut().enumerate() {
+        let (m1, m2) = letters(i);
+        if let Ok(o) = res
+            && (m1.is_some() || m2.is_some())
+        {
+            crate::io::sam::restore_read_letters(&mut o.sam_records.records, m1, m2);
+            crate::io::sam::restore_read_letters(&mut o.transcriptome_records.records, m1, m2);
+        }
+    }
+}
+
 /// [`apply_rg_per_file`] over a batch's genomic and transcriptome records;
 /// `file_index(i)` is the file of the batch's `i`-th read.
 fn apply_rg_per_file_batch(
@@ -2015,11 +2032,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                             buffer.push(record);
                         }
                         let unmapped_m1 = if write_unmapped_fastq {
-                            vec![(
-                                out_read_name.clone(),
-                                read.sequence.clone(),
-                                read.quality.clone(),
-                            )]
+                            vec![(out_read_name.clone(), read.letters(), read.quality.clone())]
                         } else {
                             Vec::new()
                         };
@@ -2231,11 +2244,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         TrRecords::default()
                     };
                     let unmapped_m1 = if write_unmapped_fastq && is_unmapped_se {
-                        vec![(
-                            out_read_name.clone(),
-                            read.sequence.clone(),
-                            read.quality.clone(),
-                        )]
+                        vec![(out_read_name.clone(), read.letters(), read.quality.clone())]
                     } else {
                         Vec::new()
                     };
@@ -2252,6 +2261,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     })
                 })
                 .collect();
+            restore_letters_batch(&mut out, |i| (batch[i].raw_letters.as_deref(), None));
             apply_rg_per_file_batch(params, &mut out, |i| batch[i].file_index);
             out
         };
@@ -2876,12 +2886,15 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             })
                         })
                         .collect();
-                    if !rg_ids.is_empty() {
-                        for (i, res) in out.iter_mut().enumerate() {
-                            if let Ok(o) = res {
-                                let fi = batch[i].cdna.file_index;
-                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
-                            }
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            crate::io::sam::restore_read_letters(
+                                &mut o.sam_records.records,
+                                batch[i].cdna.raw_letters.as_deref(),
+                                None,
+                            );
+                            let fi = batch[i].cdna.file_index;
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
                         }
                     }
                     out
@@ -3401,12 +3414,15 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             })
                         })
                         .collect();
-                    if !rg_ids.is_empty() {
-                        for (i, res) in out.iter_mut().enumerate() {
-                            if let Ok(o) = res {
-                                let fi = batch[i].mate1.file_index;
-                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
-                            }
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            crate::io::sam::restore_read_letters(
+                                &mut o.sam_records.records,
+                                batch[i].mate1.raw_letters.as_deref(),
+                                batch[i].mate2.raw_letters.as_deref(),
+                            );
+                            let fi = batch[i].mate1.file_index;
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
                         }
                     }
                     out
@@ -3646,12 +3662,12 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             (
                                 vec![(
                                     fastx_name1.clone(),
-                                    paired_read.mate1.sequence.clone(),
+                                    paired_read.mate1.letters(),
                                     paired_read.mate1.quality.clone(),
                                 )],
                                 vec![(
                                     fastx_name2.clone(),
-                                    paired_read.mate2.sequence.clone(),
+                                    paired_read.mate2.letters(),
                                     paired_read.mate2.quality.clone(),
                                 )],
                             )
@@ -3972,8 +3988,16 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         let pair_unmapped = results.is_empty() || has_half_mapped;
                         if pair_unmapped {
                             (
-                                vec![(fastx_name1.clone(), m1_seq.clone(), m1_qual.clone())],
-                                vec![(fastx_name2.clone(), m2_seq.clone(), m2_qual.clone())],
+                                vec![(
+                                    fastx_name1.clone(),
+                                    paired_read.mate1.letters(),
+                                    paired_read.mate1.quality.clone(),
+                                )],
+                                vec![(
+                                    fastx_name2.clone(),
+                                    paired_read.mate2.letters(),
+                                    paired_read.mate2.quality.clone(),
+                                )],
                             )
                         } else {
                             (Vec::new(), Vec::new())
@@ -3994,6 +4018,12 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     })
                 })
                 .collect();
+            restore_letters_batch(&mut out, |i| {
+                (
+                    batch[i].mate1.raw_letters.as_deref(),
+                    batch[i].mate2.raw_letters.as_deref(),
+                )
+            });
             apply_rg_per_file_batch(params, &mut out, |i| batch[i].mate1.file_index);
             out
         };
