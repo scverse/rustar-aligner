@@ -6,8 +6,9 @@
 //! paired by name and, per run of pairs with an identical (start, flag, S-extended CIGAR) key, the
 //! highest-`AS` pair is un-marked (kept). All records are re-emitted in the input order with the
 //! flag adjusted, a cluster at a time, so memory follows the largest cluster, not the BAM. A cluster
-//! only ends past a mate on a later coordinate, so with no such mate (single-end reads) it runs to the
-//! end of the reference. `NH`/`AS` are required (a missing tag is a fatal error, and the output then
+//! only ends past a mate on a later coordinate, and a unique read with no mate (single-end) holds it
+//! open to the end of the reference. Ties on `AS` go to the first pair by name, as STAR's glibc
+//! `qsort` (a stable merge sort) leaves them; STAR built on macOS (BSD `qsort`) can keep another. `NH`/`AS` are required (a missing tag is a fatal error, and the output then
 //! holds the clusters before it).
 //!
 //! Near-verbatim port of the sister project STAR-rs's `crates/star-io/src/bam.rs`
@@ -190,7 +191,7 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
     let mut records = Vec::new();
     let mut recs: Vec<DedupRec> = Vec::new();
     let mut group: Vec<usize> = Vec::new();
-    let mut right_max: i64 = 0;
+    let mut right_max: u32 = 0;
     for result in reader.record_bufs(&header) {
         let rec = result?;
         let tid = rec.reference_sequence_id().map_or(-1, |i| i as i64);
@@ -250,10 +251,13 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
         } else {
             (Vec::new(), 0)
         };
-        // Group into maximal overlapping clusters.
+        // Group into maximal overlapping clusters. STAR compares POS/PNEXT as uint32, so an absent
+        // mate or position (-1) is 0xFFFFFFFF: a mateless unique read holds the cluster open to the
+        // end of the reference (bamRemoveDuplicates.cpp:199-200, 205, 258).
+        let (left, right) = (pos as u32, mate_pos as u32);
         if recs
             .first()
-            .is_some_and(|first| tid != first.tid || (right_max > 0 && pos > right_max))
+            .is_some_and(|first| tid != first.tid || (right_max > 0 && left > right_max))
         {
             write_cluster(
                 &mut writer,
@@ -267,8 +271,8 @@ pub fn bam_remove_duplicates<R: Read, W: Write>(
         }
         if nh == 1 {
             group.push(recs.len());
-            if mate_pos > pos {
-                right_max = right_max.max(mate_pos);
+            if right > left {
+                right_max = right_max.max(right);
             }
         }
         recs.push(DedupRec {
@@ -493,6 +497,36 @@ mod tests {
         };
         assert_eq!(run(true), expected(0x400));
         assert_eq!(run(false), expected(0));
+    }
+
+    /// An `AS` tie keeps the first pair by (name length, name), not by file order (STAR on glibc).
+    #[test]
+    fn an_as_tie_keeps_the_first_pair_by_name() {
+        let [z1, z2] = sam_pair("zeta", "chr1", 100, 200, 30);
+        let [a1, a2] = sam_pair("alpha", "chr1", 100, 200, 30);
+        let [b1, b2] = sam_pair("b9", "chr1", 100, 200, 30);
+        let input = bam_from_sam(&[z1, a1, b1, z2, a2, b2]);
+
+        let mut out = Vec::new();
+        bam_remove_duplicates(input.as_slice(), &mut out, true, 0).unwrap();
+        let flags: Vec<u16> = names_and_flags(&out).into_iter().map(|(_, f)| f).collect();
+        assert_eq!(flags, [1123, 1123, 99, 1171, 1171, 147]);
+    }
+
+    /// A unique read without a mate (PNEXT -1, i.e. 0xFFFFFFFF to STAR) keeps the cluster open to the
+    /// end of the reference, so the two mateless reads below share one cluster, pair up and are kept.
+    #[test]
+    fn a_mateless_unique_read_keeps_the_cluster_open() {
+        let [a1, a2] = sam_pair("pa", "chr1", 100, 200, 30);
+        let [b1, b2] = sam_pair("qa", "chr1", 1000, 1100, 30);
+        let se1 = sam_line("se1", 0, "chr1", 150, 0, "NH:i:1\tAS:i:20");
+        let se2 = sam_line("se2", 0, "chr1", 1050, 0, "NH:i:1\tAS:i:20");
+        let input = bam_from_sam(&[a1, se1, a2, b1, se2, b2]);
+
+        let mut out = Vec::new();
+        bam_remove_duplicates(input.as_slice(), &mut out, true, 0).unwrap();
+        let flags: Vec<u16> = names_and_flags(&out).into_iter().map(|(_, f)| f).collect();
+        assert_eq!(flags, [99, 0, 147, 99, 0, 147]);
     }
 
     /// Clusters are written as they end: those that ended before a bad record are in the output.

@@ -11,6 +11,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- `--bamRemoveDuplicatesType`: a unique read without a mate (single-end, or
+  `PNEXT` 0) now keeps its cluster open to the end of the reference, as in
+  STAR, which reads `PNEXT` -1 as an unsigned 0xFFFFFFFF. Before, the cluster
+  ended at the next gap, so such a read could fall out of a pair and stay
+  marked as a duplicate where STAR keeps it.
+
 ### Other changes
 
 - `--bamRemoveDuplicatesType` writes each cluster of overlapping reads as it
