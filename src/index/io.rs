@@ -126,11 +126,16 @@ impl GenomeIndex {
                 prepared.extend(index.prepare_raw_junctions(&raw, 10));
             }
             if let Some(ref gtf_path) = params.sjdb_gtf_file {
-                let exons = crate::junction::gtf::parse_gtf_configured(
+                let mut exons = crate::junction::gtf::parse_gtf_configured(
                     gtf_path,
                     &params.sjdb_gtf_feature_exon,
                     &params.sjdb_gtf_chr_prefix,
                 )?;
+                crate::junction::gtf::name_orphan_exons(
+                    &mut exons,
+                    &index.genome,
+                    &params.sjdb_gtf_tag_exon_parent_transcript,
+                );
                 let raw = crate::junction::gtf::extract_junctions_configured(
                     exons,
                     &index.genome,

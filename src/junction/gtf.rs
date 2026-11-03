@@ -152,22 +152,46 @@ fn parse_attributes(attr_str: &str) -> HashMap<String, String> {
             continue;
         }
 
-        // Split on first space to separate key and value
-        let parts: Vec<&str> = pair.splitn(2, ' ').collect();
-        if parts.len() != 2 {
+        // Split on the first space, or `=` for GFF3 (`Parent=T1`).
+        let Some((key, value)) = pair.split_once([' ', '=']) else {
             continue; // Skip malformed attributes
-        }
+        };
 
-        let key = parts[0].trim().to_string();
-        let value = parts[1]
-            .trim()
-            .trim_matches('"') // Remove quotes
-            .to_string();
+        // As STAR (`GTF.cpp`), which turns `=`, quotes and tabs into spaces: the
+        // value is its first word, so `Parent = T1` gives `T1` and `"T=1"` gives `T`.
+        let Some(value) = value.split([' ', '=', '"', '\t']).find(|w| !w.is_empty()) else {
+            continue;
+        };
 
-        attributes.insert(key, value);
+        attributes.insert(key.trim().to_string(), value.to_string());
     }
 
     attributes
+}
+
+/// Give each exon on the genome that has no `transcript_tag` the transcript ID
+/// STAR invents for it (`GTF.cpp`): `tr_<chr>_<start>_<end>_<n>`, `n` counting
+/// the exons on the genome before it. Such an exon is a transcript of its own.
+pub fn name_orphan_exons(exons: &mut [GtfRecord], genome: &Genome, transcript_tag: &str) {
+    let mut n = 0usize;
+    for exon in exons {
+        let Some(chr) = genome.chr_name.iter().position(|c| *c == exon.seqname) else {
+            continue;
+        };
+        if exon.end > genome.chr_length[chr] {
+            continue;
+        }
+        if !exon.attributes.contains_key(transcript_tag) {
+            log::warn!(
+                "Exon at {}:{} has no {transcript_tag} attribute; it is a transcript of its own",
+                exon.seqname,
+                exon.start
+            );
+            let id = format!("tr_{}_{}_{}_{n}", exon.seqname, exon.start, exon.end);
+            exon.attributes.insert(transcript_tag.to_string(), id);
+        }
+        n += 1;
+    }
 }
 
 /// Extract junctions from exon records, grouping by `transcript_tag`.
@@ -184,16 +208,40 @@ pub fn extract_junctions_configured(
     genome: &Genome,
     transcript_tag: &str,
 ) -> Result<Vec<(usize, u64, u64, u8)>, Error> {
-    let mut transcripts: HashMap<String, Vec<GtfRecord>> = HashMap::new();
+    // Keyed by chromosome too: the same ID on two chromosomes (PAR genes in
+    // refGene-style GTFs) is two exon chains, and one list would mix their
+    // chromosome-local coordinates into false introns.
+    let mut transcripts: HashMap<(String, String), Vec<GtfRecord>> = HashMap::new();
+    let mut n_valid = 0usize;
 
     for exon in exons {
-        let transcript_id = exon
-            .attributes
-            .get(transcript_tag)
-            .ok_or_else(|| Error::Gtf(format!("Exon missing {transcript_tag} attribute")))?
-            .clone();
+        // STAR counts every exon on the genome, parent or not.
+        if genome.chr_name.contains(&exon.seqname) {
+            n_valid += 1;
+        }
+        // Callers name orphans first (`name_orphan_exons`); one left is skipped.
+        let Some(transcript_id) = exon.attributes.get(transcript_tag).cloned() else {
+            log::warn!(
+                "Skipping exon at {}:{} without a {transcript_tag} attribute",
+                exon.seqname,
+                exon.start
+            );
+            continue;
+        };
+        transcripts
+            .entry((exon.seqname.clone(), transcript_id))
+            .or_default()
+            .push(exon);
+    }
 
-        transcripts.entry(transcript_id).or_default().push(exon);
+    // STAR's fatal error (exit 104): an annotation that matches nothing is a
+    // mistake, nearly always `X` vs `chrX`, not an unannotated genome.
+    if n_valid == 0 {
+        return Err(Error::Gtf(
+            "no valid exon lines in the GTF file. Check its formatting. One likely cause \
+             is the difference in chromosome naming between GTF and FASTA file."
+                .to_string(),
+        ));
     }
 
     // Extract junctions from each transcript
@@ -585,6 +633,17 @@ mod tests {
                 .into_iter()
                 .collect(),
             },
+            // One exon on a known chromosome, or the whole GTF would be refused.
+            GtfRecord {
+                seqname: "chr1".to_string(),
+                feature: "exon".to_string(),
+                start: 100,
+                end: 200,
+                strand: '+',
+                attributes: vec![("transcript_id".to_string(), "T2".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
         ];
 
         let junctions = extract_junctions_from_exons(exons, &genome).unwrap();
@@ -722,5 +781,81 @@ mod tests {
         let junctions = extract_junctions_configured(exons, &genome, "Parent").unwrap();
         assert_eq!(junctions.len(), 1);
         assert_eq!(junctions[0], (0, 200, 298, 1));
+    }
+
+    fn two_chr_genome() -> Genome {
+        Genome {
+            transform_blocks: None,
+            sequence: vec![0; 8000].into(),
+            n_genome: 8000,
+            n_genome_real: 8000,
+            n_chr_real: 2,
+            chr_start: vec![0, 4000, 8000],
+            chr_length: vec![4000, 4000],
+            chr_name: vec!["c1".to_string(), "c2".to_string()],
+        }
+    }
+
+    fn exon(line: &str) -> GtfRecord {
+        parse_gtf_line(line).unwrap()
+    }
+
+    #[test]
+    fn same_transcript_id_on_two_chromosomes_is_two_chains() {
+        let a = |c: &str, s, e| format!("{c}\tt\texon\t{s}\t{e}\t.\t+\t.\ttranscript_id \"T\";");
+        let exons = vec![
+            exon(&a("c1", 1000, 1200)),
+            exon(&a("c1", 2000, 2200)),
+            exon(&a("c2", 1500, 1700)),
+            exon(&a("c2", 2500, 2700)),
+        ];
+        let got = extract_junctions_configured(exons, &two_chr_genome(), "transcript_id").unwrap();
+        assert_eq!(got, vec![(0, 1200, 1998, 1), (1, 5700, 6498, 1)]);
+    }
+
+    #[test]
+    fn no_exon_on_a_known_chromosome_is_fatal() {
+        let exons = vec![exon(
+            "X\tt\texon\t1000\t1200\t.\t+\t.\ttranscript_id \"T\";",
+        )];
+        let err = extract_junctions_configured(exons, &two_chr_genome(), "transcript_id");
+        assert!(err.unwrap_err().to_string().contains("chromosome naming"));
+        assert!(extract_junctions_configured(vec![], &two_chr_genome(), "transcript_id").is_err());
+    }
+
+    #[test]
+    fn exon_without_parent_is_its_own_transcript_and_gff3_attributes_parse() {
+        let mut exons = vec![
+            exon("X\tt\texon\t10\t20\t.\t+\t.\tID=off_genome"),
+            exon("c1\tt\texon\t1000\t1200\t.\t+\t.\tParent=T;Name=x"),
+            exon("c1\tt\texon\t2000\t2200\t.\t+\t.\tParent = T"),
+            exon("c1\tt\texon\t3000\t3200\t.\t+\t.\tID=orphan"),
+        ];
+        name_orphan_exons(&mut exons, &two_chr_genome(), "Parent");
+        assert!(!exons[0].attributes.contains_key("Parent"));
+        assert_eq!(exons[3].attributes["Parent"], "tr_c1_3000_3200_2");
+        let got = extract_junctions_configured(exons, &two_chr_genome(), "Parent").unwrap();
+        assert_eq!(got, vec![(0, 1200, 1998, 1)]);
+    }
+
+    /// STAR's exit 0 when only parentless exons are on the genome.
+    #[test]
+    fn only_parentless_exons_on_the_genome_is_not_fatal() {
+        let exons = vec![
+            exon("X\tt\texon\t1000\t1200\t.\t+\t.\ttranscript_id \"T\";"),
+            exon("c1\tt\texon\t1000\t1200\t.\t+\t.\tgene_id \"G\";"),
+        ];
+        let got = extract_junctions_configured(exons, &two_chr_genome(), "transcript_id").unwrap();
+        assert_eq!(got, vec![]);
+    }
+
+    /// STAR keeps the first word: `"T=1"` and `T=2` are both transcript `T`.
+    #[test]
+    fn attribute_value_is_its_first_word_as_in_star() {
+        let attrs = parse_attributes(r#"transcript_id "T=1"; gene_name "A B"; gene_id G"#);
+        assert_eq!(attrs["transcript_id"], "T");
+        assert_eq!(attrs["gene_name"], "A");
+        assert_eq!(attrs["gene_id"], "G");
+        assert_eq!(parse_attributes("transcript_id=T=2")["transcript_id"], "T");
     }
 }

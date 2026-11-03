@@ -287,11 +287,16 @@ impl GenomeIndex {
         let mut transcriptome = None;
 
         if let Some(ref gtf_path) = params.sjdb_gtf_file {
-            let exons = crate::junction::gtf::parse_gtf_configured(
+            let mut exons = crate::junction::gtf::parse_gtf_configured(
                 gtf_path,
                 &params.sjdb_gtf_feature_exon,
                 &params.sjdb_gtf_chr_prefix,
             )?;
+            crate::junction::gtf::name_orphan_exons(
+                &mut exons,
+                &genome,
+                &params.sjdb_gtf_tag_exon_parent_transcript,
+            );
             log::debug!("Parsed {} exon features from GTF", exons.len());
 
             let tr = TranscriptomeIndex::from_gtf_exons_configured(

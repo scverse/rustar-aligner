@@ -27,6 +27,8 @@ const GTF_ATTR_GENE_ID: &str = "gene_id";
 /// STAR's fallback for GTF records missing `gene_biotype`
 /// (`source/GTF.cpp`).
 const MISSING_GENE_TYPE: &str = "MissingGeneType";
+/// STAR's gene ID for an exon without one (`GTF.cpp`).
+pub(crate) const MISSING_GENE_ID: &str = "MissingGeneID";
 
 /// STAR's `find_attr_list` (`GTF.cpp`): the last of `tags`, in list order, that has an entry in
 /// `attrs`. `--sjdbGTFtagExonParentGeneName`/`GeneType` accept several candidate keys; when more
@@ -347,7 +349,11 @@ impl TranscriptomeIndex {
                 _ => 1u8, // forward or unknown → treat as forward (STAR default)
             };
 
-            let gene_id = first.attributes.get(gene_tag).cloned().unwrap_or_default();
+            let gene_id = first
+                .attributes
+                .get(gene_tag)
+                .cloned()
+                .unwrap_or_else(|| MISSING_GENE_ID.to_string());
             // STAR-faithful fallbacks: when the GTF record omits gene_name,
             // STAR's GTF.cpp writes geneAttr[ig][0] = gene_id (not empty).
             // When gene_biotype is omitted, it writes `MISSING_GENE_TYPE`.
@@ -438,11 +444,16 @@ impl TranscriptomeIndex {
         gtf_path: &Path,
         genome: &Genome,
     ) -> Result<Self, Error> {
-        let exons = crate::junction::gtf::parse_gtf_configured(
+        let mut exons = crate::junction::gtf::parse_gtf_configured(
             gtf_path,
             &params.sjdb_gtf_feature_exon,
             &params.sjdb_gtf_chr_prefix,
         )?;
+        crate::junction::gtf::name_orphan_exons(
+            &mut exons,
+            genome,
+            &params.sjdb_gtf_tag_exon_parent_transcript,
+        );
         Ok(Self::from_gtf_exons_configured(
             &exons,
             genome,

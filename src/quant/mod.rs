@@ -82,10 +82,11 @@ impl GeneAnnotation {
         let mut gene_span: Vec<Option<(usize, u64, u64)>> = Vec::new();
 
         for exon in exons {
-            let gene_id = match exon.attributes.get(gene_tag) {
-                Some(id) => id.clone(),
-                None => continue,
-            };
+            let gene_id = exon
+                .attributes
+                .get(gene_tag)
+                .cloned()
+                .unwrap_or_else(|| transcriptome::MISSING_GENE_ID.to_string());
 
             let gene_idx = if let Some(&idx) = gene_id_to_idx.get(&gene_id) {
                 idx
