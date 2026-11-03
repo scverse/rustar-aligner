@@ -59,6 +59,13 @@ pub struct AlignmentScorer {
     /// `--chimSegmentMin > 0`: STAR then records every finalized transcript in
     /// its window, skipping the score gate (`stitchWindowAligns.cpp:247`).
     pub record_all_window_transcripts: bool,
+    /// Keep a transcript whose end-to-end extension hit a chromosome edge,
+    /// unextended and at window score 0, as STAR does. Only the merged read of
+    /// `--peOverlapNbasesMin` sets it: STAR rescores every window transcript of
+    /// that read once split into mates (`ReadAlign_peOverlapMergeMap.cpp:276-292`),
+    /// where a kept one can win. shortcut: other reads drop it, as STAR never
+    /// reports a score-0 transcript; upgrade if chimeric detection must see it.
+    pub keep_end_to_end_kills: bool,
 }
 
 /// The three intron checks STAR applies when a transcript is finalized
@@ -151,6 +158,7 @@ impl AlignmentScorer {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         }
     }
 
@@ -198,6 +206,7 @@ impl AlignmentScorer {
             },
             multimap_score_range: params.out_filter_multimap_score_range,
             record_all_window_transcripts: params.chim_segment_min > 0,
+            keep_end_to_end_kills: false,
         }
     }
 
@@ -1257,6 +1266,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Intron from position 2, length 12 (spans positions 2-13 inclusive)
@@ -1305,6 +1315,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1352,6 +1363,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1397,6 +1409,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         let motif = scorer.detect_splice_motif(2, 12, &genome);
@@ -1435,6 +1448,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         let (score, gap_type) = scorer.score_gap(0, 5, 0, &genome);
@@ -1471,6 +1485,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Small gap (< align_intron_min) is deletion
@@ -1515,6 +1530,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Gap starting at position 2 (GT), length 26 (>= 21) is splice junction
@@ -1557,6 +1573,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         let annotated_score = scorer.score_annotated_junction(0, true);
@@ -1600,6 +1617,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // CT-AC motif: (1,3,0,1) — reverse complement of GT-AG
@@ -1711,6 +1729,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Gap of exactly 589824 starting at position 100 should be splice junction
@@ -1794,6 +1813,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Gap of 1001 (> 1000 max) should be deletion, not splice junction
@@ -1849,6 +1869,7 @@ mod tests {
             intron_filter: IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         }
     }
 

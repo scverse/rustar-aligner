@@ -57,13 +57,15 @@ type Record = (u32, u32, String, i32, u32);
 
 /// The alignment records of a run, and its `Log.final.out`.
 fn run(reads: &[&[u8]], options: &[&str]) -> (Vec<Record>, String) {
+    let fasta = format!(">c1\n{}\n", String::from_utf8_lossy(&genome()));
+    run_on(&fasta, reads, options)
+}
+
+/// [`run`] on the genome in `fasta_text`.
+fn run_on(fasta_text: &str, reads: &[&[u8]], options: &[&str]) -> (Vec<Record>, String) {
     let dir = TempDir::new().unwrap();
     let fasta = dir.path().join("g.fa");
-    fs::write(
-        &fasta,
-        format!(">c1\n{}\n", String::from_utf8_lossy(&genome())),
-    )
-    .unwrap();
+    fs::write(&fasta, fasta_text).unwrap();
     let index = dir.path().join("i");
     fs::create_dir_all(&index).unwrap();
     cargo_bin_cmd!("rustar-aligner")
@@ -232,4 +234,92 @@ fn single_end_read_past_the_chromosome_start_has_no_alignment() {
     };
     assert_eq!(count("Number of reads unmapped: other"), "1");
     assert_eq!(count("Number of reads unmapped: too short"), "0");
+}
+
+/// `--peOverlapNbasesMin` maps overlapping mates as one merged read. When that read
+/// hangs over a chromosome edge, STAR keeps its end-to-end transcript at score 0
+/// instead of dropping it (`stitchWindowAligns.cpp:44-55, 224`), and once another
+/// window scores above 0 it splits every window transcript back into mates and
+/// rescores them (`ReadAlign_peOverlapMergeMap.cpp:276-292`). The kept one then wins,
+/// soft-clipped at the edge. Here the other window is a diverged copy on c2 of the
+/// merged read's edge end.
+#[test]
+fn overlapping_mates_over_a_chromosome_edge_are_clipped_like_star() {
+    let g = genome();
+    let diverged = |s: &[u8]| -> Vec<u8> {
+        let positions: Vec<usize> = (5..s.len()).step_by(10).collect();
+        mutated(s, &positions)
+    };
+    let options = [
+        "--alignEndsType",
+        "EndToEnd",
+        "--peOverlapNbasesMin",
+        "10",
+        "--outFilterScoreMinOverLread",
+        "0.3",
+        "--outFilterMatchNminOverLread",
+        "0.3",
+    ];
+    for over in [&b"T"[..], b"GA"] {
+        let k = over.len() as u32;
+        let decoy_start = [over, &g[..40], &diverged(&g[40..150])].concat();
+        let decoy_end = [
+            &diverged(&g[g.len() - 150..g.len() - 40])[..],
+            &g[g.len() - 40..],
+            over,
+        ]
+        .concat();
+        let c2 = [
+            &g[5000..6000],
+            &decoy_start,
+            &g[6000..7000],
+            &decoy_end,
+            &g[7000..8000],
+        ]
+        .concat();
+        let fasta = format!(
+            ">c1\n{}\n>c2\n{}\n",
+            String::from_utf8_lossy(&g),
+            String::from_utf8_lossy(&c2)
+        );
+        for fragment in [130u32, 169] {
+            let f = fragment as usize;
+            // Over the start: mate 2 forward from the overhang, mate 1 reverse.
+            let frag = [over, &g[..f - over.len()]].concat();
+            let (records, _) = run_on(
+                &fasta,
+                &[&reverse_complement(&frag[f - 100..]), &frag[..100]],
+                &options,
+            );
+            assert_eq!(
+                records,
+                [
+                    record(163, 1, &format!("{k}S{}M", 100 - k), 198 - k as i32, 0),
+                    record(83, fragment - 99 - k, "100M", 198 - k as i32, 0),
+                ],
+                "start, overhang {k}, fragment {fragment}"
+            );
+            // Over the end: mate 1 forward, mate 2 reverse into the overhang.
+            let frag = [&g[g.len() - f + over.len()..], over].concat();
+            let (records, _) = run_on(
+                &fasta,
+                &[&frag[..100], &reverse_complement(&frag[f - 100..])],
+                &options,
+            );
+            assert_eq!(
+                records,
+                [
+                    record(99, 20_001 - fragment + k, "100M", 198 - k as i32, 0),
+                    record(
+                        147,
+                        19_901 + k,
+                        &format!("{}M{k}S", 100 - k),
+                        198 - k as i32,
+                        0
+                    ),
+                ],
+                "end, overhang {k}, fragment {fragment}"
+            );
+        }
+    }
 }

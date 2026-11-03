@@ -409,7 +409,9 @@ fn align_read_inner(
     // does NOT filter clusters by seed coverage. Removed to match STAR.
 
     // Step 3: Stitch seeds within each cluster
-    let scorer = AlignmentScorer::from_params(params);
+    let mut scorer = AlignmentScorer::from_params(params);
+    // Only the merged mates run without the mapped filter.
+    scorer.keep_end_to_end_kills = !mapped_filter;
     let mut transcripts = Vec::new();
     // STAR's `trAll`: every window's transcripts, before any cross-window
     // dedup or filtering, which is what its chimeric detection reads.
@@ -515,6 +517,13 @@ fn align_read_inner(
         transcripts.retain(|_| keep.next().unwrap_or(true));
     }
 
+    // No transcript above score 0 leaves STAR's `trBest` at `trInit`: no window
+    // (`ReadAlign_stitchPieces.cpp:344`). The merged mates are then not split
+    // (`ReadAlign_peOverlapMergeMap.cpp:32`).
+    if transcripts.iter().all(|t| t.score <= 0) {
+        transcripts.clear();
+    }
+
     // STAR's `trBest` (ReadAlign_stitchPieces.cpp), over the transcripts in window
     // order: greater score, or equal score and shorter genomic length. Its score
     // and mismatches go on the unmapped records.
@@ -534,8 +543,9 @@ fn align_read_inner(
     });
 
     // STAR's multMapSelect (ReadAlign_multMapSelect.cpp): score range, then the
-    // output order and the primary.
-    if !transcripts.is_empty() {
+    // output order and the primary. The merged mates skip the range: STAR splits
+    // every window transcript back into mates (`ReadAlign_peOverlapMergeMap.cpp:276`).
+    if mapped_filter && !transcripts.is_empty() {
         let max_score = transcripts.iter().map(|t| t.score).max().unwrap_or(0);
         let score_threshold = max_score - params.out_filter_multimap_score_range;
         transcripts.retain(|t| t.score >= score_threshold);

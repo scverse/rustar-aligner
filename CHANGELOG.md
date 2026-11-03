@@ -52,6 +52,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
   soft-clipped (`96M4S`, `AS:190` where STAR has `100M`, `AS:182`), and a mate
   that cannot reach its end could be clipped into a pair. A single-end read that
   runs past a chromosome end now counts as unmapped "other", as in STAR.
+- `--peOverlapNbasesMin` with `--alignEndsType EndToEnd`: a pair whose
+  overlapping mates hang over a chromosome edge maps soft-clipped at the edge
+  (`1S99M` / `100M`), as in STAR, instead of staying unmapped. The merged
+  read's transcript that hits the edge is kept at score 0, unextended, and
+  every transcript of the merged read is split back into mates and rescored,
+  not only the best ones.
 
 ### Other changes
 
