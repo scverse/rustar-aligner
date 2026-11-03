@@ -1392,13 +1392,12 @@ fn try_pair_transcripts(
         return None;
     }
 
-    // Genomic span check, only when alignMatesGapMax is set. With the default 0 STAR
-    // has no span limit beyond the window itself (stitchAlignToTranscript tests
-    // alignMatesGapMax only when it is > 0), so a pair whose span exceeds
-    // winBinNbits*winAnchorDistNbins (~589 kb) is still valid if both mates sit in
-    // one window.
-    let span = right.genome_end - left.genome_start;
-    if params.align_mates_gap_max > 0 && span > params.align_mates_gap_max as u64 {
+    // STAR limits the gap between the mates, not the fragment span: mate B's first
+    // base may start at most alignMatesGapMax after mate A's end
+    // (stitchAlignToTranscript.cpp:354). With the default 0 there is no limit.
+    if params.align_mates_gap_max > 0
+        && right.genome_start > left.genome_end + params.align_mates_gap_max as u64
+    {
         return None;
     }
 
@@ -1429,27 +1428,17 @@ fn try_pair_transcripts(
     })
 }
 
-/// Check if paired alignment is a proper pair
+/// Check if paired alignment is a proper pair (SAM flag 0x2).
+///
+/// STAR's test (ReadAlign_outputTranscriptSAM.cpp:79-81) is geometric and fails only
+/// for mates that protrude past each other, which stitching already rejects with the
+/// default alignEndsProtrude 0. alignMatesGapMax plays no part in it.
 pub(crate) fn check_proper_pair(
-    mate1_trans: &Transcript,
-    mate2_trans: &Transcript,
-    params: &Parameters,
+    _mate1_trans: &Transcript,
+    _mate2_trans: &Transcript,
+    _params: &Parameters,
 ) -> bool {
-    // Proper pair criteria:
-    // 1. Both mates mapped (checked by caller)
-    // 2. Same chromosome (checked by caller)
-    // 3. Distance within alignMatesGapMax
-
-    if params.align_mates_gap_max == 0 {
-        return true; // Auto mode = unlimited
-    }
-
-    // Calculate genomic distance
-    let start = mate1_trans.genome_start.min(mate2_trans.genome_start);
-    let end = mate1_trans.genome_end.max(mate2_trans.genome_end);
-    let genomic_span = end - start;
-
-    genomic_span <= params.align_mates_gap_max as u64
+    true
 }
 
 /// Calculate signed insert size (TLEN)
@@ -2086,12 +2075,12 @@ mod tests {
     }
 
     #[test]
-    fn test_check_proper_pair_too_far() {
+    fn test_mates_gap_max_limits_gap_not_span() {
         use crate::align::transcript::Exon;
         use cigar::op::{Kind, Op};
 
         let mut params = default_params();
-        params.align_mates_gap_max = 100;
+        params.align_mates_gap_max = 300;
 
         let t1 = Transcript {
             output_rank: 0,
@@ -2139,8 +2128,12 @@ mod tests {
             junction_strand: vec![],
         };
 
-        // Distance = 400bp, exceeds limit of 100bp
-        assert!(!check_proper_pair(&t1, &t2, &params));
+        // Gap 200 (1100..1300), span 400: STAR pairs them under a 300 limit.
+        let pair = try_pair_transcripts(&t1, &t2, 100, 100, &params, 0, 200).unwrap();
+        assert!(pair.is_proper_pair);
+        // A gap above the limit is rejected.
+        params.align_mates_gap_max = 199;
+        assert!(try_pair_transcripts(&t1, &t2, 100, 100, &params, 0, 200).is_none());
     }
 
     #[test]
