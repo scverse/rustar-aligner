@@ -225,15 +225,17 @@ There are none at present. The four yeast PE reads once listed here now match ST
 
 ### 3.2 `CellReads.stats` row order
 
-**What STAR does.** `--soloCellReadStats CB` emits its rows by iterating a libc++ `std::unordered_map`, so the order is a hash-table walk rather than a sort. At the map sizes this produces, libc++ chains new entries at the head of their bucket and walks buckets in order, which comes out as the reverse of each barcode's first appearance in read order.
+**Needs maintainer sign-off.**
 
-**What rustar-aligner does.** Emits that same reverse-first-appearance order, including across threads: the per-read accumulator merges in read order, so a threaded run writes the same file as a serial one.
+**What STAR does.** `--soloCellReadStats Standard` writes the cell rows by walking a `std::unordered_map<uintCB, …>` (`SoloCommon.h:47`, `SoloFeature_statsOutput.cpp:102`). The map is reserved for `nCB*3/2` entries (`SoloFeature_countCBgeneUMI.cpp:42`) and filled from each thread's temporary file in thread order (`:45-48`, `SoloReadFeature_inputRecords.cpp:141-152`). So the order is the standard library's bucket layout after its rehashes, not a sort. The Linux STAR build uses libstdc++; feeding its `unordered_map` the same keys in read order, reserved the same way, gives STAR's order.
 
-**Why.** Reproducing the order where it is reproducible costs nothing and keeps a byte-comparison against STAR usable on the sizes where it can work at all.
+**What rustar-aligner does.** Writes the cell rows in whitelist order, which is sorted by barcode. The `CBnotInPasslist` row stays first, as in STAR.
 
-**Impact.** Past libc++'s load factor the map rehashes, and the order then depends on the bucket count, which depends on how many distinct barcodes were seen; beyond that size the order diverges. The **values never do** — only which line they appear on. Reading the file by barcode rather than by position is unaffected either way.
+**Why.** Before this, rustar-aligner wrote the rows in reverse order of first appearance, taken from the order threads happened to finish reads, so the file changed with `--runThreadN`. That order did not match STAR's either. Matching STAR would mean re-implementing libstdc++'s hash table (its prime bucket table, rehash policy and node chaining). libstdc++ is GPL with a runtime exception, a sensitive licence under CONTRIBUTING.md, so that is not done without a maintainer decision.
 
-**Source.** `src/solo/cell_reads.rs`, locked by `rows_are_emitted_in_reverse_first_appearance_order`. STAR: `SoloFeature_statsOutput.cpp`.
+**Impact.** The **values** of every row are unchanged; only which line a barcode is on differs from STAR. A reader that looks rows up by barcode is unaffected. A line-by-line diff against STAR's file needs both sides sorted first.
+
+**Source.** `src/solo/cell_reads.rs`, locked by `rows_follow_whitelist_order_not_arrival_order`. STAR: `SoloFeature_statsOutput.cpp:102`.
 
 ---
 
