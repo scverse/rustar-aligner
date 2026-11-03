@@ -3673,3 +3673,124 @@ fn solo_out_files(output_dir: &Path) -> Vec<String> {
     out.sort();
     out
 }
+
+/// Reverse complement keeping case and the IUPAC codes used below.
+fn rc_letters(seq: &[u8]) -> Vec<u8> {
+    seq.iter()
+        .rev()
+        .map(|&b| {
+            let c = match b.to_ascii_uppercase() {
+                b'A' => b'T',
+                b'T' => b'A',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'R' => b'Y',
+                b'Y' => b'R',
+                b'N' => b'N',
+                _ => panic!("no complement for {b}"),
+            };
+            if b.is_ascii_lowercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// SEQ and `Unmapped.out.mate*` keep the read's letters, lowercase and IUPAC
+/// codes, as STAR 2.7.11b writes them (its `Read0`, reverse complemented with
+/// case kept on the reverse strand; `ReadAlign_outputTranscriptSAM.cpp:194-204`,
+/// `ReadAlign_outputAlignments.cpp:267`). `Unmapped.out.mate*` has the whole mate,
+/// before clipping. Checked against STAR's output on the same input.
+#[test]
+fn test_seq_keeps_read_letters_like_star() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+
+    // Forward read: lowercase head, an R. Reverse read: the reverse complement of
+    // a forward text with a lowercase tail and a y, so its SEQ is that text.
+    let mut fwd = genome[1000..1100].to_vec();
+    fwd[..20].make_ascii_lowercase();
+    fwd[50] = b'R';
+    let mut rev_seq = genome[3000..3100].to_vec();
+    rev_seq[70..].make_ascii_lowercase();
+    rev_seq[39] = b'y';
+    let noise = lcg_seq(777, 100).to_ascii_lowercase();
+    // Pair: lowercase mate 1, mate 2 with an n.
+    let m1 = genome[5000..5100].to_ascii_lowercase();
+    let mut m2_seq = genome[5200..5300].to_vec();
+    m2_seq[10] = b'n';
+    let m2 = rc_letters(&m2_seq);
+    let noise2 = lcg_seq(999, 100).to_ascii_lowercase();
+
+    let write = |name: &str, recs: &[(&str, &[u8])]| {
+        let path = tmpdir.path().join(name);
+        let mut text = String::new();
+        for (n, s) in recs {
+            let s = String::from_utf8_lossy(s);
+            text.push_str(&format!("@{n}\n{s}\n+\n{}\n", "I".repeat(s.len())));
+        }
+        fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let se = write(
+        "se.fq",
+        &[
+            ("fwd", &fwd),
+            ("rev", &rc_letters(&rev_seq)),
+            ("noise", &noise),
+        ],
+    );
+    let pe1 = write("pe1.fq", &[("pair", &m1), ("noise", &noise)]);
+    let pe2 = write("pe2.fq", &[("pair", &m2), ("noise", &noise2)]);
+
+    let run = |out: &str, reads: &[&str]| -> (Vec<(String, String)>, String) {
+        let prefix = format!("{}/{out}/", tmpdir.path().display());
+        cargo_bin_cmd!("rustar-aligner")
+            .args(["--genomeDir", genome_dir.to_str().unwrap(), "--readFilesIn"])
+            .args(reads)
+            .args(["--outFileNamePrefix", &prefix])
+            .args(["--outSAMunmapped", "Within", "--outReadsUnmapped", "Fastx"])
+            .args(["--clip3pNbases"])
+            .args(reads.iter().map(|_| "10"))
+            .assert()
+            .success();
+        let sam = fs::read_to_string(format!("{prefix}Aligned.out.sam")).unwrap();
+        let mut recs: Vec<(String, String)> = sam
+            .lines()
+            .filter(|l| !l.starts_with('@'))
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                (format!("{} {}", f[0], f[1]), f[9].to_string())
+            })
+            .collect();
+        recs.sort();
+        let mate1 = fs::read_to_string(format!("{prefix}Unmapped.out.mate1")).unwrap();
+        (recs, mate1)
+    };
+    let s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+
+    let (recs, mate1) = run("se", &[&se]);
+    let want = vec![
+        ("fwd 0".to_string(), s(&fwd)),
+        ("noise 4".to_string(), s(&noise)),
+        ("rev 16".to_string(), s(&rev_seq)),
+    ];
+    assert_eq!(recs, want);
+    assert_eq!(mate1.lines().nth(1), Some(s(&noise).as_str()));
+
+    let (recs, mate1) = run("pe", &[&pe1, &pe2]);
+    let want = vec![
+        ("noise 141".to_string(), s(&noise2)),
+        ("noise 77".to_string(), s(&noise)),
+        ("pair 147".to_string(), s(&m2_seq)),
+        ("pair 99".to_string(), s(&m1)),
+    ];
+    assert_eq!(recs, want);
+    // The whole mate, not the clipped 90 bases.
+    assert_eq!(mate1.lines().nth(1), Some(s(&noise).as_str()));
+}

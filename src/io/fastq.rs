@@ -22,19 +22,15 @@ impl UnmappedFastqWriter {
         })
     }
 
-    /// Write one FASTQ record. `seq` is in genome encoding (0=A,1=C,2=G,3=T,4=N).
-    /// `qual` is raw FASTQ quality bytes.
-    pub fn write_record(&mut self, name: &str, seq: &[u8], qual: &[u8]) -> Result<(), Error> {
+    /// Write one FASTQ record. `letters` are the read's bases as text
+    /// ([`EncodedRead::letters`]), `qual` raw FASTQ quality bytes.
+    pub fn write_record(&mut self, name: &str, letters: &[u8], qual: &[u8]) -> Result<(), Error> {
         self.writer.write_all(b"@").map_err(Error::from)?;
         self.writer
             .write_all(name.as_bytes())
             .map_err(Error::from)?;
         self.writer.write_all(b"\n").map_err(Error::from)?;
-        for &b in seq {
-            self.writer
-                .write_all(&[decode_base(b)])
-                .map_err(Error::from)?;
-        }
+        self.writer.write_all(letters).map_err(Error::from)?;
         self.writer.write_all(b"\n+\n").map_err(Error::from)?;
         self.writer.write_all(qual).map_err(Error::from)?;
         self.writer.write_all(b"\n").map_err(Error::from)
@@ -58,6 +54,20 @@ pub struct EncodedRead {
     /// Index of the `--readFilesIn` file this read came from (STAR
     /// `readFilesIndex`); selects the read group.
     pub file_index: u32,
+    /// The bases as written in the FASTQ, kept only when they are not all
+    /// `ACGTN` (lowercase, other IUPAC codes): STAR writes them as they are.
+    pub raw_letters: Option<Vec<u8>>,
+}
+
+impl EncodedRead {
+    /// The bases as text, as STAR writes them in SEQ and `Unmapped.out.mate*`
+    /// (its `Read0`).
+    pub fn letters(&self) -> Vec<u8> {
+        match &self.raw_letters {
+            Some(raw) => raw.clone(),
+            None => self.sequence.iter().map(|&b| decode_base(b)).collect(),
+        }
+    }
 }
 
 /// A paired-end read from two FASTQ files
@@ -209,6 +219,11 @@ impl FastqReader {
                     .to_string();
 
                 let sequence = record.sequence().iter().map(|&b| encode_base(b)).collect();
+                let raw_letters = record
+                    .sequence()
+                    .iter()
+                    .any(|b| !b"ACGTN".contains(b))
+                    .then(|| record.sequence().to_vec());
 
                 let name = match self
                     .name_separators
@@ -235,6 +250,7 @@ impl FastqReader {
                     sequence,
                     quality,
                     file_index: self.file_index,
+                    raw_letters,
                 }))
             }
             Some(Err(e)) => Err(Error::from(e)),
@@ -436,6 +452,38 @@ pub fn decode_base(encoded: u8) -> u8 {
     }
 }
 
+/// Reverse complement of read text as STAR's `revComplementNucleotides`
+/// (`SequenceFuns.cpp:16-54`): case and IUPAC codes kept, other bytes unchanged.
+pub fn revcomp_letters(letters: &[u8]) -> Vec<u8> {
+    letters
+        .iter()
+        .rev()
+        .map(|&b| {
+            let c = match b.to_ascii_uppercase() {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                b'R' => b'Y',
+                b'Y' => b'R',
+                b'K' => b'M',
+                b'M' => b'K',
+                b'B' => b'V',
+                b'D' => b'H',
+                b'V' => b'B',
+                b'H' => b'D',
+                b'N' | b'S' | b'W' => b.to_ascii_uppercase(),
+                _ => return b,
+            };
+            if b.is_ascii_lowercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Complement an encoded base (A=0↔T=3, C=1↔G=2, N=4→N=4).
 pub fn complement_base(encoded: u8) -> u8 {
     match encoded {
@@ -494,6 +542,15 @@ mod tests {
         assert_eq!(encode_base(b'R'), 4);
         assert_eq!(encode_base(b'Y'), 4);
         assert_eq!(encode_base(b'S'), 4);
+    }
+
+    /// STAR's `revComplementNucleotides` table (`SequenceFuns.cpp:16-54`).
+    #[test]
+    fn revcomp_letters_as_star() {
+        assert_eq!(
+            revcomp_letters(b"ACGTNRYKMSWBDVHacgtnrykmswbdvh.X"),
+            b"X.dbhvwskmrynacgtDBHVWSKMRYNACGT".to_vec()
+        );
     }
 
     #[test]

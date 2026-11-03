@@ -2249,6 +2249,7 @@ mod tests {
             sequence: seq.bytes().map(encode_base).collect(),
             quality: qual.bytes().collect(),
             file_index: 0,
+            raw_letters: None,
         }
     }
 
@@ -2750,6 +2751,7 @@ mod tests {
             sequence: seq.bytes().map(encode_base).collect(),
             quality: vec![b'I'; seq.len()],
             file_index: 0,
+            raw_letters: None,
         };
         // Default: exactly CB+UMI = 26 bases.
         let checked = BarcodeReadLength {
@@ -2890,6 +2892,7 @@ mod tests {
             sequence: vec![2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
             quality: vec![b'I'; 12],
             file_index: 0,
+            raw_letters: None,
         };
         let bc = layout.extract(&read).expect("adapter present");
         assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
@@ -2901,6 +2904,7 @@ mod tests {
             sequence: vec![1, 1, 2, 2, 2, 2, 0, 1, 2, 3, 3, 3, 3, 3],
             quality: vec![b'I'; 14],
             file_index: 0,
+            raw_letters: None,
         };
         let bc = layout.extract(&read).expect("adapter present, shifted");
         assert_eq!(bc.cb_seq, vec![2, 2, 2, 2]);
@@ -2912,6 +2916,7 @@ mod tests {
             sequence: vec![2, 2, 2, 2, 0, 1, 2, 0, 3, 3, 3, 3],
             quality: vec![b'I'; 12],
             file_index: 0,
+            raw_letters: None,
         };
         assert!(layout.extract(&read).is_ok());
 
@@ -2922,6 +2927,7 @@ mod tests {
             sequence: vec![2; 12],
             quality: vec![b'I'; 12],
             file_index: 0,
+            raw_letters: None,
         };
         assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoAdapter));
     }
@@ -2999,6 +3005,7 @@ mod tests {
             sequence: vec![2; 12],
             quality: vec![b'I'; 12],
             file_index: 0,
+            raw_letters: None,
         };
         assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoAdapter));
     }
@@ -3029,6 +3036,7 @@ mod tests {
             sequence: vec![0, 1, 2, 3, 3, 3, 3],
             quality: vec![b'I'; 7],
             file_index: 0,
+            raw_letters: None,
         };
         assert_eq!(layout.extract(&read), Err(BarcodeMiss::NoCb));
     }
