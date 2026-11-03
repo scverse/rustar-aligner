@@ -964,6 +964,116 @@ fn test_unmapped_reads_output() {
 // Test 8 — Two-pass mode
 // ---------------------------------------------------------------------------
 
+/// `Unmapped.out.mate*` byte for byte. Expected text is STAR 2.7.11b's output on
+/// this genome and these reads: the name fields, mate 2 carrying mate 1's name and
+/// flag in FASTQ but its own name in FASTA, and the mates not clipped.
+#[test]
+fn test_unmapped_mate_files_match_star() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = lcg_seq(88888, 20000);
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("idx");
+    build_index(&fasta, &genome_dir, "7", None);
+    let seq = |bytes: &[u8]| String::from_utf8(bytes.to_vec()).unwrap();
+    let junk = seq(&lcg_seq(424_242, 100));
+    let junk2 = seq(&lcg_seq(777_777, 100));
+    let mapped = seq(&genome[2000..2100]);
+    let all_n = "N".repeat(100);
+    let qual = "I".repeat(100);
+    let fq = |name: &str, s: &str| format!("@{name}\n{s}\n+\n{qual}\n");
+    let fa = |name: &str, s: &str| format!(">{name}\n{s}\n");
+
+    let run = |tag: &str, files: &[(&str, String)], extra: &[&str]| -> Vec<String> {
+        let mut cmd = cargo_bin_cmd!("rustar-aligner");
+        cmd.arg("--genomeDir").arg(&genome_dir);
+        cmd.arg("--readFilesIn");
+        for (file, content) in files {
+            let path = tmpdir.path().join(format!("{tag}_{file}"));
+            fs::write(&path, content).unwrap();
+            cmd.arg(path);
+        }
+        let prefix = tmpdir.path().join(format!("{tag}_"));
+        cmd.arg("--outFileNamePrefix").arg(&prefix);
+        cmd.args(["--outSAMtype", "None", "--outReadsUnmapped", "Fastx"]);
+        cmd.args(extra);
+        cmd.assert().success();
+        (1..=files.len())
+            .map(|m| {
+                let name = format!("{tag}_Unmapped.out.mate{m}");
+                fs::read_to_string(tmpdir.path().join(name)).unwrap()
+            })
+            .collect()
+    };
+
+    // Single-end FASTQ: the filter flag comes from the second name field.
+    let reads = [
+        fq("q9", &junk),
+        fq("m", &mapped),
+        fq("q10 1:Y:0:ACGT", &junk),
+        fq("q11/1 2:N:0", &junk),
+    ]
+    .concat();
+    assert_eq!(
+        run("se", &[("r.fq", reads)], &[]),
+        [[
+            fq("q9 0:N: ", &junk),
+            fq("q10 0:Y: ", &junk),
+            fq("q11 0:N: ", &junk)
+        ]
+        .concat()]
+    );
+
+    // Single-end FASTA: never flagged.
+    let reads = [fa("f1 1:Y:0", &junk), fa("f2/1", &junk)].concat();
+    assert_eq!(
+        run("sefa", &[("r.fa", reads)], &[]),
+        [[fa("f1 0:N: ", &junk), fa("f2 0:N: ", &junk)].concat()]
+    );
+
+    // Pair, FASTQ: mate 1's name and flag on both records.
+    let m1 = fq("p_1 1:Y:0", &junk);
+    let m2 = fq("p_2 2:N:0", &junk2);
+    assert_eq!(
+        run("pe", &[("1.fq", m1), ("2.fq", m2)], &[]),
+        [fq("p_1 0:Y:  00", &junk), fq("p_1 1:Y:  00", &junk2)]
+    );
+
+    // Pair, FASTA: each mate's own name.
+    let m1 = fa("p_1", &junk);
+    let m2 = fa("p_2", &junk2);
+    assert_eq!(
+        run("pefa", &[("1.fa", m1), ("2.fa", m2)], &[]),
+        [fa("p_1 0:N:  00", &junk), fa("p_2 1:N:  00", &junk2)]
+    );
+
+    // Half-mapped pairs: which mate mapped, and the records are not clipped.
+    let m1 = [fq("h1", &mapped), fq("h2", &all_n)].concat();
+    let m2 = [fq("h1", &all_n), fq("h2", &mapped)].concat();
+    let half = run(
+        "half",
+        &[("1.fq", m1), ("2.fq", m2)],
+        &[
+            "--outFilterScoreMinOverLread",
+            "0.3",
+            "--outFilterMatchNminOverLread",
+            "0.3",
+            "--clip5pNbases",
+            "3",
+            "3",
+            "--clip3pNbases",
+            "2",
+            "2",
+        ],
+    );
+    assert_eq!(
+        half,
+        [
+            [fq("h1 0:N:  10", &mapped), fq("h2 0:N:  01", &all_n)].concat(),
+            [fq("h1 1:N:  10", &all_n), fq("h2 1:N:  01", &mapped)].concat(),
+        ]
+    );
+}
+
 #[test]
 fn test_two_pass_mode() {
     let tmpdir = TempDir::new().unwrap();

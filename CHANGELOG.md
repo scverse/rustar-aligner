@@ -13,6 +13,7 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- `Unmapped.out.mate*` names are written as STAR writes them: `@q9 0:N: ` for single-end reads, and `@p 0:N:  10` / `@p 1:N:  10` for pairs, with the filter flag read from the FASTQ name line and whether each mate mapped. A FASTQ mate 2 record carries mate 1's name, and a pair's records are no longer clipped.
 - FASTA reads are accepted, in one or several lines, mixed with FASTQ, as in STAR. Their records have `*` for quality, and they go to `Unmapped.out.mate*` as FASTA.
 - A blank line at the end of a read file no longer stops the run. A blank line with reads after it is an error. See `DIVERGENCE.md` §4.8.
 - Mates named `SRR1.5.1` / `SRR1.5.2` are accepted as a pair. `SRR1.1` / `SRR1.2` are still refused, since there the number is the read's.
