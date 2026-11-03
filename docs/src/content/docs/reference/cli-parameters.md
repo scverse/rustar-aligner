@@ -65,6 +65,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--outFilterMultimapScoreRange` | `1` | Score range for keeping multi-mappers within best score. |
 | `--outFilterMismatchNmax` | `10` | Max mismatches per pair. |
 | `--outFilterMismatchNoverLmax` | `0.3` | Max ratio of mismatches to mapped length. |
+| `--outFilterMismatchNoverReadLmax` | `1.0` | Max ratio of mismatches to read length (both mates). |
 | `--outFilterScoreMin` | `0` | Min absolute alignment score. |
 | `--outFilterScoreMinOverLread` | `0.66` | Min alignment score normalized to read length. |
 | `--outFilterMatchNmin` | `0` | Min absolute matched bases. |

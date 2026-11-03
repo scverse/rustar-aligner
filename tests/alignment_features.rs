@@ -3673,3 +3673,119 @@ fn solo_out_files(output_dir: &Path) -> Vec<String> {
     out.sort();
     out
 }
+
+/// Map `mates` (one FASTQ text per mate) against the genome with a 300 bp
+/// segment planted three times, and return `(QNAME, FLAG, NH)` per record.
+fn map_on_repeat_genome(mates: &[String], extra: &[&str]) -> Vec<(String, u16, String)> {
+    let tmpdir = TempDir::new().unwrap();
+    let mut genome = build_genome();
+    let repeat = lcg_seq(4444, 300);
+    for start in [2000, 6000, 14000] {
+        genome[start..start + 300].copy_from_slice(&repeat);
+    }
+    let fasta = write_fasta(&tmpdir, &genome);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", None);
+    let mut fastqs = Vec::new();
+    for (i, text) in mates.iter().enumerate() {
+        let path = tmpdir.path().join(format!("r{i}.fq"));
+        fs::write(&path, text).unwrap();
+        fastqs.push(path.to_str().unwrap().to_string());
+    }
+    let prefix = format!("{}/", tmpdir.path().display());
+    let mut cmd = cargo_bin_cmd!("rustar-aligner");
+    cmd.args(["--genomeDir", genome_dir.to_str().unwrap(), "--readFilesIn"])
+        .args(&fastqs)
+        .args(["--outFileNamePrefix", &prefix, "--outSAMunmapped", "Within"])
+        .args(extra)
+        .assert()
+        .success();
+    let sam = fs::read_to_string(tmpdir.path().join("Aligned.out.sam")).unwrap();
+    sam.lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            let nh = f[11..].iter().find(|t| t.starts_with("NH:")).unwrap();
+            (f[0].to_string(), f[1].parse().unwrap(), nh.to_string())
+        })
+        .collect()
+}
+
+fn fastq(records: &[(&str, &[u8])]) -> String {
+    let mut out = String::new();
+    for (name, seq) in records {
+        let seq = String::from_utf8_lossy(seq);
+        out.push_str(&format!("@{name}\n{seq}\n+\n{}\n", "I".repeat(seq.len())));
+    }
+    out
+}
+
+/// Three things STAR 2.7.11b does, checked against its output on the same kind
+/// of reads: NH counts all loci when `--outSAMmultNmax` writes fewer
+/// (`ReadAlign_outputAlignments.cpp:168-177`), a FASTQ name with `1:Y:` sets 0x200
+/// on mapped and unmapped records (`ReadAlign_outputTranscriptSAM.cpp:27,91`), and
+/// `--outFilterMismatchNoverReadLmax` caps the mismatches by read length
+/// (`ReadAlign_oneRead.cpp:78`).
+#[test]
+fn test_nh_qc_fail_and_mismatch_over_read_length_match_star() {
+    let genome = build_genome();
+    let repeat = lcg_seq(4444, 300);
+    let noise = lcg_seq(777, 100);
+    // 6 mismatches in 100 bases: over 0.05 * 100, under the default 10.
+    let mut mm6 = genome[16000..16100].to_vec();
+    for p in [10, 25, 40, 55, 70, 85] {
+        mm6[p] = if mm6[p] == b'A' { b'C' } else { b'A' };
+    }
+    let se = fastq(&[
+        ("multi 1:Y:0:ACGT", &repeat[0..100]),
+        ("noise 1:Y:0:ACGT", &noise),
+        ("unique 1:N:0:ACGT", &genome[1000..1100]),
+        ("mm6", &mm6),
+    ]);
+    let args = [
+        "--outSAMmultNmax",
+        "2",
+        "--alignEndsType",
+        "EndToEnd",
+        "--outFilterMismatchNoverReadLmax",
+        "0.05",
+    ];
+    let mut got = map_on_repeat_genome(&[se], &args);
+    got.sort();
+    // STAR 2.7.11b's FLAG and NH on these reads.
+    let want: Vec<(String, u16, String)> = [
+        ("mm6", 4, "NH:i:0"),
+        ("multi", 512, "NH:i:3"),
+        ("multi", 768, "NH:i:3"),
+        ("noise", 516, "NH:i:0"),
+        ("unique", 0, "NH:i:1"),
+    ]
+    .iter()
+    .map(|(n, f, t)| (n.to_string(), *f, t.to_string()))
+    .collect();
+    assert_eq!(got, want);
+
+    // Pairs: NH counts all 6 loci (3 copies of each mate pair up across copies),
+    // and mate 1's flag marks both mates. STAR 2.7.11b's FLAG and NH.
+    let m1 = fastq(&[
+        ("multi 1:Y:0:A", &repeat[0..100]),
+        ("noise 1:Y:0:A", &noise),
+    ]);
+    let m2 = fastq(&[
+        ("multi 2:N:0:A", &rc(&repeat[200..300])),
+        ("noise 2:N:0:A", &rc(&noise)),
+    ]);
+    let got = map_on_repeat_genome(&[m1, m2], &["--outSAMmultNmax", "2"]);
+    let want: Vec<(String, u16, String)> = [
+        ("multi", 611, "NH:i:6"),
+        ("multi", 659, "NH:i:6"),
+        ("multi", 867, "NH:i:6"),
+        ("multi", 915, "NH:i:6"),
+        ("noise", 589, "NH:i:0"),
+        ("noise", 653, "NH:i:0"),
+    ]
+    .iter()
+    .map(|(n, f, t)| (n.to_string(), *f, t.to_string()))
+    .collect();
+    assert_eq!(got, want);
+}

@@ -409,7 +409,8 @@ fn align_read_inner(
     // does NOT filter clusters by seed coverage. Removed to match STAR.
 
     // Step 3: Stitch seeds within each cluster
-    let scorer = AlignmentScorer::from_params(params);
+    let mut scorer = AlignmentScorer::from_params(params);
+    scorer.n_mm_max = params.mismatch_nmax_total(read_seq.len());
     let mut transcripts = Vec::new();
     // STAR's `trAll`: every window's transcripts, before any cross-window
     // dedup or filtering, which is what its chimeric detection reads.
@@ -577,7 +578,7 @@ fn align_read_inner(
                 || n_match < (params.out_filter_match_nmin_over_lread * lread_m1) as u32
             {
                 Some(UnmappedReason::TooShort)
-            } else if best.n_mismatch > params.out_filter_mismatch_nmax
+            } else if best.n_mismatch > scorer.n_mm_max
                 || f64::from(best.n_mismatch) / f64::from(r_length.max(1))
                     > params.out_filter_mismatch_nover_lmax
             {
@@ -709,7 +710,8 @@ pub fn align_paired_read(
     let len2 = mate2_seq.len();
 
     let debug_pe = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
-    let scorer = AlignmentScorer::from_params(params);
+    let mut scorer = AlignmentScorer::from_params(params);
+    scorer.n_mm_max = params.mismatch_nmax_total(len1 + len2);
     let junction_db = if index.junction_db.is_empty() {
         None
     } else {
@@ -1081,6 +1083,9 @@ pub fn align_paired_read(
             merge_params.out_filter_match_nmin = 0;
             merge_params.out_filter_match_nmin_over_lread = 0.0;
             merge_params.out_filter_score_min_over_lread = 0.0;
+            // STAR's copyRead hands the merged read the pair's mismatch cap.
+            merge_params.out_filter_mismatch_nmax = scorer.n_mm_max;
+            merge_params.out_filter_mismatch_nover_read_lmax = 1.0;
             let (merged_transcripts, _merged_chim, _n_mapq, _unmapped, _best) =
                 align_read_inner(&merge.merged, read_name, index, &merge_params, false)?;
             let mut converted: Vec<PairedAlignment> = Vec::new();
@@ -1559,7 +1564,7 @@ fn filter_paired_transcripts(
             return Some(UnmappedReason::TooShort);
         }
 
-        if combined_nm > params.out_filter_mismatch_nmax
+        if combined_nm > params.mismatch_nmax_total(mate1_seq.len() + mate2_seq.len())
             || f64::from(combined_nm) / f64::from(combined_r_length.max(1))
                 > params.out_filter_mismatch_nover_lmax
         {

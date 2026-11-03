@@ -833,6 +833,51 @@ fn apply_rg_per_file(
     }
 }
 
+/// Flag every record of a read whose FASTQ name has the Illumina filter flag
+/// `n:Y:` as not passing quality control (0x200), mapped or not, as STAR does
+/// (`ReadAlign_outputTranscriptSAM.cpp:27,91`, `ReadAlign_alignBAM.cpp:146,198`).
+/// STAR applies `--outSAMflagAND/OR` after setting the bit, on mapped records
+/// only, so they are applied again here.
+fn apply_qc_fail(
+    records: &mut [noodles::sam::alignment::record_buf::RecordBuf],
+    filter_flag: u8,
+    params: &Parameters,
+    and_or: bool,
+) {
+    if filter_flag != b'Y' {
+        return;
+    }
+    for rec in records {
+        rec.flags_mut()
+            .insert(noodles::sam::alignment::record::Flags::QC_FAIL);
+        if and_or && !rec.flags().is_unmapped() {
+            crate::io::sam::apply_sam_flag_or_and(rec, params);
+        }
+    }
+}
+
+/// [`apply_rg_per_file`] and [`apply_qc_fail`] over a batch's genomic and
+/// transcriptome records; `read(i)` is the batch's `i`-th read (mate 1 for pairs).
+fn apply_per_read_batch(
+    params: &Parameters,
+    out: &mut BatchOut<AlignmentBatchResults>,
+    read: impl Fn(usize) -> (u32, u8),
+) {
+    for (i, res) in out.iter_mut().enumerate() {
+        if let Ok(o) = res {
+            let filter_flag = read(i).1;
+            apply_qc_fail(&mut o.sam_records.records, filter_flag, params, true);
+            apply_qc_fail(
+                &mut o.transcriptome_records.records,
+                filter_flag,
+                params,
+                false,
+            );
+        }
+    }
+    apply_rg_per_file_batch(params, out, |i| read(i).0);
+}
+
 /// [`apply_rg_per_file`] over a batch's genomic and transcriptome records;
 /// `file_index(i)` is the file of the batch's `i`-th read.
 fn apply_rg_per_file_batch(
@@ -2252,7 +2297,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     })
                 })
                 .collect();
-            apply_rg_per_file_batch(params, &mut out, |i| batch[i].file_index);
+            apply_per_read_batch(params, &mut out, |i| {
+                (batch[i].file_index, batch[i].filter_flag)
+            });
             out
         };
         Arc::new(process)
@@ -2876,12 +2923,11 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                             })
                         })
                         .collect();
-                    if !rg_ids.is_empty() {
-                        for (i, res) in out.iter_mut().enumerate() {
-                            if let Ok(o) = res {
-                                let fi = batch[i].cdna.file_index;
-                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
-                            }
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            let r = &batch[i].cdna;
+                            apply_qc_fail(&mut o.sam_records.records, r.filter_flag, params, true);
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, r.file_index);
                         }
                     }
                     out
@@ -3401,12 +3447,11 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                             })
                         })
                         .collect();
-                    if !rg_ids.is_empty() {
-                        for (i, res) in out.iter_mut().enumerate() {
-                            if let Ok(o) = res {
-                                let fi = batch[i].mate1.file_index;
-                                apply_rg_per_file(&mut o.sam_records.records, &rg_ids, fi);
-                            }
+                    for (i, res) in out.iter_mut().enumerate() {
+                        if let Ok(o) = res {
+                            let r = &batch[i].mate1;
+                            apply_qc_fail(&mut o.sam_records.records, r.filter_flag, params, true);
+                            apply_rg_per_file(&mut o.sam_records.records, &rg_ids, r.file_index);
                         }
                     }
                     out
@@ -3994,7 +4039,9 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     })
                 })
                 .collect();
-            apply_rg_per_file_batch(params, &mut out, |i| batch[i].mate1.file_index);
+            apply_per_read_batch(params, &mut out, |i| {
+                (batch[i].mate1.file_index, batch[i].mate1.filter_flag)
+            });
             out
         };
         Arc::new(process)
