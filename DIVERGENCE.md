@@ -171,6 +171,24 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Source.** `src/solo/count.rs` (`write_cellranger_summary`), `src/solo/gene.rs` (`Region`).
 
+### 1.9 A damaged junction or annotation table is refused
+
+**Needs maintainer sign-off.**
+
+**What STAR does.** It reads the index's text tables with `>>` and does not check that they are complete, except `transcriptInfo.tab` (`Transcriptome.cpp:51-56`, exit 105). On an index whose table lost its last lines or was cut mid-line:
+
+- `sjdbInfo.txt` (`Genome_genomeLoad.cpp:487-519`): missing rows read as zeros; with 10 rows missing STAR segfaults. A header whose count or overhang does not match the Genome is used as is: with the overhang off by one, 210 of 400 reads map uniquely instead of 400.
+- `sjdbList.out.tab`, read only to insert junctions at mapping or in two-pass mode (`sjdbInsertJunctions.cpp:15-18`): with one row missing STAR runs at 100% CPU and never finishes.
+- `exonInfo.tab`, `geneInfo.tab`, `exonGeTrInfo.tab` (`Transcriptome.cpp:18-29, 62-97`): exit 0 with other numbers. With 10 rows missing, `exonInfo.tab` puts 360 reads in `Aligned.toTranscriptome.out.bam` instead of 400, `exonGeTrInfo.tab` turns 40 counted reads into `N_noFeature`, and `geneInfo.tab` changes `ReadsPerGene.out.tab`.
+
+**What rustar-aligner does.** It refuses such an index with a message naming the file. Each table has to end with a newline and hold as many rows as its header says. `sjdbInfo.txt`'s junctions, each `2*sjdbOverhang+1` bytes, have to fill the Genome after the chromosomes. With junction insertion, `sjdbList.out.tab` has to hold as many junctions as `sjdbInfo.txt`. `exonGeTrInfo.tab`, which rustar-aligner does not otherwise read, is checked when present.
+
+**Why.** STAR's results on such an index are wrong or never come, and nothing says why. An index cut short by a failed copy is a common mistake.
+
+**Impact.** Only damaged indices. An intact one, from STAR or from rustar-aligner, loads as before. A table that was edited by hand and lost its final newline is refused too.
+
+**Source.** `src/index/io.rs` (`read_index_table`, `check_sjdb_list`), `src/junction/sjdb_insert.rs` (`read_sjdb_info_tab`), `src/quant/transcriptome.rs` (`check_exon_ge_tr_info`), locked by `table_with_a_cut_last_line_is_refused`, `short_sjdb_list_is_refused_when_junctions_are_inserted` and `sjdb_info_that_disagrees_with_the_genome_is_refused` in `tests/index_load.rs`.
+
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR

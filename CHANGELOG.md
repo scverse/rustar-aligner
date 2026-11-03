@@ -16,6 +16,7 @@ Sections commonly used: Features, Bug fixes, Other changes.
 - A junction near the genome's start or end no longer stops the run. `sjdb flanking window ... donor underflows` was fatal, for a GTF at `genomeGenerate` and for a novel junction after pass 1 of a two-pass run, while the same flank on a later contig simply read spacers. A flank before the genome's start reads spacers, and one past its end reads what STAR reads there: the reverse strand at `genomeGenerate`, spacers at mapping. See `DIVERGENCE.md` §3.5.
 - On-the-fly insertion that drops an old junction rebuilds the SAindex. It used to keep stale values, which misdirected seeds and could panic mid-alignment.
 - A damaged index is refused at load. A short `SA` or `SAindex` used to read as zeros or panic mid-run, and garbage in `chrLength.txt` or `chrStart.txt` panicked.
+- A junction or annotation table cut short is refused too. A last line cut mid-value in `sjdbInfo.txt`, `exonInfo.tab` or `geneInfo.tab` used to load, a short `sjdbList.out.tab` or `exonGeTrInfo.tab` went unnoticed, and `sjdbInfo.txt` was not checked against the Genome. STAR reads most of these silently and then maps or counts wrongly, or hangs. See `DIVERGENCE.md` §1.9.
 
 ### Other changes
 
