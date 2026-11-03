@@ -67,6 +67,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- `--outFilterMismatchNoverReadLmax` is accepted (default 1.0), as in STAR
+  2.7.11b. It caps the mismatches of a read at this fraction of its length
+  (both mates, after clipping), together with `--outFilterMismatchNmax`, in
+  the same places STAR does: while stitching and extending, in the mapped
+  filter and for `--quantMode TranscriptomeSAM`. On 4 000 reads and 4 000
+  pairs with 0 to 9 mismatches each, at 0.04, the SAM records are identical
+  to STAR's.
+
 - **`--clipAdapterType CellRanger4` now matches STAR exactly**, both halves of the
   clip (#198). The 5' TSO trim is an overlap alignment against the first 91 bases of the
   read, replicating `ClipCR4`'s Opal call (ACGTN alphabet; match +1, mismatch -2,
@@ -231,6 +239,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
   fails a test.
 
 ### Bug fixes
+
+- `NH` counts every locus of a multimapper, also when `--outSAMmultNmax`
+  writes fewer. A read with 3 loci under `--outSAMmultNmax 2` had `NH:i:2`,
+  STAR writes `NH:i:3`. Single-end and paired-end.
+- A read whose FASTQ name has the Illumina filter flag (`@r1 1:Y:0:ACGT`) gets
+  SAM flag 0x200 (not passing quality control) on all its records, mapped or
+  unmapped, and on both mates (from mate 1's name), in SAM, BAM and
+  `Aligned.toTranscriptome.out.bam`, as STAR does. It was never set.
 
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not

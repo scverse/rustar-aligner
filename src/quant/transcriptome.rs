@@ -1592,9 +1592,7 @@ fn prepare_for_projection(
 /// STAR's `(nMM + nMM1) > min(outFilterMismatchNmaxTotal,
 /// outFilterMismatchNoverLmax*(Lread-1))` test; `lread` is STAR's `Lread`.
 fn within_mismatch_budget(n_mm: u32, read_len_sum: u32, lread: u32, params: &Parameters) -> bool {
-    // `outFilterMismatchNmaxTotal = min(outFilterMismatchNmax,
-    // outFilterMismatchNoverReadLmax*(readLength[0]+readLength[1]))`, ratio 1.
-    let nmax_total = params.out_filter_mismatch_nmax.min(read_len_sum);
+    let nmax_total = params.mismatch_nmax_total(read_len_sum as usize);
     let rel =
         (params.out_filter_mismatch_nover_lmax * f64::from(lread.saturating_sub(1))).floor() as u32;
     n_mm <= nmax_total.min(rel)

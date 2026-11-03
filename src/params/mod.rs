@@ -861,6 +861,10 @@ pub struct Parameters {
     #[arg(long = "outFilterMismatchNoverLmax", default_value_t = 0.3)]
     pub out_filter_mismatch_nover_lmax: f64,
 
+    /// Max ratio of mismatches to read length (both mates)
+    #[arg(long = "outFilterMismatchNoverReadLmax", default_value_t = 1.0)]
+    pub out_filter_mismatch_nover_read_lmax: f64,
+
     /// Min alignment score (absolute)
     #[arg(long = "outFilterScoreMin", default_value_t = 0)]
     pub out_filter_score_min: i32,
@@ -1668,6 +1672,14 @@ impl Parameters {
                 Ok(block.join("\t"))
             })
             .collect()
+    }
+
+    /// STAR's per-read `outFilterMismatchNmaxTotal` (`ReadAlign_oneRead.cpp:78`):
+    /// `outFilterMismatchNmax` capped by `outFilterMismatchNoverReadLmax` times the
+    /// read length, both mates after clipping.
+    pub fn mismatch_nmax_total(&self, read_len: usize) -> u32 {
+        let by_len = (self.out_filter_mismatch_nover_read_lmax * read_len as f64) as u32;
+        self.out_filter_mismatch_nmax.min(by_len)
     }
 
     /// Read group ID emitted on SAM records (the first RG line's `ID:` value).

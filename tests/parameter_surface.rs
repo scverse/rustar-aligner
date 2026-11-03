@@ -96,7 +96,6 @@ const NOT_YET_ACCEPTED: &[&str] = &[
     "alignInsertionFlush",
     "alignSoftClipAtReferenceEnds",
     "alignTranscriptsPerReadNmax",
-    "outFilterMismatchNoverReadLmax",
     "seedNoneLociPerWindow",
     // Long reads.
     "winReadCoverageBasesMin",

@@ -213,7 +213,7 @@ impl SamWriter {
                 read_qual,
                 genome,
                 mapq,
-                max_output,    // NH = number of reported alignments
+                n_alignments, // NH counts every locus, not only the written ones (STAR nTr)
                 hit_index + 1, // 1-based
                 params.out_sam_attr_ih_start,
                 attrs,
@@ -363,7 +363,7 @@ impl SamWriter {
                 aligned_qual,
                 genome,
                 mapq,
-                max_output,    // NH = number of reported alignments
+                n_alignments, // NH counts every locus, not only the written ones (STAR nTr)
                 hit_index + 1, // 1-based
                 params.out_sam_attr_ih_start,
                 attrs,
@@ -482,7 +482,7 @@ impl SamWriter {
                     paired_aln.insert_size,
                     params,
                 ),
-                max_output, // NH = number of reported alignments
+                n_alignments, // NH counts every locus, not only the written ones (STAR nTr)
                 hit_index,
                 params.out_sam_attr_ih_start,
                 combined_score,
@@ -513,7 +513,7 @@ impl SamWriter {
                     -paired_aln.insert_size, // Negative for mate2 (mode 1 default)
                     params,
                 ),
-                max_output, // NH = number of reported alignments
+                n_alignments, // NH counts every locus, not only the written ones (STAR nTr)
                 hit_index,
                 params.out_sam_attr_ih_start,
                 combined_score,
@@ -3861,13 +3861,13 @@ mod tests {
         // Only 3 records output despite 5 transcripts
         assert_eq!(records.len(), 3);
 
-        // NH should be 3 (number of reported alignments)
+        // NH counts all 5 loci, as STAR's does (`outputTranscriptSAM(.., nTrOutSAM, ..)`)
         for rec in &records {
             let data = rec.data();
             assert_eq!(
                 data.get(&Tag::ALIGNMENT_HIT_COUNT),
-                Some(&Value::from(3_i32)),
-                "NH should be 3 (capped by outSAMmultNmax)"
+                Some(&Value::from(5_i32)),
+                "NH is not capped by outSAMmultNmax"
             );
         }
 
