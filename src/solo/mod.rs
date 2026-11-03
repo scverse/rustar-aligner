@@ -2233,21 +2233,29 @@ impl SoloContext {
     /// strand — matching STAR's PE quantification (cf. [`crate::quant`]'s
     /// `count_pe_read`). Each aligned pair counts as one locus.
     ///
-    /// `pairs` are the `(mate1, mate2)` transcripts of every BothMapped pair (>1
-    /// pair ⇒ multimapper). `junctions` are the pair's crossed junctions.
+    /// `results` are the read's alignments, pairs and single mates (>1 ⇒
+    /// multimapper). `junctions` are the pair's crossed junctions.
     pub fn process_read_pe(
         &self,
-        pairs: &[(&Transcript, &Transcript)],
+        results: &[crate::align::read_align::PairedAlignmentResult],
         barcode: Result<&CellBarcode, BarcodeMiss>,
         junctions: &[(u64, u64)],
     ) -> SoloReadOutcome {
         // A mate pair is one alignment in STAR (one `Transcript`, both mates'
         // blocks), so the Gene feature asks one transcript to contain the pair.
-        let alns: Vec<Transcript> = pairs
+        use crate::align::read_align::PairedAlignmentResult;
+        let alns: Vec<Transcript> = results
             .iter()
-            .map(|(m1, m2)| pair_alignment(m1, m2))
+            .map(|r| match r {
+                PairedAlignmentResult::BothMapped(pa) => {
+                    pair_alignment(&pa.mate1_transcript, &pa.mate2_transcript)
+                }
+                PairedAlignmentResult::HalfMapped {
+                    mapped_transcript, ..
+                } => mapped_transcript.clone(),
+            })
             .collect();
-        self.process_read(&alns, pairs.len(), barcode, junctions)
+        self.process_read(&alns, results.len(), barcode, junctions)
     }
 }
 

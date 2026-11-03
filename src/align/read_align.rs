@@ -239,6 +239,62 @@ pub enum PairedAlignmentResult {
     },
 }
 
+impl PairedAlignmentResult {
+    /// The score alignments of one read compete on: the pair's, or the single mate's.
+    pub fn score(&self) -> i32 {
+        match self {
+            Self::BothMapped(pa) => pa.combined_wt_score,
+            Self::HalfMapped {
+                mapped_transcript, ..
+            } => mapped_transcript.score,
+        }
+    }
+
+    /// Rank in the output order (see [`mult_map_order`]).
+    pub fn output_rank(&self) -> u32 {
+        match self {
+            Self::BothMapped(pa) => pa.output_rank,
+            Self::HalfMapped {
+                mapped_transcript, ..
+            } => mapped_transcript.output_rank,
+        }
+    }
+
+    fn output_rank_mut(&mut self) -> &mut u32 {
+        match self {
+            Self::BothMapped(pa) => &mut pa.output_rank,
+            Self::HalfMapped {
+                mapped_transcript, ..
+            } => &mut mapped_transcript.output_rank,
+        }
+    }
+
+    fn g_length(&self) -> u64 {
+        match self {
+            Self::BothMapped(pa) => pa.star_g_length(),
+            Self::HalfMapped {
+                mapped_transcript: t,
+                ..
+            } => t.genome_end - t.genome_start,
+        }
+    }
+
+    /// The transcript of mate 1 and of mate 2, where that mate is aligned.
+    fn mates(&self) -> [Option<&Transcript>; 2] {
+        match self {
+            Self::BothMapped(pa) => [Some(&pa.mate1_transcript), Some(&pa.mate2_transcript)],
+            Self::HalfMapped {
+                mapped_transcript,
+                mate1_is_mapped: true,
+            } => [Some(mapped_transcript), None],
+            Self::HalfMapped {
+                mapped_transcript,
+                mate1_is_mapped: false,
+            } => [None, Some(mapped_transcript)],
+        }
+    }
+}
+
 /// Align a read to the genome.
 ///
 /// # Algorithm
@@ -697,8 +753,8 @@ type PairedAlignResult = (
 /// 3. Tag seeds with mate_id (0=mate1, 1=mate2); adjust read_pos to combined-read coords
 /// 4. Cluster and stitch combined seeds → WorkingTranscripts spanning both mates
 /// 5. Split each WT by mate_id → finalize each half → pair
-/// 6. Decision tree: dedup → score-range → TooManyLoci → quality filter
-/// 7. Half-mapped fallback from single-mate WTs
+/// 6. Decision tree over pairs and single mates alike: dedup → score-range →
+///    quality filter → TooManyLoci
 ///
 /// # Arguments
 /// * `mate1_seq` - First mate sequence (encoded)
@@ -782,9 +838,9 @@ pub fn align_paired_read(
     let combined_score_threshold =
         (params.out_filter_score_min_over_lread * (len1 + len2) as f64) as i32;
 
-    let mut joint_pairs: Vec<PairedAlignment> = Vec::new();
-    let mut single_mate1_transcripts: Vec<Transcript> = Vec::new();
-    let mut single_mate2_transcripts: Vec<Transcript> = Vec::new();
+    // Pairs and single-mate alignments in one list, in window order: they compete
+    // for the score range, the primary and NH alike.
+    let mut alignments: Vec<PairedAlignmentResult> = Vec::new();
     // STAR's `trAll` for chimeric detection: per window, the combined-read
     // transcripts — whole pairs and single mates alike.
     let mut chim_windows: Vec<Vec<crate::chimeric::WinTr>> = Vec::new();
@@ -956,10 +1012,10 @@ pub fn align_paired_read(
                     ));
                 }
                 if let Some(pair) = pair {
-                    joint_pairs.push(pair);
+                    alignments.push(PairedAlignmentResult::BothMapped(Box::new(pair)));
                 }
             } else {
-                // Single-mate WT: save for half-mapped fallback
+                // Single-mate WT
                 let all_m1 = wt.exons.iter().all(|e| e.mate_id == 0);
                 let all_m2 = wt.exons.iter().all(|e| e.mate_id == 1);
                 if all_m1 {
@@ -1000,7 +1056,10 @@ pub fn align_paired_read(
                                 combined_len,
                             ));
                         }
-                        single_mate1_transcripts.push(t);
+                        alignments.push(PairedAlignmentResult::HalfMapped {
+                            mapped_transcript: t,
+                            mate1_is_mapped: true,
+                        });
                     }
                 } else if all_m2 {
                     let (read_slice, orig_rev) = if stitch_is_reverse {
@@ -1040,7 +1099,10 @@ pub fn align_paired_read(
                                 combined_len,
                             ));
                         }
-                        single_mate2_transcripts.push(t);
+                        alignments.push(PairedAlignmentResult::HalfMapped {
+                            mapped_transcript: t,
+                            mate1_is_mapped: false,
+                        });
                     }
                 }
             }
@@ -1072,7 +1134,7 @@ pub fn align_paired_read(
     // rescoring from scratch in the PE frame (`crate::align::pe_overlap`). STAR's semantics
     // (mirrored here, per `star_pe_overlap.rs` in the sister project STAR-rs) are an
     // unconditional overwrite: if the merge succeeds and at least one transcript converts,
-    // the separate-mate `joint_pairs` computed above is replaced outright — no additional
+    // the separate-mate `alignments` computed above are replaced outright — no additional
     // score comparison, and the multimap-range filter below is not skipped, it just runs once
     // on the replaced set instead of twice.
     if params.pe_overlap_nbases_min > 0 {
@@ -1097,7 +1159,7 @@ pub fn align_paired_read(
             merge_params.out_filter_score_min_over_lread = 0.0;
             let (merged_transcripts, _merged_chim, _n_mapq, _unmapped, _best) =
                 align_read_inner(&merge.merged, read_name, index, &merge_params, false)?;
-            let mut converted: Vec<PairedAlignment> = Vec::new();
+            let mut converted: Vec<PairedAlignmentResult> = Vec::new();
             for t in &merged_transcripts {
                 let Some((m1, m2)) = crate::align::pe_overlap::convert_merged_transcript_to_pe(
                     t,
@@ -1118,56 +1180,56 @@ pub fn align_paired_read(
                     + scorer.genomic_length_penalty(combined_span);
                 let is_proper_pair = check_proper_pair(&m1, &m2, params);
                 let insert_size = calculate_insert_size(&m1, &m2);
-                converted.push(PairedAlignment {
-                    output_rank: 0,
-                    mate1_transcript: m1,
-                    mate2_transcript: m2,
-                    mate1_region: (0, len1),
-                    mate2_region: (0, len2),
-                    is_proper_pair,
-                    insert_size,
-                    combined_wt_score,
-                });
+                converted.push(PairedAlignmentResult::BothMapped(Box::new(
+                    PairedAlignment {
+                        output_rank: 0,
+                        mate1_transcript: m1,
+                        mate2_transcript: m2,
+                        mate1_region: (0, len1),
+                        mate2_region: (0, len2),
+                        is_proper_pair,
+                        insert_size,
+                        combined_wt_score,
+                    },
+                )));
             }
             if !converted.is_empty() {
                 pe_overlap_replaced = true;
-                joint_pairs = converted;
+                alignments = converted;
             }
         }
     }
 
-    // --- Decision tree: dedup, score-filter, quality-filter, then half-mapped fallback ---
+    // --- Decision tree: dedup, score-filter, quality-filter, too many loci ---
 
-    // Step 1: position dedup — remove exact (chr, mate1_pos, mate2_pos, strand, CIGAR) duplicates.
+    // Step 1: position dedup — remove exact (chr, mate positions, strands, CIGARs) duplicates.
     // Run dedup BEFORE score-range filter so the backup pool is already deduplicated.
     // (STAR's ordering is multMapSelect → dedup, but dedup before multMapSelect is equivalent
     // since removing exact duplicates doesn't change the best score.)
     // Order-preserving exact dedup (keep first in discovery order). We must not
     // sort by position here: STAR's primary tie-break falls back to the
-    // earliest-discovered pair, so discovery order has to survive to the
+    // earliest-discovered alignment, so discovery order has to survive to the
     // primary-selection sort below.
     {
         // Keyed on the mate positions, with the CIGARs of one key compared
-        // directly: no CIGAR string is built per pair.
-        let mut firsts: rustc_hash::FxHashMap<(usize, u64, bool, u64, bool), Vec<usize>> =
+        // directly: no CIGAR string is built per alignment.
+        type MatePos = Option<(usize, u64, bool)>;
+        let mut firsts: rustc_hash::FxHashMap<[MatePos; 2], Vec<usize>> =
             rustc_hash::FxHashMap::default();
-        let keep: Vec<bool> = joint_pairs
+        let keep: Vec<bool> = alignments
             .iter()
             .enumerate()
-            .map(|(i, p)| {
-                let (m1, m2) = (&p.mate1_transcript, &p.mate2_transcript);
+            .map(|(i, a)| {
+                let mates = a.mates();
                 let same = firsts
-                    .entry((
-                        m1.chr_idx,
-                        m1.genome_start,
-                        m1.is_reverse,
-                        m2.genome_start,
-                        m2.is_reverse,
-                    ))
+                    .entry(mates.map(|m| m.map(|t| (t.chr_idx, t.genome_start, t.is_reverse))))
                     .or_default();
                 let dup = same.iter().any(|&j| {
-                    let q = &joint_pairs[j];
-                    q.mate1_transcript.cigar == m1.cigar && q.mate2_transcript.cigar == m2.cigar
+                    alignments[j]
+                        .mates()
+                        .iter()
+                        .zip(&mates)
+                        .all(|(q, m)| q.map(|t| &t.cigar) == m.map(|t| &t.cigar))
                 });
                 if !dup {
                     same.push(i);
@@ -1176,91 +1238,68 @@ pub fn align_paired_read(
             })
             .collect();
         let mut keep = keep.into_iter();
-        joint_pairs.retain(|_| keep.next().unwrap_or(true));
+        alignments.retain(|_| keep.next().unwrap_or(true));
     }
 
     // Step 2: score-range filter (STAR's multMapSelect).
-    if !joint_pairs.is_empty() {
-        let best_score = joint_pairs
-            .iter()
-            .map(|pa| pa.combined_wt_score)
-            .max()
-            .unwrap_or(0);
+    if let Some(best_score) = alignments.iter().map(PairedAlignmentResult::score).max() {
         let score_threshold = best_score - params.out_filter_multimap_score_range;
-        joint_pairs.retain(|pa| pa.combined_wt_score >= score_threshold);
+        alignments.retain(|a| a.score() >= score_threshold);
     }
 
     if params.out_multimapper_order == MultimapperOrder::Random {
         // Under Random, the tied top-score prefix is shuffled with a per-read seed
         // (deterministic per read, so thread-count invariant).
-        joint_pairs.sort_by(|a, b| {
-            b.combined_wt_score.cmp(&a.combined_wt_score).then_with(|| {
-                (
-                    a.mate1_transcript.chr_idx,
-                    a.mate1_transcript.genome_start,
-                    a.mate1_transcript.is_reverse,
-                )
-                    .cmp(&(
-                        b.mate1_transcript.chr_idx,
-                        b.mate1_transcript.genome_start,
-                        b.mate1_transcript.is_reverse,
-                    ))
-            })
+        alignments.sort_by_key(|a| {
+            let t = a.mates().into_iter().flatten().next();
+            (
+                std::cmp::Reverse(a.score()),
+                t.map(|t| (t.chr_idx, t.genome_start, t.is_reverse)),
+            )
         });
         shuffle_tied_prefix(
-            &mut joint_pairs,
-            |pa| pa.combined_wt_score,
+            &mut alignments,
+            PairedAlignmentResult::score,
             per_read_seed(params.run_rng_seed, read_name),
         );
-        for (rank, pair) in joint_pairs.iter_mut().enumerate() {
-            pair.output_rank = rank as u32;
+        for (rank, alignment) in alignments.iter_mut().enumerate() {
+            *alignment.output_rank_mut() = rank as u32;
         }
     } else {
         mult_map_order(
-            &mut joint_pairs,
-            |pa| pa.combined_wt_score,
-            PairedAlignment::star_g_length,
-            |pa| &mut pa.output_rank,
+            &mut alignments,
+            PairedAlignmentResult::score,
+            PairedAlignmentResult::g_length,
+            PairedAlignmentResult::output_rank_mut,
             params.out_sam_mult_nmax >= 0,
         );
     }
 
     // `--peOverlapNbasesMin` may have replaced the pairs: fold the final ones into
     // trBest too (the best pair is STAR's trBest whenever a pair exists).
-    for p in joint_pairs.iter().filter(|_| pe_overlap_replaced) {
-        let score = p.combined_wt_score;
+    for a in alignments.iter().filter(|_| pe_overlap_replaced) {
+        let score = a.score();
         if best_tr.is_none_or(|(b, _)| score > b.score) {
-            best_tr = Some((
-                BestTr {
-                    score,
-                    n_mm: p.mate1_transcript.n_mismatch + p.mate2_transcript.n_mismatch,
-                },
-                0,
-            ));
+            let n_mm = a.mates().iter().flatten().map(|t| t.n_mismatch).sum();
+            best_tr = Some((BestTr { score, n_mm }, 0));
         }
     }
     let best_tr = best_tr.map_or_else(BestTr::default, |(b, _)| b);
 
-    // Step 4: quality filter (mappedFilter). The best pair is STAR's `trBest`
-    // whenever a pair exists (a single mate cannot clear the combined-length
-    // gates), so a failure here unmaps the read with that reason rather than
-    // falling through to the half-mapped fallback.
-    if let Some(reason) = filter_paired_transcripts(
-        &mut joint_pairs,
-        mate1_seq,
-        mate2_seq,
-        &index.genome,
-        params,
-    ) {
+    // Step 4: quality filter (mappedFilter). It looks at the best alignment only,
+    // and a failure unmaps the read with that reason.
+    if let Some(reason) =
+        filter_paired_transcripts(&mut alignments, mate1_seq, mate2_seq, &index.genome, params)
+    {
         return Ok((Vec::new(), pe_chimeric, 0, Some(reason), best_tr));
     }
 
     // Step 5: too-many-loci — STAR checks `multi` AFTER mappedFilter, only when the
-    // best pair passes the score/match/mismatch gates (ReadAlign_mappedFilter.cpp).
-    // Pairs that survive quality but exceed outFilterMultimapNmax → too many loci;
-    // a read whose best pair fails quality was already emptied above (→ unmapped).
-    if joint_pairs.len() > params.out_filter_multimap_nmax as usize {
-        let n_loci = joint_pairs.len();
+    // best alignment passes the score/match/mismatch gates (ReadAlign_mappedFilter.cpp).
+    // Alignments that survive quality but exceed outFilterMultimapNmax → too many loci;
+    // a read whose best alignment fails quality was already emptied above (→ unmapped).
+    let n_loci = alignments.len();
+    if n_loci > params.out_filter_multimap_nmax as usize {
         return Ok((
             Vec::new(),
             pe_chimeric,
@@ -1270,92 +1309,22 @@ pub fn align_paired_read(
         ));
     }
 
-    if !joint_pairs.is_empty() {
-        let pe_mapq_n = joint_pairs.len().max(1);
-        let results = joint_pairs
-            .into_iter()
-            .map(|pa| PairedAlignmentResult::BothMapped(Box::new(pa)))
-            .collect();
-        return Ok((results, pe_chimeric, pe_mapq_n, None, best_tr));
-    }
-
-    // Half-mapped fallback: report the best-scoring single-mate transcript.
-    // STAR applies the quality filter to the COMBINED read (Lread-1 = len1+len2), so we
-    // use the same threshold for each mate here.
-    let single_mate_threshold = combined_score_threshold.max(params.out_filter_score_min);
-
-    let best_m1 = single_mate1_transcripts
-        .into_iter()
-        .filter(|t| t.score >= single_mate_threshold)
-        .max_by_key(|t| t.score);
-    let best_m2 = single_mate2_transcripts
-        .into_iter()
-        .filter(|t| t.score >= single_mate_threshold)
-        .max_by_key(|t| t.score);
-
-    match (best_m1, best_m2) {
-        (Some(t1), None) => Ok((
-            vec![PairedAlignmentResult::HalfMapped {
-                mapped_transcript: t1,
-                mate1_is_mapped: true,
-            }],
-            pe_chimeric,
-            1,
-            None,
-            best_tr,
-        )),
-        (None, Some(t2)) => Ok((
-            vec![PairedAlignmentResult::HalfMapped {
-                mapped_transcript: t2,
-                mate1_is_mapped: false,
-            }],
-            pe_chimeric,
-            1,
-            None,
-            best_tr,
-        )),
-        (Some(t1), Some(t2)) => {
-            // Both have single-mate alignments but couldn't form a valid pair.
-            // Report the higher-scoring mate as half-mapped.
-            if t1.score >= t2.score {
-                Ok((
-                    vec![PairedAlignmentResult::HalfMapped {
-                        mapped_transcript: t1,
-                        mate1_is_mapped: true,
-                    }],
-                    pe_chimeric,
-                    1,
-                    None,
-                    best_tr,
-                ))
-            } else {
-                Ok((
-                    vec![PairedAlignmentResult::HalfMapped {
-                        mapped_transcript: t2,
-                        mate1_is_mapped: false,
-                    }],
-                    pe_chimeric,
-                    1,
-                    None,
-                    best_tr,
-                ))
-            }
-        }
+    if alignments.is_empty() {
         // STAR splits this case in two (`ReadAlign_mappedFilter.cpp`): a read
         // with no good window at all is `unmappedOther` ("other"), and only a
         // read that *had* a window whose best transcript failed the score or
         // length thresholds is `unmappedShort` ("too short"). Reporting every
         // unmapped pair as too short empties the "other" bucket, which is what
         // #48 measured on paired-end data.
-        (None, None) => {
-            let reason = if clusters.is_empty() || !any_transcript {
-                UnmappedReason::Other
-            } else {
-                UnmappedReason::TooShort
-            };
-            Ok((Vec::new(), pe_chimeric, 0, Some(reason), best_tr))
-        }
+        let reason = if clusters.is_empty() || !any_transcript {
+            UnmappedReason::Other
+        } else {
+            UnmappedReason::TooShort
+        };
+        return Ok((Vec::new(), pe_chimeric, 0, Some(reason), best_tr));
     }
+
+    Ok((alignments, pe_chimeric, n_loci, None, best_tr))
 }
 
 /// Attempt to pair two per-mate transcripts into a PairedAlignment.
@@ -1477,10 +1446,10 @@ pub(crate) fn calculate_insert_size(mate1_trans: &Transcript, mate2_trans: &Tran
     }
 }
 
-/// Filter paired transcripts by quality thresholds.
+/// Filter a pair's alignments by quality thresholds.
 /// STAR's mappedFilter applies ALL quality checks to trBest (the highest-scoring transcript).
 fn filter_paired_transcripts(
-    paired_alns: &mut Vec<PairedAlignment>,
+    alignments: &mut Vec<PairedAlignmentResult>,
     mate1_seq: &[u8],
     mate2_seq: &[u8],
     genome: &crate::genome::Genome,
@@ -1491,47 +1460,44 @@ fn filter_paired_transcripts(
     // all transcripts in the score window are included (they affect NH/MAPQ). If trBest fails,
     // the read is unmapped.
     //
-    // Returns why the read is unmapped when the best pair fails, in STAR's
+    // Returns why the read is unmapped when the best alignment fails, in STAR's
     // order: too short (score or matched bases), then too many mismatches.
-    // The pairs arrive sorted by score (and shuffled among ties under
+    // The alignments arrive sorted by score (and shuffled among ties under
     // `--outMultimapperOrder Random`), so the first is the primary, as in SE.
-    // `max_by_key` would return the *last* of tied pairs.
-    let best_pa = paired_alns.first();
-    if let Some(best) = best_pa {
-        let mate1_len = (best.mate1_region.1 - best.mate1_region.0) as f64;
-        let mate2_len = (best.mate2_region.1 - best.mate2_region.0) as f64;
-        let combined_lread_m1 = mate1_len + mate2_len;
-        let combined_nm = best.mate1_transcript.n_mismatch + best.mate2_transcript.n_mismatch;
-        let combined_score = best.combined_wt_score;
+    // `max_by_key` would return the *last* of tied alignments.
+    let best = alignments.first()?;
+    // The combined read's length, also when only one mate aligned.
+    let combined_lread_m1 = (mate1_seq.len() + mate2_seq.len()) as f64;
+    let mates = best.mates();
+    let combined_score = best.score();
 
-        if combined_score < params.out_filter_score_min
-            || combined_score < (params.out_filter_score_min_over_lread * combined_lread_m1) as i32
-        {
-            paired_alns.clear();
-            return Some(UnmappedReason::TooShort);
-        }
+    if combined_score < params.out_filter_score_min
+        || combined_score < (params.out_filter_score_min_over_lread * combined_lread_m1) as i32
+    {
+        alignments.clear();
+        return Some(UnmappedReason::TooShort);
+    }
 
-        // STAR's `nMatch` (read == genome) and `rLength` (aligned bases) of the
-        // combined transcript: the mismatch ratio is over `rLength`, not the
-        // read length (`ReadAlign_mappedFilter.cpp`).
-        let combined_match = star_n_match(&best.mate1_transcript, mate1_seq, genome)
-            + star_n_match(&best.mate2_transcript, mate2_seq, genome);
-        let combined_r_length =
-            star_r_length(&best.mate1_transcript) + star_r_length(&best.mate2_transcript);
-        if combined_match < params.out_filter_match_nmin
-            || combined_match < (params.out_filter_match_nmin_over_lread * combined_lread_m1) as u32
-        {
-            paired_alns.clear();
-            return Some(UnmappedReason::TooShort);
-        }
+    // STAR's `nMatch` (read == genome) and `rLength` (aligned bases) of the
+    // combined transcript: the mismatch ratio is over `rLength`, not the
+    // read length (`ReadAlign_mappedFilter.cpp`).
+    let combined_match = mates[0].map_or(0, |t| star_n_match(t, mate1_seq, genome))
+        + mates[1].map_or(0, |t| star_n_match(t, mate2_seq, genome));
+    if combined_match < params.out_filter_match_nmin
+        || combined_match < (params.out_filter_match_nmin_over_lread * combined_lread_m1) as u32
+    {
+        alignments.clear();
+        return Some(UnmappedReason::TooShort);
+    }
 
-        if combined_nm > params.out_filter_mismatch_nmax
-            || f64::from(combined_nm) / f64::from(combined_r_length.max(1))
-                > params.out_filter_mismatch_nover_lmax
-        {
-            paired_alns.clear();
-            return Some(UnmappedReason::TooManyMismatches);
-        }
+    let combined_nm: u32 = mates.iter().flatten().map(|t| t.n_mismatch).sum();
+    let combined_r_length: u32 = mates.iter().flatten().map(|t| star_r_length(t)).sum();
+    if combined_nm > params.out_filter_mismatch_nmax
+        || f64::from(combined_nm) / f64::from(combined_r_length.max(1))
+            > params.out_filter_mismatch_nover_lmax
+    {
+        alignments.clear();
+        return Some(UnmappedReason::TooManyMismatches);
     }
     // Too many loci is the caller's to decide, after these gates and with the
     // loci count intact; clearing here made it unreachable and turned those

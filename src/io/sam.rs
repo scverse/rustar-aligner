@@ -1,12 +1,12 @@
 //! SAM/BAM output writer with noodles
-use crate::align::read_align::PairedAlignment;
+use crate::align::read_align::PairedAlignmentResult;
 use crate::align::transcript::{Transcript, cigar_to_string};
 use crate::error::Error;
 use crate::genome::Genome;
 use crate::io::fastq::{complement_base, decode_base};
 use crate::junction::encode_motif;
 use crate::mapq::calculate_mapq;
-use crate::params::{Parameters, SamAttributes};
+use crate::params::{OutSamUnmapped, Parameters, SamAttributes};
 use crate::stats::{BestTr, UnmappedReason};
 use bstr::BString;
 use noodles::sam;
@@ -399,7 +399,7 @@ impl SamWriter {
     /// * `mate1_qual` - First mate quality scores
     /// * `mate2_seq` - Second mate sequence (encoded)
     /// * `mate2_qual` - Second mate quality scores
-    /// * `paired_alignments` - Paired alignments
+    /// * `paired_alignments` - The read's alignments: pairs and single mates, primary first
     /// * `genome` - Genome index
     /// * `params` - Parameters
     #[allow(clippy::too_many_arguments)]
@@ -414,7 +414,7 @@ impl SamWriter {
         m1_clip3p: usize,
         m2_clip5p: usize,
         m2_clip3p: usize,
-        paired_alignments: &[PairedAlignment],
+        paired_alignments: &[PairedAlignmentResult],
         genome: &Genome,
         params: &Parameters,
         n_for_mapq: usize,
@@ -448,16 +448,62 @@ impl SamWriter {
         let mut records = Vec::with_capacity(max_output * 2);
         let best_score = paired_alignments
             .iter()
-            .map(|p| p.combined_wt_score)
+            .map(PairedAlignmentResult::score)
             .max()
             .unwrap_or(i32::MIN);
+        // Observed from STAR: `Within` writes one unmapped-mate record, after all the
+        // read's alignments, when the primary has one mate; `Within KeepPairs` writes
+        // one after every single-mate alignment.
+        let mut primary_unmapped_mate = None;
 
-        for (pair_idx, (is_primary, paired_aln)) in
-            output_order(paired_alignments, |p| p.output_rank)
+        for (pair_idx, (is_primary, alignment)) in
+            output_order(paired_alignments, PairedAlignmentResult::output_rank)
                 .take(max_output)
                 .enumerate()
         {
             let hit_index = pair_idx + 1; // 1-based
+            let paired_aln = match alignment {
+                PairedAlignmentResult::BothMapped(pa) => pa,
+                PairedAlignmentResult::HalfMapped {
+                    mapped_transcript,
+                    mate1_is_mapped,
+                } => {
+                    let (mut mapped, mut unmapped) = Self::build_half_mapped_records(
+                        read_name,
+                        mate1_seq,
+                        mate1_qual,
+                        mate2_seq,
+                        mate2_qual,
+                        m1_clip5p,
+                        m1_clip3p,
+                        m2_clip5p,
+                        m2_clip3p,
+                        mapped_transcript,
+                        *mate1_is_mapped,
+                        genome,
+                        params,
+                        mapq,
+                        n_alignments,
+                        hit_index,
+                    )?;
+                    // Observed from STAR: --outSAMflagOR/AND leave an unmapped mate alone.
+                    set_secondary(&mut mapped, !is_primary);
+                    apply_sam_flag_or_and(&mut mapped, params);
+                    set_secondary(&mut unmapped, !is_primary);
+                    for rec in [&mut mapped, &mut unmapped] {
+                        apply_primary_flag(rec, mapped_transcript.score, best_score, params);
+                    }
+                    records.push(mapped);
+                    match params.out_sam_unmapped {
+                        OutSamUnmapped::WithinKeepPairs => records.push(unmapped),
+                        OutSamUnmapped::Within if is_primary => {
+                            primary_unmapped_mate = Some(unmapped);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            };
             // STAR reports the pre-split combined WT score (with length penalty) as AS.
             // This is stored as combined_wt_score, matching STAR's primaryScore.
             let combined_score = paired_aln.combined_wt_score;
@@ -482,7 +528,7 @@ impl SamWriter {
                     paired_aln.insert_size,
                     params,
                 ),
-                max_output, // NH = number of reported alignments
+                n_alignments, // NH counts them all, reported or not (observed from STAR)
                 hit_index,
                 params.out_sam_attr_ih_start,
                 combined_score,
@@ -513,7 +559,7 @@ impl SamWriter {
                     -paired_aln.insert_size, // Negative for mate2 (mode 1 default)
                     params,
                 ),
-                max_output, // NH = number of reported alignments
+                n_alignments, // NH counts them all, reported or not (observed from STAR)
                 hit_index,
                 params.out_sam_attr_ih_start,
                 combined_score,
@@ -538,13 +584,16 @@ impl SamWriter {
                 records.push(rec2);
             }
         }
+        records.extend(primary_unmapped_mate);
 
         Ok(records)
     }
 
-    /// Build SAM records for a half-mapped pair (one mate mapped, one unmapped).
+    /// Build the SAM records of a single-mate alignment of a pair.
     ///
-    /// Returns 2 records: mate1 first, mate2 second (regardless of which is mapped).
+    /// Returns the mapped mate's record and the unmapped mate's. The caller sets
+    /// the flags that depend on the read's other alignments, and decides whether
+    /// the unmapped mate's record is written.
     ///
     /// **Mapped mate:** Normal alignment with FLAG 0x8 (mate unmapped).
     ///   RNEXT `*`, PNEXT 0, as STAR.
@@ -552,8 +601,7 @@ impl SamWriter {
     /// **Unmapped mate:** FLAG 0x4, uT:A:4, MAPQ 0, RNAME `*`, POS 0, RNEXT/PNEXT
     ///   at the mapped mate. SEQ/QUAL in forward orientation (no RC).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_half_mapped_records(
+    fn build_half_mapped_records(
         read_name: &str,
         mate1_seq: &[u8],
         mate1_qual: &[u8],
@@ -567,13 +615,10 @@ impl SamWriter {
         mate1_is_mapped: bool,
         genome: &Genome,
         params: &Parameters,
-        n_for_mapq: usize,
-    ) -> Result<Vec<RecordBuf>, Error> {
-        let mut records = Vec::with_capacity(2);
-
-        let n_alignments = 1usize;
-        let effective_n = n_alignments.max(n_for_mapq);
-        let mapq = calculate_mapq(effective_n, params.out_sam_mapq_unique);
+        mapq: u8,
+        n_alignments: usize,
+        hit_index: usize,
+    ) -> Result<(RecordBuf, RecordBuf), Error> {
         let attrs = params.out_sam_attributes;
         let rg_id_owned = params.primary_rg_id()?;
         let rg_id = rg_id_owned.as_deref();
@@ -654,7 +699,7 @@ impl SamWriter {
         if attrs.contains(SamAttributes::HI) {
             data.insert(
                 Tag::HIT_INDEX,
-                Value::from(params.out_sam_attr_ih_start as i32),
+                Value::from((hit_index - 1) as i32 + params.out_sam_attr_ih_start as i32),
             );
         }
         if attrs.contains(SamAttributes::AS) {
@@ -701,7 +746,6 @@ impl SamWriter {
             data.insert(Tag::new(b'M', b'D'), Value::String(BString::from(md)));
         }
         maybe_insert_rg_tag(&mut mapped_rec, rg_id);
-        apply_sam_flag_or_and(&mut mapped_rec, params);
         // Soft-clip the mapped mate's clipped bases (STAR convention), matching the
         // both-mapped path. No-op when the mapped mate has no clip.
         if mapped_clip5p > 0 || mapped_clip3p > 0 {
@@ -763,16 +807,7 @@ impl SamWriter {
             },
         );
 
-        // Order: mate1 first, mate2 second
-        if mate1_is_mapped {
-            records.push(mapped_rec);
-            records.push(unmapped_rec);
-        } else {
-            records.push(unmapped_rec);
-            records.push(mapped_rec);
-        }
-
-        Ok(records)
+        Ok((mapped_rec, unmapped_rec))
     }
 
     /// Build transcriptome-space SAM records for `--quantMode TranscriptomeSAM`.
@@ -5134,13 +5169,50 @@ mod tests {
         );
     }
 
+    /// The records of a one-mate alignment under `--outSAMunmapped Within`.
+    fn half_mapped_records(
+        mapped_transcript: &Transcript,
+        mate1_is_mapped: bool,
+        genome: &Genome,
+    ) -> Vec<RecordBuf> {
+        let params = Parameters::parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "r1.fq",
+            "r2.fq",
+            "--outSAMunmapped",
+            "Within",
+        ]);
+        let mate1_seq = [0, 1, 2, 3];
+        let mate2_seq = [3, 2, 1, 0];
+        let qual = [30, 30, 30, 30];
+        SamWriter::build_paired_records(
+            "read1",
+            &mate1_seq,
+            &qual,
+            &mate2_seq,
+            &qual,
+            0,
+            0,
+            0,
+            0,
+            &[PairedAlignmentResult::HalfMapped {
+                mapped_transcript: mapped_transcript.clone(),
+                mate1_is_mapped,
+            }],
+            genome,
+            &params,
+            1,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_build_half_mapped_flags() {
         use crate::align::transcript::Exon;
         use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             output_rank: 0,
@@ -5165,29 +5237,8 @@ mod tests {
             junction_strand: vec![],
         };
 
-        let mate1_seq = vec![0, 1, 2, 3]; // ACGT
-        let mate1_qual = vec![30, 30, 30, 30];
-        let mate2_seq = vec![3, 2, 1, 0]; // TGCA
-        let mate2_qual = vec![30, 30, 30, 30];
-
         // mate1 is mapped
-        let records = SamWriter::build_half_mapped_records(
-            "read1",
-            &mate1_seq,
-            &mate1_qual,
-            &mate2_seq,
-            &mate2_qual,
-            0,
-            0,
-            0,
-            0,
-            &mapped_transcript,
-            true, // mate1_is_mapped
-            &genome,
-            &params,
-            1,
-        )
-        .unwrap();
+        let records = half_mapped_records(&mapped_transcript, true, &genome);
 
         assert_eq!(records.len(), 2);
 
@@ -5214,7 +5265,6 @@ mod tests {
         use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             output_rank: 0,
@@ -5239,28 +5289,7 @@ mod tests {
             junction_strand: vec![],
         };
 
-        let mate1_seq = vec![0, 1, 2, 3];
-        let mate1_qual = vec![30, 30, 30, 30];
-        let mate2_seq = vec![3, 2, 1, 0];
-        let mate2_qual = vec![30, 30, 30, 30];
-
-        let records = SamWriter::build_half_mapped_records(
-            "read1",
-            &mate1_seq,
-            &mate1_qual,
-            &mate2_seq,
-            &mate2_qual,
-            0,
-            0,
-            0,
-            0,
-            &mapped_transcript,
-            true,
-            &genome,
-            &params,
-            1,
-        )
-        .unwrap();
+        let records = half_mapped_records(&mapped_transcript, true, &genome);
 
         // mapped_pos = genome_start(2) - chr_start(0) + 1 = 3
         let expected_pos = 3usize;
@@ -5304,7 +5333,6 @@ mod tests {
         use cigar::op::{Kind, Op};
 
         let genome = make_test_genome();
-        let params = Parameters::parse_from(["rustar-aligner", "--readFilesIn", "r1.fq", "r2.fq"]);
 
         let mapped_transcript = Transcript {
             output_rank: 0,
@@ -5329,60 +5357,23 @@ mod tests {
             junction_strand: vec![],
         };
 
-        let mate1_seq = vec![0, 1, 2, 3];
-        let mate1_qual = vec![30, 30, 30, 30];
-        let mate2_seq = vec![3, 2, 1, 0];
-        let mate2_qual = vec![30, 30, 30, 30];
-
-        // When mate1 is mapped: mate1 comes first, mate2 second
-        let records_m1 = SamWriter::build_half_mapped_records(
-            "read1",
-            &mate1_seq,
-            &mate1_qual,
-            &mate2_seq,
-            &mate2_qual,
-            0,
-            0,
-            0,
-            0,
-            &mapped_transcript,
-            true,
-            &genome,
-            &params,
-            1,
-        )
-        .unwrap();
+        // The mapped mate comes first, whichever it is (observed from STAR).
+        let records_m1 = half_mapped_records(&mapped_transcript, true, &genome);
         assert!(records_m1[0].flags().is_first_segment()); // First record = mate1
         assert!(records_m1[1].flags().is_last_segment()); // Second record = mate2
 
-        // When mate2 is mapped: mate1 still comes first, mate2 second
-        let records_m2 = SamWriter::build_half_mapped_records(
-            "read1",
-            &mate1_seq,
-            &mate1_qual,
-            &mate2_seq,
-            &mate2_qual,
-            0,
-            0,
-            0,
-            0,
-            &mapped_transcript,
-            false,
-            &genome,
-            &params,
-            1,
-        )
-        .unwrap();
-        assert!(records_m2[0].flags().is_first_segment()); // First record = mate1 (unmapped)
-        assert!(records_m2[1].flags().is_last_segment()); // Second record = mate2 (mapped)
-        assert!(records_m2[0].flags().is_unmapped()); // mate1 is unmapped
-        assert!(!records_m2[1].flags().is_unmapped()); // mate2 is mapped
+        let records_m2 = half_mapped_records(&mapped_transcript, false, &genome);
+        assert!(records_m2[0].flags().is_last_segment()); // First record = mate2 (mapped)
+        assert!(records_m2[1].flags().is_first_segment()); // Second record = mate1 (unmapped)
+        assert!(!records_m2[0].flags().is_unmapped());
+        assert!(records_m2[1].flags().is_unmapped());
     }
 
     /// STAR writes the mate on the forward strand first (the mate of the
     /// transcript's first exon), so mate2 leads when mate1 is reverse.
     #[test]
     fn test_build_paired_records_forward_mate_first() {
+        use crate::align::read_align::PairedAlignment;
         use crate::align::transcript::Exon;
         use cigar::op::{Kind, Op};
 
@@ -5433,7 +5424,7 @@ mod tests {
                 0,
                 0,
                 0,
-                &[p],
+                &[PairedAlignmentResult::BothMapped(Box::new(p))],
                 &genome,
                 &params,
                 1,

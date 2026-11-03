@@ -492,20 +492,12 @@ pub fn wasp_type_pe(
 
         let (results, _chim, _n_for_mapq, _reason, _best) =
             align_paired_read(&remap1, &remap2, read_name, index, remap_params)?;
-        let both: Vec<&PairedAlignment> = results
-            .iter()
-            .filter_map(|r| match r {
-                PairedAlignmentResult::BothMapped(pa) => Some(pa.as_ref()),
-                PairedAlignmentResult::HalfMapped { .. } => None,
-            })
-            .collect();
-        if both.is_empty() {
+        let Some(PairedAlignmentResult::BothMapped(pa)) = results.first() else {
             return Ok(4); // re-map unmapped / half-mapped / too-many-loci
-        }
-        if both.len() > 1 {
+        };
+        if results.len() > 1 {
             return Ok(5);
         }
-        let pa = both[0];
         if !same_exons(&pa.mate1_transcript, tr1) || !same_exons(&pa.mate2_transcript, tr2) {
             return Ok(6);
         }
