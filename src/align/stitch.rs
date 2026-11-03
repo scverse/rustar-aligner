@@ -10,9 +10,9 @@ use noodles::sam::alignment::record::cigar;
 pub(crate) const PE_SPACER_BASE: u8 = 11;
 
 /// Sentinel score returned by end-to-end extension (`--alignEndsType`) when the
-/// forced extension runs into a chromosome boundary. STAR sets a large negative
-/// score here; we use it to reject the transcript in `finalize_transcript`.
-const EXTEND_TO_END_KILL: i32 = i32::MIN / 2;
+/// forced extension runs into a chromosome boundary: STAR's own value
+/// (`extendAlign.cpp:27`), which it adds to the transcript's score.
+const EXTEND_TO_END_KILL: i32 = -999_999_999;
 
 /// Count mismatches in an alignment by comparing read sequence to genome sequence.
 ///
@@ -2506,9 +2506,15 @@ fn wt_final_score(wt: &WorkingTranscript, scorer: &AlignmentScorer) -> i32 {
     match (wt.exons.first(), wt.exons.last()) {
         (Some(first), Some(last)) => {
             let span = last.genome_end - first.genome_start;
-            // Not floored: an end-to-end extension can take a transcript below zero,
-            // and then the window's score gate must reject it.
-            wt.score + scorer.genomic_length_penalty(span)
+            // STAR floors at 0 when it applies the penalty (`stitchWindowAligns.cpp:224`),
+            // which keeps a killed transcript at score 0. Only the merged mates keep
+            // kills (see `keep_end_to_end_kills`); elsewhere the gate must reject them.
+            let score = wt.score + scorer.genomic_length_penalty(span);
+            if scorer.keep_end_to_end_kills && scorer.score_genomic_length_log2_scale != 0.0 {
+                score.max(0)
+            } else {
+                score
+            }
         }
         _ => wt.score,
     }
@@ -2867,15 +2873,24 @@ fn stitch_recurse(
 
                 // An end-to-end extension that ran into a chromosome boundary kills the
                 // transcript: it cannot reach the read's end, and it may not be clipped.
-                if first_ext.max_score == EXTEND_TO_END_KILL
-                    || second_ext.max_score == EXTEND_TO_END_KILL
-                {
+                let killed = [&first_ext, &second_ext].map(|e| e.max_score == EXTEND_TO_END_KILL);
+                if killed.contains(&true) && !scorer.keep_end_to_end_kills {
                     break 'leaf;
                 }
 
                 // Apply the extensions to wt
-                if first_ext.extend_len > 0 || second_ext.extend_len > 0 {
+                if first_ext.extend_len > 0 || second_ext.extend_len > 0 || killed.contains(&true) {
                     mark = Some(wt.mark_ends());
+                }
+                // STAR adds a killed extension and goes on (`stitchWindowAligns.cpp:44-55`):
+                // no bases, the kill score and nMMmax+1 mismatches.
+                for (e, _) in [&first_ext, &second_ext]
+                    .iter()
+                    .zip(killed)
+                    .filter(|(_, k)| *k)
+                {
+                    wt.score += e.max_score;
+                    wt.n_mismatch += e.n_mismatch;
                 }
                 if do_left_first {
                     if first_ext.extend_len > 0 {
@@ -4067,6 +4082,7 @@ mod tests {
             intron_filter: crate::align::score::IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
         let cluster = SeedCluster {
             alignments: Vec::new(),
@@ -4360,6 +4376,7 @@ mod tests {
             intron_filter: crate::align::score::IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Left overhang (prev.length) = 3, below min of 5
@@ -4407,6 +4424,7 @@ mod tests {
             intron_filter: crate::align::score::IntronFilter::default(),
             multimap_score_range: 1,
             record_all_window_transcripts: false,
+            keep_end_to_end_kills: false,
         };
 
         // Both overhangs >= 5
