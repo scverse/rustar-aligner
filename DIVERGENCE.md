@@ -175,9 +175,9 @@ A rustar-aligner extension with no STAR equivalent, off by default (`No`). With 
 
 **Needs maintainer sign-off.**
 
-**What STAR does.** Observed output, source not read: STAR 2.7.11b stops with a bus error (exit 138) on a read pair with `--chimMultimapNmax 20 --chimJunctionOverhangMin 1`, where rustar-aligner on `main` stalled in `place()` because the trailing segment's new length was not positive.
+**What STAR does.** When the trailing segment's first block ends before the leading segment's last block starts, `jRmax` is clamped to 0 and the new block length `roStart1+L-roStart0-jRbest-1` (`ReadAlign_chimericDetectionOld.cpp:154-155`, `:253-256`; the same formula in `ChimericAlign_chimericStitching.cpp`) is negative in a `uint`, so it wraps. STAR 2.7.11b then stops with a bus error (exit 138) on a read pair with `--chimMultimapNmax 20 --chimJunctionOverhangMin 1`, where rustar-aligner on `main` stalled in `place()` on the same wrapped length. A block that ends exactly where the other starts gets length 0, which STAR keeps.
 
-**What rustar-aligner does.** It rejects that candidate, reports no chimera for it, and carries on with exit 0.
+**What rustar-aligner does.** It rejects only the negative case, reports no chimera for it, and carries on with exit 0. The length-0 case is kept, as in STAR, and the overhang filters decide it.
 
 **Why.** A run should not die on one read, and there is no STAR output to match. Stopping with an error instead would be a one-line change.
 

@@ -662,15 +662,13 @@ fn place(
         }
     };
 
-    let jr_max = {
-        let m = ro_start1 + l1;
-        if m > ro_start0 { m - ro_start0 - 1 } else { 0 }
-    };
-    // The trailing segment ends before the leading one's last block: no junction
-    // to scan for, and a length below would go negative.
-    if jr_max == 0 {
+    // The trailing segment ends before the leading one's last block starts: its
+    // new length below would be negative, which crashes STAR (DIVERGENCE.md 1.9).
+    // Ending exactly there leaves length 0, which STAR keeps, and so do we.
+    if ro_start1 + l1 <= ro_start0 {
         return None;
     }
+    let jr_max = ro_start1 + l1 - ro_start0 - 1;
     let (mut motif, mut jr_best) = (0i32, 0i64);
     let (mut j_score, mut j_score_best) = (0i32, -999_999i32);
     let mut jr = 0i64;
@@ -718,12 +716,8 @@ fn place(
         jr += 1;
     }
 
-    // The mate-spacer skip above can leave `jr_best` at `jr_max`, with nothing left
-    // of the trailing segment.
+    // At least 0: the mate-spacer skip above can leave `jr_best` at `jr_max`, no further.
     let new_l1 = jr_max - jr_best;
-    if new_l1 <= 0 {
-        return None;
-    }
 
     // Shift the junction.
     let jr_best = jr_best as usize;
@@ -1504,9 +1498,10 @@ mod tests {
     }
 
     /// The scan skips offset 30 (mate 1's length) and so can settle on
-    /// `jr_best == jr_max`, leaving a trailing block of length 0.
+    /// `jr_best == jr_max`, leaving a trailing block of length 0. STAR keeps such
+    /// a candidate (the overhang filters drop it later), and so does `place`.
     #[test]
-    fn place_rejects_a_junction_leaving_no_trailing_bases() {
+    fn place_keeps_a_junction_leaving_no_trailing_bases() {
         let gn = genome();
         let mut fwd = slice(&gn, 100, 61);
         fwd[30] = 5;
@@ -1518,7 +1513,8 @@ mod tests {
         let t0 = wintr(vec![exon(100, 0, 40, 0)], vec![], 10);
         let t1 = wintr(vec![exon(g1, 20, 12, 0)], vec![], 10);
         let prm = params(&["--chimScoreJunctionNonGTAG", "0"]);
-        assert!(place(t0, t1, 0, &read, &gn, &prm).is_none());
+        let placed = place(t0, t1, 0, &read, &gn, &prm).expect("kept, as in STAR");
+        assert_eq!(placed.t1.exons[0].l, 0);
     }
 
     /// A single-end read, half chr0 and half chr1: the old detector pins the
