@@ -13,6 +13,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- `test/parity_suite.sh` runs on macOS. It called GNU `time -f`, compared a
+  padded `wc -l` count, and passed `zcat`, which on macOS reads only `.Z`
+  files: both tools read 0 reads, exited 0, and every comparison came out
+  "identical". It now times with Python, uses `gzcat` where it exists, and
+  `parity_compare.py` warns when either tool read 0 reads.
 - Third-party notices completed. `LICENSES/` gains the licences of code
   ported from DegNorm (MIT) and David Elworthy's `sgt.h` via STAR (BSD
   2-clause), and of libc++ (Apache 2.0 with LLVM Exceptions), whose random

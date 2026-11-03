@@ -5,7 +5,9 @@
 #   DATA=path/to/testdata STAR=path/to/STAR RUSTAR=target/release/rustar-aligner \
 #     test/parity_suite.sh fetch|index|run|compare|all
 #
-# Needs curl, seqtk, samtools and python3. THREADS (default 8) sets --runThreadN. Files already
+# Needs curl, seqtk, samtools and python3; runs on Linux and macOS. On macOS, Homebrew's STAR
+# stops on geneInfo.tab with --quantMode or --soloType, so use a STAR built for Linux there.
+# THREADS (default 8) sets --runThreadN. Files already
 # in $DATA are reused, so a slow download (the two ERR12389696 files are 1.6 GB each) can be
 # replaced by copies checked against ENA's MD5s.
 # Data (all public, pinned):
@@ -59,7 +61,7 @@ fetch() {
     local h=$P/chr21/ERR188021_2M_$m.fastq.gz
     if [ ! -s "$h" ]; then
       head_fq "https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR188/ERR188021/ERR188021_$m.fastq.gz" 8000000 > "$h.part"
-      [ "$(gunzip -c "$h.part" | wc -l)" = 8000000 ] && mv "$h.part" "$h" \
+      [ "$(gunzip -c "$h.part" | wc -l | tr -d " ")" = 8000000 ] && mv "$h.part" "$h" \
         || { echo "ERR188021_$m: download incomplete" >&2; exit 1; }
     fi
     get "$NFC/$MODULES/$g/test_starfusion_rnaseq_$m.fastq.gz" "$P/fusion/test_starfusion_rnaseq_$m.fastq.gz"
@@ -74,7 +76,18 @@ fetch() {
 
 TOOLS=(star rustar)
 bin() { [ "$1" = star ] && echo "$STAR" || echo "$RUSTAR"; }
-timed() { /usr/bin/time -f "%e %M" -o "$1" "${@:2}"; }
+# timed FILE CMD...: run CMD and write "wall-seconds peak-RSS-KB" to FILE, as GNU
+# `time -f "%e %M"` does; macOS's /usr/bin/time has no -f.
+TIMED='import resource, subprocess, sys, time
+t = time.time(); rc = subprocess.call(sys.argv[2:])
+rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss  # bytes on macOS, KB on Linux
+kb = rss // 1024 if sys.platform == "darwin" else rss
+open(sys.argv[1], "w").write("%.2f %d\n" % (time.time() - t, kb))
+sys.exit(rc)'
+timed() { python3 -c "$TIMED" "$@"; }
+# macOS's zcat only reads .Z files; gzcat is its gzip one. One word, as --readFilesCommand
+# takes one on main.
+ZCAT=$(command -v gzcat || echo zcat)
 
 index() {  # genome fasta gtf sjdbOverhang SAindexNbases [extra args]
   for t in "${TOOLS[@]}"; do
@@ -99,7 +112,7 @@ align() {  # name genome args...
   for t in "${TOOLS[@]}"; do
     local o=$P/out/${t}_$name/; mkdir -p "$o"
     timed "$o/time.txt" "$(bin $t)" --runThreadN "$THREADS" --genomeDir "$P/idx/${t}_$g" \
-      --readFilesCommand zcat --outFileNamePrefix "$o" "$@" > "$o/stdout.txt" 2>&1 \
+      --readFilesCommand "$ZCAT" --outFileNamePrefix "$o" "$@" > "$o/stdout.txt" 2>&1 \
       || echo "FAIL $t $name" >&2
   done
 }
