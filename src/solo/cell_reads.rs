@@ -9,25 +9,15 @@
 //! `CBnotInPasslist` row, so the columns account for every read rather than
 //! only the ones that succeeded.
 //!
-//! # D24: row order
+//! # Row order (DIVERGENCE.md 3.2)
 //!
-//! STAR iterates a libc++ `std::unordered_map` to emit these rows, so the order
-//! is a hash-table walk, not a sort. For the small maps this produces, libc++
-//! chains new entries at the head of their bucket and walks buckets in order,
-//! which comes out as the reverse of first appearance in read order. That is
-//! what this reproduces.
-//!
-//! It is not reproducible in general: past the load factor libc++ rehashes, and
-//! the order after a rehash depends on the bucket count, which depends on how
-//! many distinct barcodes were seen. At that size the order diverges. The
-//! **values never do** — only which line they appear on. A consumer that reads
-//! this file by barcode rather than by position is unaffected either way, and
-//! sorting by barcode is the only stable thing to do with it.
-//!
-//! Reads are folded in under a mutex held by `SoloContext`, so the order is the
-//! order reads were processed in regardless of thread count.
+//! STAR walks a `std::unordered_map` to emit these rows, so its order is the
+//! standard library's hash-table layout, not a sort. rustar-aligner writes the
+//! cell rows in whitelist order (sorted by barcode) instead. That does not
+//! depend on the thread count or on which thread saw a barcode first. The
+//! **values** are the same either way; only which line a barcode is on differs.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// What happened to one read, as the fourteen optional flags STAR tracks.
@@ -73,13 +63,10 @@ pub struct CellReadFlag {
 /// The accumulator behind `CellReads.stats`.
 #[derive(Debug, Default, Clone)]
 pub struct CellReadStats {
-    /// Whitelist index to its fifteen counters.
+    /// Whitelist index to its fifteen counters; also the output row order.
     cells: BTreeMap<u32, [u64; 15]>,
     /// The single bucket for reads whose barcode did not resolve.
     no_cb: [u64; 15],
-    /// Whitelist indices in first-appearance order; emitted reversed (D24).
-    order: Vec<u32>,
-    seen: HashSet<u32>,
 }
 
 impl CellReadStats {
@@ -116,9 +103,6 @@ impl CellReadStats {
 
     /// Record a read that resolved to whitelist cell `cb`.
     pub fn add_cell(&mut self, cb: u32, flag: &CellReadFlag) {
-        if self.seen.insert(cb) {
-            self.order.push(cb);
-        }
         Self::fold(self.cells.entry(cb).or_insert([0; 15]), flag);
     }
 
@@ -146,10 +130,10 @@ impl CellReadStats {
             s.push_str(&v.to_string());
         }
         s.push_str("\t0\t0\t0\t0\n");
-        // Reverse first-appearance order — see D24 in the module docs.
-        for &cb in self.order.iter().rev() {
+        // Whitelist order, whatever order the threads folded reads in.
+        for (&cb, counts) in &self.cells {
             s.push_str(&barcode_of(cb));
-            for v in &self.cells[&cb] {
+            for v in counts {
                 s.push('\t');
                 s.push_str(&v.to_string());
             }
@@ -245,22 +229,25 @@ mod tests {
         assert_eq!(&row[16..], ["0", "0", "0", "0"], "no UMI columns for it");
     }
 
-    /// D24: rows come out in reverse first-appearance order, which is what
-    /// STAR's libc++ hash-map walk produces at these sizes.
+    /// Rows come out in whitelist order whatever order the reads arrived in,
+    /// so a threaded run writes the same file as a serial one.
     #[test]
-    fn rows_are_emitted_in_reverse_first_appearance_order() {
-        let mut st = CellReadStats::new();
-        for cb in [4u32, 1, 9] {
-            st.add_cell(cb, &flag_perfect_counted());
-        }
-        st.add_cell(1, &flag_perfect_counted()); // seen again: order unchanged
-        let out = st.render(|i| format!("CB{i}"), &BTreeMap::new());
+    fn rows_follow_whitelist_order_not_arrival_order() {
+        let render = |arrival: &[u32]| {
+            let mut st = CellReadStats::new();
+            for &cb in arrival {
+                st.add_cell(cb, &flag_perfect_counted());
+            }
+            st.render(|i| format!("CB{i}"), &BTreeMap::new())
+        };
+        let out = render(&[4, 1, 9, 1]);
         let cbs: Vec<&str> = out
             .lines()
             .skip(2)
             .map(|l| l.split('\t').next().unwrap())
             .collect();
-        assert_eq!(cbs, ["CB9", "CB1", "CB4"]);
+        assert_eq!(cbs, ["CB1", "CB4", "CB9"]);
+        assert_eq!(out, render(&[9, 1, 4, 1]));
     }
 
     /// The UMI and gene totals come from the final matrix, not from the read
@@ -269,8 +256,8 @@ mod tests {
     #[test]
     fn umi_and_gene_totals_come_from_the_matrix() {
         let mut st = CellReadStats::new();
-        st.add_cell(2, &flag_perfect_counted());
         st.add_cell(3, &flag_perfect_counted());
+        st.add_cell(2, &flag_perfect_counted());
         let mut umi_gene = BTreeMap::new();
         umi_gene.insert(2u32, (17u32, 5u32));
         let out = st.render(|i| format!("CB{i}"), &umi_gene);
@@ -279,10 +266,9 @@ mod tests {
             .skip(2)
             .map(|l| l.split('\t').collect())
             .collect();
-        // Reverse order: CB3 first, then CB2.
-        assert_eq!(rows[0][0], "CB3");
-        assert_eq!(&rows[0][16..18], ["0", "0"]);
-        assert_eq!(rows[1][0], "CB2");
-        assert_eq!(&rows[1][16..18], ["17", "5"]);
+        assert_eq!(rows[0][0], "CB2");
+        assert_eq!(&rows[0][16..18], ["17", "5"]);
+        assert_eq!(rows[1][0], "CB3");
+        assert_eq!(&rows[1][16..18], ["0", "0"]);
     }
 }

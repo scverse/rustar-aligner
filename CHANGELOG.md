@@ -232,6 +232,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`CellReads.stats` no longer changes with `--runThreadN`.** The cell rows
+  were written in reverse order of first appearance, taken from whichever
+  thread finished a read first, so the same input gave the same rows in a
+  different order at 1, 4 and 8 threads. They are now written in whitelist
+  order (sorted by barcode). STAR's order is a libstdc++ hash-table walk that
+  is not reproduced; DIVERGENCE.md 3.2 says why.
+
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
   written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull
