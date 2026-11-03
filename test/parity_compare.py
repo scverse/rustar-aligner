@@ -111,6 +111,10 @@ def align(a, b, name):
     diff = [f"{x.split('|')[0].strip()}: {x.split('|')[1].strip()} vs {y.split('|')[1].strip()}"
             for x, y in zip(la, lb) if x != y and "|" in x and "|" in y]
     print("   Log.final.out: " + ("identical" if la == lb else "; ".join(diff) or "differs"))
+    for tool, log in (("STAR", la), ("rustar-aligner", lb)):
+        n = next((x.split("|")[1].strip() for x in log if "Number of input reads" in x), "")
+        if n == "0":  # a --readFilesCommand that read nothing still exits 0
+            print(f"   WARNING: {tool} read 0 reads; check --readFilesCommand ({name})")
     sa = os.path.join(a, "Solo.out")
     if os.path.isdir(sa):
         sb = os.path.join(b, "Solo.out")
