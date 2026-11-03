@@ -239,7 +239,8 @@ Sections commonly used: Features, Bug fixes, Other changes.
   counts for a gene in a stranded column when an exon it overlaps is on that
   strand. A transcript with strand `.` is strand 0 in `transcriptInfo.tab`
   and `exonGeTrInfo.tab` (it was 1), and its exons count in both stranded
-  columns, as in STAR.
+  columns, as in STAR. STARsolo's `tr_strand == 1` test now treats such a
+  transcript as reverse, also as STAR does.
 
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
