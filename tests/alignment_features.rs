@@ -3154,8 +3154,88 @@ fn align_pair(
         .collect()
 }
 
+/// Contigs far smaller than the default 2^16 window bin: an index built with
+/// `--genomeChrBinNbits 11` must cap winBinNbits at 11 at mapping time, although
+/// the mapping command line does not repeat that option. Otherwise contigs share
+/// a bin, reads are lost as "too short" and repeats are reported as unique.
+/// Expected numbers are STAR 2.7.11b's on this genome and these reads.
+#[test]
+fn test_window_bins_capped_by_the_index_chr_bins() {
+    let tmpdir = TempDir::new().unwrap();
+    let sequence = xorshift_seq(0x9E37_79B9_7F4A_7C15, 700_000);
+    let repeat = &sequence[..200];
+    let mut fasta = String::new();
+    let mut reads = String::new();
+    let mut add_read = |name: String, seq: &[u8]| {
+        let seq = String::from_utf8_lossy(seq);
+        reads += &format!("@{name}\n{seq}\n+\n{}\n", "I".repeat(seq.len()));
+    };
+    let mut start = 200;
+    for i in 0..200usize {
+        let len = 2000 + (i * 13) % 1500;
+        let mut contig = sequence[start..start + len].to_vec();
+        start += len;
+        if i < 4 {
+            contig[500..700].copy_from_slice(repeat);
+        }
+        fasta += &format!(">c{i}\n{}\n", String::from_utf8_lossy(&contig));
+        for st in [0, 300, 900, len - 100] {
+            let read = &contig[st..st + 100];
+            if i % 2 == 0 {
+                add_read(format!("r{i}_{st}"), read);
+            } else {
+                add_read(format!("r{i}_{st}"), &rc(read));
+            }
+        }
+    }
+    add_read("rep".to_string(), &repeat[20..120]);
+    let fa_path = tmpdir.path().join("contigs.fa");
+    fs::write(&fa_path, fasta).unwrap();
+    let fq_path = tmpdir.path().join("reads.fq");
+    fs::write(&fq_path, reads).unwrap();
+    let genome_dir = tmpdir.path().join("idx");
+    fs::create_dir_all(&genome_dir).unwrap();
+    cargo_bin_cmd!("rustar-aligner")
+        .arg("--runMode")
+        .arg("genomeGenerate")
+        .arg("--genomeDir")
+        .arg(&genome_dir)
+        .arg("--genomeFastaFiles")
+        .arg(&fa_path)
+        .args(["--genomeSAindexNbases", "8", "--genomeChrBinNbits", "11"])
+        .arg("--outFileNamePrefix")
+        .arg(genome_dir.join("run_"))
+        .assert()
+        .success();
+    let prefix = tmpdir.path().join("out_");
+    cargo_bin_cmd!("rustar-aligner")
+        .arg("--genomeDir")
+        .arg(&genome_dir)
+        .arg("--readFilesIn")
+        .arg(&fq_path)
+        .arg("--outFileNamePrefix")
+        .arg(&prefix)
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(tmpdir.path().join("out_Log.final.out")).unwrap();
+    let value = |label: &str| {
+        log.lines()
+            .find(|l| l.contains(label))
+            .and_then(|l| l.split('|').nth(1))
+            .map(|v| v.trim().to_string())
+            .unwrap()
+    };
+    assert_eq!(value("Uniquely mapped reads number"), "800");
+    assert_eq!(value("Number of reads mapped to multiple loci"), "1");
+    assert_eq!(value("Number of reads unmapped: too short"), "0");
+    let sam = fs::read_to_string(tmpdir.path().join("out_Aligned.out.sam")).unwrap();
+    let rep = sam.lines().filter(|l| l.starts_with("rep\t")).count();
+    assert_eq!(rep, 4);
+}
+
 /// A pair whose mates are both spliced across 420 kb introns spans 840 kb,
-/// more than winBinNbits*winAnchorDistNbins (589,824). With alignIntronMax and
+/// more than 2^winBinNbits * winAnchorDistNbins (589,824). With alignIntronMax and
 /// alignMatesGapMax at 0, STAR puts the whole pair in one window and reports it;
 /// rustar-aligner used to reject any pair spanning more than that distance.
 /// Expected alignments are STAR 2.7.11b's on this genome.
