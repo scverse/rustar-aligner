@@ -267,17 +267,17 @@ There are none at present. The four yeast PE reads once listed here now match ST
 
 ---
 
-### 3.5 `Genome` file: one byte of a flank past the genome end
+### 3.5 `SAindex` after a junction flank past the genome end
 
-**What STAR does.** A junction's acceptor flank that runs past the end of the genome reads STAR's padding after `G`. With a last chromosome ending at the bin boundary minus 2, `--sjdbOverhang 100` and an acceptor 97 bases from the end, the flank's last three bases lie past the end, and STAR's `Genome` holds `5 5 0` for them.
+**What STAR does.** At `genomeGenerate`, STAR keeps the reverse strand right after `G` (`Genome_genomeGenerate.cpp:176-181`) and copies junction flanks straight from `G` (`sjdbPrepare.cpp:210-211`), so an acceptor flank running past the end of the genome reads `comp(G[2n-1-p])`: the padding, then the complement of the last bases. At mapping time that strand is not in memory and the same flank reads spacers.
 
-**What rustar-aligner does.** It writes spacers for the whole missing part: `5 5 5`.
+**What rustar-aligner does.** The same (`build_gsj`, `mirror_past_end`). On a last contig of 4094 bases with exons 3000-3100 and 4000-4094, `--sjdbOverhang 100 --genomeChrBinNbits 12`, `Genome`, `SA`, `sjdbList.out.tab` and `sjdbInfo.txt` are byte-identical to STAR's whether the last base is `T` or `G`. `SAindex` is identical for `T`; for `G`, 2 of its bytes differ.
 
-**Why.** The `0` is not explained by STAR's output, and its source was not read for this. The padding is spacers everywhere else, and a donor flank past the genome's start matches STAR byte for byte.
+**Why.** Not found: the `SAindex` difference was measured, not explained.
 
-**Impact.** Only a junction whose acceptor flank overruns the genome's end by at least three bases, which used to stop the run. That byte also moves `SA` and `SAindex` entries for the suffixes crossing it. A read would have to span the end of that flank to notice.
+**Impact.** Only a junction whose acceptor flank overruns the genome's end, which used to stop the run. The two bytes are SAindex entries for prefixes that cross the end of that flank.
 
-**Source.** `src/junction/sjdb_insert.rs` (`build_gsj`), locked by `build_gsj_pads_an_acceptor_flank_past_the_genome_end`.
+**Source.** `src/junction/sjdb_insert.rs` (`build_gsj`), locked by `build_gsj_acceptor_flank_past_the_genome_end`.
 
 ## 4. Implementation divergences (no intended output difference)
 

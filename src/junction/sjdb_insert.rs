@@ -515,11 +515,17 @@ fn merge_cross_strand(
 /// Callers supply junctions in sorted/deduplicated order (via
 /// [`sort_and_dedup`]). `genome` is read through
 /// `Genome::sequence[..n_genome_real]`.
+///
+/// `mirror_past_end`: at `genomeGenerate` STAR keeps the reverse strand right
+/// after `G` (`Genome_genomeGenerate.cpp:176-181`), so an acceptor flank past
+/// the end reads `comp(G[2n-1-p])`. At mapping it is not there and STAR reads
+/// spacers, as for a donor flank before the start.
 pub fn build_gsj(
     junctions: &[PreparedJunction],
     genome: &Genome,
     n_genome_real: u64,
     sjdb_overhang: u32,
+    mirror_past_end: bool,
 ) -> Result<Vec<u8>, Error> {
     let overhang = sjdb_overhang as usize;
     let sjdb_length = 2 * overhang + 1;
@@ -534,7 +540,8 @@ pub fn build_gsj(
         }
 
         // A flank running past either end of the genome keeps its spacer bytes
-        // for the missing part, what STAR reads from the padding around G.
+        // for the missing part, what STAR reads from the padding around G,
+        // except past the end at genomeGenerate (`mirror_past_end`).
         let base = i * sjdb_length;
         let donor_len = overhang.min(start);
         gsj[base + overhang - donor_len..base + overhang]
@@ -542,6 +549,13 @@ pub fn build_gsj(
         let acceptor_len = overhang.min(forward.len() - a0);
         gsj[base + overhang..base + overhang + acceptor_len]
             .copy_from_slice(&forward[a0..a0 + acceptor_len]);
+        if mirror_past_end {
+            let n = forward.len();
+            for k in acceptor_len..overhang.min(2 * n - a0) {
+                let b = forward[2 * n - 1 - (a0 + k)];
+                gsj[base + overhang + k] = if b < 4 { 3 - b } else { b };
+            }
+        }
         // base + 2*overhang = trailing spacer, already initialized.
     }
 
@@ -893,7 +907,7 @@ mod tests {
         f[203] = 1;
         let g = make_test_genome(f);
         let junction = pj(0, 100, 200, 1, 0, 1);
-        let gsj = build_gsj(&[junction], &g, g.n_genome, 3).unwrap();
+        let gsj = build_gsj(&[junction], &g, g.n_genome, 3, true).unwrap();
         assert_eq!(gsj, vec![0, 1, 2, 3, 0, 1, GSJ_SPACING]);
     }
 
@@ -917,7 +931,7 @@ mod tests {
         // start_pos/end_pos are SHIFTED (stored form for motif==0).
         // With shift_left=2, original_start = 102, original_end = 199.
         let junction = pj(0, 100, 197, 0, 2, 0);
-        let gsj = build_gsj(&[junction], &g, g.n_genome, 4).unwrap();
+        let gsj = build_gsj(&[junction], &g, g.n_genome, 4, true).unwrap();
         // Donor: forward[98..102] = [0,1,2,3]
         // Acceptor: forward[200..204] = [2,3,0,1]
         assert_eq!(gsj, vec![0, 1, 2, 3, 2, 3, 0, 1, GSJ_SPACING]);
@@ -941,7 +955,7 @@ mod tests {
         let g = make_test_genome(f);
         let a = pj(0, 100, 200, 1, 0, 1);
         let b = pj(0, 300, 350, 1, 0, 1);
-        let gsj = build_gsj(&[a, b], &g, g.n_genome, 2).unwrap();
+        let gsj = build_gsj(&[a, b], &g, g.n_genome, 2, true).unwrap();
         // sjdb_length = 5 (2 donor + 2 acceptor + 1 spacer) per junction.
         assert_eq!(
             gsj,
@@ -964,25 +978,32 @@ mod tests {
     fn build_gsj_pads_a_donor_flank_before_the_genome_start() {
         let g = make_test_genome((0..300).map(|i| (i % 4) as u8).collect());
         let near = pj(0, 3, 200, 1, 0, 1); // original_start=3, overhang 10
-        let gsj = build_gsj(&[near], &g, g.n_genome, 10).unwrap();
+        let gsj = build_gsj(&[near], &g, g.n_genome, 10, true).unwrap();
         // Seven spacers, then bases 0..3, then the acceptor from original_end+1.
         assert_eq!(&gsj[..10], &[5, 5, 5, 5, 5, 5, 5, 0, 1, 2]);
         assert_eq!(gsj[10], (201 % 4) as u8);
     }
 
+    /// Past the end STAR reads its reverse strand at genomeGenerate, `comp(G[2n-1-p])`,
+    /// and spacers at mapping.
     #[test]
-    fn build_gsj_pads_an_acceptor_flank_past_the_genome_end() {
-        let g = make_test_genome(vec![0u8; 300]);
+    fn build_gsj_acceptor_flank_past_the_genome_end() {
+        let g = make_test_genome((0..300).map(|i| (i % 4) as u8).collect());
         let near = pj(0, 50, 294, 1, 0, 1); // acceptor starts at 295: five real bases
-        let gsj = build_gsj(&[near], &g, g.n_genome, 10).unwrap();
-        assert_eq!(&gsj[10..20], &[0, 0, 0, 0, 0, 5, 5, 5, 5, 5]);
+        let real = [3, 0, 1, 2, 3];
+        let generate = build_gsj(std::slice::from_ref(&near), &g, g.n_genome, 10, true).unwrap();
+        assert_eq!(&generate[10..15], &real);
+        assert_eq!(&generate[15..20], &[0, 1, 2, 3, 0]); // comp of bases 299, 298, ..., 295
+        let mapping = build_gsj(&[near], &g, g.n_genome, 10, false).unwrap();
+        assert_eq!(&mapping[10..15], &real);
+        assert_eq!(&mapping[15..20], &[5, 5, 5, 5, 5]);
     }
 
     #[test]
     fn build_gsj_errors_when_the_intron_overruns_the_genome() {
         let g = make_test_genome(vec![0u8; 300]);
         let bad = pj(0, 50, 400, 1, 0, 1);
-        let err = build_gsj(&[bad], &g, g.n_genome, 10).unwrap_err();
+        let err = build_gsj(&[bad], &g, g.n_genome, 10, true).unwrap_err();
         assert!(format!("{err}").contains("overruns"));
     }
 

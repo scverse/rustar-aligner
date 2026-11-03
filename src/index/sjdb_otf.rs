@@ -239,7 +239,7 @@ pub fn insert_junctions(
         chr_length: genome.chr_length.clone(),
         chr_start: genome.chr_start.clone(),
     };
-    let gsj = sjdb_insert::build_gsj(&all, &real_genome, n_real, overhang)?;
+    let gsj = sjdb_insert::build_gsj(&all, &real_genome, n_real, overhang, false)?;
     // STAR's working `Gsj` array: forward blocks, their reverse complement,
     // then a terminating spacer (`sjdbBuildIndex.cpp:31-40`).
     let mut gsj2 = Vec::with_capacity(2 * gsj.len() + 1);
