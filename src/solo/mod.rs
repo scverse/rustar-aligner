@@ -32,6 +32,7 @@ use crate::error::Error;
 use crate::io::fastq::{EncodedRead, FastqReader, decode_base};
 use crate::params::{Parameters, SoloType};
 use crate::quant::GeneAnnotation;
+use crate::solo::cell_reads::{CellReadEntry, ReadCb};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1288,9 +1289,10 @@ pub struct SoloContext {
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
     pub want_multi: bool,
-    /// `--soloCellReadStats CB`: the per-cell read summary, or `None` when the
-    /// flag is off. Behind a mutex like the other per-read collections; the
-    /// lock is only taken when the flag asks for the file.
+    /// `--soloCellReadStats Standard`: the per-cell read summary, or `None`
+    /// when the flag is off. Each read's entry rides in its
+    /// [`SoloReadOutcome`] and is folded by the in-order consumer, one lock
+    /// per batch ([`SoloContext::fold_cell_reads`]).
     pub cell_read_stats: Option<Mutex<crate::solo::cell_reads::CellReadStats>>,
     /// Chromosome indices named by `--genomeChrSetMitochondrial`, for the
     /// `mito` column.
@@ -1404,6 +1406,9 @@ pub struct SoloReadOutcome {
     /// Barcode facts for the per-read SAM tags. `None` when the barcode read was
     /// too short to extract a CB+UMI at all.
     pub barcode: Option<SoloBarcodeTags>,
+    /// This read's `CellReads.stats` entry, when `--soloCellReadStats` asked
+    /// for the file; the consumer folds it in input order.
+    pub cell_read: Option<crate::solo::cell_reads::CellReadEntry>,
 }
 
 impl SoloReadOutcome {
@@ -1621,6 +1626,13 @@ impl SoloContext {
                 (tags || velocyto).then(|| Mutex::new(Vec::new()))
             })
             .collect();
+        let n_features = features.len();
+        let has_whitelist = !matches!(whitelist, CbWhitelist::NoWhitelist { .. });
+        if params.solo_cell_read_stats == "CB" {
+            log::warn!(
+                "--soloCellReadStats CB is deprecated: use Standard, STAR's name for the same file"
+            );
+        }
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
             whitelist,
@@ -1641,8 +1653,14 @@ impl SoloContext {
             velocyto_enabled,
             velocyto_records: Mutex::new(VelocytoRecords::default()),
             want_multi,
-            cell_read_stats: (params.solo_cell_read_stats == "CB")
-                .then(|| Mutex::new(crate::solo::cell_reads::CellReadStats::new())),
+            cell_read_stats: params.solo_cell_read_stats_yes().then(|| {
+                Mutex::new(crate::solo::cell_reads::CellReadStats::new(
+                    n_features,
+                    params.solo_cb_match_type().one_exact(),
+                    want_multi,
+                    has_whitelist,
+                ))
+            }),
             mito_chr: params
                 .genome_chr_set_mitochondrial
                 .iter()
@@ -1950,11 +1968,24 @@ impl SoloContext {
             }
         }
 
+        // `CellReads.stats` counts every read, whatever its barcode did.
+        let mut cell_flags = self
+            .cell_read_stats
+            .is_some()
+            .then(|| self.cell_read_flags(cdna_transcripts, n_loci, &class));
+        let no_cb_entry = |flags: &mut Option<Vec<u16>>| {
+            flags.take().map(|flags| CellReadEntry {
+                cb: ReadCb::None,
+                flags,
+            })
+        };
+
         // No barcode → nothing to count.
         let bc = match barcode {
             Ok(bc) => bc,
             Err(miss) => {
                 self.record_barcode_miss(miss);
+                out.cell_read = no_cb_entry(&mut cell_flags);
                 return out;
             }
         };
@@ -1980,11 +2011,16 @@ impl SoloContext {
         let cb_resolved: Option<u32> = match &cb_match {
             CbMatch::Exact(idx) | CbMatch::Corrected(idx) => Some(*idx),
             CbMatch::Multi(_) => None, // deferred to collation
-            CbMatch::NoMatch | CbMatch::NinCb | CbMatch::MultMatchRejected => return out,
+            CbMatch::NoMatch | CbMatch::NinCb | CbMatch::MultMatchRejected => {
+                out.cell_read = no_cb_entry(&mut cell_flags);
+                return out;
+            }
         };
 
-        // UMI validity.
+        // UMI validity. A rejected UMI replaces the read's `cbMatch` with a
+        // negative code, so `CellReads.stats` has it under `CBnotInPasslist`.
         let UmiCheck::Ok(umi) = umi_status else {
+            out.cell_read = no_cb_entry(&mut cell_flags);
             return out;
         };
 
@@ -2136,14 +2172,17 @@ impl SoloContext {
         // The read's `cbMatch` is >= 0 here: STAR's `SoloReadFeature::record`
         // counts it for every feature.
         self.record_feature_stats(n_loci, &class, &out, code == 0, junctions);
-        self.record_cell_read(
-            cb_resolved,
-            &cb_match,
-            n_loci,
-            &class,
-            cdna_transcripts,
-            &out,
-        );
+        out.cell_read = cell_flags.map(|flags| CellReadEntry {
+            cb: match cb_match {
+                CbMatch::Exact(idx) => ReadCb::Exact(idx),
+                CbMatch::Corrected(idx) => ReadCb::Corrected(idx),
+                CbMatch::Multi(cands) => ReadCb::Multi(cands),
+                CbMatch::NoMatch | CbMatch::NinCb | CbMatch::MultMatchRejected => {
+                    unreachable!("returned above")
+                }
+            },
+            flags,
+        });
         // Transcript3p: every transcript this read is concordant with, and how
         // far its 3' end sits from each transcript's. Uniquely-mapped reads
         // only — a read at several genomic loci says nothing about isoforms.
@@ -2165,52 +2204,62 @@ impl SoloContext {
         out
     }
 
-    /// Fold one read into `CellReads.stats`, when `--soloCellReadStats CB`
-    /// asked for it.
-    ///
-    /// Called at the end of read processing so the counted flags reflect what
-    /// the read actually produced, rather than what it looked eligible for.
-    #[allow(clippy::too_many_arguments)]
-    fn record_cell_read(
+    /// One read's read-stage `CellReads.stats` flags, per feature
+    /// (`SoloReadFeature_record.cpp:25-60`): `genomeU`/`genomeM` from its
+    /// number of loci, `mito` if any alignment is on a mitochondrial
+    /// chromosome, `featureU`/`featureM` from the size of the feature's gene
+    /// set, and the region bit from the feature's `ovType`. Only `Gene` has
+    /// one: `exonic` whenever it found a gene
+    /// (`Transcriptome_classifyAlign.cpp:262-263`); `GeneFull` sets none.
+    fn cell_read_flags(
         &self,
-        cb_resolved: Option<u32>,
-        cb_match: &CbMatch,
-        n_loci: usize,
-        class: &crate::solo::gene::ReadClass,
         transcripts: &[Transcript],
-        out: &SoloReadOutcome,
-    ) {
-        let Some(stats) = &self.cell_read_stats else {
-            return;
+        n_loci: usize,
+        class: &ReadClass,
+    ) -> Vec<u16> {
+        use crate::solo::cell_reads::bit;
+        let mut common = match n_loci {
+            0 => 0,
+            1 => bit::GENOME_U,
+            _ => bit::GENOME_M,
         };
-        let counted_u = out.per_feature.iter().any(|f| f.record.is_some());
-        let counted_m = out.per_feature.iter().any(|f| f.multi_gene.is_some());
-        let feature_u = counted_u || out.per_feature.iter().any(|f| f.multi.is_some());
-        let flag = crate::solo::cell_reads::CellReadFlag {
-            cb_perfect: matches!(cb_match, CbMatch::Exact(_)),
-            cb_mm_unique: matches!(cb_match, CbMatch::Corrected(_)),
-            cb_mm_multiple: matches!(cb_match, CbMatch::Multi(_)),
-            genome_u: n_loci == 1,
-            genome_m: n_loci > 1,
-            feature_u,
-            feature_m: counted_m,
-            // The region columns split by strand: STAR reports an antisense
-            // read under `exonicAS`/`intronicAS`, not under `exonic`/`intronic`.
-            exonic: !class.antisense && class.region == Some(Region::Exonic),
-            intronic: !class.antisense && class.region == Some(Region::Intronic),
-            exonic_as: class.antisense && class.region == Some(Region::Exonic),
-            intronic_as: class.antisense && class.region == Some(Region::Intronic),
-            mito: !self.mito_chr.is_empty()
-                && transcripts
-                    .iter()
-                    .any(|t| self.mito_chr.contains(&t.chr_idx)),
-            counted_u,
-            counted_m,
-        };
-        let mut stats = stats.lock().unwrap();
-        match cb_resolved {
-            Some(cb) => stats.add_cell(cb, &flag),
-            None => stats.add_no_cb(&flag),
+        if transcripts
+            .iter()
+            .any(|t| self.mito_chr.contains(&t.chr_idx))
+        {
+            common |= bit::MITO;
+        }
+        self.features
+            .iter()
+            .map(|&feature| {
+                let assignment = match feature {
+                    SoloFeature::Gene => class.gene,
+                    SoloFeature::GeneFull => class.gene_full,
+                };
+                let found = match assignment {
+                    GeneAssignment::Gene(_) => bit::FEATURE_U,
+                    GeneAssignment::Ambiguous => bit::FEATURE_M,
+                    GeneAssignment::NoFeature | GeneAssignment::Unmapped => 0,
+                };
+                let region = if feature == SoloFeature::Gene && found != 0 {
+                    bit::EXONIC
+                } else {
+                    0
+                };
+                common | found | region
+            })
+            .collect()
+    }
+
+    /// Fold a batch of reads' `CellReads.stats` entries, in input order.
+    pub fn fold_cell_reads(&self, entries: Vec<CellReadEntry>) {
+        if let Some(stats) = &self.cell_read_stats
+            && !entries.is_empty()
+        {
+            let mut stats = stats.lock().unwrap();
+            for e in entries {
+                stats.fold(e);
+            }
         }
     }
 

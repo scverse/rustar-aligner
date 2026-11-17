@@ -225,17 +225,15 @@ There are none at present. The four yeast PE reads once listed here now match ST
 
 ### 3.2 `CellReads.stats` row order
 
-**What STAR does.** `--soloCellReadStats CB` emits its rows by iterating a libc++ `std::unordered_map`, so the order is a hash-table walk rather than a sort. At the map sizes this produces, libc++ chains new entries at the head of their bucket and walks buckets in order, which comes out as the reverse of each barcode's first appearance in read order.
+**What STAR does.** `--soloCellReadStats Standard` writes its rows by iterating `readFlagCounts.flagCounts`, a `std::unordered_map` keyed by whitelist index and reserved at `nCB*3/2` buckets (`SoloCommon.h`, `SoloFeature_countCBgeneUMI.cpp`, `SoloFeature_statsOutput.cpp`), so the order is a hash-table walk rather than a sort.
 
-**What rustar-aligner does.** Emits that same reverse-first-appearance order, including across threads: the per-read accumulator merges in read order, so a threaded run writes the same file as a serial one.
+**What rustar-aligner does.** Writes the rows in reverse order of each barcode's first appearance in the reads. Each read's entry is folded by the in-order consumer of the alignment loop, so a threaded run writes the same file as a serial one. A read whose barcode is resolved only at the end (a one-mismatch correction under `oneExact`, or a 1MM_multi barcode) counts as appearing where it was read.
 
-**Why.** Reproducing the order where it is reproducible costs nothing and keeps a byte-comparison against STAR usable on the sizes where it can work at all.
+**Measured.** On CellRanger's tiny 10x data (6,982 barcodes), STAR 2.7.11b (macOS build) writes the same order at 1 and at 8 threads, and rustar-aligner's order matches it only on the first rows. A model of a libc++ walk (identity hash, the bucket a key modulo a prime, a node for an empty bucket at the front of the list), fed rustar-aligner's first-appearance order, does not reproduce STAR's order for any bucket count up to 12,000 or any of three barcode keys (sorted-whitelist rank, file position, packed sequence). What sets STAR's order is not settled, and it may differ between standard libraries.
 
-**Impact.** Past libc++'s load factor the map rehashes, and the order then depends on the bucket count, which depends on how many distinct barcodes were seen; beyond that size the order diverges. The **values never do** — only which line they appear on. Reading the file by barcode rather than by position is unaffected either way.
+**Why.** The values are what the file reports; the row order is an artefact of STAR's container.
 
-**Source.** `src/solo/cell_reads.rs`, locked by `rows_are_emitted_in_reverse_first_appearance_order`. STAR: `SoloFeature_statsOutput.cpp`.
-
----
+**Impact.** Every value matches (on tiny 10x, all but the 3 barcodes of 3 reads rustar-aligner maps and STAR leaves unmapped); only the line each barcode is on differs. Read the file by barcode, not by position. A byte comparison against STAR's file does not work; sort both by barcode first.
 
 ### 3.3 SAM/BAM header program lines
 

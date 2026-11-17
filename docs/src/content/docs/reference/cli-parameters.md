@@ -24,6 +24,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--genomeSAindexNbases` | `14` | Length of the SA pre-indexing string (log2). Lower for small genomes. |
 | `--genomeChrBinNbits` | `18` | Log2 of chromosome bin size. |
 | `--genomeSAsparseD` | `1` | SA sparsity (higher = less RAM, slower mapping). |
+| `--genomeChrSetMitochondrial` | `chrM M MT` | Chromosomes counted as mitochondrial, for the `mito` column of `CellReads.stats`. `-` names none. |
 
 ## Read input
 
@@ -162,6 +163,7 @@ Run `rustar-aligner --help` for the full machine-generated listing.
 | `--quantGeneCoverage` | `No` | rustar-aligner extension. `Yes` writes per-gene exonic coverage to `GeneCoverage.out.bin` for DegNorm. See [DegNorm](/rustar-aligner/guides/degnorm/). |
 | `--degNormSampleId` | basename of `--outFileNamePrefix` | rustar-aligner extension. Sample name stored in `GeneCoverage.out.bin`. |
 | `--degNormCoverageFiles` | — | rustar-aligner extension. Two or more `GeneCoverage.out.bin` files: runs the DegNorm merge (no reads, no `--runMode`) and writes `DegNorm.out/`. Tuning: `--degNormIter`, `--degNormNmfIter`, `--degNormDownsampleRate`, `--degNormMinimaxCoverage`, `--degNormSkipBaselineSelection`, `--degNormBins`, `--degNormMinHighCoverage` (see the guide). |
+| `--soloCellReadStats` | `None` | `Standard` writes `Solo.out/<feature>/CellReads.stats` as STARsolo does: per cell barcode, how its reads' barcodes matched (`cbMatch`, `cbPerfect`, `cbMMunique`, `cbMMmultiple`), whether they mapped uniquely (`genomeU`/`genomeM`), reached one or several genes of the feature (`featureU`/`featureM`), their region (`exonic` for `Gene`; `GeneFull` sets none), `mito`, whether they reached the unique or multi-gene matrix (`countedU`/`countedM`), and the cell's UMI and gene totals. Reads whose barcode or UMI did not pass are summed in the `CBnotInPasslist` row. Rows come in reverse first-appearance order, which is not STAR's order (see the divergence notes); the values match, so read it by barcode. `CB` is a deprecated alias of `Standard`; STAR rejects it. |
 | `--soloCellRangerSummary` | `No` | rustar-aligner extension. `Yes` writes `Solo.out/<feature>/CellRanger.summary.csv` for `Gene` and `GeneFull` (both needed): the fractions of all reads that map uniquely in exonic, intronic or intergenic regions, or antisense to a gene, under CellRanger's metric names. STARsolo's `Summary.csv` is unchanged. |
 
 ## Two-pass mode

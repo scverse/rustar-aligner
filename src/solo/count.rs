@@ -924,6 +924,11 @@ fn fmt_real(v: f64) -> String {
 /// counts, cb-ascending) and merges each cell with its gene-ambiguous molecules
 /// (deduplicated by UMI, gene set = union). Cells present only in multi records
 /// (no unique gene) are skipped.
+///
+/// Returns, per cell, what the first method added to it: STAR's
+/// `nUMIperCBmulti` (the multi-gene UMIs it distributed) and `nGenePerCBmulti`
+/// (the genes they reached that had no unique count), for `CellReads.stats`
+/// (`SoloFeature_outputResults.cpp:134-221`).
 #[allow(clippy::too_many_arguments)]
 fn build_multi_matrices(
     raw_body: &tempfile::NamedTempFile,
@@ -934,9 +939,10 @@ fn build_multi_matrices(
     n_features: usize,
     n_barcodes: usize,
     gzip: bool,
-) -> Result<(), Error> {
+) -> Result<HashMap<u32, (f64, u32)>, Error> {
+    let mut per_cell: HashMap<u32, (f64, u32)> = HashMap::default();
     if methods.is_empty() {
-        return Ok(());
+        return Ok(per_cell);
     }
     use rayon::prelude::*;
     let mut multi: Vec<&crate::solo::MultiGeneRecord> = multi_records.iter().collect();
@@ -991,6 +997,16 @@ fn build_multi_matrices(
             let mols = cell_molecules(cb, mptr);
             for (k, &m) in methods.iter().enumerate() {
                 let counts = distribute_multi(m, u, &mols);
+                if k == 0 && !mols.is_empty() {
+                    let genes: std::collections::BTreeSet<u32> =
+                        mols.iter().flatten().copied().collect();
+                    let entry = per_cell.entry(cb).or_insert((0.0, 0));
+                    for g in genes {
+                        let unique = u.get(&g).copied();
+                        entry.0 += counts.get(&g).copied().unwrap_or(0.0) - unique.unwrap_or(0.0);
+                        entry.1 += u32::from(unique.is_none());
+                    }
+                }
                 let mut entries: Vec<(u32, f64)> =
                     counts.into_iter().filter(|&(_, v)| v > 1e-9).collect();
                 entries.sort_unstable_by_key(|&(g, _)| g);
@@ -1051,7 +1067,7 @@ fn build_multi_matrices(
         })?;
     }
     let _ = matrix_name; // UniqueAndMult uses a fixed name scheme
-    Ok(())
+    Ok(per_cell)
 }
 
 /// CellRanger's multi-gene UMI resolution, as STAR implements it for
@@ -1601,6 +1617,15 @@ pub fn write_gene_matrix(
     // The Gene feature's called cells, which Velocyto's filtered matrices use.
     let mut gene_called: Option<Vec<u32>> = None;
 
+    // `CellReads.stats`: the corrections that waited on the exact counts are
+    // resolved as `inputRecords` resolves them, the same for every feature.
+    if let Some(cell_stats) = &ctx.cell_read_stats {
+        cell_stats.lock().unwrap().resolve(
+            |cb| cb_passes_one_exact(true, &exact_counts, cb),
+            |cands| resolve_multi_cb(cands, &exact_counts, pseudocount),
+        );
+    }
+
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
     for (fi, (feature, recorder)) in ctx.features.iter().zip(&ctx.recorders).enumerate() {
         let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
@@ -1651,27 +1676,6 @@ pub fn write_gene_matrix(
             mstats.nnz,
             if gzip { " [gzip]" } else { "" },
         );
-
-        // `--soloCellReadStats CB`: the per-cell read summary, alongside the
-        // raw matrix because its UMI and gene columns are the raw totals.
-        if let Some(cell_stats) = &ctx.cell_read_stats {
-            let umi_gene: std::collections::BTreeMap<u32, (u32, u32)> = mstats
-                .cells
-                .iter()
-                .map(|c| (c.cb, (c.n_umis as u32, c.n_genes)))
-                .collect();
-            let path = feature_dir.join("CellReads.stats");
-            let text = cell_stats.lock().unwrap().render(
-                |cb| {
-                    ctx.whitelist
-                        .barcode_string(cb)
-                        .unwrap_or_else(|| cb.to_string())
-                },
-                &umi_gene,
-            );
-            std::fs::write(&path, text).map_err(|e| Error::io(e, &path))?;
-            log::info!("STARsolo: wrote {}/CellReads.stats", feature.dir_name());
-        }
 
         // Filtered (cell-called) matrix per --soloCellFilter. EmptyDrops_CR runs
         // the Monte-Carlo rescue (needs the per-cell profiles in the body).
@@ -1730,13 +1734,14 @@ pub fn write_gene_matrix(
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
         let (mut multi_counted, mut multi_dropped) = (0u64, 0u64);
+        let mut multi_per_cell: HashMap<u32, (f64, u32)> = HashMap::default();
         if !multi_methods.is_empty() {
             let mut mg = recorder.multi_gene.lock().unwrap();
             let before = mg.len();
             mg.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
             multi_counted = mg.len() as u64;
             multi_dropped = (before - mg.len()) as u64;
-            build_multi_matrices(
+            multi_per_cell = build_multi_matrices(
                 &body,
                 &mg,
                 &multi_methods,
@@ -1752,6 +1757,30 @@ pub fn write_gene_matrix(
                 feature.dir_name(),
                 mg.len(),
             );
+        }
+
+        // `--soloCellReadStats Standard`: the per-cell read summary. Its UMI
+        // and gene columns are the raw matrices' totals, so it follows them
+        // (`SoloFeature_statsOutput.cpp:88-123`).
+        if let Some(cell_stats) = &ctx.cell_read_stats {
+            let unique: HashMap<u32, (u64, u32)> = mstats
+                .cells
+                .iter()
+                .map(|c| (c.cb, (c.n_umis, c.n_genes)))
+                .collect();
+            let path = feature_dir.join("CellReads.stats");
+            let text = cell_stats.lock().unwrap().render(
+                fi,
+                |cb| {
+                    ctx.whitelist
+                        .barcode_string(cb)
+                        .unwrap_or_else(|| cb.to_string())
+                },
+                &unique,
+                &multi_per_cell,
+            );
+            std::fs::write(&path, text).map_err(|e| Error::io(e, &path))?;
+            log::info!("STARsolo: wrote {}/CellReads.stats", feature.dir_name());
         }
 
         // Features.stats: the counting-stage figures (`inputRecords`,

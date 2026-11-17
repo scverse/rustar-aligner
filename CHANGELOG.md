@@ -232,6 +232,25 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`CellReads.stats` as STARsolo writes it.** `--soloCellReadStats` now
+  takes STAR's value, `Standard`; `CB`, which rustar-aligner took before,
+  is kept as a deprecated alias. `--genomeChrSetMitochondrial` defaults to
+  STAR's `chrM M MT` instead of naming nothing. The file's values now follow
+  STAR's (`SoloReadFeature_record.cpp`, `SoloReadFeature_inputRecords.cpp`):
+  each feature keeps its own table, so `Gene` and `GeneFull` no longer print
+  the same rows, and the region columns come from the feature's own overlap
+  type (`exonic` for a `Gene` read with a gene, nothing for `GeneFull`)
+  instead of CellRanger's positional regions. Every read is counted under
+  `cbMatch`, including those whose barcode or UMI was rejected; one-mismatch
+  corrections and 1MM_multi barcodes are resolved with the run's exact counts,
+  as the matrix resolves them, so `cbMMunique`/`cbMMmultiple` and the rows
+  match; `featureM` and `countedM` are filled; and `nUMImulti`/`nGenesMulti`
+  come from the first `--soloMultiMappers` matrix. Rows are folded in input
+  order by the in-order consumer, so their order no longer depends on thread
+  timing; it is still not STAR's order (DIVERGENCE.md 3.2). On CellRanger's tiny 10x data every value matches STARsolo 2.7.11b
+  except on the 3 barcodes of 3 reads rustar-aligner maps and STAR leaves
+  unmapped.
+
 - **STARsolo's stats files as STAR writes them.** `Solo.out/Barcodes.stats`,
   `<feature>/Features.stats` and `<feature>/UMIperCellSorted.txt` were not
   written, SJ and Velocyto had no `Summary.csv`, and the Gene/GeneFull

@@ -2522,6 +2522,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
+        cell_read: Option<crate::solo::cell_reads::CellReadEntry>,
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -2575,6 +2576,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut no_feature_multi: Vec<Vec<SoloMultiRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
+                let mut cell_reads: Vec<crate::solo::cell_reads::CellReadEntry> = Vec::new();
                 for result in products {
                     let product = result?;
                     writer.write_batch(&product.sam_records.records)?;
@@ -2597,7 +2599,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     }
                     sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
+                    cell_reads.extend(product.cell_read);
                 }
+                solo.fold_cell_reads(cell_reads);
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
                     recorder.extend(
                         std::mem::take(&mut feat_records[fi]),
@@ -2710,6 +2714,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                     per_feature: outcome.per_feature,
                                     sj: outcome.sj,
                                     velocyto: outcome.velocyto,
+                                    cell_read: outcome.cell_read,
                                 });
                             }
 
@@ -2873,6 +2878,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                                 per_feature: outcome.per_feature,
                                 sj: outcome.sj,
                                 velocyto: outcome.velocyto,
+                                cell_read: outcome.cell_read,
                             })
                         })
                         .collect();
@@ -2971,6 +2977,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: crate::solo::SjRecords,
         velocyto: Option<crate::solo::VelocytoRecord>,
+        cell_read: Option<crate::solo::cell_reads::CellReadEntry>,
     }
 
     info!("STARsolo: aligning 5' paired-end reads and quantifying barcodes...");
@@ -3012,6 +3019,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     (0..n_feat).map(|_| Vec::new()).collect();
                 let mut no_feature_multi: Vec<Vec<SoloMultiRecord>> =
                     (0..n_feat).map(|_| Vec::new()).collect();
+                let mut cell_reads: Vec<crate::solo::cell_reads::CellReadEntry> = Vec::new();
                 for result in products {
                     let product = result?;
                     writer.write_batch(&product.sam_records.records)?;
@@ -3034,7 +3042,9 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                     }
                     sj_batch.append(product.sj);
                     velo_batch.extend(product.velocyto);
+                    cell_reads.extend(product.cell_read);
                 }
+                solo.fold_cell_reads(cell_reads);
                 for (fi, recorder) in solo.recorders.iter().enumerate() {
                     recorder.extend(
                         std::mem::take(&mut feat_records[fi]),
@@ -3398,6 +3408,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
                                 per_feature: outcome.per_feature,
                                 sj: outcome.sj,
                                 velocyto: outcome.velocyto,
+                                cell_read: outcome.cell_read,
                             })
                         })
                         .collect();
