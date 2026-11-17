@@ -1414,15 +1414,20 @@ pub struct Parameters {
     #[arg(long = "soloCBmatchWLtype", default_value = "1MM_multi")]
     pub solo_cb_match_wl_type: String,
 
-    /// `CB`: write `Solo.out/<feature>/CellReads.stats`, a per-cell-barcode
-    /// summary of what happened to the reads carrying it. `None` (the default)
-    /// writes nothing.
+    /// `Standard`: write `Solo.out/<feature>/CellReads.stats`, a
+    /// per-cell-barcode summary of what happened to the reads carrying it.
+    /// `None` (the default) writes nothing. `CB` is a deprecated alias of
+    /// `Standard` (STAR rejects it).
     #[arg(long = "soloCellReadStats", default_value = "None")]
     pub solo_cell_read_stats: String,
 
     /// Chromosome names treated as mitochondrial, for the `mito` column of
-    /// `CellReads.stats`. `-` (the default) names none.
-    #[arg(long = "genomeChrSetMitochondrial", num_args = 1.., default_values_t = vec!["-".to_string()])]
+    /// `CellReads.stats`. STAR's default is `chrM M MT`; `-` names none.
+    #[arg(
+        long = "genomeChrSetMitochondrial",
+        num_args = 1..,
+        default_values_t = ["chrM", "M", "MT"].map(String::from)
+    )]
     pub genome_chr_set_mitochondrial: Vec<String>,
     /// Two-column `CB cluster` file assigning cells to clusters, for
     /// `--soloFeatures Transcript3p`.
@@ -1535,6 +1540,12 @@ impl Parameters {
         } else {
             SamAttributes::empty()
         }
+    }
+
+    /// `--soloCellReadStats Standard` (or its deprecated alias `CB`): write
+    /// `CellReads.stats`.
+    pub fn solo_cell_read_stats_yes(&self) -> bool {
+        matches!(self.solo_cell_read_stats.as_str(), "Standard" | "CB")
     }
 
     /// Whether the run has to track STAR's readInfo, the per-read (cell,
@@ -2601,12 +2612,17 @@ impl Parameters {
                      SOLUTION: rerun with --soloUMIfiltering MultiGeneUMI_CR --soloUMIdedup 1MM_CR",
                 ));
             }
-            // --soloCellReadStats: `CB` is the only value STAR defines.
-            if !matches!(params.solo_cell_read_stats.as_str(), "CB" | "None") {
+            // --soloCellReadStats: STAR defines `Standard` and `None`
+            // (`ParametersSolo.cpp:441-451`); `CB`, which rustar-aligner took
+            // before, stays as a deprecated alias of `Standard`.
+            if !matches!(
+                params.solo_cell_read_stats.as_str(),
+                "Standard" | "None" | "CB"
+            ) {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     format!(
-                        "unknown --soloCellReadStats '{}'; expected CB or None",
+                        "unknown --soloCellReadStats '{}'; expected Standard or None",
                         params.solo_cell_read_stats
                     ),
                 ));
