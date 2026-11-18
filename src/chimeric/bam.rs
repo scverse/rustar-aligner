@@ -258,14 +258,14 @@ fn align_bam(
     params: &Parameters,
 ) -> Result<Vec<RecordBuf>, Error> {
     let n_ex = t.exons.len();
-    let (mut n_mates, mut i_ex_mate) = (1usize, n_ex - 1);
-    for i in 0..n_ex - 1 {
-        if t.canon_sj[i] == SJ_MATE_GAP {
-            n_mates = 2;
-            i_ex_mate = i;
-            break;
-        }
-    }
+    // The first mate gap splits the exons between the mates.
+    let (n_mates, i_ex_mate) = match t.canon_sj[..n_ex - 1]
+        .iter()
+        .position(|&sj| sj == SJ_MATE_GAP)
+    {
+        Some(i) => (2usize, i),
+        None => (1usize, n_ex - 1),
+    };
     let rl = b.read_length;
     let rl_orig = [read.seq[0].len(), read.seq[1].len()];
     let left_mate = if b.paired { t.str_ as usize } else { 0 };
