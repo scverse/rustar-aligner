@@ -403,7 +403,6 @@ impl SamWriter {
     /// * `genome` - Genome index
     /// * `params` - Parameters
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn build_paired_records(
         read_name: &str,
         mate1_seq: &[u8],
@@ -542,7 +541,6 @@ impl SamWriter {
     ///
     /// **Unmapped mate:** FLAG 0x4, uT:A:4, MAPQ 0, RNAME `*`, POS 0, RNEXT/PNEXT
     ///   at the mapped mate. SEQ/QUAL in forward orientation (no RC).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn build_half_mapped_records(
         read_name: &str,
